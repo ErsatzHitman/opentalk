@@ -143,8 +143,7 @@ pub fn transcribe(cfg: &Config, audio: &Audio) -> Result<Transcript, SttError> {
 
 /// Start a streaming session if the active provider/model streams and the config prefers it.
 pub fn start_stream(cfg: &Config) -> Option<Result<Box<dyn StreamingSession>, SttError>> {
-    let _ = cfg;
-    todo!("stt-stream")
+    streaming::start(cfg)
 }
 
 /// Pre-warm the active provider's connection (called at hotkey press).

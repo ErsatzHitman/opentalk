@@ -4,6 +4,7 @@
 //!
 //! Contract: the deterministic pipeline (`core::cleanup::process_pre_llm`) runs first; this module
 //! only polishes. Any failure/timeout/invalid output => caller keeps the deterministic text.
+pub mod enterprise;
 pub mod prompt;
 pub mod registry;
 
