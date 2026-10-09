@@ -34,12 +34,7 @@ pub(crate) struct Creds<'a> {
 fn run(origin: &str, region: &str, model: &str, creds: &Creds, unix_secs: u64, system: &str, user: &str, deadline: &Deadline) -> Result<String, LlmError> {
     let path = format!("/model/{}/converse", uri_encode(model));
     let url = format!("{origin}{path}");
-    let body = serde_json::to_vec(&json!({
-        "system": [{ "text": system }],
-        "messages": [{ "role": "user", "content": [{ "text": user }] }],
-        "inferenceConfig": { "temperature": 0, "maxTokens": max_tokens_for(user) },
-    }))
-    .map_err(|e| LlmError::Network(e.to_string()))?;
+    let body = serde_json::to_vec(&request_body(model, system, user)).map_err(|e| LlmError::Network(e.to_string()))?;
 
     let date = amz_date(unix_secs);
     let mut headers = vec![
@@ -62,6 +57,19 @@ fn run(origin: &str, region: &str, model: &str, creds: &Creds, unix_secs: u64, s
     }
     let v = resp.json().map_err(|e| LlmError::InvalidOutput(format!("bad JSON: {e}")))?;
     extract(&v)
+}
+
+/// Converse body. Newer Claude models (Opus 4.7+, Sonnet 5+, ...) reject `temperature`.
+fn request_body(model: &str, system: &str, user: &str) -> Value {
+    let mut inference = json!({ "maxTokens": max_tokens_for(user) });
+    if !crate::llm::providers::anthropic::rejects_temperature(model) {
+        inference["temperature"] = json!(0);
+    }
+    json!({
+        "system": [{ "text": system }],
+        "messages": [{ "role": "user", "content": [{ "text": user }] }],
+        "inferenceConfig": inference,
+    })
 }
 
 /// Concatenated text blocks of `output.message.content`.
@@ -390,6 +398,16 @@ mod tests {
         let reqs = mock.reqs.lock().unwrap();
         assert!(reqs[0].header("x-amz-security-token").is_none());
         assert!(reqs[0].header("authorization").unwrap().contains("SignedHeaders=content-type;host;x-amz-date,"));
+    }
+
+    #[test]
+    fn temperature_omitted_for_models_that_reject_it() {
+        let b = request_body("anthropic.claude-haiku-4-5-20251001-v1:0", "s", "u");
+        assert_eq!(b["inferenceConfig"]["temperature"], json!(0));
+        for m in ["anthropic.claude-opus-4-7", "us.anthropic.claude-sonnet-5-v1:0"] {
+            assert!(request_body(m, "s", "u")["inferenceConfig"].get("temperature").is_none(), "{m}");
+        }
+        assert_eq!(request_body("amazon.nova-micro-v1:0", "s", "u")["inferenceConfig"]["temperature"], json!(0));
     }
 
     #[test]

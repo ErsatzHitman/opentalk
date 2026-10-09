@@ -20,13 +20,35 @@ pub fn complete(cfg: &Config, system: &str, user: &str, timeout_ms: u64) -> Resu
 }
 
 /// [`complete`] with an explicit origin override (no process-global env read).
+///
+/// The request runs on a short-lived thread and the caller waits at most `timeout + 300 ms`, so a
+/// stall outside ureq's own deadline (DNS, TLS handshake, DPAPI) cannot hold up the paste.
 pub(crate) fn complete_with(cfg: &Config, system: &str, user: &str, timeout_ms: u64, base: Option<&str>) -> Result<String, LlmError> {
+    if !matches!(cfg.ai_cleanup.provider, LlmProviderId::AzureOpenai | LlmProviderId::Bedrock | LlmProviderId::Vertex) {
+        return Err(LlmError::NotConfigured);
+    }
     let deadline = Deadline::new(timeout_ms);
-    let base = base.map(|b| b.trim().trim_end_matches('/'));
+    let (cfg, system, user, base) = (cfg.clone(), system.to_string(), user.to_string(), base.map(str::to_string));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let spawned = std::thread::Builder::new().name("llm-enterprise".into()).spawn(move || {
+        let _ = tx.send(dispatch(&cfg, &system, &user, &deadline, base.as_deref()));
+    });
+    if let Err(e) = spawned {
+        return Err(LlmError::Network(format!("cannot start request thread: {e}")));
+    }
+    match rx.recv_timeout(Duration::from_millis(timeout_ms) + Duration::from_millis(300)) {
+        Ok(r) => r,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(LlmError::Timeout),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(LlmError::Network("request thread ended".into())),
+    }
+}
+
+fn dispatch(cfg: &Config, system: &str, user: &str, deadline: &Deadline, base: Option<&str>) -> Result<String, LlmError> {
+    let base = base.map(|b| b.trim().trim_end_matches('/')).filter(|b| !b.is_empty());
     match cfg.ai_cleanup.provider {
-        LlmProviderId::AzureOpenai => azure::complete(cfg, system, user, &deadline, base),
-        LlmProviderId::Bedrock => bedrock::complete(cfg, system, user, &deadline, base),
-        LlmProviderId::Vertex => vertex::complete(cfg, system, user, &deadline, base),
+        LlmProviderId::AzureOpenai => azure::complete(cfg, system, user, deadline, base),
+        LlmProviderId::Bedrock => bedrock::complete(cfg, system, user, deadline, base),
+        LlmProviderId::Vertex => vertex::complete(cfg, system, user, deadline, base),
         _ => Err(LlmError::NotConfigured),
     }
 }

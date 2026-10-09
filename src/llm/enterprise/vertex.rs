@@ -15,10 +15,13 @@ use rsa::{Pkcs1v15Sign, RsaPrivateKey};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
+/// Extra output tokens on top of the text budget for the (minimal) thinking Gemini may still do.
+const THINKING_HEADROOM: u32 = 1024;
 const SCOPE: &str = "https://www.googleapis.com/auth/cloud-platform";
 /// DER `DigestInfo` prefix for SHA-256 (RFC 8017 section 9.2); lets us reuse the workspace sha2.
 const SHA256_DIGEST_INFO: [u8; 19] = [0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05, 0x00, 0x04, 0x20];
@@ -32,13 +35,17 @@ struct ServiceAccount {
 }
 
 struct Cached {
-    /// `token_url|client_email` the token belongs to.
-    key: String,
     token: String,
     valid_until: Instant,
 }
 
-static TOKEN: Mutex<Option<Cached>> = Mutex::new(None);
+/// Access tokens by `token_url|client_email` (one entry in production; a map keeps independent
+/// accounts and parallel tests from evicting each other).
+static TOKENS: Mutex<Option<HashMap<String, Cached>>> = Mutex::new(None);
+
+fn cache_key(sa: &ServiceAccount, token_url: &str) -> String {
+    format!("{token_url}|{}", sa.client_email)
+}
 
 pub(super) fn complete(cfg: &Config, system: &str, user: &str, deadline: &Deadline, base: Option<&str>) -> Result<String, LlmError> {
     let ai = &cfg.ai_cleanup;
@@ -61,23 +68,50 @@ pub(super) fn complete(cfg: &Config, system: &str, user: &str, deadline: &Deadli
         uri_encode(&project),
         uri_encode(model.trim())
     );
-    run(&sa, &token_url, &url, system, user, deadline)
+    run(&sa, &token_url, &url, &build_body(&model, system, user), deadline)
 }
 
-fn run(sa: &ServiceAccount, token_url: &str, url: &str, system: &str, user: &str, deadline: &Deadline) -> Result<String, LlmError> {
-    let body = json!({
-        "systemInstruction": { "parts": [{ "text": system }] },
-        "contents": [{ "role": "user", "parts": [{ "text": user }] }],
-        "generationConfig": { "temperature": 0, "maxOutputTokens": max_tokens_for(user) },
+/// Gemini 3.x wants the default temperature (low values loop), as in `providers::gemini`.
+fn is_gemini3(model: &str) -> bool {
+    model.starts_with("gemini-3-") || model.starts_with("gemini-3.")
+}
+
+/// Same request policy as the direct Gemini provider: default temperature on Gemini 3, minimal
+/// thinking (plus token headroom for it, since thinking bills against `maxOutputTokens`), and the
+/// system prompt inlined for non-Gemini models that reject system instructions.
+fn build_body(model: &str, system: &str, user: &str) -> Value {
+    let lower = model.trim().to_ascii_lowercase();
+    let lower = lower.rsplit('/').next().unwrap_or(&lower);
+    let mut gen_cfg = json!({
+        "temperature": if is_gemini3(lower) { 1 } else { 0 },
+        "maxOutputTokens": max_tokens_for(user) + THINKING_HEADROOM,
     });
+    if let Some(t) = crate::llm::providers::gemini::thinking_config(lower) {
+        gen_cfg["thinkingConfig"] = t;
+    }
+    let mut body = json!({
+        "contents": [{ "role": "user", "parts": [{ "text": user }] }],
+        "generationConfig": gen_cfg,
+    });
+    if lower.starts_with("gemini-") {
+        body["systemInstruction"] = json!({ "parts": [{ "text": system }] });
+    } else {
+        body["contents"][0]["parts"][0]["text"] = json!(format!("{system}\n\n{user}"));
+    }
+    body
+}
+
+fn run(sa: &ServiceAccount, token_url: &str, url: &str, body: &Value, deadline: &Deadline) -> Result<String, LlmError> {
     for attempt in 0..2 {
         let token = access_token(sa, token_url, deadline)?;
         let auth = format!("Bearer {token}");
-        let resp = http::post_json(url, &[("Authorization", &auth)], &body, deadline.remaining()?).map_err(net_err)?;
+        let resp = http::post_json(url, &[("Authorization", &auth)], body, deadline.remaining()?).map_err(net_err)?;
         if resp.status == 401 && attempt == 0 {
             // Revoked or expired early: drop the cache and sign in again once.
-            if let Ok(mut g) = TOKEN.lock() {
-                *g = None;
+            if let Ok(mut g) = TOKENS.lock() {
+                if let Some(m) = g.as_mut() {
+                    m.remove(&cache_key(sa, token_url));
+                }
             }
             continue;
         }
@@ -112,10 +146,10 @@ fn extract(v: &Value) -> Result<String, LlmError> {
 
 /// Cached OAuth access token for this service account, refreshed 60 s before expiry.
 fn access_token(sa: &ServiceAccount, token_url: &str, deadline: &Deadline) -> Result<String, LlmError> {
-    let key = format!("{token_url}|{}", sa.client_email);
-    if let Ok(g) = TOKEN.lock() {
-        if let Some(c) = g.as_ref() {
-            if c.key == key && Instant::now() < c.valid_until {
+    let key = cache_key(sa, token_url);
+    if let Ok(g) = TOKENS.lock() {
+        if let Some(c) = g.as_ref().and_then(|m| m.get(&key)) {
+            if Instant::now() < c.valid_until {
                 return Ok(c.token.clone());
             }
         }
@@ -130,8 +164,10 @@ fn access_token(sa: &ServiceAccount, token_url: &str, deadline: &Deadline) -> Re
     let v = resp.json().map_err(|e| LlmError::InvalidOutput(format!("bad token JSON: {e}")))?;
     let token = v.get("access_token").and_then(Value::as_str).filter(|t| !t.is_empty()).ok_or_else(|| LlmError::InvalidOutput("token response without access_token".into()))?;
     let ttl = v.get("expires_in").and_then(Value::as_u64).unwrap_or(3600).saturating_sub(60);
-    if let Ok(mut g) = TOKEN.lock() {
-        *g = Some(Cached { key, token: token.to_string(), valid_until: Instant::now() + Duration::from_secs(ttl) });
+    if let Ok(mut g) = TOKENS.lock() {
+        let m = g.get_or_insert_with(HashMap::new);
+        m.retain(|_, c| Instant::now() < c.valid_until);
+        m.insert(key, Cached { token: token.to_string(), valid_until: Instant::now() + Duration::from_secs(ttl) });
     }
     Ok(token.to_string())
 }
@@ -244,7 +280,7 @@ Erzm2wnHzmRdLqeWvIM8AlM=
         let mock = vertex_mock(3600, hits.clone());
         let s = sa("shape@proj.iam.gserviceaccount.com");
         let url = format!("{}/v1/projects/proj/locations/us-central1/publishers/google/models/gemini-3.5-flash-lite:generateContent", mock.base);
-        let out = run(&s, &format!("{}/token", mock.base), &url, "SYS", "USR", &Deadline::new(10_000)).unwrap();
+        let out = run(&s, &format!("{}/token", mock.base), &url, &build_body("gemini-3.5-flash-lite", "SYS", "USR"), &Deadline::new(10_000)).unwrap();
         assert_eq!(out, "Hello, world.");
 
         let reqs = mock.reqs.lock().unwrap();
@@ -263,7 +299,25 @@ Erzm2wnHzmRdLqeWvIM8AlM=
         let b: Value = serde_json::from_str(&g.body).unwrap();
         assert_eq!(b["systemInstruction"]["parts"][0]["text"], "SYS");
         assert_eq!(b["contents"][0], json!({"role":"user","parts":[{"text":"USR"}]}));
+        // Gemini 3: default temperature, minimal thinking, thinking headroom.
+        assert_eq!(b["generationConfig"]["temperature"], json!(1));
+        assert_eq!(b["generationConfig"]["thinkingConfig"], json!({"thinkingLevel":"minimal"}));
+        assert_eq!(b["generationConfig"]["maxOutputTokens"], json!(256 + THINKING_HEADROOM));
+    }
+
+    #[test]
+    fn body_follows_model_family() {
+        let b = build_body("gemini-2.5-flash", "SYS", "USR");
         assert_eq!(b["generationConfig"]["temperature"], json!(0));
+        assert_eq!(b["generationConfig"]["thinkingConfig"], json!({"thinkingBudget":0}));
+        assert_eq!(b["systemInstruction"]["parts"][0]["text"], "SYS");
+        let b = build_body("gemini-3.1-pro-preview", "S", "U");
+        assert_eq!(b["generationConfig"]["thinkingConfig"], json!({"thinkingLevel":"low"}));
+        // Models without system-instruction support get the prompt inlined.
+        let b = build_body("gemma-4-31b-it", "SYS", "USR");
+        assert!(b.get("systemInstruction").is_none());
+        assert_eq!(b["contents"][0]["parts"][0]["text"], "SYS\n\nUSR");
+        assert!(b["generationConfig"].get("thinkingConfig").is_none());
     }
 
     #[test]
@@ -273,7 +327,7 @@ Erzm2wnHzmRdLqeWvIM8AlM=
         let s = sa("cache@proj.iam.gserviceaccount.com");
         let url = format!("{}/v1/x:generateContent", mock.base);
         for _ in 0..3 {
-            run(&s, &format!("{}/token", mock.base), &url, "s", "u", &Deadline::new(10_000)).unwrap();
+            run(&s, &format!("{}/token", mock.base), &url, &build_body("gemini-3.5-flash-lite", "s", "u"), &Deadline::new(10_000)).unwrap();
         }
         assert_eq!(hits.load(Ordering::SeqCst), 1, "one exchange serves three completions");
 
@@ -283,7 +337,7 @@ Erzm2wnHzmRdLqeWvIM8AlM=
         let s2 = sa("shortlived@proj.iam.gserviceaccount.com");
         let url2 = format!("{}/v1/x:generateContent", mock2.base);
         for _ in 0..2 {
-            run(&s2, &format!("{}/token", mock2.base), &url2, "s", "u", &Deadline::new(10_000)).unwrap();
+            run(&s2, &format!("{}/token", mock2.base), &url2, &build_body("gemini-3.5-flash-lite", "s", "u"), &Deadline::new(10_000)).unwrap();
         }
         assert_eq!(hits2.load(Ordering::SeqCst), 2);
     }
@@ -304,7 +358,7 @@ Erzm2wnHzmRdLqeWvIM8AlM=
         });
         let s = sa("refresh@proj.iam.gserviceaccount.com");
         let url = format!("{}/v1/x:generateContent", mock.base);
-        assert_eq!(run(&s, &format!("{}/token", mock.base), &url, "s", "u", &Deadline::new(10_000)).unwrap(), "Hello, world.");
+        assert_eq!(run(&s, &format!("{}/token", mock.base), &url, &build_body("gemini-3.5-flash-lite", "s", "u"), &Deadline::new(10_000)).unwrap(), "Hello, world.");
         assert_eq!(hits.load(Ordering::SeqCst), 2);
     }
 
@@ -312,7 +366,7 @@ Erzm2wnHzmRdLqeWvIM8AlM=
     fn token_endpoint_error_maps() {
         let mock = serve(|_| (400, r#"{"error":"invalid_grant","error_description":"Invalid JWT Signature."}"#.into()));
         let s = sa("bad@proj.iam.gserviceaccount.com");
-        let e = run(&s, &format!("{}/token", mock.base), &format!("{}/v1/x:generateContent", mock.base), "s", "u", &Deadline::new(10_000)).unwrap_err();
+        let e = run(&s, &format!("{}/token", mock.base), &format!("{}/v1/x:generateContent", mock.base), &build_body("gemini-3.5-flash-lite", "s", "u"), &Deadline::new(10_000)).unwrap_err();
         assert_eq!(e, LlmError::Http { status: 400, detail: "Invalid JWT Signature.".into() });
     }
 
