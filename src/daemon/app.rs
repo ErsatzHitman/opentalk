@@ -7,6 +7,7 @@
 //! - [`pipeline`]: the text stages shared with `--transcribe-file`
 //! - [`latency`]: per-dictation latency samples (ring buffer + log line)
 //! - [`settings`]: the Settings child process
+//! - [`micpolicy`]: when a microphone stream may stay prepared (not on Bluetooth headsets)
 //! - [`cli_cmds`]: `--transcribe-file` and `--bench`
 //!
 //! States: Idle -> (hotkey down) Arming [Hold mode, 150 ms] -> Recording -> (stop) Thinking
@@ -22,6 +23,7 @@ mod dictation;
 mod host;
 pub mod latency;
 pub mod machine;
+pub mod micpolicy;
 pub mod pipeline;
 pub mod settings;
 

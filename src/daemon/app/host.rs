@@ -23,6 +23,7 @@ use windows::core::{HSTRING, PCWSTR};
 
 use super::dictation::{ActiveJob, Failed, RecSession};
 use super::machine::{Action, Input, Machine, Phase};
+use super::micpolicy;
 use super::settings::{self, SettingsProc};
 use crate::core::config::{Config, SttProviderId};
 use crate::core::ipc::{self, IpcMsg};
@@ -31,7 +32,7 @@ use crate::core::{autostart, history, secrets};
 use crate::daemon::hotkey::{self, HotkeyEvent};
 use crate::daemon::pill::{Pill, PillEvent, PillMode, PillOptions};
 use crate::daemon::tray::{Tray, TrayCmd, TrayState};
-use crate::daemon::{audio, media, sound};
+use crate::daemon::{media, sound};
 use crate::{log_err, log_info, log_warn};
 
 pub(super) const WM_HOTKEY_EVT: u32 = ipc::WM_OT_INTERNAL_BASE + 1;
@@ -249,8 +250,8 @@ impl App {
             Action::CancelArming => self.kill_timer(TIMER_ARM),
             Action::StartRecording { hold } => {
                 self.kill_timer(TIMER_ARM);
-                let t0 = if hold { self.arm_t0 } else { t0 };
-                self.start_recording(t0);
+                let key_down = if hold { self.arm_t0 } else { t0 };
+                self.start_recording(t0, key_down);
             }
             Action::StopRecording => self.stop_recording(),
             Action::CancelRecording => self.cancel_recording(),
@@ -364,8 +365,8 @@ impl App {
         self.machine.set_mode(self.cfg.activation_mode);
         let opts = pill_options(&self.cfg);
         self.pill.set_options(opts);
-        if self.cfg.mic_device_id != old.mic_device_id {
-            audio::Recorder::prepare(self.cfg.mic_device_id.as_deref());
+        if self.cfg.mic_device_id != old.mic_device_id || self.cfg.mic_warm_hold_secs != old.mic_warm_hold_secs {
+            micpolicy::prepare_in_background(self.cfg.mic_device_id.clone(), self.cfg.mic_warm_hold_secs);
         }
         if self.cfg.pause_media && !old.pause_media {
             media::warm();
@@ -628,6 +629,7 @@ pub fn run(hidden: bool) -> i32 {
     }
     hotkey::set_start_menu_mask(app.cfg.suppress_start_menu);
     let mic = app.cfg.mic_device_id.clone();
+    let warm_hold = app.cfg.mic_warm_hold_secs;
     let pause_media = app.cfg.pause_media;
     let audio_cues = app.cfg.audio_cues;
     let start_minimized = app.cfg.start_minimized;
@@ -635,10 +637,7 @@ pub fn run(hidden: bool) -> i32 {
 
     // Warm-ups: none of these block message handling for long, and none opens the microphone
     // (a prepared stream is initialised but not started, so the mic indicator stays off).
-    match mic.as_deref() {
-        Some(id) => audio::Recorder::prepare(Some(id)),
-        None => audio::warmup(),
-    }
+    micpolicy::prepare_in_background(mic, warm_hold);
     if pause_media {
         media::warm();
     }

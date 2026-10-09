@@ -155,16 +155,29 @@ fn take_session(feed: Option<Feed>) -> Option<Box<dyn StreamingSession>> {
 }
 
 /// Stop a recorder nobody wants any more, off the UI thread (stopping waits for its capture loop).
-fn discard_recorder(recorder: Recorder) {
-    let spawned = std::thread::Builder::new().name("rec-discard".into()).spawn(move || recorder.cancel());
+fn discard_recorder(recorder: Recorder, cfg: &Config) {
+    let (mic, warm) = (cfg.mic_device_id.clone(), cfg.mic_warm_hold_secs);
+    let spawned = std::thread::Builder::new().name("rec-discard".into()).spawn(move || {
+        recorder.cancel();
+        super::micpolicy::after_recording(mic.as_deref(), warm);
+    });
     if let Err(e) = spawned {
         log_warn!("cannot spawn a thread to stop the recorder: {e}");
     }
 }
 
 impl App {
-    /// Begin a dictation (state machine already moved to Recording). `t0` is when the trigger arrived.
-    pub(super) fn start_recording(&mut self, t0: f64) {
+    /// Begin a dictation (state machine already moved to Recording). `t_trigger` is when the event
+    /// that starts recording arrived (key press, or the end of hold-mode arming), `t0` when the
+    /// hotkey went down.
+    pub(super) fn start_recording(&mut self, t_trigger: f64, t0: f64) {
+        // The pill comes first (PLAN §9.1): nothing before it may block, not even a DPAPI decrypt.
+        self.pill.follow_cursor_display();
+        self.pill.set_mode(PillMode::Preparing);
+        let hotkey_pill = now_ms() - t_trigger;
+        // The paste target is the window that had focus when the hotkey went down (the pill never
+        // takes focus, so showing it first does not change the answer).
+        let target = paste::capture_foreground();
         let cfg = self.cfg.clone();
         if let Some((title, msg)) = preflight(&cfg) {
             self.machine.step(Input::StartFailed);
@@ -172,11 +185,6 @@ impl App {
             self.pill.show_error(&title, &msg, false);
             return;
         }
-        // The paste target is the window that had focus when the hotkey went down.
-        let target = paste::capture_foreground();
-        self.pill.follow_cursor_display();
-        self.pill.set_mode(PillMode::Preparing);
-        let hotkey_pill = now_ms() - t0;
         self.seq += 1;
         let seq = self.seq;
         stt::prewarm(&cfg);
@@ -283,7 +291,7 @@ impl App {
         let Some(rec) = self.rec.as_mut().filter(|r| r.seq == seq) else {
             // Cancelled while the stream was coming up.
             if let Ok(r) = result {
-                discard_recorder(r);
+                discard_recorder(r, &self.cfg);
             }
             return;
         };
@@ -402,12 +410,17 @@ impl App {
         let hwnd = self.hwnd;
         self.job = Some(ActiveJob { id, cancel: job.cancel.clone() });
         let spawned = std::thread::Builder::new().name("dictation-worker".into()).spawn(move || {
+            let live = matches!(job.capture, Capture::Live { .. });
+            let (mic, warm) = (job.cfg.mic_device_id.clone(), job.cfg.mic_warm_hold_secs);
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_job(job))).unwrap_or_else(|_| Outcome::Failed {
                 title: "Something went wrong".into(),
                 message: "OpenTalk hit an internal error while processing that recording.".into(),
                 retry: None,
             });
             notify(hwnd, Note::JobDone { seq: id, outcome });
+            if live {
+                super::micpolicy::after_recording(mic.as_deref(), warm);
+            }
         });
         if let Err(e) = spawned {
             log_warn!("cannot start the worker thread: {e}");
@@ -469,7 +482,7 @@ impl App {
             }
             // A recorder still starting is discarded when its note arrives (seq no longer matches).
             if let Some(r) = rec.recorder {
-                discard_recorder(r);
+                discard_recorder(r, &self.cfg);
             }
             log_info!("recording #{} cancelled", rec.seq);
         }
