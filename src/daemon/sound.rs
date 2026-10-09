@@ -243,9 +243,8 @@ mod tests {
 
     #[test]
     fn cues_are_cached_and_distinct() {
-        init();
+        // `cues()`, not `init()`: init plays through the audio device (desktop tests only).
         let a = cues() as *const Cues;
-        init();
         assert_eq!(a, cues() as *const Cues);
         assert_ne!(cues().start, cues().stop);
     }

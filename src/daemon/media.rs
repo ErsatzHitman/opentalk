@@ -8,6 +8,7 @@
 //! touching any session). Call [`warm`] at start-up to take the first-request cost off the
 //! first dictation.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -29,6 +30,10 @@ enum Cmd {
 }
 
 static WORKER: OnceLock<Option<Mutex<Sender<Cmd>>>> = OnceLock::new();
+/// A pause request is queued or running on the worker. While a previous pause is still stuck
+/// (a media app that never answers), later calls return at once instead of each blocking for
+/// the whole budget on the hotkey path.
+static PAUSE_PENDING: AtomicBool = AtomicBool::new(false);
 
 fn worker() -> Option<&'static Mutex<Sender<Cmd>>> {
     WORKER
@@ -58,9 +63,14 @@ pub fn warm() {
 
 /// Pause playing media. Returns true if something was paused (and should be resumed).
 pub fn pause_if_playing() -> bool {
+    if PAUSE_PENDING.swap(true, Ordering::AcqRel) {
+        crate::log_warn!("media: previous pause still running; skipped");
+        return false;
+    }
     let (reply, rx) = mpsc::channel();
     let deadline = Instant::now() + PAUSE_BUDGET;
     if !send(Cmd::Pause { deadline, reply }) {
+        PAUSE_PENDING.store(false, Ordering::Release);
         return false;
     }
     match rx.recv_timeout(PAUSE_BUDGET) {
@@ -89,6 +99,7 @@ fn worker_main(rx: Receiver<Cmd>) {
             }
             Cmd::Pause { deadline, reply } => {
                 let n = pause_playing(&mut manager, &mut paused, deadline);
+                PAUSE_PENDING.store(false, Ordering::Release);
                 let _ = reply.send(n > 0);
             }
             Cmd::Resume => resume_paused(&mut paused),
@@ -317,7 +328,6 @@ mod tests {
         assert_eq!(next.status.get(), Status::Playing);
         assert!(!log.borrow().iter().any(|l| l == "pause next"));
     }
-
 
     fn playing_apps() -> Vec<String> {
         // SAFETY: plain COM init for the test thread.

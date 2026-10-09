@@ -763,7 +763,9 @@ fn hook_thread_main(ready: std::sync::mpsc::Sender<Result<(), String>>) {
             return;
         }
     };
-    HOOK_THREAD.store(unsafe { windows::Win32::System::Threading::GetCurrentThreadId() }, Ordering::SeqCst);
+    // SAFETY: GetCurrentThreadId has no preconditions.
+    let tid = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
+    HOOK_THREAD.store(tid, Ordering::SeqCst);
     let _ = ready.send(Ok(()));
     let mut msg = MSG::default();
     // SAFETY: plain message loop on the thread that owns the hook.
