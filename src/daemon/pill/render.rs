@@ -2,7 +2,6 @@
 //! No Win32 is touched except the (cached) GDI text masks used by the tooltip and the error card, so
 //! the output is deterministic for goldens.
 
-use super::PillMode;
 use super::anim::*;
 use super::card;
 use super::glow::{self, GlowFrame, Sprites};
@@ -435,13 +434,11 @@ fn render_error(st: &RenderState, e: &card::ErrorCard, t: f64, pm: &mut Pixmap) 
     pm.draw_pixmap(0, 0, layer.as_ref(), &PixmapPaint { opacity: op.clamp(0.0, 1.0), blend_mode: tiny_skia::BlendMode::SourceOver, quality: FilterQuality::Bilinear }, tf, None);
 }
 
-#[allow(dead_code)]
-fn _mode_used(_: PillMode) {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::core::config::PanelPosition;
+    use crate::daemon::pill::PillMode;
     use crate::daemon::pill::theme::Palette;
 
     fn rec_state(dark: bool) -> RenderState {

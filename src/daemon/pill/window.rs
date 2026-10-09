@@ -3,7 +3,7 @@
 //! click-vs-drag, the right-click menu, per-monitor DPI and the on-demand 60 fps animation timer.
 
 use super::card::CardHover;
-use super::model::{Hit, Pointer, RenderState, TickOutcome, window_size};
+use super::model::{Hit, Pointer, RenderState, TickOutcome};
 use super::render::{pixel_size, render_into};
 use super::theme::{Palette, resolve_dark};
 use super::{PillEvent, PillMode, PillOptions};
@@ -14,7 +14,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use tiny_skia::Pixmap;
-use windows::Win32::Foundation::{COLORREF, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WAIT_OBJECT_0, WPARAM, CloseHandle};
+use windows::Win32::Foundation::{COLORREF, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, SIZE, WAIT_OBJECT_0, WPARAM, CloseHandle};
 use windows::Win32::Graphics::Gdi::{
     AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS, DeleteDC,
     DeleteObject, GetMonitorInfoW, HBITMAP, HDC, HGDIOBJ, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint,
@@ -870,11 +870,6 @@ impl Drop for Window {
             }
         }
     }
-}
-
-#[allow(dead_code)]
-fn _unused(_: RECT, _: &mut Option<u8>, _: fn(&RenderState) -> (f32, f32)) {
-    let _ = window_size;
 }
 
 #[cfg(test)]

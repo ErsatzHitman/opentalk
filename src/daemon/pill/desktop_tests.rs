@@ -2,6 +2,7 @@
 //! `cargo test desktop_ -- --ignored --test-threads=1`.
 
 use super::*;
+use windows::Win32::Foundation::RECT;
 use std::time::{Duration, Instant};
 use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetWindowRect, IsWindowVisible, MSG, PM_REMOVE, PeekMessageW, SendMessageW, SetCursorPos, TranslateMessage,

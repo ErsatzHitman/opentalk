@@ -119,24 +119,46 @@ fn measure_raw(g: &Gdi, text: &str) -> i32 {
     size.cx
 }
 
-/// Advance width of `text` in device px (fractional, measured unhinted at 4x).
+fn metric_cache() -> &'static Mutex<HashMap<(String, Font), f32>> {
+    static C: std::sync::OnceLock<Mutex<HashMap<(String, Font), f32>>> = std::sync::OnceLock::new();
+    C.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Advance width of `text` in device px (fractional, measured unhinted at 4x; cached).
 pub fn measure(text: &str, font: Font) -> f32 {
     if text.is_empty() {
         return 0.0;
     }
+    let key = (text.to_string(), font);
+    if let Some(v) = metric_cache().lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+        return *v;
+    }
     let Some(g) = Gdi::new(big(font)) else { return 0.0 };
-    measure_raw(&g, text) as f32 / SS as f32
+    let v = measure_raw(&g, text) as f32 / SS as f32;
+    let mut c = metric_cache().lock().unwrap_or_else(|e| e.into_inner());
+    if c.len() > 2048 {
+        c.clear();
+    }
+    c.insert(key, v);
+    v
 }
 
-/// Ascent + descent of the font in device px.
+/// Ascent + descent of the font in device px (cached).
 pub fn content_height(font: Font) -> f32 {
+    static H: std::sync::OnceLock<Mutex<HashMap<Font, f32>>> = std::sync::OnceLock::new();
+    let m = H.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(v) = m.lock().unwrap_or_else(|e| e.into_inner()).get(&font) {
+        return *v;
+    }
     let Some(g) = Gdi::new(big(font)) else { return font.px as f32 };
     let mut tm = TEXTMETRICW::default();
     // SAFETY: valid DC, valid out-pointer.
     unsafe {
         let _ = GetTextMetricsW(g.dc, &mut tm);
     }
-    tm.tmHeight.max(1) as f32 / SS as f32
+    let v = tm.tmHeight.max(1) as f32 / SS as f32;
+    m.lock().unwrap_or_else(|e| e.into_inner()).insert(font, v);
+    v
 }
 
 fn rasterize(text: &str, font: Font) -> Option<Mask> {
