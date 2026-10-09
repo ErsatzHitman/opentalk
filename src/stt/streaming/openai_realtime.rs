@@ -203,12 +203,14 @@ impl Protocol for RealtimeProto {
     }
 
     fn text(&self) -> String {
-        let finals: Vec<&str> = self.order.iter().filter_map(|id| self.texts.get(id).map(String::as_str)).collect();
-        if !finals.is_empty() {
-            return finals.join(" ");
-        }
-        let partials: Vec<&str> = self.order.iter().filter_map(|id| self.partials.get(id).map(|s| s.trim())).filter(|s| !s.is_empty()).collect();
-        partials.join(" ")
+        // Per item: its final text, else what has streamed so far, so an item still in flight
+        // at the ceiling does not lose its words just because an earlier item completed.
+        self.order
+            .iter()
+            .filter_map(|id| self.texts.get(id).map(String::as_str).or_else(|| self.partials.get(id).map(|s| s.trim())))
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     fn error(&self) -> Option<SttError> {
@@ -276,5 +278,17 @@ mod tests {
         p.on_message(r#"{"type":"conversation.item.input_audio_transcription.delta","item_id":"a","delta":"hel"}"#, &mut out);
         p.on_message(r#"{"type":"conversation.item.input_audio_transcription.delta","item_id":"a","delta":"lo"}"#, &mut out);
         assert_eq!(p.text(), "hello");
+    }
+
+    #[test]
+    fn unfinished_item_keeps_its_partial_after_earlier_finals() {
+        let mut p = RealtimeProto::default();
+        let mut out = Vec::new();
+        p.on_message(r#"{"type":"input_audio_buffer.committed","item_id":"a"}"#, &mut out);
+        p.on_message(r#"{"type":"input_audio_buffer.committed","item_id":"b"}"#, &mut out);
+        p.on_message(r#"{"type":"conversation.item.input_audio_transcription.completed","item_id":"a","transcript":"first part"}"#, &mut out);
+        p.on_message(r#"{"type":"conversation.item.input_audio_transcription.delta","item_id":"b","delta":"second"}"#, &mut out);
+        p.on_message(r#"{"type":"conversation.item.input_audio_transcription.delta","item_id":"b","delta":" part"}"#, &mut out);
+        assert_eq!(p.text(), "first part second part");
     }
 }
