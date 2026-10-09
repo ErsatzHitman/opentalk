@@ -68,6 +68,8 @@ struct AssemblyProto {
     began: bool,
     turns: Vec<Turn>,
     partial: String,
+    /// `turn_order` of the turn `partial` belongs to.
+    partial_order: Option<u64>,
     finalize_sent: bool,
     flushed: bool,
     terminated: bool,
@@ -101,19 +103,24 @@ impl AssemblyProto {
         if transcript.is_empty() {
             return false;
         }
+        let order = v["turn_order"].as_u64();
         if v["end_of_turn"].as_bool() != Some(true) {
             let changed = self.partial != transcript;
             self.partial = transcript.to_string();
+            self.partial_order = order;
             return changed;
         }
         let formatted = v["turn_is_formatted"].as_bool() == Some(true);
-        let order = v["turn_order"].as_u64();
         let normalized = normalize(transcript);
         if normalized.is_empty() {
             return false;
         }
-        self.partial.clear();
-        if self.finalize_sent && formatted {
+        // A late formatted copy of an earlier turn must not drop (or settle) the turn in progress.
+        if order.is_none() || self.partial_order.is_none() || order >= self.partial_order {
+            self.partial.clear();
+            self.partial_order = None;
+        }
+        if self.finalize_sent && formatted && self.partial.is_empty() {
             self.flushed = true;
         }
         // The server can emit the same turn raw and then formatted: keep one, prefer formatted.
@@ -272,5 +279,20 @@ mod tests {
         let mut o = Vec::new();
         p.on_message(&turn("only a partial", false, false, 0), &mut o);
         assert_eq!(p.text(), "only a partial");
+    }
+
+    #[test]
+    fn late_formatted_earlier_turn_does_not_settle_the_open_turn() {
+        let mut p = AssemblyProto::default();
+        let mut o = Vec::new();
+        p.on_message(&turn("first turn", true, false, 0), &mut o);
+        p.on_message(&turn("second tu", false, false, 1), &mut o);
+        p.finalize();
+        // the formatted copy of turn 0 arrives after ForceEndpoint, turn 1 is still open
+        assert!(p.on_message(&turn("First turn.", true, true, 0), &mut o));
+        assert!(!p.done() && p.partial_pending());
+        assert!(p.on_message(&turn("Second turn.", true, true, 1), &mut o));
+        assert!(p.done() && !p.partial_pending());
+        assert_eq!(p.text(), "First turn. Second turn.");
     }
 }
