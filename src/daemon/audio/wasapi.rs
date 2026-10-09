@@ -66,10 +66,14 @@ impl Drop for Ev {
     }
 }
 
-struct ComGuard(bool);
+/// `uninit`: this thread's CoInitializeEx succeeded and must be balanced. That also means the
+/// thread is in the MTA (a thread that is already an STA gets RPC_E_CHANGED_MODE).
+struct ComGuard {
+    uninit: bool,
+}
 impl Drop for ComGuard {
     fn drop(&mut self) {
-        if self.0 {
+        if self.uninit {
             // SAFETY: balances the successful CoInitializeEx on this thread.
             unsafe { CoUninitialize() };
         }
@@ -81,13 +85,18 @@ thread_local! {
         // SAFETY: standard COM init; S_FALSE (already initialised) also needs the matching uninit.
         // RPC_E_CHANGED_MODE (thread is STA) is fine: COM is usable, we just must not uninit.
         let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
-        ComGuard(hr.is_ok())
+        ComGuard { uninit: hr.is_ok() }
     };
 }
 
 /// Make sure COM is usable on the calling thread.
 pub(crate) fn ensure_com() {
     COM.with(|_| {});
+}
+
+/// True when the calling thread is in the MTA (after `ensure_com`).
+fn in_mta() -> bool {
+    COM.with(|g| g.uninit)
 }
 
 struct SendEnum(IMMDeviceEnumerator, #[allow(dead_code)] IMMNotificationClient);
@@ -126,15 +135,24 @@ impl IMMNotificationClient_Impl for Notifier_Impl {
 
 static ENUMERATOR: Mutex<Option<SendEnum>> = Mutex::new(None);
 
+fn create_enumerator() -> Result<IMMDeviceEnumerator, String> {
+    // SAFETY: CLSID/IID come from the windows crate; no outer unknown.
+    unsafe { CoCreateInstance(&MMDeviceEnumerator, None::<&IUnknown>, CLSCTX_ALL) }.map_err(|e| format!("device enumerator: {e}"))
+}
+
+/// The process-wide enumerator (created and cached on an MTA thread). An STA caller (a GUI
+/// thread) gets a private, uncached one so the shared object never belongs to an apartment
+/// that may go away.
 fn enumerator() -> Result<IMMDeviceEnumerator, String> {
     ensure_com();
+    if !in_mta() {
+        return create_enumerator();
+    }
     let mut slot = ENUMERATOR.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(e) = slot.as_ref() {
         return Ok(e.0.clone());
     }
-    // SAFETY: CLSID/IID come from the windows crate; no outer unknown.
-    let e: IMMDeviceEnumerator =
-        unsafe { CoCreateInstance(&MMDeviceEnumerator, None::<&IUnknown>, CLSCTX_ALL) }.map_err(|e| format!("device enumerator: {e}"))?;
+    let e = create_enumerator()?;
     let notifier: IMMNotificationClient = Notifier.into();
     // SAFETY: the notifier is kept alive next to the enumerator for the life of the process.
     if let Err(err) = unsafe { e.RegisterEndpointNotificationCallback(&notifier) } {
