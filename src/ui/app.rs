@@ -40,6 +40,8 @@ pub struct App {
     sys_dark: bool,
     applied_dark: Option<bool>,
     was_focused: bool,
+    /// Time (egui seconds) of the next idle working-set trim, if one is pending.
+    trim_at: Option<f64>,
     support_open_id: Id,
 }
 
@@ -60,6 +62,7 @@ impl App {
             sys_dark: !theme::system_apps_use_light_theme(),
             applied_dark: None,
             was_focused: true,
+            trim_at: Some(1.5),
             support_open_id: Id::new("support-menu"),
         };
         if let Some(s) = launch.settings {
@@ -128,7 +131,19 @@ impl eframe::App for App {
             self.sys_dark = !theme::system_apps_use_light_theme();
             self.hist.reload();
         }
+        if !focused && self.was_focused {
+            self.trim_at = Some(ctx.input(|i| i.time) + 0.5);
+        }
         self.was_focused = focused;
+        if let Some(t) = self.trim_at {
+            let now = ctx.input(|i| i.time);
+            if now >= t {
+                trim_working_set();
+                self.trim_at = None;
+            } else {
+                ctx.request_repaint_after(std::time::Duration::from_secs_f64(t - now));
+            }
+        }
 
         let dark = self.dark();
         let p = Palette::for_dark(dark);
@@ -524,5 +539,16 @@ mod tests {
         let off_bar = (32 * 64 + 26) * 4;
         assert_eq!(ic.rgba[off_bar + 3], 255);
         assert!(ic.rgba[off_bar] < 120, "between bars it is the blue disc");
+    }
+}
+
+/// Hand the pages the GL driver and font atlas touched at start-up back to Windows. The panel is
+/// idle almost all the time, so this keeps its resident size small; pages fault back in on demand.
+fn trim_working_set() {
+    use windows::Win32::System::ProcessStatus::EmptyWorkingSet;
+    use windows::Win32::System::Threading::GetCurrentProcess;
+    // SAFETY: the pseudo handle from GetCurrentProcess is always valid for this process.
+    unsafe {
+        let _ = EmptyWorkingSet(GetCurrentProcess());
     }
 }
