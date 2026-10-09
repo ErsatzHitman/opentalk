@@ -29,7 +29,7 @@ Companion spec with exact pixel and colour values: `docs/SPEC.md`.
 | Hotkey to pill visible | ≤16 ms | Timestamped debug log (QPC) |
 | Hotkey to mic capturing | ≤50 ms | Log: hook event → first WASAPI packet |
 | Stop to text pasted | Network RTT + ≤40 ms local overhead | Log: stop → request sent → response → paste done |
-| Upload size | Silence-trimmed 16 kHz mono (FLAC optional, see Phase 7) | Bytes logged per request |
+| Upload size | Silence-trimmed 16 kHz mono PCM WAV (FLAC measured and not adopted, see §9.5) | Bytes logged per request |
 
 ---
 
@@ -285,7 +285,7 @@ OpenWhispr already has History (its Home page) and a Dictionary page with Snippe
 2. **Pre-built capture.** Keep `IMMDeviceEnumerator` and the device resolved at start-up, and re-resolve on `IMMNotificationClient` default-device change. The `IAudioClient` is created at the hotkey press, which is about 10–20 ms. An optional "keep mic warm" setting is offered, mirroring `micWarmHoldSeconds`, default off, because Windows shows the mic indicator while it is warm.
 3. **TLS pre-warm at hotkey press.** A background `HEAD`/`GET` opens the TLS connection to the provider host while you speak, so the upload reuses a warm keep-alive socket. That saves about 50–150 ms.
 4. **Trim leading and trailing silence** (energy VAD with 150 ms padding) before upload. Smaller body, fewer hallucinations.
-5. **Upload format.** 16 kHz mono PCM WAV. Phase 7 measures FLAC (`flacenc`, pure Rust): adopt it if it saves at least 30 ms on a median connection.
+5. **Upload format.** 16 kHz mono PCM WAV. **Decision (Phase 8 experiment, 2026-10-10): keep WAV, do not adopt FLAC.** `flacenc` 0.5.1 (pure Rust) shrinks the trimmed upload by 42-57% (a clean TTS clip 271,244 -> 128,297 bytes; the same clip with a mic-like noise floor -> 158,109 bytes) and encodes in about 1.8-1.9 ms per second of audio (~15 ms for 8.5 s). Net of that encode time, the saving is below the 30 ms bar at a 20 Mbps uplink for a typical 5 s dictation (17-25 ms) and falls to 1-8 ms at 50 Mbps; it only clears 30 ms below roughly 13 Mbps (5 s) or 20 Mbps (8.5 s). The price is +242 KB in the executable (3% of the 7.51 MB build, about half of the remaining 0.49 MB under the 8 MB budget), a per-provider format-acceptance matrix, and extra CPU on the hot path. Full numbers: `BENCHMARK.md`, section "FLAC upload experiment". Revisit only as an opt-in for slow uplinks (below about 10 Mbps), not as the default.
 6. **Streaming providers** (Deepgram, AssemblyAI, Realtime) send audio during recording, so stop-to-text is roughly the finalize time (about 150–300 ms).
 7. **Local post-processing:** deterministic cleanup under 1 ms. Paste is about 10 ms delay plus `SendInput`.
 8. **History write** happens after the paste, on the worker thread.
@@ -335,7 +335,7 @@ OpenWhispr already has History (its Home page) and a Dictionary page with Snippe
 | 5 | Cleanup | Deterministic pipeline, LLM cleanup (OpenAI, Anthropic, Gemini, Groq, OpenRouter, Custom), validation, snippets, dictionary fixes | Fixture suite green; OpenRouter free-model cleanup works with fallback |
 | 6 | Streaming and remaining BYOK | Deepgram WS, AssemblyAI WS, OpenAI Realtime, Gemini Live, Corti, Tinfoil per decision | Mock WS tests pass |
 | 7 | Settings UI | egui shell, History, Dictionary/Snippets, Settings modal, hotkey capture, provider Test button | Every setting persists and the daemon applies it live |
-| 8 | Hardening and bench | Enterprise (Bedrock/Vertex), FLAC experiment, DPI and multi-monitor, UIPI, bench report, polish | `BENCHMARK.md` meets the §1 targets |
+| 8 | Hardening and bench | Enterprise (Bedrock/Vertex), FLAC experiment (done: not adopted, §9.5), DPI and multi-monitor, UIPI, bench report, polish | `BENCHMARK.md` meets the §1 targets |
 
 ---
 
