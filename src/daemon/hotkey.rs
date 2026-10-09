@@ -11,7 +11,7 @@
 
 use std::sync::Mutex;
 use std::sync::TryLockError;
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HotkeyEvent {
@@ -686,7 +686,8 @@ static MATCHER: Mutex<Matcher<SysKeys>> = Mutex::new(Matcher::with_keys(SysKeys,
 static TARGET_HWND: AtomicIsize = AtomicIsize::new(0);
 static TARGET_MSG: AtomicU32 = AtomicU32::new(0);
 static HOOK_THREAD: AtomicU32 = AtomicU32::new(0);
-static STARTING: AtomicBool = AtomicBool::new(false);
+/// Join handle of the running hook thread; also serialises `start`/`stop`.
+static HOOK_JOIN: Mutex<Option<std::thread::JoinHandle<()>>> = Mutex::new(None);
 
 fn lock_matcher() -> std::sync::MutexGuard<'static, Matcher<SysKeys>> {
     MATCHER.lock().unwrap_or_else(|p| p.into_inner())
@@ -779,6 +780,8 @@ fn hook_thread_main(ready: std::sync::mpsc::Sender<Result<(), String>>) {
 /// Install the hook thread. Events are posted as `PostMessageW(hwnd, msg, HotkeyEvent as usize, 0)`.
 pub fn start(hwnd: isize, msg: u32, spec: &str) -> Result<(), String> {
     let parsed = parse(spec)?;
+    // Held for the whole call so a concurrent `stop`/`start` cannot see a half-started thread.
+    let mut slot = HOOK_JOIN.lock().unwrap_or_else(|p| p.into_inner());
     {
         let mut m = lock_matcher();
         if std::env::var("OPENTALK_ALLOW_INJECTED").is_ok_and(|v| v == "1") {
@@ -788,26 +791,41 @@ pub fn start(hwnd: isize, msg: u32, spec: &str) -> Result<(), String> {
         TARGET_MSG.store(msg, Ordering::SeqCst);
         m.set_spec(parsed);
     }
-    if HOOK_THREAD.load(Ordering::SeqCst) != 0 || STARTING.swap(true, Ordering::SeqCst) {
+    if slot.as_ref().is_some_and(|h| !h.is_finished()) {
         return Ok(());
     }
+    // A previous thread that died on its own: reap it before starting a new one.
+    if let Some(dead) = slot.take() {
+        let _ = dead.join();
+    }
     let (tx, rx) = std::sync::mpsc::channel();
-    let spawned = std::thread::Builder::new().name("hotkey-hook".into()).spawn(move || hook_thread_main(tx));
-    let result = match spawned {
-        Ok(_) => rx.recv().unwrap_or_else(|_| Err("hook thread exited early".into())),
-        Err(e) => Err(format!("cannot spawn hook thread: {e}")),
-    };
-    STARTING.store(false, Ordering::SeqCst);
-    result
+    let handle = std::thread::Builder::new()
+        .name("hotkey-hook".into())
+        .spawn(move || hook_thread_main(tx))
+        .map_err(|e| format!("cannot spawn hook thread: {e}"))?;
+    match rx.recv().unwrap_or_else(|_| Err("hook thread exited early".into())) {
+        Ok(()) => {
+            *slot = Some(handle);
+            Ok(())
+        }
+        Err(e) => {
+            let _ = handle.join();
+            Err(e)
+        }
+    }
 }
 
-/// Remove the hook and end its thread (the daemon normally just exits instead).
+/// Remove the hook and end its thread (the daemon normally just exits instead). Returns once the
+/// hook is gone, so an immediate `start` cannot race the old thread's shutdown.
 pub fn stop() {
+    let mut slot = HOOK_JOIN.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(handle) = slot.take() else { return };
     let tid = HOOK_THREAD.load(Ordering::SeqCst);
     if tid != 0 {
         // SAFETY: posting WM_QUIT to a thread id; failure just means the thread is gone.
         let _ = unsafe { PostThreadMessageW(tid, WM_QUIT, WPARAM(0), LPARAM(0)) };
     }
+    let _ = handle.join();
 }
 
 pub fn set_hotkey(spec: &str) -> Result<(), String> {
@@ -1696,6 +1714,31 @@ mod tests {
             assert!(pump_until(hwnd, 1, 300).is_empty(), "injected ignored again");
 
             stop();
+            // SAFETY: destroying the window created above on this thread.
+            unsafe {
+                let _ = DestroyWindow(hwnd);
+            }
+        }
+
+        /// `stop()` must wait for the old hook thread, or an immediate `start()` sees it alive,
+        /// skips installing a new hook, and the dying thread takes the only hook with it.
+        #[test]
+        #[ignore = "desktop: installs and removes a real WH_KEYBOARD_LL hook repeatedly"]
+        fn desktop_hook_stop_then_start_is_reliable() {
+            let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            let hwnd = make_window();
+            set_allow_injected(true);
+            for round in 0..20 {
+                start(hwnd.0 as isize, WM_APP + 7, "F22").expect("hook installs");
+                SEEN.lock().unwrap().clear();
+                send(&[(0x85, false), (0x85, true)]);
+                let got = pump_until(hwnd, 2, 1500);
+                assert_eq!(got, vec![HotkeyEvent::Down, HotkeyEvent::Up], "round {round}");
+                stop();
+            }
+            // Idempotent.
+            stop();
+            set_allow_injected(false);
             // SAFETY: destroying the window created above on this thread.
             unsafe {
                 let _ = DestroyWindow(hwnd);
