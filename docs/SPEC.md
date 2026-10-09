@@ -3,6 +3,8 @@
 Toolchain: rustup stable-x86_64-pc-windows-gnu + WinLibs mingw64 at C:\Users\aksha\tools\mingw64\bin (dlltool).
 Build: `PATH=$HOME/.cargo/bin:/c/Users/aksha/tools/mingw64/bin:$PATH cargo build --release`
 
+> **Approved by the user (2026-10-10):** the implemented recording pill and the round app-icon bubble beside it look right. Treat the current rendering in `src/daemon/pill*` as the reference: fix bugs or clear SPEC mismatches only, and do not restyle, resize or re-time it.
+
 ## Pill (exact OpenWhispr VoicePill)
 - Window 208x120, layered, topmost, no-activate, toolwindow. Placed at work area bottom-right, 4px margin.
   Group anchored 12px from window right and bottom (pill right edge 16px from work-area edge).
