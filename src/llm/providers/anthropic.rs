@@ -14,7 +14,8 @@ pub fn rejects_temperature(model: &str) -> bool {
     for (family, first_rejecting_major) in [("opus", 5u32), ("sonnet", 5), ("haiku", 6)] {
         if let Some(rest) = m.split(&format!("{family}-")).nth(1) {
             let mut nums = rest.split(['-', '.']).map(|p| p.parse::<u32>());
-            let major = nums.next().and_then(Result::ok);
+            // A date stamp (`claude-3-5-sonnet-20241022`) is not a version.
+            let major = nums.next().and_then(Result::ok).filter(|n| *n < 100);
             let minor = nums.next().and_then(Result::ok).filter(|n| *n < 100).unwrap_or(0);
             if let Some(major) = major {
                 if major >= first_rejecting_major {
@@ -97,7 +98,7 @@ mod tests {
 
     #[test]
     fn temperature_rule() {
-        for m in ["claude-haiku-4-5", "claude-sonnet-4-6", "claude-opus-4-6", "claude-opus-4-5", "claude-sonnet-4-5", "anthropic.claude-haiku-4-5"] {
+        for m in ["claude-haiku-4-5", "claude-sonnet-4-6", "claude-opus-4-6", "claude-opus-4-5", "claude-sonnet-4-5", "anthropic.claude-haiku-4-5", "claude-3-5-sonnet-20241022", "claude-opus-4-1-20250805", "claude-sonnet-4-5-20250929"] {
             assert!(!rejects_temperature(m), "{m} accepts temperature");
         }
         for m in ["claude-opus-4-7", "claude-opus-4-8", "claude-opus-5", "claude-sonnet-5", "claude-fable-5", "claude-fable-5-1", "claude-sonnet-5-1"] {

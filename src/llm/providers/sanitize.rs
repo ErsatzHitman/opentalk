@@ -130,6 +130,12 @@ fn without_interjection(plain: String) -> String {
     plain
 }
 
+/// Did the speaker dictate `label` followed by a colon (typed, or spoken as "colon")? Then it is
+/// content ("output colon done" -> "Output: done"), not a label the model added.
+fn speaker_said_label(raw_low: &str, label: &str) -> bool {
+    raw_low.contains(&format!("{label}:")) || raw_low.contains(&format!("{label} colon"))
+}
+
 fn strip_preamble(s: &str, raw_low: &str) -> String {
     let mut cur = s.trim().to_string();
     for _ in 0..3 {
@@ -140,7 +146,7 @@ fn strip_preamble(s: &str, raw_low: &str) -> String {
         let first_plain = without_interjection(plain_label(&first));
         if let Some(head) = first_plain.strip_suffix(':') {
             // Whole line is a label.
-            if is_label_head(head.trim()) && !raw_low.contains(first_plain.as_str()) {
+            if is_label_head(head.trim()) && !speaker_said_label(raw_low, head.trim()) {
                 match rest {
                     Some(r) => {
                         cur = r.trim().to_string();
@@ -152,7 +158,7 @@ fn strip_preamble(s: &str, raw_low: &str) -> String {
         } else if let Some((head, tail)) = first.split_once(':') {
             // "Cleaned transcript: Hello there." -> keep the text after the label.
             let head_plain = without_interjection(plain_label(head));
-            if is_label_head(&head_plain) && !tail.trim().is_empty() && !raw_low.contains(&format!("{head_plain}:")) {
+            if is_label_head(&head_plain) && !tail.trim().is_empty() && !speaker_said_label(raw_low, &head_plain) {
                 let tail = tail.trim_start_matches(|c: char| c == '*' || c.is_whitespace());
                 cur = match rest {
                     Some(r) => format!("{tail}\n{r}"),
@@ -462,6 +468,9 @@ mod tests {
         // The speaker dictated the label itself.
         assert_eq!(sanitize("Cleaned transcript: it works.", "cleaned transcript: it works"), "Cleaned transcript: it works.");
         assert_eq!(sanitize("**Send it.**", "send it"), "**Send it.**");
+        // A spoken "colon" after a label-like word is dictated content.
+        assert_eq!(sanitize("Output: done.", "output colon done"), "Output: done.");
+        assert_eq!(sanitize("Result: pass", "result colon pass"), "Result: pass");
     }
 
     // --- validate ---

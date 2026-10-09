@@ -7,6 +7,9 @@ use serde_json::{Value, json};
 pub const OPENROUTER_REFERER: &str = "https://github.com/opentalk";
 pub const OPENROUTER_TITLE: &str = "OpenTalk";
 
+/// Floor for `max_tokens` on chat-completions providers (see [`build`]).
+const MIN_MAX_TOKENS: u32 = 1024;
+
 /// Chat-completions endpoint for a base URL (a base already ending in `/chat/completions` is kept).
 pub fn endpoint(base_url: &str) -> String {
     let b = base_url.trim_end_matches('/');
@@ -20,7 +23,9 @@ pub fn build(req: &Req) -> Built {
             { "role": "system", "content": req.system },
             { "role": "user", "content": req.user },
         ],
-        "max_tokens": req.max_tokens,
+        // Reasoning-capable models (gpt-oss, Qwen3, the :free thinking models) spend this budget on
+        // thinking too; a larger cap costs nothing when they answer briefly.
+        "max_tokens": req.max_tokens.max(MIN_MAX_TOKENS),
     });
     if !openai_rejects_temperature(req.model) {
         body["temperature"] = json!(0);
@@ -99,7 +104,10 @@ mod tests {
         assert_eq!(b.body["messages"][1], json!({"role":"user","content":"USR"}));
         assert_eq!(b.body["temperature"], 0);
         assert_eq!(b.body["reasoning_effort"], "low");
-        assert_eq!(b.body["max_tokens"], 300);
+        assert_eq!(b.body["max_tokens"], MIN_MAX_TOKENS);
+        let mut big = req(LlmProviderId::Groq, "https://g/v1", "m", "k");
+        big.max_tokens = 4000;
+        assert_eq!(build(&big).body["max_tokens"], 4000);
         assert_eq!(b.headers, vec![("Authorization", "Bearer gsk_testkey_123".to_string())]);
         let b = build(&req(LlmProviderId::Groq, "https://g/v1", "qwen/qwen3.8-27b", "k"));
         assert!(b.body.get("reasoning_effort").is_none());
