@@ -9,6 +9,8 @@
 //!   opentalk.exe --bench ...          benchmark helpers (see bench/bench.ps1)
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 #![allow(dead_code)]
+// rustc embeds its own default manifest next to ours (build.rs); GNU ld reports the pair.
+#![allow(linker_messages)]
 
 mod core;
 mod daemon;
@@ -17,8 +19,15 @@ mod stt;
 mod ui;
 
 fn main() {
+    // Anchor the monotonic clock at process start so logged times measure from launch.
+    core::timing::now_ms();
     let args: Vec<String> = std::env::args().skip(1).collect();
-    core::logging::init(args.first().map(String::as_str).unwrap_or("daemon"));
+    // Daemon modes (no argument, or --hidden from launch-at-login) share one log file.
+    let log_name = match args.first().map(String::as_str) {
+        None | Some("--hidden") => "daemon",
+        Some(other) => other,
+    };
+    core::logging::init(log_name);
     let code = match args.first().map(String::as_str) {
         Some("--settings") => {
             ui::run(args.get(1).map(String::as_str));
