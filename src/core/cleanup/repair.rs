@@ -265,10 +265,12 @@ pub fn apply_line_breaks(doc: &mut Doc<'_>, turkish: bool) {
             pending = 0;
         }
     }
+    let leading = del[0];
     doc.remove(&del);
     doc.trailing_nl = doc.trailing_nl.max(trailing);
-    for t in doc.toks.iter_mut() {
-        if matches!(t.ws, Ws::Newlines(_))
+    for (i, t) in doc.toks.iter_mut().enumerate() {
+        // A break at the very start leaves no newline, but the text after it still starts a line.
+        if (matches!(t.ws, Ws::Newlines(_)) || (i == 0 && leading))
             && t.is_word()
             && let Some(c) = capitalized(t, turkish)
         {

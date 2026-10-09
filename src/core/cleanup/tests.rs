@@ -575,23 +575,23 @@ fn bench_stages() {
     med("tok+loops", || { let mut d = tokens::tokenize(&input); prep::collapse_loops(&mut d); });
     med("+fillers", || {
         let mut d = tokens::tokenize(&input); prep::collapse_loops(&mut d);
-        fillers::remove_fillers(&mut d, &fillers::Opts { en: true, ja: false, zh: false, aggressive: true, dictionary: &[] });
+        fillers::remove_fillers(&mut d, &fillers::Opts { en: true, um_at_pause_only: false, ja: false, zh: false, aggressive: true, dictionary: &[] });
     });
     med("+stutter", || {
         let mut d = tokens::tokenize(&input); prep::collapse_loops(&mut d);
-        fillers::remove_fillers(&mut d, &fillers::Opts { en: true, ja: false, zh: false, aggressive: true, dictionary: &[] });
+        fillers::remove_fillers(&mut d, &fillers::Opts { en: true, um_at_pause_only: false, ja: false, zh: false, aggressive: true, dictionary: &[] });
         stutter::collapse_stutters(&mut d);
     });
     med("+repair+render", || {
         let mut d = tokens::tokenize(&input); prep::collapse_loops(&mut d);
-        fillers::remove_fillers(&mut d, &fillers::Opts { en: true, ja: false, zh: false, aggressive: true, dictionary: &[] });
+        fillers::remove_fillers(&mut d, &fillers::Opts { en: true, um_at_pause_only: false, ja: false, zh: false, aggressive: true, dictionary: &[] });
         stutter::collapse_stutters(&mut d);
         repair::repair(&mut d, &repair::RepairOpts { turkish: false, english: true, french: false, auto: false });
         std::hint::black_box(d.render());
     });
     let cleaned = {
         let mut d = tokens::tokenize(&input); prep::collapse_loops(&mut d);
-        fillers::remove_fillers(&mut d, &fillers::Opts { en: true, ja: false, zh: false, aggressive: true, dictionary: &[] });
+        fillers::remove_fillers(&mut d, &fillers::Opts { en: true, um_at_pause_only: false, ja: false, zh: false, aggressive: true, dictionary: &[] });
         stutter::collapse_stutters(&mut d);
         repair::repair(&mut d, &repair::RepairOpts { turkish: false, english: true, french: false, auto: false });
         d.render()
@@ -613,4 +613,36 @@ fn bench_stages() {
     med("process(all)", || { std::hint::black_box(process(&input, &c)); });
     let c2 = CleanupCtx { dictionary: &[], snippets: &[], fuzzy_dictionary: false, spoken_line_breaks: false, ..c.clone() };
     med("process(bare)", || { std::hint::black_box(process(&input, &c2)); });
+}
+
+/// Unknown language: "um" between two words is a Portuguese article, not a hesitation.
+#[test]
+fn auto_language_keeps_um_article_between_words() {
+    let auto = |s: &str| process(s, &ctx("auto", FillerMode::Standard));
+    assert_eq!(auto("Um, olá, eu quero um café"), "Olá, eu quero um café");
+    assert_eq!(auto("Eu tenho um carro e um gato"), "Eu tenho um carro e um gato");
+    assert_eq!(auto("Um, hello there"), "Hello there");
+    assert_eq!(auto("we went to um the store"), "We went to the store");
+    assert_eq!(auto("I was thinking, um, that we go"), "I was thinking that we go");
+}
+
+/// A leading spoken break leaves no newline, but the text after it still starts a line.
+#[test]
+fn leading_line_break_capitalizes_next_word() {
+    let mut c = ctx("en", FillerMode::Standard);
+    c.spoken_line_breaks = true;
+    assert_eq!(process("new line hello new paragraph world", &c), "Hello
+
+World");
+    assert_eq!(process("hello new line world", &c), "Hello
+World");
+}
+
+/// A plural / possessive of a dictionary term is left alone by the fuzzy pass.
+#[test]
+fn fuzzy_keeps_plural_of_term() {
+    let dict = strs(&["Mahendra", "Kubernetes"]);
+    let mut c = ctx("en", FillerMode::Standard);
+    c.dictionary = &dict;
+    assert_eq!(process("Mahendras car is here", &c), "Mahendras car is here");
 }

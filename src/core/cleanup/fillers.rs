@@ -6,6 +6,10 @@ use super::tokens::{lower, Doc, Tok, Ws};
 pub struct Opts<'a> {
     /// "um" / "er" are fillers (English text).
     pub en: bool,
+    /// Language unknown and nothing marks the text as English: "um" / "er" only count as
+    /// hesitations at a pause (text edge or next to punctuation), never between two words
+    /// (Portuguese "um café").
+    pub um_at_pause_only: bool,
     /// Strip Japanese / Chinese hesitation strings from unspaced runs.
     pub ja: bool,
     pub zh: bool,
@@ -203,6 +207,13 @@ pub fn remove_fillers(doc: &mut Doc<'_>, o: &Opts<'_>) {
         if !t.is_word() || !is_hesitation(&t.lc, o.en) {
             continue;
         }
+        if o.um_at_pause_only && !is_hesitation(&t.lc, false) {
+            let before = i == 0 || !doc.toks[i - 1].is_word();
+            let after = doc.toks.get(i + 1).is_none_or(|nx| !nx.is_word());
+            if !before && !after {
+                continue;
+            }
+        }
         let c = collapse(&t.lc);
         let next_pair = doc
             .toks
@@ -327,7 +338,7 @@ mod tests {
 
     fn run(s: &str, en: bool, aggressive: bool) -> String {
         let mut d = tokenize(s);
-        remove_fillers(&mut d, &Opts { en, ja: true, zh: true, aggressive, dictionary: &[] });
+        remove_fillers(&mut d, &Opts { en, um_at_pause_only: false, ja: true, zh: true, aggressive, dictionary: &[] });
         d.render()
     }
 
@@ -402,7 +413,7 @@ mod tests {
     fn protected_dictionary_words_survive() {
         let mut d = tokenize("we love Hmm the band, um");
         let dict = vec!["hmm".to_string()];
-        remove_fillers(&mut d, &Opts { en: true, ja: false, zh: false, aggressive: false, dictionary: &dict });
+        remove_fillers(&mut d, &Opts { en: true, um_at_pause_only: false, ja: false, zh: false, aggressive: false, dictionary: &dict });
         assert_eq!(d.render(), "we love Hmm the band");
     }
 }

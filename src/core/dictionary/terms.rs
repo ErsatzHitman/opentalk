@@ -380,6 +380,12 @@ pub fn fuzzy_fix(text: &str, dictionary: &[String]) -> String {
                 }
             }
             let Some((d, ti, false)) = found else { continue };
+            // A plural / possessive of a term ("Mahendras") is the user's word, not a mishearing;
+            // replacing it would drop the "s".
+            let tc = &idx.fuzzy[ti].compact;
+            if compact.len() == tc.len() + 1 && compact.ends_with(&['s']) && compact[..tc.len()] == tc[..] {
+                continue;
+            }
             // Guards run only for the rare span that has a candidate.
             let piece =
                 |k: usize| -> String { chars[words[w + k].0..words[w + k].1].iter().map(|&c| fold1(c)).collect() };

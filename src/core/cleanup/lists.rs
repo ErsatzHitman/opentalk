@@ -279,6 +279,10 @@ word_set! {
     /// Words that mark text as English for the lone-"i" fix (positive evidence; words that other
     /// languages also use, such as "to", "is", "so" or "okay", are left out).
     is_english_marker: "the"
+        | "and"
+        | "that"
+        | "this"
+        | "think"
         | "you"
         | "your"
         | "with"

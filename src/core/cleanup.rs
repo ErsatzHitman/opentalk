@@ -86,11 +86,13 @@ pub fn process_pre_llm(raw: &str, ctx: &CleanupCtx) -> String {
         // unknown language they only count as fillers when the text shows no sign of those.
         let english = lang == "en"
             || (auto && !doc.toks.iter().any(|t| t.is_word() && lists::is_non_english_marker(&t.lc)));
+        let english_marker = auto && doc.toks.iter().any(|t| t.is_word() && lists::is_english_marker(&t.lc));
         // 4-6. Hesitations, context fillers, aggressive extras (with their commas).
         fillers::remove_fillers(
             &mut doc,
             &fillers::Opts {
                 en: english,
+                um_at_pause_only: auto && !english_marker,
                 ja: auto || lang == "ja",
                 zh: auto || lang == "zh" || lang == "yue",
                 aggressive: ctx.filler_mode == FillerMode::Aggressive,
