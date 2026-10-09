@@ -5,7 +5,7 @@
 //! --transcribe-file <wav> [--provider id] [--model m] [--llm | --no-llm]
 //! --bench dictate <n> <wav>        toggle a running daemon twice per round, wait for history
 //! --bench latency [n]              print the daemon log's latency lines + median/p95 summary
-//! --bench toggle | cancel | quit   one IPC message to the running daemon
+//! --bench toggle | cancel | quit | settings   one IPC message to the running daemon
 //! --bench wait-ready [secs]        block until the daemon window exists
 //! --bench mock-stt [--port P] [--delay-ms D] [--text T]   OpenAI-shaped local STT server
 //! ```
@@ -145,6 +145,7 @@ pub fn bench(args: &[String]) -> i32 {
         Some("toggle") => send(IpcMsg::Toggle),
         Some("cancel") => send(IpcMsg::Cancel),
         Some("quit") => send(IpcMsg::Quit),
+        Some("settings") => send(IpcMsg::OpenSettings),
         Some("wait-ready") => bench_wait_ready(&args[1..]),
         Some("mock-stt") => bench_mock(&args[1..]),
         Some("info") => bench_info(),
