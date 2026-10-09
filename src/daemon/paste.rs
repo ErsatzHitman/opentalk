@@ -34,10 +34,10 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT,
     KEYEVENTF_KEYUP, MAPVK_VK_TO_VSC, MapVirtualKeyW, SendInput, VIRTUAL_KEY, VK_CONTROL,
     VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_RCONTROL, VK_RMENU, VK_RSHIFT, VK_RWIN,
-    VK_SHIFT, VK_V,
+    VK_SHIFT, VK_V, VK_F24,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    ASFW_ANY, AllowSetForegroundWindow, CreateWindowExW, DestroyWindow, EnumChildWindows,
+    ASFW_ANY, AllowSetForegroundWindow, BringWindowToTop, CreateWindowExW, DestroyWindow, EnumChildWindows,
     GA_ROOTOWNER, GetAncestor, GetClassNameW, GetForegroundWindow, GetWindowThreadProcessId,
     HWND_MESSAGE, IsIconic, IsWindow, SW_RESTORE, SetForegroundWindow, ShowWindow, WINDOW_EX_STYLE,
     WS_POPUP,
@@ -586,6 +586,24 @@ fn utf16_bytes(text: &str) -> Vec<u8> {
     v
 }
 
+/// Windows clipboard text uses CRLF line breaks; classic Edit controls draw a lone LF as a box and
+/// keep everything on one line. A lone `\n` becomes `\r\n` (existing CRLF pairs are left alone).
+fn to_crlf(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.contains('\n') {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len() + 8);
+    let mut prev = ' ';
+    for c in text.chars() {
+        if c == '\n' && prev != '\r' {
+            out.push('\r');
+        }
+        out.push(c);
+        prev = c;
+    }
+    std::borrow::Cow::Owned(out)
+}
+
 /// Replace the clipboard with `text`, flagged so Win+V history and cloud sync ignore it.
 fn write_text(text: &str) -> bool {
     let Some(owner) = Owner::new() else { return false };
@@ -593,7 +611,7 @@ fn write_text(text: &str) -> bool {
     if !cb.empty() {
         return false;
     }
-    let ok = cb.set(CF_UNICODETEXT, &utf16_bytes(text));
+    let ok = cb.set(CF_UNICODETEXT, &utf16_bytes(&to_crlf(text)));
     add_exclusion_markers(&cb, &[]);
     ok
 }
@@ -664,11 +682,36 @@ fn ensure_foreground(target: &Target) -> bool {
         return true;
     }
     let hwnd = to_hwnd(target.hwnd);
+    // SAFETY: trivially safe query.
+    if !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
+        return false;
+    }
+    for attempt in 0..2 {
+        if attempt == 1 {
+            // Windows refuses SetForegroundWindow to a process that did not receive the last input
+            // event. A tap of an unassigned key (F24) counts as input and is ignored by apps.
+            let _ = send_chord(&[key(VK_F24, false), key(VK_F24, true)]);
+        }
+        try_set_foreground(hwnd);
+        let deadline = Instant::now() + Duration::from_millis(150);
+        loop {
+            if foreground_matches(target) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+    false
+}
+
+/// One `SetForegroundWindow` attempt, with this thread's input attached to the current foreground
+/// thread so Windows treats it as the active one.
+fn try_set_foreground(hwnd: HWND) {
     // SAFETY: Win32 focus calls; thread input is detached on every path.
     unsafe {
-        if !IsWindow(Some(hwnd)).as_bool() {
-            return false;
-        }
         let fg = GetForegroundWindow();
         let fg_tid = if fg.is_invalid() { 0 } else { GetWindowThreadProcessId(fg, None) };
         let our_tid = GetCurrentThreadId();
@@ -677,20 +720,11 @@ fn ensure_foreground(target: &Target) -> bool {
         if IsIconic(hwnd).as_bool() {
             let _ = ShowWindow(hwnd, SW_RESTORE);
         }
+        let _ = BringWindowToTop(hwnd);
         let _ = SetForegroundWindow(hwnd);
         if attached {
             let _ = AttachThreadInput(our_tid, fg_tid, false);
         }
-    }
-    let deadline = Instant::now() + Duration::from_millis(250);
-    loop {
-        if foreground_matches(target) {
-            return true;
-        }
-        if Instant::now() >= deadline {
-            return false;
-        }
-        thread::sleep(Duration::from_millis(10));
     }
 }
 
@@ -1010,6 +1044,15 @@ mod tests {
     }
 
     #[test]
+    fn crlf_normalisation() {
+        assert_eq!(to_crlf("a"), "a");
+        assert_eq!(to_crlf("a\nb"), "a\r\nb");
+        assert_eq!(to_crlf("a\r\nb"), "a\r\nb");
+        assert_eq!(to_crlf("a\n\nb\n"), "a\r\n\r\nb\r\n");
+        assert_eq!(to_crlf(""), "");
+    }
+
+    #[test]
     fn file_name_split() {
         assert_eq!(file_name(r"C:\Windows\explorer.exe"), "explorer.exe");
         assert_eq!(file_name("a.exe"), "a.exe");
@@ -1160,6 +1203,18 @@ mod tests {
     #[test]
     #[ignore]
     fn desktop_paste_notepad() {
+        paste_into_notepad(false);
+    }
+
+    /// Focus moves to another window between the hotkey press and the paste: the paste must still
+    /// land in the captured window (and multi-line text arrives intact).
+    #[test]
+    #[ignore]
+    fn desktop_paste_restores_focus() {
+        paste_into_notepad(true);
+    }
+
+    fn paste_into_notepad(steal_focus: bool) {
         use std::collections::HashSet;
         use std::process::Command;
         use windows::Win32::UI::WindowsAndMessaging::{
@@ -1235,7 +1290,39 @@ mod tests {
         assert!(!target.is_terminal);
         assert!(!target.elevated);
 
-        let text = "OpenTalk paste check \u{2014} caf\u{e9} 123";
+        let thief = if steal_focus {
+            use windows::Win32::UI::WindowsAndMessaging::WS_VISIBLE;
+            // SAFETY: a visible popup created and destroyed on this thread.
+            let h = unsafe {
+                CreateWindowExW(
+                    WINDOW_EX_STYLE(0),
+                    w!("STATIC"),
+                    w!("focus thief"),
+                    WS_POPUP | WS_VISIBLE,
+                    100,
+                    100,
+                    200,
+                    100,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            }
+            .expect("thief window");
+            let t = Target { hwnd: h.0 as isize, ..Default::default() };
+            assert!(ensure_foreground(&t), "thief could not take focus");
+            assert!(!foreground_matches(&target));
+            Some(h)
+        } else {
+            None
+        };
+
+        let text = if steal_focus {
+            "OpenTalk focus check\r\nsecond line"
+        } else {
+            "OpenTalk paste check \u{2014} caf\u{e9} 123"
+        };
         assert!(copy_to_clipboard("original user clipboard"));
         let (out, restore) = paste_inner(
             text,
@@ -1268,7 +1355,14 @@ mod tests {
             let _ = Command::new("taskkill").args(["/F", "/PID", &pid.to_string()]).output();
         }
         assert!(restore_clipboard(&user_clip));
+        if let Some(h) = thief {
+            // SAFETY: created above on this thread.
+            unsafe {
+                let _ = DestroyWindow(h);
+            }
+        }
         assert!(edit != 0, "edit control not found");
-        assert!(got.contains(text), "notepad text was {got:?}");
+        let norm = |s: &str| s.replace("\r\n", "\n").replace('\r', "\n");
+        assert!(norm(&got).contains(&norm(text)), "notepad text was {got:?}");
     }
 }
