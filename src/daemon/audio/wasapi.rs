@@ -743,9 +743,10 @@ fn run_session(prepared: &mut Option<Stream>, req: StartReq) {
 
     let (cpu0, cyc0) = (thread_cpu_ms(), thread_cycles());
     let mut clock = PacketClock { last: None, sum_ms: 0.0, max_ms: 0.0, n: 0 };
-    let handles = [stop.event_handle(), stream.event.0];
     let mut lost = false;
+    let mut retried = false;
     loop {
+        let handles = [stop.event_handle(), stream.event.0];
         // Stop is listed first so it wins when both are signalled.
         // SAFETY: both handles are valid for the loop's lifetime.
         let r = unsafe { WaitForMultipleObjects(&handles, false, IDLE_WAKE_MS) };
@@ -757,6 +758,16 @@ fn run_session(prepared: &mut Option<Stream>, req: StartReq) {
         }
         // Always drain: after stop it picks up the last packets; on timeout it detects a dead device.
         if let Err(e) = drain(&mut stream, &mut out, &mut clock, &mut stats) {
+            // A parked stream can go stale (device format changed, driver reset) while `Start`
+            // still succeeds. If nothing was captured yet, open a fresh stream once and carry on.
+            if out.len() == 0 && was_prepared && !retried && !stopping {
+                retried = true;
+                log_warn!("audio: parked stream failed on first read ({e}); re-opening the device");
+                if let Ok(fresh) = start_stream(prepared, device.as_deref()).and_then(|()| prepared.take().ok_or_else(|| "no stream".to_string())) {
+                    stream = fresh;
+                    continue;
+                }
+            }
             if e.code() == AUDCLNT_E_DEVICE_INVALIDATED {
                 log_warn!("audio: capture device invalidated (unplugged/disabled); keeping {} ms captured", out.len() / 16);
             } else {
@@ -809,6 +820,24 @@ mod tests {
 
     fn f32_bytes(v: &[f32]) -> Vec<u8> {
         v.iter().flat_map(|x| x.to_le_bytes()).collect()
+    }
+
+    /// The GUI thread is an STA; device listing must work there and agree with an MTA caller.
+    #[test]
+    #[ignore]
+    fn desktop_list_devices_from_sta_and_mta_threads() {
+        use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
+        let sta = std::thread::spawn(|| {
+            // SAFETY: standard COM init on a fresh thread; the thread ends right after.
+            let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+            list_devices()
+        })
+        .join()
+        .expect("STA thread panicked");
+        let mta = std::thread::spawn(list_devices).join().expect("MTA thread panicked");
+        assert_eq!(sta, mta);
+        assert!(sta.iter().filter(|d| d.is_default).count() <= 1);
+        assert!(sta.iter().all(|d| !d.id.is_empty() && !d.name.is_empty()));
     }
 
     #[test]
