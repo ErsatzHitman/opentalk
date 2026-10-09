@@ -42,6 +42,8 @@ pub(super) const WM_TRAY_EVT: u32 = ipc::WM_OT_INTERNAL_BASE + 3;
 pub(super) const WM_NOTE: u32 = ipc::WM_OT_INTERNAL_BASE + 4;
 /// The Settings child process exited (posted by its watcher thread).
 pub(super) const WM_SETTINGS_EXITED: u32 = ipc::WM_OT_INTERNAL_BASE + 5;
+/// Start-up: add the tray icon once the message loop runs.
+const WM_CREATE_TRAY: u32 = ipc::WM_OT_INTERNAL_BASE + 6;
 
 pub(super) const TIMER_ARM: usize = 1;
 pub(super) const TIMER_CAP: usize = 2;
@@ -290,14 +292,10 @@ impl App {
         if days == 0 {
             return;
         }
-        std::thread::Builder::new()
-            .name("history-prune".into())
-            .spawn(move || match history::prune(days) {
-                Ok(0) => {}
-                Ok(n) => log_info!("history: pruned {n} entries older than {days} days"),
-                Err(e) => log_warn!("history: prune failed: {e}"),
-            })
-            .ok();
+        let spawned = std::thread::Builder::new().name("history-prune".into()).spawn(move || prune_history_now(days));
+        if let Err(e) = spawned {
+            log_warn!("history: cannot start the prune thread: {e}");
+        }
     }
 
     // ---- IPC ----------------------------------------------------------------------------
@@ -402,6 +400,18 @@ impl App {
     }
 }
 
+/// Drop history entries older than `days` (0 = keep forever). Blocking; call off the UI thread.
+fn prune_history_now(days: u32) {
+    if days == 0 {
+        return;
+    }
+    match history::prune(days) {
+        Ok(0) => {}
+        Ok(n) => log_info!("history: pruned {n} entries older than {days} days"),
+        Err(e) => log_warn!("history: prune failed: {e}"),
+    }
+}
+
 /// Inverse of `ev as usize` for the events the pill posts.
 fn event_from_code(code: usize) -> Option<PillEvent> {
     use PillEvent as E;
@@ -423,6 +433,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         })),
         WM_NOTE => Some(with_app(|a| a.on_notes())),
         WM_SETTINGS_EXITED => Some(with_app(|a| a.on_settings_exited())),
+        WM_CREATE_TRAY => Some(with_app(|a| match Tray::create(a.hwnd, WM_TRAY_EVT) {
+            Ok(t) => a.tray = Some(t),
+            Err(e) => log_warn!("tray unavailable: {e}"),
+        })),
         WM_TIMER => Some(with_app(|a| a.on_timer(wparam.0))),
         WM_POWERBROADCAST if wparam.0 == PBT_APMRESUMEAUTOMATIC => Some(with_app(|a| a.reinstall_hook("resume"))),
         WM_WTSSESSION_CHANGE if wparam.0 == WTS_SESSION_UNLOCK => Some(with_app(|a| a.reinstall_hook("unlock"))),
@@ -600,7 +614,8 @@ pub fn run(hidden: bool) -> i32 {
     allow_ipc_from_lower_integrity(hwnd_of(hwnd));
     register_session_notifications(hwnd_of(hwnd));
 
-    let first_run = needs_setup(&cfg);
+    // Only an interactive launch opens Settings, so a login launch skips the key lookups.
+    let first_run = !hidden && needs_setup(&cfg);
     let mut app = match App::new(hwnd, cfg) {
         Ok(a) => a,
         Err(e) => {
@@ -609,10 +624,6 @@ pub fn run(hidden: bool) -> i32 {
         }
     };
     app.pill.set_mode(PillMode::Idle);
-    match Tray::create(hwnd, WM_TRAY_EVT) {
-        Ok(t) => app.tray = Some(t),
-        Err(e) => log_warn!("tray unavailable: {e}"),
-    }
     match hotkey::start(hwnd, WM_HOTKEY_EVT, &app.cfg.hotkey) {
         Ok(()) => {}
         Err(e) => {
@@ -633,21 +644,31 @@ pub fn run(hidden: bool) -> i32 {
     let pause_media = app.cfg.pause_media;
     let audio_cues = app.cfg.audio_cues;
     let start_minimized = app.cfg.start_minimized;
+    // Shell_NotifyIconW is a synchronous call into Explorer (occasionally ~200 ms): add the tray
+    // icon from the message loop, after the hotkey is already live.
+    post(hwnd, WM_CREATE_TRAY, 0);
+    let retention = app.cfg.history_retention_days;
     APP.with(|cell| *cell.borrow_mut() = Some(app));
 
-    // Warm-ups: none of these block message handling for long, and none opens the microphone
-    // (a prepared stream is initialised but not started, so the mic indicator stays off).
-    micpolicy::prepare_in_background(mic, warm_hold);
+    // Warm-ups run on one short-lived thread so the message loop (and the hotkey) is live at once.
+    // None of them opens the microphone: a prepared stream is initialised but not started, so the
+    // mic indicator stays off.
     if pause_media {
         media::warm();
     }
-    if audio_cues {
-        sound::init();
+    let warm = std::thread::Builder::new().name("startup-warm".into()).spawn(move || {
+        micpolicy::prepare_now(mic.as_deref(), warm_hold);
+        if audio_cues {
+            sound::init();
+        }
+        if let Err(e) = autostart::sync() {
+            log_warn!("autostart sync failed: {e}");
+        }
+        prune_history_now(retention);
+    });
+    if let Err(e) = warm {
+        log_warn!("cannot start the warm-up thread ({e}); dictations start cold");
     }
-    if let Err(e) = autostart::sync() {
-        log_warn!("autostart sync failed: {e}");
-    }
-    with_app(|a| a.prune_history());
     // SAFETY: timer on our own window.
     unsafe {
         SetTimer(Some(hwnd_of(hwnd)), TIMER_PRUNE, PRUNE_EVERY_MS, None);

@@ -53,20 +53,26 @@ pub fn may_keep_prepared(device_id: Option<&str>, warm_hold_secs: u32) -> bool {
     !enumerator_name(device_id).is_some_and(|n| is_bluetooth_enumerator(&n))
 }
 
-/// Start-up / microphone change: prepare the stream in the background unless the endpoint is a
-/// Bluetooth headset (see the module docs). Runs on its own short-lived thread.
-pub fn prepare_in_background(device_id: Option<String>, warm_hold_secs: u32) {
-    let spawned = std::thread::Builder::new().name("mic-prepare".into()).stack_size(256 * 1024).spawn(move || {
-        if may_keep_prepared(device_id.as_deref(), warm_hold_secs) {
-            match device_id.as_deref() {
-                Some(id) => audio::Recorder::prepare(Some(id)),
-                None => audio::warmup(),
-            }
-        } else {
-            log_info!("audio: Bluetooth microphone; not keeping a stream prepared (keep-warm is off)");
-            audio::Recorder::release_prepared();
+/// Prepare the stream for `device_id` unless it is a Bluetooth headset (see the module docs).
+/// Blocks for a few ms (endpoint lookup); the preparing itself happens on the audio thread.
+pub fn prepare_now(device_id: Option<&str>, warm_hold_secs: u32) {
+    if may_keep_prepared(device_id, warm_hold_secs) {
+        match device_id {
+            Some(id) => audio::Recorder::prepare(Some(id)),
+            None => audio::warmup(),
         }
-    });
+    } else {
+        log_info!("audio: Bluetooth microphone; not keeping a stream prepared (keep-warm is off)");
+        audio::Recorder::release_prepared();
+    }
+}
+
+/// [`prepare_now`] on a short-lived thread (microphone setting changed).
+pub fn prepare_in_background(device_id: Option<String>, warm_hold_secs: u32) {
+    let spawned = std::thread::Builder::new()
+        .name("mic-prepare".into())
+        .stack_size(256 * 1024)
+        .spawn(move || prepare_now(device_id.as_deref(), warm_hold_secs));
     if spawned.is_err() {
         // Without the check thread, fall back to the plain warm-up (never fatal).
         audio::warmup();
