@@ -54,18 +54,22 @@ impl std::fmt::Display for HttpError {
     }
 }
 
+/// Classify a transport/IO error message. Windows reports socket deadlines as WSAETIMEDOUT
+/// ("... did not properly respond ... (os error 10060)"), which never says "timed out".
+fn transport_error(msg: String) -> HttpError {
+    let low = msg.to_ascii_lowercase();
+    if low.contains("timed out") || low.contains("timeout") || low.contains("os error 10060") || low.contains("did not properly respond") {
+        HttpError::Timeout
+    } else {
+        HttpError::Network(msg)
+    }
+}
+
 fn convert(res: Result<ureq::Response, ureq::Error>) -> Result<HttpResponse, HttpError> {
     let resp = match res {
         Ok(r) => r,
         Err(ureq::Error::Status(_, r)) => r,
-        Err(ureq::Error::Transport(t)) => {
-            let msg = t.to_string();
-            return Err(if msg.to_ascii_lowercase().contains("timed out") || msg.contains("Timeout") {
-                HttpError::Timeout
-            } else {
-                HttpError::Network(msg)
-            });
-        }
+        Err(ureq::Error::Transport(t)) => return Err(transport_error(t.to_string())),
     };
     let status = resp.status();
     let headers = resp
@@ -77,7 +81,10 @@ fn convert(res: Result<ureq::Response, ureq::Error>) -> Result<HttpResponse, Htt
     resp.into_reader()
         .take(32 * 1024 * 1024)
         .read_to_string(&mut body)
-        .map_err(|e| HttpError::Network(e.to_string()))?;
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => HttpError::Timeout,
+            _ => transport_error(e.to_string()),
+        })?;
     Ok(HttpResponse { status, headers, body })
 }
 
@@ -186,5 +193,13 @@ mod tests {
         assert!(b.contains("name=\"model\"\r\n\r\nwhisper-1\r\n"));
         assert!(b.contains("filename=\"audio.wav\"\r\nContent-Type: audio/wav\r\n\r\nRIFF\r\n"));
         assert!(b.ends_with(&format!("--{boundary}--\r\n")));
+    }
+
+    #[test]
+    fn timeout_messages_are_classified() {
+        let wsa = "Network Error: A connection attempt failed because the connected party did not properly respond after a period of time (os error 10060)";
+        assert_eq!(transport_error(wsa.into()), HttpError::Timeout);
+        assert_eq!(transport_error("io: timed out reading response".into()), HttpError::Timeout);
+        assert!(matches!(transport_error("Connect error: connection refused (os error 10061)".into()), HttpError::Network(_)));
     }
 }
