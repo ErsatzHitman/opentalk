@@ -130,14 +130,34 @@ pub fn clean_transcript(raw: &str) -> String {
 
 /// A chat model that never received the audio (or declined) answers "I'm sorry, but I can't
 /// transcribe the audio." in prose; pasting that as dictation would be worse than an error.
-/// Deliberately narrow: a short apology/refusal that names transcribing or missing audio.
+/// Deliberately narrow: a short apology/refusal that talks about the audio input itself, so
+/// a dictated sentence such as "I can't transcribe the interview until Friday" survives.
 fn is_refusal(t: &str) -> bool {
     let lower = t.trim().to_lowercase().replace('\u{2019}', "'");
     if lower.chars().count() > 240 {
         return false;
     }
     let opens = ["i'm sorry", "i am sorry", "sorry,", "sorry!", "i can't", "i cannot", "i'm unable", "i am unable", "unfortunately"];
-    let about_audio = ["transcrib", "no audio", "audio was provided", "audio file", "audio content", "didn't receive any audio", "did not receive any audio"];
+    let about_audio = [
+        "transcribe the audio",
+        "transcribe this audio",
+        "transcribe audio",
+        "transcribe the provided audio",
+        "no audio",
+        "audio was provided",
+        "audio provided",
+        "audio attached",
+        "audio file attached",
+        "audio content",
+        "receive any audio",
+        "receive the audio",
+        "access to the audio",
+        "access to audio",
+        "listen to audio",
+        "listen to the audio",
+        "process audio",
+        "process the audio",
+    ];
     opens.iter().any(|o| lower.starts_with(o)) && about_audio.iter().any(|a| lower.contains(a))
 }
 
@@ -239,6 +259,9 @@ mod tests {
             ("Unfortunately there is no audio file attached.", ""),
             ("I'm sorry I can't make the meeting tomorrow.", "I'm sorry I can't make the meeting tomorrow."),
             ("I can't believe we shipped it.", "I can't believe we shipped it."),
+            ("I can't transcribe the interview until Friday.", "I can't transcribe the interview until Friday."),
+            ("Sorry, the audio file was corrupted, can you resend it?", "Sorry, the audio file was corrupted, can you resend it?"),
+            ("I'm unable to process the audio you sent.", ""),
             ("(laughs) that was great", "(laughs) that was great"),
             ("(Please send the report) ok", "(Please send the report) ok"),
             ("", ""),

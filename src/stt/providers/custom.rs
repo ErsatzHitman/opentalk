@@ -24,8 +24,10 @@ impl BatchProvider for Custom {
     }
 
     fn prewarm_url(&self, creds: &Credentials) -> Option<String> {
-        let base = normalize_base_url(creds.base_url.as_deref()?);
-        (!base.is_empty()).then_some(base)
+        // Same scheme defaulting and http-only-on-private-hosts rule as `transcribe`.
+        let raw = creds.base_url.as_deref().map(str::trim).filter(|b| !b.is_empty())?;
+        let base = normalize_base_url(&with_https_scheme(raw));
+        (!base.is_empty() && is_secure_endpoint(&base)).then_some(base)
     }
 
     fn transcribe(&self, audio: &Audio, opts: &SttOptions, creds: &Credentials) -> Result<Transcript, SttError> {
@@ -195,6 +197,16 @@ fn is_private_host(h: &str) -> bool {
 mod tests {
     use super::*;
     use crate::stt::providers::testutil::*;
+
+    #[test]
+    fn prewarm_url_defaults_scheme_and_skips_insecure_hosts() {
+        let c = |u: &str| Credentials { api_key: None, base_url: Some(u.into()), extra: vec![] };
+        assert_eq!(Custom.prewarm_url(&c("contoso.openai.azure.com/")).as_deref(), Some("https://contoso.openai.azure.com"));
+        assert_eq!(Custom.prewarm_url(&c("http://127.0.0.1:8080/v1/audio/transcriptions")).as_deref(), Some("http://127.0.0.1:8080/v1"));
+        assert_eq!(Custom.prewarm_url(&c("http://stt.example.com/v1")), None);
+        assert_eq!(Custom.prewarm_url(&c("  ")), None);
+        assert_eq!(Custom.prewarm_url(&Credentials::default()), None);
+    }
 
     #[test]
     fn normalizes_like_openwhispr() {
