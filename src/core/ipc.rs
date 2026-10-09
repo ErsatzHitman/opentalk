@@ -1,7 +1,7 @@
 //! Daemon <-> settings-process signalling via window messages to the daemon's hidden
 //! message window (class `DAEMON_WINDOW_CLASS`). Config/history live in files; messages only notify.
 //! TASK core-data implements `notify_daemon` (FindWindowW + PostMessageW) and `daemon_running`.
-use windows::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HWND, LPARAM, WPARAM};
+use windows::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HWND, LPARAM, WPARAM};
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::WindowsAndMessaging::{FindWindowExW, FindWindowW, HWND_MESSAGE, PostMessageW};
 use windows::core::{HSTRING, PCWSTR};
@@ -91,8 +91,9 @@ impl Drop for SingleInstanceGuard {
 }
 
 /// Take the process-wide single-instance lock. `None` means another daemon already holds it.
-/// If the mutex cannot be created at all (should not happen) we fail open and return a guard
-/// that owns nothing, so a broken environment never locks the user out of the app.
+/// Access denied means a daemon at a higher integrity level (elevated) holds it, so that also
+/// counts as taken. Any other failure to create it fails open with a guard that owns nothing,
+/// so a broken environment never locks the user out of the app.
 pub fn acquire_single_instance() -> Option<SingleInstanceGuard> {
     acquire_named(SINGLE_INSTANCE_MUTEX)
 }
@@ -110,6 +111,7 @@ fn acquire_named(name: &str) -> Option<SingleInstanceGuard> {
                     Some(SingleInstanceGuard(h))
                 }
             }
+            Err(e) if e.code() == ERROR_ACCESS_DENIED.to_hresult() => None,
             Err(_) => Some(SingleInstanceGuard(HANDLE::default())),
         }
     }

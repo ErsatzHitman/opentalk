@@ -36,6 +36,27 @@ pub fn set_enabled(enabled: bool) -> io::Result<()> {
     set_enabled_in(&REAL, enabled, &exe.to_string_lossy())
 }
 
+/// Re-point an existing Run entry at the current exe (after the user moved or renamed it).
+/// Never creates the entry and never touches StartupApproved, so a user's disable sticks.
+/// Returns true if the value was rewritten. Call once at daemon start-up.
+pub fn sync() -> io::Result<bool> {
+    let exe = std::env::current_exe()?;
+    sync_in(&REAL, &exe.to_string_lossy())
+}
+
+fn sync_in(keys: &Keys, exe: &str) -> io::Result<bool> {
+    let Some((_, data)) = read_value(keys.run, VALUE_NAME) else { return Ok(false) };
+    let wide: Vec<u16> = data.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+    let current = String::from_utf16_lossy(&wide);
+    let want = command_line(exe);
+    if current.trim_end_matches('\0') == want {
+        return Ok(false);
+    }
+    let wide: Vec<u16> = want.encode_utf16().chain(std::iter::once(0)).collect();
+    write_value(keys.run, VALUE_NAME, REG_SZ, &u16s_to_bytes(&wide))?;
+    Ok(true)
+}
+
 /// `"<exe>" --hidden`: the daemon starts straight into the tray.
 pub fn command_line(exe: &str) -> String {
     format!("\"{exe}\" --hidden")
@@ -231,8 +252,20 @@ mod tests {
         set_enabled_in(&k, true, exe).unwrap();
         assert!(read_value(k.approved, VALUE_NAME).is_some());
 
+        // A moved exe is re-pointed; the user's StartupApproved choice is left alone.
+        assert!(!sync_in(&k, exe).unwrap(), "already current");
+        let moved = r"D:\elsewhere\opentalk.exe";
+        assert!(sync_in(&k, moved).unwrap());
+        let (_, data) = read_value(k.run, VALUE_NAME).unwrap();
+        let wide: Vec<u16> = data.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        assert_eq!(String::from_utf16_lossy(&wide).trim_end_matches('\0'), command_line(moved));
+        assert!(read_value(k.approved, VALUE_NAME).is_some());
+
         set_enabled_in(&k, false, exe).unwrap();
         assert!(!is_enabled_in(&k));
+        // Sync never creates a disabled entry.
+        assert!(!sync_in(&k, exe).unwrap());
+        assert!(read_value(k.run, VALUE_NAME).is_none());
         // Disabling twice is fine.
         set_enabled_in(&k, false, exe).unwrap();
     }

@@ -55,7 +55,8 @@ pub fn get(name: &str) -> Option<String> {
     get_with(&paths::secrets_file(), name, &|k| std::env::var(k).ok())
 }
 
-/// Encrypt and store (empty string deletes).
+/// Encrypt and store (empty string deletes). Surrounding whitespace is trimmed first: a pasted
+/// key often carries a trailing newline, which would make every request's auth header invalid.
 pub fn set(name: &str, value: &str) -> io::Result<()> {
     set_in(&paths::secrets_file(), name, value)
 }
@@ -99,6 +100,7 @@ fn get_with(path: &Path, name: &str, env: &dyn Fn(&str) -> Option<String>) -> Op
 }
 
 fn set_in(path: &Path, name: &str, value: &str) -> io::Result<()> {
+    let value = value.trim();
     let _g = FILE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut store = match std::fs::read(path) {
         Ok(bytes) => match serde_json::from_slice::<Store>(&bytes) {
@@ -238,6 +240,13 @@ mod tests {
         assert_eq!(list_in(&p), vec!["groq".to_string()]);
         // Deleting something absent is a no-op.
         set_in(&p, "nothing", "").unwrap();
+        // Pasted keys are trimmed; whitespace-only deletes.
+        set_in(&p, "openai", "  sk-pasted
+").unwrap();
+        assert_eq!(get_with(&p, "openai", &no_env).as_deref(), Some("sk-pasted"));
+        set_in(&p, "openai", " 
+").unwrap();
+        assert_eq!(get_with(&p, "openai", &no_env), None);
     }
 
     #[test]
