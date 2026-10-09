@@ -372,6 +372,9 @@ impl App {
         if self.cfg.audio_cues && !old.audio_cues {
             sound::init();
         }
+        if !self.cfg.keep_failed_audio && self.last_failed.take().is_some() {
+            log_info!("keep failed audio turned off: dropped the recording kept for Retry");
+        }
         if self.cfg.history_retention_days != old.history_retention_days {
             self.prune_history();
         }

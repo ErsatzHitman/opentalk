@@ -462,9 +462,9 @@ impl App {
             Outcome::Nothing => self.pill.show_error(NO_SPEECH_TITLE, NO_SPEECH_BODY, false),
             Outcome::Failed { title, message, retry } => {
                 let can_retry = retry.is_some();
-                if retry.is_some() {
-                    self.last_failed = retry;
-                }
+                // Only the newest failure can be retried: an older recording is never kept behind
+                // a failure that did not keep its own audio (keep_failed_audio off).
+                self.last_failed = retry;
                 self.pill.show_error(&title, &message, can_retry);
             }
             Outcome::Cancelled => {}

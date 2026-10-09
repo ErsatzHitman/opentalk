@@ -99,7 +99,8 @@ theme, cleanup, microphone) without a restart.
 - Audio is recorded **only** between your start and stop (or while you hold the key) and sent to the speech-to-text
   provider you chose, over HTTPS (or WSS for streaming). Nothing is sent anywhere else, and there is no telemetry or account.
 - Audio is never written to disk. After a *failed* transcription the last recording stays in memory so Retry works, and is
-  dropped when you dictate again or quit (turn it off in Privacy & Data).
+  dropped by the next dictation that succeeds or fails, when you turn *keep failed audio* off in Privacy & Data, or
+  when you quit.
 - API keys are encrypted with Windows DPAPI (current user) in `secrets.json`; they are never logged.
 - History (text, app name, provider, timing) is a local `history.jsonl` you can clear or auto-prune.
 - With AI cleanup on, the *transcribed text* (not audio) is sent to the LLM provider you chose.
