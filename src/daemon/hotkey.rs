@@ -479,6 +479,11 @@ pub struct Matcher<K: KeyState = SysKeys> {
     win_used: bool,
     /// The Esc key-down was swallowed, so its key-up (and repeats) must be too.
     esc_swallowed: bool,
+    /// VK of the most recent non-modifier key-down (0 = none); modifiers count only when they
+    /// are the main key. Windows auto-repeats only the last key pressed, so a main-key down after
+    /// a different key-down cannot be a repeat. Modifiers are left out because AltGr repeats as
+    /// alternating LCtrl/RAlt downs.
+    last_down: u32,
 }
 
 impl<K: KeyState> Matcher<K> {
@@ -494,6 +499,7 @@ impl<K: KeyState> Matcher<K> {
             allow_injected: false,
             win_used: false,
             esc_swallowed: false,
+            last_down: 0,
         }
     }
 
@@ -534,6 +540,7 @@ impl<K: KeyState> Matcher<K> {
         let was_active = std::mem::take(&mut self.active);
         self.win_used = false;
         self.esc_swallowed = false;
+        self.last_down = 0;
         self.mods = 0;
         self.sync_mods(0);
         was_active.then_some(HotkeyEvent::Up)
@@ -579,6 +586,10 @@ impl<K: KeyState> Matcher<K> {
         let mut out = Outcome::default();
         if self.suspended || (injected && !self.allow_injected) {
             return out;
+        }
+        let prev_down = self.last_down;
+        if down && (mod_bit(vk) == 0 || self.spec.vk == Some(vk)) {
+            self.last_down = vk;
         }
 
         // Esc: the key-up of a swallowed Esc is always eaten, even if capture turned off since.
@@ -636,7 +647,13 @@ impl<K: KeyState> Matcher<K> {
                 }
                 Some(t) if vk == t => {
                     if down {
-                        // Auto-repeat (already active) is ignored.
+                        // Active and the last key down: auto-repeat, ignored. Active after some
+                        // other key went down: the key-up was missed (e.g. released on the Win+L
+                        // secure desktop), so this is a new press.
+                        if self.active && prev_down != t {
+                            self.active = false;
+                            out.push(HotkeyEvent::Up);
+                        }
                         if !self.active && self.required_ok() {
                             self.active = true;
                             out.push(HotkeyEvent::Down);
@@ -1285,6 +1302,44 @@ mod tests {
         assert_eq!(h.press_ev(b'A' as u32), vec![U]);
         // A new F8 press works.
         assert_eq!(h.press_ev(0x77), vec![D]);
+    }
+
+    #[test]
+    fn missed_main_key_up_then_same_key_is_a_new_press() {
+        let mut h = harness("F8");
+        assert_eq!(h.press_ev(0x77), vec![D]);
+        // Win+L while F8 is held; F8, Win and L are released on the secure desktop (unseen).
+        h.press_ev(VK_LWIN);
+        h.press_ev(b'L' as u32);
+        h.down.borrow_mut().clear();
+        // The first event after unlock is the next F8 press: it ends the stale press and starts anew.
+        assert_eq!(h.press_ev(0x77), vec![U, D]);
+        assert!(h.press_ev(0x77).is_empty(), "auto-repeat");
+        assert_eq!(h.release_ev(0x77), vec![U]);
+    }
+
+    #[test]
+    fn altgr_repeat_is_not_a_new_press() {
+        // Holding AltGr repeats as LCtrl, RAlt, LCtrl, RAlt, ...
+        let mut h = harness("RightAlt");
+        h.press_ev(VK_LCONTROL);
+        assert_eq!(h.press_ev(VK_RMENU), vec![D]);
+        for _ in 0..3 {
+            assert!(h.press_ev(VK_LCONTROL).is_empty());
+            assert!(h.press_ev(VK_RMENU).is_empty());
+        }
+        h.release_ev(VK_LCONTROL);
+        assert_eq!(h.release_ev(VK_RMENU), vec![U]);
+    }
+
+    #[test]
+    fn repeat_survives_another_keys_release() {
+        let mut h = harness("F8");
+        h.press_ev(VK_LSHIFT);
+        assert_eq!(h.press_ev(0x77), vec![D]);
+        assert!(h.release_ev(VK_LSHIFT).is_empty());
+        assert!(h.press_ev(0x77).is_empty(), "still auto-repeat: no other key went down");
+        assert_eq!(h.release_ev(0x77), vec![U]);
     }
 
     #[test]
