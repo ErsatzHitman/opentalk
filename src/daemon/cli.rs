@@ -2,6 +2,7 @@
 //! first attaches to the parent console (`AttachConsole(ATTACH_PARENT_PROCESS)`) to print.
 
 pub fn attach_console() {
+    // SAFETY: plain call without preconditions; it fails harmlessly when there is no parent console.
     unsafe {
         let _ = windows::Win32::System::Console::AttachConsole(windows::Win32::System::Console::ATTACH_PARENT_PROCESS);
     }

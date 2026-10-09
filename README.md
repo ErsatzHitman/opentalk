@@ -105,7 +105,7 @@ theme, cleanup, microphone) without a restart.
 - History (text, app name, provider, timing) is a local `history.jsonl` you can clear or auto-prune.
 - With AI cleanup on, the *transcribed text* (not audio) is sent to the LLM provider you chose.
 - Dictation text goes through the clipboard for pasting; it is excluded from Win+V clipboard history and the previous
-  clipboard contents are restored afterwards.
+  clipboard contents are restored afterwards (unless *Keep transcription in clipboard* is on).
 
 ## Layout
 

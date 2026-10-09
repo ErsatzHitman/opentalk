@@ -3,7 +3,8 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$script:KeyFileDefault = 'C:/Users/aksha/AppData/Local/Temp/claude/D--openwhispr/8fc84a6d-11b7-44ef-a857-0498a3e693e9/scratchpad/openrouter.key'
+# OpenRouter key file for live runs: -KeyFile, or the OPENTALK_OPENROUTER_KEY_FILE environment variable.
+$script:KeyFileDefault = $env:OPENTALK_OPENROUTER_KEY_FILE
 
 function New-TempHome([string]$prefix = 'opentalk') {
     $dir = Join-Path ([IO.Path]::GetTempPath()) ("{0}-{1}" -f $prefix, [Guid]::NewGuid().ToString('N').Substring(0, 8))
@@ -101,7 +102,7 @@ function Wait-History([string]$home_, [int]$count, [int]$timeoutSec) {
 }
 
 function Read-OpenRouterKey([string]$keyFile) {
-    if (-not (Test-Path $keyFile)) { return $null }
+    if (-not $keyFile -or -not (Test-Path $keyFile)) { return $null }
     return (Get-Content -Raw $keyFile).Trim()
 }
 
