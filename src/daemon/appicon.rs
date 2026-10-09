@@ -1,6 +1,37 @@
 //! Foreground application icon for the Spokenly-style bubble. TASK win-output implements:
 //! exe path -> high-quality icon (IShellItemImageFactory / SHGetFileInfo / ExtractIconEx at
 //! >= 48 px), UWP via package logo when needed, friendly name from FileDescription; per-exe cache.
+//!
+//! Extraction order: `IShellItemImageFactory` (sharp, alpha-correct, any size; for packaged apps it
+//! is asked for the `shell:AppsFolder\<AUMID>` item, which yields the Start-menu tile), then
+//! `PrivateExtractIconsW` (exact-size resource icon), then `SHGetFileInfoW` (system large icon).
+//! Icons from `HICON`s are rasterised on black and white to recover their alpha channel.
+use std::collections::HashMap;
+use std::ffi::c_void;
+use std::sync::Mutex;
+
+use windows::Win32::Foundation::{CloseHandle, HANDLE, SIZE};
+use windows::Win32::Graphics::Gdi::{
+    BITMAP, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS,
+    DeleteDC, DeleteObject, GetDIBits, GetObjectW, HBITMAP, HGDIOBJ, SelectObject,
+};
+use windows::Win32::Storage::FileSystem::{
+    FILE_FLAGS_AND_ATTRIBUTES, GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW,
+};
+use windows::Win32::Storage::Packaging::Appx::GetApplicationUserModelId;
+use windows::Win32::System::Com::{
+    COINIT_APARTMENTTHREADED, CoInitializeEx, CoTaskMemFree, CoUninitialize,
+};
+use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+use windows::Win32::UI::Shell::{
+    IShellItem, IShellItemImageFactory, SHCreateItemFromParsingName, SHGFI_ICON, SHGFI_LARGEICON,
+    SHGetFileInfoW, SHFILEINFOW, SIIGBF_BIGGERSIZEOK, SIIGBF_ICONONLY, SIGDN_NORMALDISPLAY,
+};
+use windows::Win32::UI::WindowsAndMessaging::{
+    DI_NORMAL, DestroyIcon, DrawIconEx, HICON, PrivateExtractIconsW,
+};
+use windows::core::{PCWSTR, PWSTR};
+
 use super::paste::Target;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -13,14 +44,617 @@ pub struct AppIcon {
     pub size: u32,
 }
 
+type Cache = Mutex<HashMap<(String, u32), AppIcon>>;
+
+fn cache() -> &'static Cache {
+    static CACHE: std::sync::OnceLock<Cache> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The cache survives a panic elsewhere while it was held (it only ever holds whole entries).
+fn lock_cache() -> std::sync::MutexGuard<'static, HashMap<(String, u32), AppIcon>> {
+    cache().lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Largest icon we ever produce (a bigger request is clamped).
+const MAX_PX: u32 = 256;
+
 /// Icon for the target's process at roughly `px` pixels (cached).
 pub fn load(target: &Target, px: u32) -> Option<AppIcon> {
-    let _ = (target, px);
-    todo!("win-output")
+    let px = px.clamp(16, MAX_PX);
+    if target.exe_path.is_empty() {
+        return None;
+    }
+    let key = (target.exe_path.to_ascii_lowercase(), px);
+    if let Some(hit) = lock_cache().get(&key) {
+        return Some(hit.clone());
+    }
+    let icon = extract(&target.exe_path, target.pid, px)?;
+    lock_cache().insert(key, icon.clone());
+    Some(icon)
 }
 
 /// Load an icon directly from an exe/ico path (used by `--render-pill --app-icon`).
 pub fn load_path(path: &str, px: u32) -> Option<AppIcon> {
-    let _ = (path, px);
-    todo!("win-output")
+    let px = px.clamp(16, MAX_PX);
+    if path.is_empty() {
+        return None;
+    }
+    let key = (path.to_ascii_lowercase(), px);
+    if let Some(hit) = lock_cache().get(&key) {
+        return Some(hit.clone());
+    }
+    let icon = extract(path, 0, px)?;
+    lock_cache().insert(key, icon.clone());
+    Some(icon)
+}
+
+fn extract(path: &str, pid: u32, px: u32) -> Option<AppIcon> {
+    let _com = Com::init();
+    let exe_name = file_name(path).to_ascii_lowercase();
+
+    // Packaged (UWP / MSIX) apps: the exe has no good icon; use the Start-menu tile instead.
+    let mut packaged_name = None;
+    let mut rgba = None;
+    if pid != 0 && path.to_ascii_lowercase().contains("\\windowsapps\\") {
+        if let Some(aumid) = aumid_of(pid) {
+            let item = format!("shell:AppsFolder\\{aumid}");
+            if let Some(img) = shell_image(&item, px) {
+                packaged_name = display_name(&item);
+                rgba = Some(img);
+            }
+        }
+    }
+    let rgba = rgba
+        .or_else(|| shell_image(path, px))
+        .or_else(|| private_extract(path, px))
+        .or_else(|| shgetfileinfo(path, px))?;
+
+    let name = packaged_name
+        .or_else(|| friendly_name(path))
+        .unwrap_or_else(|| name_from_stem(&exe_name));
+    Some(AppIcon { name, exe_name, rgba, size: px })
+}
+
+// ---------------------------------------------------------------------------------------------
+// Names
+// ---------------------------------------------------------------------------------------------
+
+fn file_name(path: &str) -> &str {
+    path.rsplit(['\\', '/']).next().unwrap_or(path)
+}
+
+/// "windows-terminal.exe" -> "Windows Terminal".
+fn name_from_stem(exe_name: &str) -> String {
+    let stem = match exe_name.rsplit_once('.') {
+        Some((s, _)) if !s.is_empty() => s,
+        _ => exe_name,
+    };
+    let words: Vec<String> = stem
+        .split(['-', '_', ' ', '.'])
+        .filter(|w| !w.is_empty())
+        .map(|w| {
+            let mut cs = w.chars();
+            match cs.next() {
+                Some(f) => f.to_uppercase().chain(cs).collect(),
+                None => String::new(),
+            }
+        })
+        .collect();
+    if words.is_empty() { exe_name.to_owned() } else { words.join(" ") }
+}
+
+fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// `FileDescription` from the version resource, via the file's translation table.
+fn friendly_name(path: &str) -> Option<String> {
+    let wpath = wide(path);
+    // SAFETY: buffers are sized from the API's own length report; pointers returned by
+    // VerQueryValueW point into `data`, which outlives their use.
+    unsafe {
+        let size = GetFileVersionInfoSizeW(PCWSTR(wpath.as_ptr()), None);
+        if size == 0 {
+            return None;
+        }
+        let mut data = vec![0u8; size as usize];
+        GetFileVersionInfoW(PCWSTR(wpath.as_ptr()), None, size, data.as_mut_ptr() as *mut c_void)
+            .ok()?;
+
+        let query = |sub: &str| -> Option<String> {
+            let wsub = wide(sub);
+            let mut p: *mut c_void = std::ptr::null_mut();
+            let mut len = 0u32;
+            if !VerQueryValueW(data.as_ptr() as *const c_void, PCWSTR(wsub.as_ptr()), &mut p, &mut len)
+                .as_bool()
+                || p.is_null()
+                || len == 0
+            {
+                return None;
+            }
+            let units = std::slice::from_raw_parts(p as *const u16, len as usize);
+            let end = units.iter().position(|&u| u == 0).unwrap_or(units.len());
+            clean_description(&String::from_utf16_lossy(&units[..end]))
+        };
+
+        // (language, codepage) pairs the file declares, then the usual suspects.
+        let mut langs: Vec<(u16, u16)> = Vec::new();
+        let wsub = wide("\\VarFileInfo\\Translation");
+        let mut p: *mut c_void = std::ptr::null_mut();
+        let mut len = 0u32;
+        if VerQueryValueW(data.as_ptr() as *const c_void, PCWSTR(wsub.as_ptr()), &mut p, &mut len)
+            .as_bool()
+            && !p.is_null()
+        {
+            let pairs = std::slice::from_raw_parts(p as *const u16, (len / 2) as usize);
+            for c in pairs.chunks_exact(2) {
+                langs.push((c[0], c[1]));
+            }
+        }
+        for extra in [(0x0409, 0x04B0), (0x0409, 0x04E4), (0x0000, 0x04B0)] {
+            if !langs.contains(&extra) {
+                langs.push(extra);
+            }
+        }
+        langs
+            .into_iter()
+            .find_map(|(l, cp)| query(&format!("\\StringFileInfo\\{l:04x}{cp:04x}\\FileDescription")))
+    }
+}
+
+/// Trim and reject empty / control-laden descriptions.
+fn clean_description(s: &str) -> Option<String> {
+    let t: String = s.chars().filter(|c| !c.is_control()).collect();
+    let t = t.trim();
+    if t.is_empty() { None } else { Some(t.to_owned()) }
+}
+
+/// AppUserModelId of a packaged process.
+fn aumid_of(pid: u32) -> Option<String> {
+    // SAFETY: handle closed on every path; buffer sized by the API's length report.
+    unsafe {
+        let h: HANDLE = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let mut len = 0u32;
+        let _ = GetApplicationUserModelId(h, &mut len, None);
+        let r = if len > 1 {
+            let mut buf = vec![0u16; len as usize];
+            let rc = GetApplicationUserModelId(h, &mut len, Some(PWSTR(buf.as_mut_ptr())));
+            if rc.0 == 0 {
+                let end = buf.iter().position(|&u| u == 0).unwrap_or(buf.len());
+                Some(String::from_utf16_lossy(&buf[..end]))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let _ = CloseHandle(h);
+        r
+    }
+}
+
+/// Shell display name of an item path ("Calculator" for an AppsFolder item).
+fn display_name(path: &str) -> Option<String> {
+    let w = wide(path);
+    // SAFETY: the returned PWSTR is CoTaskMem-allocated and freed here.
+    unsafe {
+        let item: IShellItem = SHCreateItemFromParsingName(PCWSTR(w.as_ptr()), None).ok()?;
+        let p = item.GetDisplayName(SIGDN_NORMALDISPLAY).ok()?;
+        let s = p.to_string().ok();
+        CoTaskMemFree(Some(p.0 as *const c_void));
+        s.and_then(|s| clean_description(&s))
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Pixel extraction
+// ---------------------------------------------------------------------------------------------
+
+/// Apartment guard (STA); balanced uninit only when this call actually initialised COM.
+struct Com(bool);
+
+impl Com {
+    fn init() -> Com {
+        // SAFETY: standard COM init; RPC_E_CHANGED_MODE just means the thread already has COM.
+        Com(unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.is_ok())
+    }
+}
+
+impl Drop for Com {
+    fn drop(&mut self) {
+        if self.0 {
+            // SAFETY: paired with the successful CoInitializeEx above.
+            unsafe { CoUninitialize() };
+        }
+    }
+}
+
+/// `IShellItemImageFactory::GetImage(ICONONLY)` -> straight RGBA at exactly `px` x `px`.
+fn shell_image(path: &str, px: u32) -> Option<Vec<u8>> {
+    let w = wide(path);
+    // SAFETY: HBITMAP is deleted before returning.
+    unsafe {
+        let factory: IShellItemImageFactory =
+            SHCreateItemFromParsingName(PCWSTR(w.as_ptr()), None).ok()?;
+        let hbm = factory
+            .GetImage(SIZE { cx: px as i32, cy: px as i32 }, SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK)
+            .ok()?;
+        let r = hbitmap_to_rgba(hbm);
+        let _ = DeleteObject(HGDIOBJ(hbm.0));
+        let (mut bgra, bw, bh) = r?;
+        bgra_to_straight_rgba(&mut bgra);
+        fit_square(bgra, bw, bh, px)
+    }
+}
+
+/// Read a 32bpp bitmap as top-down BGRA.
+unsafe fn hbitmap_to_rgba(hbm: HBITMAP) -> Option<(Vec<u8>, u32, u32)> {
+    // SAFETY: caller passes a valid bitmap; GetDIBits fills a buffer we sized for w*h*4 bytes.
+    unsafe {
+        let mut bm = BITMAP::default();
+        if GetObjectW(HGDIOBJ(hbm.0), size_of::<BITMAP>() as i32, Some(&mut bm as *mut _ as *mut c_void))
+            == 0
+        {
+            return None;
+        }
+        let (w, h) = (bm.bmWidth, bm.bmHeight);
+        if w <= 0 || h <= 0 {
+            return None;
+        }
+        let hdc = CreateCompatibleDC(None);
+        if hdc.is_invalid() {
+            return None;
+        }
+        let mut bmi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: w,
+                biHeight: -h, // top-down
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut buf = vec![0u8; (w * h * 4) as usize];
+        let lines = GetDIBits(
+            hdc,
+            hbm,
+            0,
+            h as u32,
+            Some(buf.as_mut_ptr() as *mut c_void),
+            &mut bmi,
+            DIB_RGB_COLORS,
+        );
+        let _ = DeleteDC(hdc);
+        if lines == 0 {
+            return None;
+        }
+        Some((buf, w as u32, h as u32))
+    }
+}
+
+/// In place: BGRA (premultiplied if every colour channel <= alpha) -> straight RGBA. A bitmap with
+/// no alpha at all (all zero) is treated as opaque.
+fn bgra_to_straight_rgba(px: &mut [u8]) {
+    let has_alpha = px.chunks_exact(4).any(|p| p[3] != 0);
+    let premultiplied = has_alpha && px.chunks_exact(4).all(|p| p[0] <= p[3] && p[1] <= p[3] && p[2] <= p[3]);
+    for p in px.chunks_exact_mut(4) {
+        let (b, g, r) = (p[0], p[1], p[2]);
+        let a = if has_alpha { p[3] } else { 255 };
+        let un = |c: u8| -> u8 {
+            if premultiplied && a != 0 && a != 255 {
+                ((c as u32 * 255 + a as u32 / 2) / a as u32).min(255) as u8
+            } else {
+                c
+            }
+        };
+        p[0] = un(r);
+        p[1] = un(g);
+        p[2] = un(b);
+        p[3] = a;
+    }
+}
+
+/// Return `px` x `px` straight RGBA from a `w` x `h` source: untouched when it already fits,
+/// otherwise bilinearly resampled (aspect kept, centred).
+fn fit_square(src: Vec<u8>, w: u32, h: u32, px: u32) -> Option<Vec<u8>> {
+    if w == 0 || h == 0 || src.len() < (w * h * 4) as usize {
+        return None;
+    }
+    if w == px && h == px {
+        return Some(src);
+    }
+    let scale = (px as f32 / w as f32).min(px as f32 / h as f32);
+    let (dw, dh) = (((w as f32 * scale).round() as u32).max(1), ((h as f32 * scale).round() as u32).max(1));
+    let (ox, oy) = ((px - dw.min(px)) / 2, (px - dh.min(px)) / 2);
+    let mut out = vec![0u8; (px * px * 4) as usize];
+    let at = |x: u32, y: u32| -> [f32; 4] {
+        let i = ((y.min(h - 1) * w + x.min(w - 1)) * 4) as usize;
+        let a = src[i + 3] as f32;
+        // premultiplied for correct blending
+        [src[i] as f32 * a / 255.0, src[i + 1] as f32 * a / 255.0, src[i + 2] as f32 * a / 255.0, a]
+    };
+    // Box-filter when shrinking by more than 2x would alias; average a kernel of the source footprint.
+    let (fx, fy) = (w as f32 / dw as f32, h as f32 / dh as f32);
+    for y in 0..dh.min(px) {
+        for x in 0..dw.min(px) {
+            let (sx, sy) = ((x as f32 + 0.5) * fx - 0.5, (y as f32 + 0.5) * fy - 0.5);
+            let (kx, ky) = (fx.max(1.0), fy.max(1.0));
+            let (x0, x1) = ((sx - kx / 2.0).floor().max(0.0) as u32, (sx + kx / 2.0).ceil().max(0.0) as u32);
+            let (y0, y1) = ((sy - ky / 2.0).floor().max(0.0) as u32, (sy + ky / 2.0).ceil().max(0.0) as u32);
+            let mut acc = [0f32; 4];
+            let mut n = 0f32;
+            for yy in y0..=y1.min(h - 1) {
+                for xx in x0..=x1.min(w - 1) {
+                    let v = at(xx, yy);
+                    for k in 0..4 {
+                        acc[k] += v[k];
+                    }
+                    n += 1.0;
+                }
+            }
+            if n == 0.0 {
+                continue;
+            }
+            let a = acc[3] / n;
+            let o = (((y + oy) * px + (x + ox)) * 4) as usize;
+            if a > 0.0 {
+                for k in 0..3 {
+                    out[o + k] = ((acc[k] / n) * 255.0 / a).round().clamp(0.0, 255.0) as u8;
+                }
+            }
+            out[o + 3] = a.round().clamp(0.0, 255.0) as u8;
+        }
+    }
+    Some(out)
+}
+
+/// Rasterise an HICON at `px` on black and on white and solve for colour + alpha per pixel.
+fn hicon_to_rgba(hicon: HICON, px: u32) -> Option<Vec<u8>> {
+    // SAFETY: a private memory DC + 32bpp DIB section are created, drawn into and released here.
+    unsafe {
+        let hdc = CreateCompatibleDC(None);
+        if hdc.is_invalid() {
+            return None;
+        }
+        let bmi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: px as i32,
+                biHeight: -(px as i32),
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut bits: *mut c_void = std::ptr::null_mut();
+        let Ok(dib) = CreateDIBSection(Some(hdc), &bmi, DIB_RGB_COLORS, &mut bits, None, 0) else {
+            let _ = DeleteDC(hdc);
+            return None;
+        };
+        if bits.is_null() {
+            let _ = DeleteObject(HGDIOBJ(dib.0));
+            let _ = DeleteDC(hdc);
+            return None;
+        }
+        let old = SelectObject(hdc, HGDIOBJ(dib.0));
+        let n = (px * px * 4) as usize;
+        let render = |fill: u8| -> Option<Vec<u8>> {
+            let s = std::slice::from_raw_parts_mut(bits as *mut u8, n);
+            s.fill(fill);
+            DrawIconEx(hdc, 0, 0, hicon, px as i32, px as i32, 0, None, DI_NORMAL).ok()?;
+            Some(s.to_vec())
+        };
+        let on_black = render(0x00);
+        let on_white = render(0xFF);
+        SelectObject(hdc, old);
+        let _ = DeleteObject(HGDIOBJ(dib.0));
+        let _ = DeleteDC(hdc);
+
+        let (b, w) = (on_black?, on_white?);
+        let mut out = vec![0u8; n];
+        for i in (0..n).step_by(4) {
+            // white - black = 255 * (1 - alpha) per channel
+            let d = (0..3).map(|k| (w[i + k] as i32 - b[i + k] as i32).clamp(0, 255)).sum::<i32>() / 3;
+            let a = (255 - d).clamp(0, 255) as u32;
+            if a > 0 {
+                for k in 0..3 {
+                    // b = colour * alpha (premultiplied)
+                    out[i + (2 - k)] = ((b[i + k] as u32 * 255 + a / 2) / a).min(255) as u8;
+                }
+            }
+            out[i + 3] = a as u8;
+        }
+        Some(out)
+    }
+}
+
+fn private_extract(path: &str, px: u32) -> Option<Vec<u8>> {
+    let mut wpath = [0u16; 260];
+    let units: Vec<u16> = path.encode_utf16().collect();
+    if units.len() >= wpath.len() {
+        return None;
+    }
+    wpath[..units.len()].copy_from_slice(&units);
+    let mut icons = [HICON::default()];
+    // SAFETY: icons[0] receives at most one HICON, which is destroyed after drawing.
+    unsafe {
+        let n = PrivateExtractIconsW(&wpath, 0, px as i32, px as i32, Some(&mut icons), None, 0);
+        if n == 0 || n == u32::MAX || icons[0].is_invalid() {
+            return None;
+        }
+        let r = hicon_to_rgba(icons[0], px);
+        let _ = DestroyIcon(icons[0]);
+        r
+    }
+}
+
+fn shgetfileinfo(path: &str, px: u32) -> Option<Vec<u8>> {
+    let w = wide(path);
+    let mut info = SHFILEINFOW::default();
+    // SAFETY: `info` is a valid out struct; its HICON is destroyed after drawing.
+    unsafe {
+        let ok = SHGetFileInfoW(
+            PCWSTR(w.as_ptr()),
+            FILE_FLAGS_AND_ATTRIBUTES(0),
+            Some(&mut info),
+            size_of::<SHFILEINFOW>() as u32,
+            SHGFI_ICON | SHGFI_LARGEICON,
+        );
+        if ok == 0 || info.hIcon.is_invalid() {
+            return None;
+        }
+        let r = hicon_to_rgba(info.hIcon, px);
+        let _ = DestroyIcon(info.hIcon);
+        r
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn system_exe(name: &str) -> String {
+        let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+        format!(r"{root}\{name}")
+    }
+
+    #[test]
+    fn stem_names() {
+        assert_eq!(name_from_stem("explorer.exe"), "Explorer");
+        assert_eq!(name_from_stem("windows-terminal.exe"), "Windows Terminal");
+        assert_eq!(name_from_stem("my_app.exe"), "My App");
+        assert_eq!(name_from_stem("noext"), "Noext");
+    }
+
+    #[test]
+    fn description_cleaning() {
+        assert_eq!(clean_description("  Notepad \r\n").as_deref(), Some("Notepad"));
+        assert_eq!(clean_description("   "), None);
+        assert_eq!(clean_description("\u{0}\u{1}"), None);
+    }
+
+    #[test]
+    fn unpremultiply() {
+        // premultiplied half-transparent red: B=0 G=0 R=128 A=128 -> straight R=255
+        let mut px = vec![0, 0, 128, 128, 0, 0, 0, 0];
+        bgra_to_straight_rgba(&mut px);
+        assert_eq!(&px[..4], &[255, 0, 0, 128]);
+        assert_eq!(&px[4..], &[0, 0, 0, 0]);
+        // straight data (a channel exceeds alpha) is only reordered
+        let mut px = vec![10, 20, 200, 100];
+        bgra_to_straight_rgba(&mut px);
+        assert_eq!(px, vec![200, 20, 10, 100]);
+        // no alpha at all -> opaque
+        let mut px = vec![1, 2, 3, 0];
+        bgra_to_straight_rgba(&mut px);
+        assert_eq!(px, vec![3, 2, 1, 255]);
+    }
+
+    #[test]
+    fn resize_keeps_color_and_size() {
+        // 2x2 solid opaque green scaled to 4x4
+        let src = [0u8, 255, 0, 255].repeat(4);
+        let out = fit_square(src, 2, 2, 4).unwrap();
+        assert_eq!(out.len(), 4 * 4 * 4);
+        assert!(out.chunks_exact(4).all(|p| p == [0, 255, 0, 255]));
+        // non-square is letterboxed (transparent bars)
+        let src = [255u8, 0, 0, 255].repeat(4 * 2);
+        let out = fit_square(src, 4, 2, 4).unwrap();
+        assert_eq!(&out[..4], &[0, 0, 0, 0]);
+        let mid = ((4 + 1) * 4) as usize; // row 1, col 1
+        assert_eq!(&out[mid..mid + 4], &[255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn explorer_icon_and_name() {
+        let path = system_exe("explorer.exe");
+        let icon = load_path(&path, 64).expect("explorer icon");
+        assert_eq!(icon.size, 64);
+        assert_eq!(icon.rgba.len(), 64 * 64 * 4);
+        assert!(icon.rgba.chunks_exact(4).any(|p| p[3] > 200), "has opaque pixels");
+        assert!(icon.rgba.chunks_exact(4).any(|p| p[3] == 0), "has transparent corners");
+        assert_eq!(icon.exe_name, "explorer.exe");
+        assert!(!icon.name.is_empty());
+        eprintln!("explorer: name={:?}", icon.name);
+
+        // Write a PNG for visual inspection.
+        let mut pm = tiny_skia::Pixmap::new(icon.size, icon.size).unwrap();
+        for (dst, src) in pm.pixels_mut().iter_mut().zip(icon.rgba.chunks_exact(4)) {
+            *dst = tiny_skia::ColorU8::from_rgba(src[0], src[1], src[2], src[3]).premultiply();
+        }
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target");
+        let _ = std::fs::create_dir_all(&dir);
+        pm.save_png(dir.join("appicon_explorer.png")).unwrap();
+    }
+
+    #[test]
+    fn cache_hit_returns_same() {
+        let t = Target { exe_path: system_exe("explorer.exe"), ..Default::default() };
+        let a = load(&t, 48).expect("icon");
+        let b = load(&t, 48).expect("cached icon");
+        assert_eq!(a, b);
+        assert_eq!(a.size, 48);
+        // different size is a different cache entry
+        assert_eq!(load(&t, 32).unwrap().size, 32);
+    }
+
+    #[test]
+    fn missing_file_is_none() {
+        assert!(load_path(r"C:\definitely\not\here.exe", 48).is_none());
+        let t = Target::default();
+        assert!(load(&t, 48).is_none());
+    }
+
+    #[test]
+    fn fallback_extractors_work() {
+        let path = system_exe("notepad.exe");
+        if !std::path::Path::new(&path).exists() {
+            return;
+        }
+        let a = private_extract(&path, 48);
+        let b = shgetfileinfo(&path, 48);
+        assert!(a.is_some() || b.is_some());
+        for img in [a, b].into_iter().flatten() {
+            assert_eq!(img.len(), 48 * 48 * 4);
+            assert!(img.chunks_exact(4).any(|p| p[3] > 0));
+        }
+    }
+
+    #[test]
+    fn friendly_name_from_version_info() {
+        let n = friendly_name(&system_exe("notepad.exe"));
+        assert!(n.is_some_and(|s| !s.is_empty()));
+    }
+
+    #[test]
+    fn packaged_app_tile() {
+        // Settings ships with every Windows 11; tolerate machines that lack it.
+        let _com = Com::init();
+        let item = r"shell:AppsFolder\windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel";
+        if let Some(img) = shell_image(item, 48) {
+            assert_eq!(img.len(), 48 * 48 * 4);
+            assert!(img.chunks_exact(4).any(|p| p[3] > 200));
+            let name = display_name(item);
+            eprintln!("packaged tile name: {name:?}");
+            assert!(name.is_some_and(|n| !n.is_empty()));
+        }
+    }
+
+    /// Icon + name for whatever window is in front right now (packaged or not).
+    #[test]
+    #[ignore]
+    fn desktop_foreground_app_icon() {
+        let t = super::super::paste::capture_foreground().expect("foreground window");
+        let icon = load(&t, 48).expect("icon for the foreground app");
+        eprintln!("foreground app: {} ({})", icon.name, icon.exe_name);
+        assert_eq!(icon.rgba.len(), 48 * 48 * 4);
+        assert!(icon.rgba.chunks_exact(4).any(|p| p[3] > 200));
+        assert!(!icon.name.is_empty());
+    }
 }

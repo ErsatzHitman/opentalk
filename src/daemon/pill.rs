@@ -1,15 +1,37 @@
 //! The floating recording indicator — exact reproduction of OpenWhispr's VoicePill
-//! (docs/SPEC.md "Pill") + the Spokenly-style app-icon bubble. TASK pill implements; it may split
-//! into submodules under src/daemon/pill/ (render.rs, glow.rs, text.rs, window.rs, anim.rs).
+//! (docs/SPEC.md "Pill") + the Spokenly-style app-icon bubble.
 //!
 //! Window: layered 208x120 (DPI-scaled), WS_EX_LAYERED|TOPMOST|TOOLWINDOW|NOACTIVATE, rendered with
-//! tiny-skia into a premultiplied BGRA DIB and pushed with UpdateLayeredWindow. Animation frames
-//! only while something animates (own high-res timer thread posts ticks to the pill window).
-//! Transparent pixels pass clicks through.
+//! a pure software renderer into a premultiplied BGRA DIB and pushed with UpdateLayeredWindow.
+//! Animation frames only while something animates (own high-res timer thread posts ticks to the
+//! pill window). Transparent pixels pass clicks through.
+//!
+//! Layout of this module:
+//! - `model`   — `RenderState`: all visual state as CSS-transition-style tracks (pure, testable)
+//! - `render`  — `render(state, t_ms) -> Pixmap`, no Win32 (deterministic goldens)
+//! - `raster`  — SDF rasteriser (capsules, rings, soft shadows)
+//! - `glow`    — the Signal glow (analytic conic ring + pre-blurred halo/comet sprites)
+//! - `text`    — GDI `DrawTextW` into grayscale masks
+//! - `card`    — the dictation error card
+//! - `anim`    — easing, tracks, waveform sampler, looping keyframes
+//! - `theme`   — design tokens and system theme lookup
+//! - `window`  — Win32 layer: layered window, DPI, hit-testing, drag, menu, animation timer
+//! - `preview` — `--render-pill` CLI and golden scenarios
 use super::appicon::AppIcon;
 use crate::core::config::{PanelPosition, Theme};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
+
+mod anim;
+mod card;
+mod glow;
+mod model;
+mod preview;
+mod raster;
+mod render;
+mod text;
+mod theme;
+mod window;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PillMode {
@@ -51,49 +73,54 @@ pub struct PillOptions {
 }
 
 pub struct Pill {
-    _private: (),
+    win: window::Window,
 }
 
 impl Pill {
     /// Create the window (hidden or idle per options). `level` is the live mic RMS (f32 bits).
     /// `on_event` runs on the UI thread from the window procedure.
     pub fn create(level: Arc<AtomicU32>, opts: PillOptions, on_event: Box<dyn FnMut(PillEvent)>) -> Result<Pill, String> {
-        let _ = (level, opts, on_event);
-        todo!("pill")
+        let win = window::Window::create(level, opts, on_event)?;
+        Ok(Pill { win })
     }
+
     pub fn set_mode(&mut self, mode: PillMode) {
-        let _ = mode;
-        todo!("pill")
+        self.win.with(|i| i.set_mode(mode));
     }
+
     pub fn mode(&self) -> PillMode {
-        todo!("pill")
+        self.win.with(|i| i.mode())
     }
+
     /// Active-app bubble content (None hides the bubble).
     pub fn set_app(&mut self, app: Option<AppIcon>) {
-        let _ = app;
-        todo!("pill")
+        self.win.with(|i| {
+            let bubble = app.and_then(|a| model::AppBubble::new(&a.name, &a.rgba, a.size, i.st.scale));
+            i.set_app(bubble);
+        });
     }
+
     /// Show the error card (auto-dismiss 3/4/5 s by length). `retry` adds a Retry button.
     pub fn show_error(&mut self, title: &str, description: &str, retry: bool) {
-        let _ = (title, description, retry);
-        todo!("pill")
+        self.win.with(|i| i.show_error(title, description, retry));
     }
+
     pub fn set_options(&mut self, opts: PillOptions) {
-        let _ = opts;
-        todo!("pill")
+        self.win.with(|i| i.set_options(opts));
     }
+
     /// Move to the display under the cursor (called at every dictation start).
     pub fn follow_cursor_display(&mut self) {
-        todo!("pill")
+        self.win.with(|i| i.follow_cursor_display());
     }
+
     pub fn hwnd(&self) -> isize {
-        todo!("pill")
+        self.win.hwnd()
     }
 }
 
 /// `--render-pill <state> <t_ms> <out.png> [--dark] [--scale s] [--app-icon path] [--level 0..1]`
 /// States: idle, hover, preparing, recording, thinking, unavailable, cancel, error, tooltip.
 pub fn cli_render(args: &[String]) -> i32 {
-    let _ = args;
-    todo!("pill")
+    preview::cli_render(args)
 }
