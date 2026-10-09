@@ -65,14 +65,8 @@ impl Deadline {
     }
 }
 
-/// Secret lookup with the documented `OPENTALK_SECRET_<NAME>` env override first.
+/// Trimmed, non-empty secret (`core::secrets::get` already honours `OPENTALK_SECRET_<NAME>`).
 pub(crate) fn secret(name: &str) -> Option<String> {
-    let env = format!("OPENTALK_SECRET_{}", name.to_ascii_uppercase());
-    if let Ok(v) = std::env::var(&env) {
-        if !v.trim().is_empty() {
-            return Some(v.trim().to_string());
-        }
-    }
     crate::core::secrets::get(name).map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
 }
 

@@ -32,7 +32,8 @@ impl std::fmt::Display for LlmError {
 /// Default hard deadline for a cleanup call.
 const DEFAULT_TIMEOUT_MS: u64 = 4_000;
 
-/// Env override of the API base URL for every non-enterprise provider (mock servers, proxies).
+/// Env override of the API origin for every provider (mock servers, proxies). Enterprise
+/// providers keep their path layout and swap only the origin.
 pub const BASE_URL_ENV: &str = "OPENTALK_LLM_BASE_URL";
 
 /// Clean `text` with the configured LLM. Uses `cfg.ai_cleanup.timeout_ms` (default 4 s), no retries.
@@ -63,7 +64,7 @@ pub fn cleanup_with(
     let user = prompt::user_message(text);
 
     let output = if info.enterprise {
-        enterprise::complete(cfg, &system, &user, timeout_ms)?
+        enterprise::complete_with(cfg, &system, &user, timeout_ms, base_override)?
     } else {
         let model = cfg.llm_model();
         if model.trim().is_empty() {
@@ -166,6 +167,19 @@ mod tests {
         assert!(sys.ends_with("when they appear in the text): Friday"));
         assert_eq!(b["input"][1]["content"], format!("<transcript>\n{RAW}\n</transcript>\n\nOutput only the cleaned transcript."));
         assert!(b["max_output_tokens"].as_u64().unwrap() >= 1024);
+    }
+
+    #[test]
+    fn enterprise_honours_base_override() {
+        // SAFETY: every test that sets this variable sets the same value.
+        unsafe { std::env::set_var("OPENTALK_SECRET_AZURE_OPENAI", "ENVKEY") };
+        let body = chat_body(CLEAN);
+        let (base, rx) = serve_once(200, &body, Duration::ZERO);
+        let mut c = cfg(LlmProviderId::AzureOpenai, "");
+        c.ai_cleanup.azure_deployment = "dep".into();
+        assert_eq!(cleanup_with(&c, RAW, &[], None, Some(&base)).unwrap(), CLEAN);
+        let req = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(req.path(), "/openai/deployments/dep/chat/completions?api-version=2024-10-21");
     }
 
     #[test]
