@@ -147,9 +147,9 @@ fn taskbar_is_light() -> bool {
 }
 
 /// The OpenWhispr logo (24-unit viewBox: ring r=10, three bars, stroke 2, round caps) as straight
-/// RGBA, `size` x `size`, single colour.
+/// RGBA, `size` x `size`, single colour. Empty for a zero size.
 pub(crate) fn render_logo(size: u32, light_glyph: bool) -> Vec<u8> {
-    let mut pm = Pixmap::new(size, size).expect("icon size is non-zero");
+    let Some(mut pm) = Pixmap::new(size, size) else { return Vec::new() };
     let mut paint = Paint::default();
     let c = if light_glyph { 255 } else { 0 };
     paint.set_color_rgba8(c, c, c, 255);

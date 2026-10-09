@@ -876,8 +876,8 @@ pub(crate) fn paste_inner(
         Err(SendError::Failed) => return fail(SEND_FAILED_REASON),
     }
 
-    let restore = pending.map(|(gen_id, snap)| {
-        thread::spawn(move || {
+    let restore = pending.and_then(|(gen_id, snap)| {
+        let spawned = thread::Builder::new().name("clipboard-restore".into()).spawn(move || {
             thread::sleep(RESTORE_DELAY);
             // A newer paste took over this snapshot (or abandoned it): nothing to do here.
             if !take_pending(gen_id) {
@@ -888,7 +888,16 @@ pub(crate) fn paste_inner(
             if unsafe { GetClipboardSequenceNumber() } == seq && !restore_clipboard(&snap) {
                 crate::log_warn!("paste: could not restore the previous clipboard contents");
             }
-        })
+        });
+        match spawned {
+            Ok(h) => Some(h),
+            Err(_) => {
+                // No thread for the delayed restore: leave the dictation text on the clipboard.
+                abandon_pending(gen_id);
+                crate::log_warn!("paste: could not start the clipboard restore thread");
+                None
+            }
+        }
     });
     (PasteOutcome::Pasted, restore)
 }
