@@ -51,6 +51,11 @@ fn cache() -> &'static Cache {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// The cache survives a panic elsewhere while it was held (it only ever holds whole entries).
+fn lock_cache() -> std::sync::MutexGuard<'static, HashMap<(String, u32), AppIcon>> {
+    cache().lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Largest icon we ever produce (a bigger request is clamped).
 const MAX_PX: u32 = 256;
 
@@ -61,13 +66,11 @@ pub fn load(target: &Target, px: u32) -> Option<AppIcon> {
         return None;
     }
     let key = (target.exe_path.to_ascii_lowercase(), px);
-    if let Some(hit) = cache().lock().ok()?.get(&key) {
+    if let Some(hit) = lock_cache().get(&key) {
         return Some(hit.clone());
     }
     let icon = extract(&target.exe_path, target.pid, px)?;
-    if let Ok(mut c) = cache().lock() {
-        c.insert(key, icon.clone());
-    }
+    lock_cache().insert(key, icon.clone());
     Some(icon)
 }
 
@@ -78,13 +81,11 @@ pub fn load_path(path: &str, px: u32) -> Option<AppIcon> {
         return None;
     }
     let key = (path.to_ascii_lowercase(), px);
-    if let Some(hit) = cache().lock().ok()?.get(&key) {
+    if let Some(hit) = lock_cache().get(&key) {
         return Some(hit.clone());
     }
     let icon = extract(path, 0, px)?;
-    if let Ok(mut c) = cache().lock() {
-        c.insert(key, icon.clone());
-    }
+    lock_cache().insert(key, icon.clone());
     Some(icon)
 }
 
