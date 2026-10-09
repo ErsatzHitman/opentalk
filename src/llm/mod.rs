@@ -247,7 +247,6 @@ mod tests {
         let models = [
             "nvidia/nemotron-3.5-lightning:free",
             "google/gemma-4-31b-it:free",
-            "liquid/lfm-2.5-2.6b:free",
             "nvidia/nemotron-3-super-120b-a12b:free",
             "poolside/laguna-s-2.1:free",
             "apodex/apodex-1.1-mini:free",

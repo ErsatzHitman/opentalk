@@ -133,7 +133,12 @@ fn without_interjection(plain: String) -> String {
 /// Did the speaker dictate `label` followed by a colon (typed, or spoken as "colon")? Then it is
 /// content ("output colon done" -> "Output: done"), not a label the model added.
 fn speaker_said_label(raw_low: &str, label: &str) -> bool {
-    raw_low.contains(&format!("{label}:")) || raw_low.contains(&format!("{label} colon"))
+    // A dictation that opens with the label words ("final version attached") owns them too.
+    let opens_with = raw_low
+        .trim_start()
+        .strip_prefix(label)
+        .is_some_and(|rest| !rest.starts_with(|c: char| c.is_alphanumeric()));
+    opens_with || raw_low.contains(&format!("{label}:")) || raw_low.contains(&format!("{label} colon"))
 }
 
 fn strip_preamble(s: &str, raw_low: &str) -> String {
@@ -471,6 +476,10 @@ mod tests {
         // A spoken "colon" after a label-like word is dictated content.
         assert_eq!(sanitize("Output: done.", "output colon done"), "Output: done.");
         assert_eq!(sanitize("Result: pass", "result colon pass"), "Result: pass");
+        // A dictation that opens with the label-like words keeps them.
+        assert_eq!(sanitize("Final version: attached.", "final version attached"), "Final version: attached.");
+        assert_eq!(sanitize("Result: we won.", "result we won"), "Result: we won.");
+        assert_eq!(sanitize("Output: Results are in.", "results are in"), "Results are in.");
     }
 
     // --- validate ---

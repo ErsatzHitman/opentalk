@@ -1,16 +1,16 @@
 //! OpenAI Responses API: `POST {base}/responses`.
-use super::{Built, Req, bare_model, embedded_error, is_o_series, openai_rejects_temperature, send};
+use super::{Built, Req, bare_model, embedded_error, gpt_major, openai_rejects_temperature, send};
 use crate::llm::LlmError;
 use serde_json::{Value, json};
 
 /// Reasoning effort for the model, if it should be set. The original gpt-5 family (gpt-5,
-/// gpt-5-mini, gpt-5-nano) accepts `minimal`; later gpt-5.x models dropped it, so they get `low`.
-/// o-series and non-reasoning models send none.
+/// gpt-5-mini, gpt-5-nano) accepts `minimal`; later gpt-5.x and gpt-6+ models dropped it, so they
+/// get `low`. o-series and non-reasoning models send none.
 pub fn reasoning_effort(model: &str) -> Option<&'static str> {
     let m = bare_model(model);
     if m == "gpt-5" || m.starts_with("gpt-5-") {
         Some("minimal")
-    } else if m.starts_with("gpt-5") {
+    } else if gpt_major(&m).is_some_and(|v| v >= 5) {
         Some("low")
     } else {
         None
@@ -19,8 +19,7 @@ pub fn reasoning_effort(model: &str) -> Option<&'static str> {
 
 /// Does this model spend output tokens on hidden reasoning?
 pub fn is_reasoning(model: &str) -> bool {
-    let m = bare_model(model);
-    m.starts_with("gpt-5") || is_o_series(&m)
+    openai_rejects_temperature(model)
 }
 
 pub fn build(req: &Req) -> Built {
@@ -110,9 +109,10 @@ mod tests {
 
     #[test]
     fn gpt5_omits_temperature_and_sets_effort() {
-        for (m, effort) in [("gpt-5-nano", Some("minimal")), ("gpt-5", Some("minimal")), ("gpt-5.2", Some("low")), ("gpt-5.6-luna", Some("low")), ("o3-mini", None), ("gpt-4.1", None)] {
+        for (m, effort) in [("gpt-5-nano", Some("minimal")), ("gpt-5", Some("minimal")), ("gpt-5.2", Some("low")), ("gpt-5.6-luna", Some("low")), ("gpt-6-astra", Some("low")), ("o3-mini", None), ("gpt-4.1", None)] {
             let b = build(&req("https://x/v1", m));
             assert_eq!(openai_rejects_temperature(m), m != "gpt-4.1", "{m}");
+            assert_eq!(is_reasoning(m), m != "gpt-4.1", "{m}");
             assert_eq!(b.body.get("temperature").is_none(), m != "gpt-4.1", "{m}");
             assert_eq!(b.body.pointer("/reasoning/effort").and_then(Value::as_str), effort, "{m}");
         }

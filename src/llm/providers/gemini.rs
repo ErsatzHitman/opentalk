@@ -53,9 +53,7 @@ pub fn build(req: &Req) -> Built {
     } else {
         // Gemma models served through the Gemini API reject system instructions
         // ("Developer instruction is not enabled"): inline the prompt ahead of the transcript.
-        body["contents"][0]["parts"][0]["text"] = json!(format!("{}
-
-{}", req.system, req.user));
+        body["contents"][0]["parts"][0]["text"] = json!(format!("{}\n\n{}", req.system, req.user));
     }
     Built {
         url: format!("{}/models/{}:generateContent", req.base_url, model),
@@ -135,9 +133,7 @@ mod tests {
         let b = build(&req("https://g", "gemma-4-31b-it"));
         assert!(b.body["generationConfig"].get("thinkingConfig").is_none());
         assert!(b.body.get("systemInstruction").is_none());
-        assert_eq!(b.body["contents"][0]["parts"][0]["text"], "SYS
-
-USR");
+        assert_eq!(b.body["contents"][0]["parts"][0]["text"], "SYS\n\nUSR");
     }
 
     #[test]

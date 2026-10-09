@@ -36,9 +36,10 @@ pub struct Built {
 }
 
 /// Output budget for `text_chars` of input: twice the input length (tokens are ~ chars / 4, so this
-/// is generous), at least 256. Reasoning models also spend this budget on thinking, so they get 1024+.
+/// is generous), at least 256. Reasoning models also spend this budget on hidden thinking, so they
+/// get 4096+ (a cap, not a spend; the 4 s deadline bounds the real cost).
 pub fn max_tokens(text_chars: usize, reasoning: bool) -> u32 {
-    let floor = if reasoning { 1024 } else { 256 };
+    let floor = if reasoning { 4096 } else { 256 };
     (text_chars.saturating_mul(2)).clamp(floor, 16_384) as u32
 }
 
@@ -52,10 +53,17 @@ pub fn is_o_series(bare: &str) -> bool {
     it.next() == Some('o') && it.next().is_some_and(|c| c.is_ascii_digit())
 }
 
-/// OpenAI reasoning models (gpt-5*, o1/o3/o4*) reject `temperature`.
+/// Major version of a `gpt-N…` id (`gpt-5.6-luna` -> 5, `gpt-6-astra` -> 6, `gpt-4o` -> 4).
+pub fn gpt_major(bare: &str) -> Option<u32> {
+    let rest = bare.strip_prefix("gpt-")?;
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
+}
+
+/// OpenAI reasoning models (gpt-5 and newer, o1/o3/o4*) reject `temperature`.
 pub fn openai_rejects_temperature(model: &str) -> bool {
     let m = bare_model(model);
-    m.starts_with("gpt-5") || is_o_series(&m)
+    gpt_major(&m).is_some_and(|v| v >= 5) || is_o_series(&m)
 }
 
 /// Run the provider-specific completion.
