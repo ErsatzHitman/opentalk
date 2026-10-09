@@ -5,7 +5,7 @@ use super::*;
 use windows::Win32::Foundation::RECT;
 use std::time::{Duration, Instant};
 use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, GetWindowRect, IsWindowVisible, MSG, PM_REMOVE, PeekMessageW, SendMessageW, SetCursorPos, TranslateMessage,
+    DispatchMessageW, GetWindowRect, IsWindowVisible, MSG, PM_REMOVE, PeekMessageW, SendMessageW, TranslateMessage,
     WM_MOUSEMOVE as MOVE,
 };
 
@@ -134,10 +134,26 @@ fn desktop_pill_click_drag_hover_hittest() {
     send(hwnd, WM_LBUTTONUP, 0, lparam(px + 3, py));
     assert_eq!(events.borrow().as_slice(), &[PillEvent::Clicked]);
 
-    // changing options re-docks the pill (the dragged position is not persisted)
+    // re-applying the same options keeps the dragged spot; a new panel position re-docks the pill
+    // (the dragged position is not persisted)
+    w.with(|i| i.set_options(opts()));
+    let kept = rect(hwnd);
+    assert_eq!((kept.left - start.left, kept.top - start.top), (-60, -30), "unrelated option change keeps the drag");
+    w.with(|i| i.set_options(PillOptions { position: PanelPosition::BottomLeft, ..opts() }));
     w.with(|i| i.set_options(opts()));
     let back = rect(hwnd);
     assert_eq!((back.left, back.top), (start.left, start.top));
+
+    // capture lost mid-press (Alt+Tab): later moves are hovers, not a drag
+    let g = w.with(|i| i.st.geometry(i.now()));
+    let (px, py) = ((g.pill.cx() * scale) as i32, (g.pill.cy() * scale) as i32);
+    send(hwnd, WM_LBUTTONDOWN, 1, lparam(px, py));
+    send(hwnd, WM_CAPTURECHANGED, 0, LPARAM(0));
+    send(hwnd, MOVE, 0, lparam(px - 40, py - 20));
+    let after = rect(hwnd);
+    assert_eq!((after.left, after.top), (start.left, start.top), "no drag after capture loss");
+    send(hwnd, WM_LBUTTONUP, 0, lparam(px, py));
+    assert!(events.borrow().len() == 1, "no click after capture loss: {:?}", events.borrow());
 }
 
 #[test]
@@ -150,14 +166,10 @@ fn desktop_pill_cancel_button_and_error_card() {
     let scale = w.with(|i| i.st.scale);
     let g = w.with(|i| i.st.geometry(i.now()));
     let (px, py) = ((g.pill.cx() * scale) as i32, (g.pill.cy() * scale) as i32);
-    // real hover: park the actual cursor on the pill (restored below)
-    let r = rect(hwnd);
-    let mut old = POINT::default();
-    // SAFETY: cursor query/move on the desktop, restored at the end of the test.
-    unsafe {
-        let _ = GetCursorPos(&mut old);
-        let _ = SetCursorPos(r.left + px, r.top + py);
-    }
+    // hover without touching the real cursor: mark leave-tracking as armed so the synthetic move is
+    // not cancelled by an immediate WM_MOUSELEAVE (the cursor is elsewhere)
+    w.with(|i| i.tracking = true);
+    send(hwnd, MOVE, 0, lparam(px, py));
     pump(600);
     let g = w.with(|i| i.st.geometry(i.now()));
     assert!(g.cancel_t > 0.99, "cancel bud emerged (pointer {:?})", w.with(|i| i.st.pointer()));
@@ -165,10 +177,7 @@ fn desktop_pill_cancel_button_and_error_card() {
     send(hwnd, WM_LBUTTONDOWN, 1, lparam(cx, cy));
     send(hwnd, WM_LBUTTONUP, 0, lparam(cx, cy));
     assert_eq!(events.borrow().as_slice(), &[PillEvent::CancelClicked]);
-    // SAFETY: restoring the cursor position saved above.
-    unsafe {
-        let _ = SetCursorPos(old.x, old.y);
-    }
+    send(hwnd, WM_MOUSELEAVE, 0, LPARAM(0));
     w.with(|i| i.set_mode(PillMode::Idle));
     pump(100);
 

@@ -120,7 +120,8 @@ impl std::fmt::Debug for AppBubble {
 impl AppBubble {
     /// From straight RGBA (`size` x `size`).
     pub fn new(name: &str, rgba: &[u8], size: u32, scale: f32) -> Option<AppBubble> {
-        if size == 0 || rgba.len() < (size * size * 4) as usize {
+        let need = (size as usize).checked_mul(size as usize).and_then(|n| n.checked_mul(4));
+        if size == 0 || need.is_none_or(|n| rgba.len() < n) {
             return None;
         }
         let mut src = Pixmap::new(size, size)?;

@@ -39,6 +39,8 @@ use windows::core::{PCWSTR, w};
 
 pub const WM_APP_TICK: u32 = WM_APP + 0x50;
 const WM_MOUSELEAVE: u32 = 0x02A3;
+const WM_CAPTURECHANGED: u32 = 0x0215;
+const WM_DPICHANGED: u32 = 0x02E0;
 const CLASS_NAME: PCWSTR = w!("OpenTalkPill");
 const DRAG_THRESHOLD_PX: f32 = 5.0;
 
@@ -390,12 +392,9 @@ impl Inner {
 
     fn present(&mut self) {
         let t = self.now();
-        self.ensure_buffers();
-        render_into(&self.st, t, &mut self.pm);
         let visible = self.st.wants_visible(t, self.opts.auto_hide) || self.st.is_animating(t);
-        let Some(dib) = self.dib.as_mut() else { return };
-        dib.upload(self.pm.data());
         if !visible {
+            // nothing to draw while hidden; the next visible frame is rendered from scratch
             if self.visible {
                 // SAFETY: valid window handle.
                 unsafe {
@@ -405,6 +404,10 @@ impl Inner {
             }
             return;
         }
+        self.ensure_buffers();
+        render_into(&self.st, t, &mut self.pm);
+        let Some(dib) = self.dib.as_mut() else { return };
+        dib.upload(self.pm.data());
         let pos = POINT { x: self.pos.0, y: self.pos.1 };
         let size = SIZE { cx: dib.w, cy: dib.h };
         let src = POINT { x: 0, y: 0 };
@@ -600,6 +603,16 @@ impl Inner {
                 }
                 out.result = Some(LRESULT(0));
             }
+            WM_CAPTURECHANGED => {
+                // capture taken away mid-press (Alt+Tab, a modal, ...): end the press so a later
+                // hover is not treated as a drag. Our own ReleaseCapture re-enters while borrowed
+                // and never reaches here.
+                if self.down.take().is_some() {
+                    self.st.set_dragging(false);
+                    self.update_pointer(Hit::None);
+                }
+                out.result = Some(LRESULT(0));
+            }
             WM_RBUTTONUP => {
                 let (lx, ly) = self.client_point(lp);
                 if self.hit_at_client(lx, ly) == Hit::Pill && self.st.error().is_none() {
@@ -622,12 +635,11 @@ impl Inner {
                 } else {
                     self.present();
                 }
+                // the frame above was the final one at rest (it also hid an idle auto-hide pill)
                 if !self.st.is_animating(now) {
                     if let Some(t) = &self.timer {
                         t.stop();
                     }
-                    // final frame at rest (also hides the window when idle + auto-hide)
-                    self.present();
                 }
                 out.result = Some(LRESULT(0));
             }
@@ -644,6 +656,12 @@ impl Inner {
                     self.refresh_monitor(self.monitor);
                     self.relayout();
                 }
+            }
+            WM_DPICHANGED => {
+                // scaling changed on our monitor; layered windows ignore the suggested rect
+                self.refresh_monitor(self.monitor);
+                self.relayout();
+                out.result = Some(LRESULT(0));
             }
             WM_DISPLAYCHANGE => {
                 self.refresh_monitor(cursor_monitor());
@@ -832,7 +850,7 @@ impl Inner {
         let now = self.now();
         self.st.error = Some(super::card::ErrorCard::new(title, desc, retry, now));
         self.st.set_pointer(Pointer::default(), now);
-        self.custom_pos = None;
+        // the card is anchored at the default spot (see `relayout`); a dragged position comes back after it
         self.relayout();
         self.sync_timer();
     }
@@ -840,6 +858,9 @@ impl Inner {
     pub fn set_options(&mut self, opts: PillOptions) {
         let now = self.now();
         let dark = resolve_dark(opts.theme);
+        if opts.position != self.opts.position {
+            self.custom_pos = None;
+        }
         self.st.set_position(opts.position);
         self.st.hotkey_label = opts.hotkey_label.clone();
         self.st.show_app_bubble = opts.show_app_bubble;
@@ -850,7 +871,6 @@ impl Inner {
         // re-evaluate bubble wanted/hidden state
         let app = self.st.app().cloned();
         self.st.set_app(app, now);
-        self.custom_pos = None;
         self.relayout();
         self.sync_timer();
     }
@@ -858,11 +878,10 @@ impl Inner {
     pub fn follow_cursor_display(&mut self) {
         let hmon = cursor_monitor();
         if hmon != self.monitor {
-            self.refresh_monitor(hmon);
             self.custom_pos = None;
-        } else if let Some(w) = monitor_info(hmon) {
-            self.work = w;
         }
+        // also picks up a scaling change on the same monitor
+        self.refresh_monitor(hmon);
         self.relayout();
     }
 

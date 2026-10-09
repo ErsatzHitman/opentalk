@@ -285,10 +285,11 @@ pub fn cli_render(args: &[String]) -> i32 {
         return 2;
     }
     let state = args[0].as_str();
-    let t_ms: f64 = match args[1].parse() {
-        Ok(v) => v,
-        Err(_) => {
-            eprintln!("invalid t_ms '{}'", args[1]);
+    // scenes are simulated frame by frame, so bound the clock (10 min)
+    let t_ms: f64 = match args[1].parse::<f64>() {
+        Ok(v) if (0.0..=600_000.0).contains(&v) => v,
+        _ => {
+            eprintln!("invalid t_ms '{}' (expected 0..=600000)", args[1]);
             return 2;
         }
     };
