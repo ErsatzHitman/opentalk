@@ -107,7 +107,21 @@ try {
 
     # Dictate: toggle (start), let the injected WAV play, toggle (stop).
     $t0 = [Diagnostics.Stopwatch]::StartNew()
+    if ($Mode -eq 'paste' -and [OtWin32]::GetForegroundWindow() -ne $hwnd) { throw 'the target lost the foreground before dictation (someone is using the desktop?)' }
     if ((Invoke-Ot $Exe @('--bench', 'toggle') $envv 15).Code -ne 0) { throw 'toggle (start) failed' }
+    if ($Mode -eq 'paste') {
+        # The paste goes to the window that had focus at the start: never let it be someone else's.
+        $expectExe = if ($result.target -eq 'notepad') { 'notepad.exe' } else { 'powershell.exe' }
+        $started = $null; $sw = [Diagnostics.Stopwatch]::StartNew()
+        while (-not $started -and $sw.Elapsed.TotalSeconds -lt 5) {
+            Start-Sleep -Milliseconds 100
+            $started = Get-Content (Join-Path $home_ 'logs\daemon.log') -ErrorAction SilentlyContinue | Where-Object { $_ -match 'recording #\d+ started' } | Select-Object -Last 1
+        }
+        if ("$started" -notmatch "target=$([regex]::Escape($expectExe))") {
+            Invoke-Ot $Exe @('--bench', 'cancel') $envv 15 | Out-Null
+            throw "dictation captured the wrong paste target ($started); cancelled"
+        }
+    }
     Start-Sleep -Milliseconds ($wavMs + 700)
     if ((Invoke-Ot $Exe @('--bench', 'toggle') $envv 15).Code -ne 0) { throw 'toggle (stop) failed' }
     $hist = Wait-History $home_ 1 $TimeoutSec
@@ -118,6 +132,7 @@ try {
     $result.raw = $entry.raw
     $result.history_text = $entry.text
     $result.latency_ms = $entry.latency_ms
+    $result.ai_cleaned = [bool]$entry.ai_cleaned
     if ($entry.status -ne 'ok') { throw "history status '$($entry.status)': $($entry.error)" }
 
     Start-Sleep -Milliseconds 700   # let SendInput + the target app settle
@@ -160,7 +175,7 @@ finally {
     }
     if ($notepad -and -not $notepad.HasExited) { try { $notepad.Kill() } catch {} }
     Stop-Daemon $Exe $daemon $envv
-    Stop-Quietly $mock.Proc
+    if ($mock) { Stop-Quietly $mock.Proc }
     Remove-Item -Recurse -Force $home_ -ErrorAction SilentlyContinue
 }
 

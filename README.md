@@ -40,6 +40,8 @@ cargo test                     # unit and headless end-to-end tests (no network,
 
 `build.rs` embeds the icon (`assets/opentalk.ico`), the manifest (per-monitor-v2 DPI, `asInvoker`, Windows 10/11,
 long paths, UTF-8 code page) and version info with `windres`. Set `OPENTALK_NO_RESOURCES=1` to skip that step.
+It also turns `opengl32.dll` into a delay-loaded import with `dlltool`, so the daemon never loads OpenGL (only the
+Settings window draws with it); `OPENTALK_NO_DELAYLOAD=1` keeps the normal import.
 `cargo run --example make_icon` regenerates the icon from the OpenWhispr logo geometry.
 
 Desktop and live tests are `#[ignore]`d and named `desktop_*` / `live_*`:
@@ -119,4 +121,20 @@ docs/                  PLAN, SPEC, BENCHMARK
 
 ## Benchmark
 
-See [docs/BENCHMARK.md](docs/BENCHMARK.md) for the measured numbers against the targets (and Spokenly's ~3% CPU / ~110 MB).
+Measured with `bench/bench.ps1` on an i7-14650HX (24 logical cores), release build, local mock STT so the network does not
+enter the numbers. Full report: [docs/BENCHMARK.md](docs/BENCHMARK.md).
+
+| | OpenTalk | Target | Spokenly |
+|---|---|---|---|
+| Idle CPU (60 s) | 0.0% | ~0% | ~3% |
+| Recording CPU (30 s, real mic) | 0.41% of all cores (9.9% of one core; ~2.5% projected on 4 cores) | <= 1.5% | ~3% |
+| Daemon memory, idle | 17.9 MB working set, 4.6 MB private bytes, ~3 MB private working set | <= 25 MB | ~110 MB |
+| Daemon memory, recording | 19.5 MB WS (app bubble off) / 23-39 MB WS with the app bubble (shared shell DLLs; private WS ~5.5 MB) | <= 25 MB | ~110 MB |
+| Settings window | 13 MB working set, separate process, 0% CPU idle | <= 80 MB | - |
+| Executable | 7.51 MB, one file | <= 8 MB | - |
+| Start-up | daemon ready in ~20 ms | - | - |
+| Hotkey -> pill / -> first mic packet | 1.4 ms / 19.9 ms (median) | <= 16 / <= 50 ms | - |
+| Local overhead stop -> paste (excluding STT) | ~1 ms before paste, ~18 ms including a real `SendInput` paste | <= 40 ms | - |
+
+Live checks use OpenRouter `:free` models only: AI cleanup works through `nvidia/nemotron-3.5-lightning:free` (~1 s); no free
+audio model returned a transcript during these runs (gated to "agentic harnesses", or upstream capacity errors).

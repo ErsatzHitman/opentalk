@@ -3,7 +3,7 @@
 //!
 //! ```text
 //! --transcribe-file <wav> [--provider id] [--model m] [--llm | --no-llm]
-//! --bench dictate <n> <wav>        toggle a running daemon twice per round, wait for history
+//! --bench dictate <n> <wav> [secs] toggle a running daemon twice per round, wait (default 45 s) for history
 //! --bench latency [n]              print the daemon log's latency lines + median/p95 summary
 //! --bench toggle | cancel | quit | settings   one IPC message to the running daemon
 //! --bench wait-ready [secs]        block until the daemon window exists
@@ -151,7 +151,7 @@ pub fn bench(args: &[String]) -> i32 {
         Some("mock-stt") => bench_mock(&args[1..]),
         Some("info") => bench_info(),
         _ => {
-            eprintln!("usage: opentalk --bench dictate <n> <wav> | latency [n] | toggle | cancel | quit | wait-ready [secs] | mock-stt [--port P] [--delay-ms D] [--text T]");
+            eprintln!("usage: opentalk --bench dictate <n> <wav> [secs] | latency [n] | toggle | cancel | quit | wait-ready [secs] | mock-stt [--port P] [--delay-ms D] [--text T]");
             2
         }
     }
@@ -180,12 +180,14 @@ fn bench_wait_ready(args: &[String]) -> i32 {
     1
 }
 
-/// `--bench dictate <n> <wav>`: needs a daemon started with `OPENTALK_INJECT_WAV=<wav>`.
+/// `--bench dictate <n> <wav> [secs]`: needs a daemon started with `OPENTALK_INJECT_WAV=<wav>`.
+/// Each round waits up to `secs` (default 45) after the stop for its history entry.
 fn bench_dictate(args: &[String]) -> i32 {
     let (Some(n), Some(wav)) = (args.first().and_then(|s| s.parse::<u32>().ok()), args.get(1)) else {
-        eprintln!("usage: opentalk --bench dictate <n> <wav>");
+        eprintln!("usage: opentalk --bench dictate <n> <wav> [secs]");
         return 2;
     };
+    let wait = Duration::from_secs(args.get(2).and_then(|s| s.parse().ok()).unwrap_or(45));
     let wav_ms = match std::fs::read(wav).ok().and_then(|b| Audio::from_wav(&b)) {
         Some(a) => a.duration_ms(),
         None => {
@@ -210,7 +212,7 @@ fn bench_dictate(args: &[String]) -> i32 {
         let stop = Instant::now();
         ipc::notify_daemon(IpcMsg::Toggle);
         let mut status = "timeout".to_string();
-        while stop.elapsed() < Duration::from_secs(45) {
+        while stop.elapsed() < wait {
             let all = history::load_all();
             if all.len() > before {
                 status = format!("{:?}", all[0].status).to_ascii_lowercase();

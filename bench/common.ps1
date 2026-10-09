@@ -150,6 +150,42 @@ function Measure-Process($proc, [double]$seconds, [int]$intervalMs = 250) {
     }
 }
 
+# Per-thread CPU time (ms) of a process, keyed by thread id, with the thread descriptions Rust sets.
+function Get-ThreadTimes([int]$procId) {
+    if (-not ('OtThreads' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System; using System.Runtime.InteropServices;
+public static class OtThreads {
+    [DllImport("kernel32.dll")] static extern IntPtr OpenThread(uint access, bool inherit, uint id);
+    [DllImport("kernel32.dll")] static extern int GetThreadDescription(IntPtr h, out IntPtr d);
+    [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+    [DllImport("kernel32.dll")] static extern IntPtr LocalFree(IntPtr h);
+    public static string Name(uint id) {
+        IntPtr h = OpenThread(0x0800, false, id); if (h == IntPtr.Zero) return "";
+        IntPtr d; string s = "";
+        if (GetThreadDescription(h, out d) >= 0 && d != IntPtr.Zero) { s = Marshal.PtrToStringUni(d); LocalFree(d); }
+        CloseHandle(h); return s;
+    }
+}
+'@
+    }
+    $out = @{}
+    foreach ($t in (Get-Process -Id $procId).Threads) {
+        try { $out[$t.Id] = [pscustomobject]@{ Name = [OtThreads]::Name([uint32]$t.Id); Ms = $t.TotalProcessorTime.TotalMilliseconds } } catch {}
+    }
+    return $out
+}
+
+# Busiest threads between two Get-ThreadTimes snapshots: "name pct%" (% of one core).
+function Get-TopThreads($before, $after, [double]$seconds, [int]$top = 3) {
+    $rows = foreach ($id in $after.Keys) {
+        $b = if ($before.ContainsKey($id)) { $before[$id].Ms } else { 0 }
+        $n = if ($after[$id].Name) { $after[$id].Name } else { "tid$id" }
+        [pscustomobject]@{ Name = $n; Pct = [math]::Round(($after[$id].Ms - $b) / ($seconds * 1000) * 100, 2) }
+    }
+    return @($rows | Sort-Object Pct -Descending | Select-Object -First $top | ForEach-Object { "$($_.Name) $($_.Pct)%" })
+}
+
 # ---- desktop helpers (Notepad e2e) -------------------------------------------------------
 
 function Add-Win32 {

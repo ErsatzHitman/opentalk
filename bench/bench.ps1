@@ -21,7 +21,7 @@ param(
     [int]$RecordSec = 30,
     [int]$SettingsSec = 20,
     [int]$LiveDictations = 3,
-    [string]$LiveModel = 'nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free',
+    [string]$LiveModels = 'nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free,thinkingmachines/inkling-small:free,thinkingmachines/inkling:free',
     [switch]$Quick,
     [switch]$SkipLive,
     [switch]$SkipMic,
@@ -175,10 +175,13 @@ try {
     Section "recording $RecordSec s (injected WAV, then silence)"
     $before = (Read-History $h).Count
     Invoke-Ot $Exe @('--bench', 'toggle') $e 15 | Out-Null
+    $thr0 = Get-ThreadTimes $daemon.Id
     $R['recording_injected'] = Measure-Process $daemon $RecordSec
+    $R.recording_injected | Add-Member top_threads (Get-TopThreads $thr0 (Get-ThreadTimes $daemon.Id) $RecordSec)
+    $R.recording_injected | Add-Member private_ws_mb (Get-PrivateWsMB $daemon.Id)
     Invoke-Ot $Exe @('--bench', 'toggle') $e 15 | Out-Null
     Wait-History $h ($before + 1) 30 | Out-Null
-    Write-Host ("recording (injected): {0}% of all cores ({1}% of one core), WS peak {2} MB, private peak {3} MB" -f $R.recording_injected.CpuPctAll, $R.recording_injected.CpuPctCore, $R.recording_injected.WsPeakMB, $R.recording_injected.PrivPeakMB)
+    Write-Host ("recording (injected): {0}% of all cores ({1}% of one core), WS peak {2} MB, private peak {3} MB; busiest threads: {4}" -f $R.recording_injected.CpuPctAll, $R.recording_injected.CpuPctCore, $R.recording_injected.WsPeakMB, $R.recording_injected.PrivPeakMB, ($R.recording_injected.top_threads -join ', '))
 
     # ---- settings window --------------------------------------------------------------
     Section "settings window open ($SettingsSec s)"
@@ -214,7 +217,9 @@ if (-not $SkipMic) {
     Section "recording $RecordSec s (real microphone, cancelled, no upload)"
     $h = New-TempHome 'ot-bench-mic'
     $e = New-Env $h @{ OPENTALK_STT_BASE_URL = $mock.Url; OPENTALK_SECRET_OPENAI = 'bench-dummy-key-123456' }
-    Write-Config $h @{ audio_cues = $false; auto_paste = $false; stt = @{ provider = 'openai' } }
+    # App bubble off here: its icon lookup loads the shell's image stack (see the notes), and this
+    # run isolates the cost of capture + pill.
+    Write-Config $h @{ audio_cues = $false; auto_paste = $false; show_app_bubble = $false; start_minimized = $true; stt = @{ provider = 'openai' } }
     $daemon = Start-Daemon $Exe $e
     try {
         Start-Sleep -Seconds 2
@@ -226,6 +231,7 @@ if (-not $SkipMic) {
             $R['recording_mic'] = $null
         } else {
             $R['recording_mic'] = Measure-Process $daemon $RecordSec
+            $R.recording_mic | Add-Member private_ws_mb (Get-PrivateWsMB $daemon.Id)
             Write-Host ("recording (mic): {0}% of all cores ({1}% of one core), WS peak {2} MB, private peak {3} MB" -f $R.recording_mic.CpuPctAll, $R.recording_mic.CpuPctCore, $R.recording_mic.WsPeakMB, $R.recording_mic.PrivPeakMB)
             Invoke-Ot $Exe @('--bench', 'cancel') $e 15 | Out-Null
         }
@@ -248,8 +254,8 @@ if (-not $SkipE2E) {
             $raw = & powershell -NoProfile -ExecutionPolicy Bypass -File $script -Exe $Exe -Stt $mode -Target form -Mode paste 2>&1 | Out-String
             $json = $null
             if ($raw -match '(?s)(\{.*\})') { try { $json = $Matches[1] | ConvertFrom-Json } catch {} }
-            $row = [ordered]@{ stt = $mode; pass = [bool]($json -and $json.pass); error = if ($json) { $json.error } else { 'no JSON from tests\e2e.ps1' } }
-            if ($json -and $json.latency_line) { $row.latency = ConvertFrom-LatencyLine $json.latency_line }
+            $row = [ordered]@{ stt = $mode; pass = [bool]($json -and $json.pass); error = if ($json -and $json.PSObject.Properties['error']) { $json.error } elseif ($json) { $null } else { 'no JSON from tests\e2e.ps1' } }
+            if ($json -and $json.PSObject.Properties['latency_line'] -and $json.latency_line) { $row.latency = ConvertFrom-LatencyLine $json.latency_line }
             $R['e2e'] += [pscustomobject]$row
             Write-Host ("e2e {0}: pass={1} {2}" -f $mode, $row.pass, $(if ($row.latency) { "paste {0} ms, total {1} ms" -f $row.latency.paste, $row.latency.total } else { $row.error }))
         }
@@ -257,31 +263,45 @@ if (-not $SkipE2E) {
 }
 
 # ---- live OpenRouter (free models only) ---------------------------------------------------
+# Rotates over the free audio-input models (free tiers rate-limit, gate or drop audio); each round
+# uses the next model whose last attempt did not fail.
 $R['live'] = $null
 if (-not $SkipLive) {
-    Section "live OpenRouter ($LiveModel), $LiveDictations dictations"
+    $models = @($LiveModels -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_.EndsWith(':free') })
+    Section "live OpenRouter ($($models -join ', ')), $LiveDictations dictations"
     $key = Read-OpenRouterKey $KeyFile
-    if (-not $key -or -not $LiveModel.EndsWith(':free')) {
-        Write-Host 'skipped (no key, or model is not :free)' -ForegroundColor Yellow
+    if (-not $key -or $models.Count -eq 0) {
+        Write-Host 'skipped (no key, or no :free model)' -ForegroundColor Yellow
     } else {
-        $h = New-TempHome 'ot-bench-live'
-        $e = New-Env $h @{ OPENTALK_INJECT_WAV = $wav; OPENTALK_SECRET_OPENROUTER = $key }
-        Write-Config $h @{ audio_cues = $false; auto_paste = $false; keep_in_clipboard = $true; stt = @{ provider = 'openrouter'; models = @{ openrouter = $LiveModel }; timeout_ms = 45000 } }
-        $daemon = Start-Daemon $Exe $e
-        try {
-            $d = Invoke-Ot $Exe @('--bench', 'dictate', $LiveDictations, $wav) $e 600
-            $rounds = @($d.Out -split "`n" | Where-Object { $_.Trim().StartsWith('{') } | ForEach-Object { $_ | ConvertFrom-Json })
-            $hist = Read-History $h
-            $live = [ordered]@{ model = $LiveModel; rounds = $rounds.Count; ok = @($hist | Where-Object { $_.status -eq 'ok' }).Count
-                errors = @($hist | Where-Object { $_.status -eq 'failed' } | ForEach-Object { $_.error } | Select-Object -Unique) }
-            $live.latency = (Invoke-Ot $Exe @('--bench', 'latency') $e 30).Out | ConvertFrom-Json
-            $R['live'] = $live
-            Write-Host ("live: {0}/{1} ok; errors: {2}" -f $live.ok, $live.rounds, ($live.errors -join ' | '))
+        $live = [ordered]@{ models = $models; rounds = 0; ok = 0; per_model = [ordered]@{} }
+        $round = 0
+        foreach ($m in $models) {
+            if ($round -ge $LiveDictations) { break }
+            $h = New-TempHome 'ot-bench-live'
+            $e = New-Env $h @{ OPENTALK_INJECT_WAV = $wav; OPENTALK_SECRET_OPENROUTER = $key }
+            Write-Config $h @{ audio_cues = $false; auto_paste = $false; keep_in_clipboard = $true; start_minimized = $true; stt = @{ provider = 'openrouter'; models = @{ openrouter = $m }; timeout_ms = 90000 } }
+            $daemon = Start-Daemon $Exe $e
+            try {
+                $n = 1
+                $null = Invoke-Ot $Exe @('--bench', 'dictate', $n, $wav, '150') $e 900
+                $round += $n
+                $hist = Read-History $h
+                $ok = @($hist | Where-Object { $_.status -eq 'ok' })
+                $live.rounds += $hist.Count; $live.ok += $ok.Count
+                $live.per_model[$m] = [ordered]@{
+                    ok = $ok.Count; total = $hist.Count
+                    errors = @($hist | Where-Object { $_.status -ne 'ok' } | ForEach-Object { if ($_.error) { $_.error } else { "status $($_.status)" } } | Select-Object -Unique)
+                    texts = @($ok | ForEach-Object { $_.text })
+                }
+                if ($ok.Count) { $live.latency = (Invoke-Ot $Exe @('--bench', 'latency') $e 30).Out | ConvertFrom-Json }
+                Write-Host ("live {0}: {1}/{2} ok {3}" -f $m, $ok.Count, $hist.Count, (($live.per_model[$m].errors) -join ' | '))
+            }
+            finally {
+                Stop-Daemon $Exe $daemon $e
+                Remove-Item -Recurse -Force $h -ErrorAction SilentlyContinue
+            }
         }
-        finally {
-            Stop-Daemon $Exe $daemon $e
-            Remove-Item -Recurse -Force $h -ErrorAction SilentlyContinue
-        }
+        $R['live'] = $live
     }
 }
 
@@ -308,11 +328,14 @@ the one-core figure (100% = one fully busy core) is given in brackets.
 |---|---|---|---|---|
 | Idle CPU (daemon, $($R.idle.Seconds) s) | $($R.idle.CpuPctAll)% ($($R.idle.CpuPctCore)% of one core) | ~0.0% | ~3% | $(Verdict ($R.idle.CpuPctCore -lt 0.5)) |
 | Recording CPU ($recLabel, $RecordSec s) | $($rec.CpuPctAll)% ($($rec.CpuPctCore)% of one core) | <= 1.5% | ~3% | $(Verdict ($rec.CpuPctAll -le 1.5)) |
+| Recording CPU, projected on a 4-core laptop (one-core % / 4) | $([math]::Round($rec.CpuPctCore / 4, 2))% | <= 1.5% | ~3% | $(Verdict ($rec.CpuPctCore / 4 -le 1.5)) |
+| Busiest daemon threads while recording (injected, % of one core) | $(if ($R.recording_injected.top_threads) { $R.recording_injected.top_threads -join ', ' } else { 'n/a' }) | - | - | - |
 | Daemon working set, idle (mean / peak) | $($R.idle.WsMeanMB) / $($R.idle.WsPeakMB) MB | <= 25 MB | ~110 MB | $(Verdict ($R.idle.WsPeakMB -le 25)) |
 | Daemon private bytes, idle (mean / peak) | $($R.idle.PrivMeanMB) / $($R.idle.PrivPeakMB) MB | <= 15 MB | n/a | $(Verdict ($R.idle.PrivPeakMB -le 15)) |
 | Daemon private working set, idle (Task Manager "Memory") | $(Fmt $R.idle.private_ws_mb ' MB') | n/a | ~110 MB | - |
 | Daemon working set during $Dictations dictations (peak) | $($R.dictations.WsPeakMB) MB | <= 25 MB | ~110 MB | $(Verdict ($R.dictations.WsPeakMB -le 25)) |
-| Daemon working set while recording (peak) | $($rec.WsPeakMB) MB | <= 25 MB | ~110 MB | $(Verdict ($rec.WsPeakMB -le 25)) |
+| Daemon working set while recording, app bubble on (peak / private WS) | $($R.recording_injected.WsPeakMB) / $(Fmt $R.recording_injected.private_ws_mb ' MB') | <= 25 MB | ~110 MB | $(Verdict ($R.recording_injected.WsPeakMB -le 25)) |
+$(if ($R.recording_mic) { "| Daemon working set while recording, real mic, app bubble off (peak / private WS) | $($R.recording_mic.WsPeakMB) / $(Fmt $R.recording_mic.private_ws_mb ' MB') | <= 25 MB | ~110 MB | $(Verdict ($R.recording_mic.WsPeakMB -le 25)) |" })
 | Settings window working set (mean / peak) | $(if ($R.settings) { "$($R.settings.WsMeanMB) / $($R.settings.WsPeakMB) MB" } else { 'n/a' }) | <= 80 MB, only while open | n/a | $(if ($R.settings) { Verdict ($R.settings.WsPeakMB -le 80) } else { '-' }) |
 | Settings window CPU while idle | $(if ($R.settings) { "$($R.settings.CpuPctAll)%" } else { 'n/a' }) | ~0 | n/a | - |
 | Executable size | $($R.env.exe_mb) MB | <= 8 MB | n/a | $(Verdict ($R.env.exe_mb -le 8)) |
@@ -351,6 +374,18 @@ then the text is read back with UI Automation.
 The mock answers 40 ms after the request (or after ``Finalize`` when streaming), so local overhead = total - STT.
 "
 })
+$(if (Test-Path (Join-Path $outDir 'size.json')) { $sz = Get-Content -Raw (Join-Path $outDir 'size.json') | ConvertFrom-Json
+"## Binary size
+
+Release executable, measured by rebuilding the same commit with parts of the cleanup LLM code stubbed out (``bench/out/size.json``):
+
+| Build | Bytes | MB | Delta |
+|---|---|---|---|
+" + (($sz.builds | ForEach-Object { "| $($_.name) | $($_.bytes) | $([math]::Round($_.bytes / 1MB, 2)) | $(if ($_.delta) { '+' + [math]::Round($_.delta / 1KB) + ' KB' } else { '-' }) |" }) -join "`n") + "
+
+$($sz.note)
+" })
+$(if (Test-Path (Join-Path $outDir 'extra.md')) { (Get-Content -Raw -Encoding UTF8 (Join-Path $outDir 'extra.md')).TrimEnd() + "`n" })
 ## Scenario details
 
 | Scenario | Duration | CPU (all cores) | CPU (one core) | WS mean / peak MB | Private mean / peak MB | Threads | Handles |
@@ -368,7 +403,7 @@ $(if ($R.settings) { "Settings window: opened in $($R.settings_open_ms) ms; priv
 
 ## Live check (OpenRouter, ``:free`` models only)
 
-$(if ($R.live) { "Model ``$($R.live.model)``: $($R.live.ok) of $($R.live.rounds) dictations succeeded.`n`n" + $(if ($R.live.errors.Count) { "Errors reported by the provider:`n`n" + (($R.live.errors | ForEach-Object { "- $_" }) -join "`n") } else { "No errors." }) } else { 'Not run.' })
+$(if ($R.live) { "$($R.live.ok) of $($R.live.rounds) live dictations succeeded.`n`n| Model | OK | Errors reported (redacted by OpenTalk) |`n|---|---|---|`n" + (($R.live.per_model.Keys | ForEach-Object { $pm = $R.live.per_model[$_]; "| ``$_`` | $($pm.ok) / $($pm.total) | $((@($pm.errors) | ForEach-Object { $_ -replace '\|', '/' }) -join '; ') |" }) -join "`n") } else { 'Not run.' })
 
 Free OpenRouter models are rate limited and sometimes not available to non-agent clients, so this section is a smoke test of the real
 network path, not a latency reference; the table above is measured against a local mock to isolate OpenTalk's own cost.
@@ -383,6 +418,26 @@ network path, not a latency reference; the table above is measured against a loc
   speed does not enter the numbers.
 - Samples are taken every 250 ms with ``Process.TotalProcessorTime``, ``WorkingSet64`` and ``PrivateMemorySize64``.
 - Latencies come from the daemon's own QPC-stamped log lines (``latency seq=...``), read back with ``--bench latency``.
+- Per-thread CPU uses ``ProcessThread.TotalProcessorTime`` and the thread names Rust sets (``SetThreadDescription``).
+
+## Notes
+
+- **opengl32.dll is delay-loaded** (``build.rs``). Only the Settings window draws with OpenGL, but a load-time import put
+  ``opengl32.dll`` into the daemon too, and overlay injectors that hook GL processes (RivaTuner/MSI Afterburner, which runs on
+  this machine) then treated the daemon as a 3D app: its private commit jumped from ~2 MB to ~58 MB at the first STA
+  ``CoInitializeEx``. With the delay-load import the daemon never loads the DLL; Settings loads it on its first WGL call.
+  The Settings process's large private-bytes figure is that same injector inside a real GL process; its working set is small.
+- **Recording CPU is dominated by the pill**: the ``main`` thread renders and uploads the 60 fps capsule animation
+  (~0.7 ms per frame); WASAPI capture and the VAD/level meter stay well under 1% of one core. On this 24-core machine that is far
+  below the 1.5% target; the 4-core projection above is the number to watch (the pill could drop to 30 fps once its
+  entrance has finished, see the open issues).
+- **Working set and the app bubble**: the active-app icon is fetched with ``IShellItemImageFactory``, which loads ~35 shell
+  DLLs (XAML, StateRepository, thumbcache, ...) into the daemon on the first dictation. They are shared image pages, so the
+  working set grows by ~17 MB while the private working set (Task Manager's "Memory") grows by ~2-4 MB. With the bubble off
+  the daemon stays at ~19 MB WS / ~3.6 MB private WS while recording. A lighter icon path for plain Win32 executables
+  (``SHGetFileInfoW``/``PrivateExtractIconsW``) is an open follow-up for the app-icon module.
+- Clipboard and paste timings are only meaningful on an unlocked desktop: Windows refuses clipboard access while the
+  workstation is locked, so ``copy_to_clipboard`` exhausts its retries (~95 ms) and real-paste e2e runs are skipped.
 "@
 $md | Set-Content -Encoding UTF8 (Join-Path $PSScriptRoot '..\docs\BENCHMARK.md')
 Write-Host "`nwrote docs\BENCHMARK.md and bench\out\results.json"
