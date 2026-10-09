@@ -106,8 +106,28 @@ fn ensure_manager(slot: &mut Option<Manager>) -> Option<&Manager> {
     slot.as_ref()
 }
 
-fn status_of(s: &Session) -> Option<Status> {
-    s.GetPlaybackInfo().ok()?.PlaybackStatus().ok()
+/// The slice of a media session the pause/resume logic needs (a trait so it is unit-testable).
+trait Ctl {
+    fn status(&self) -> Option<Status>;
+    fn can_pause(&self) -> bool;
+    /// `Ok(true)` when the app accepted the command.
+    fn pause(&self) -> windows::core::Result<bool>;
+    fn play(&self) -> windows::core::Result<bool>;
+}
+
+impl Ctl for Session {
+    fn status(&self) -> Option<Status> {
+        self.GetPlaybackInfo().ok()?.PlaybackStatus().ok()
+    }
+    fn can_pause(&self) -> bool {
+        self.GetPlaybackInfo().and_then(|i| i.Controls()).and_then(|c| c.IsPauseEnabled()).unwrap_or(true)
+    }
+    fn pause(&self) -> windows::core::Result<bool> {
+        self.TryPauseAsync()?.join()
+    }
+    fn play(&self) -> windows::core::Result<bool> {
+        self.TryPlayAsync()?.join()
+    }
 }
 
 /// Pause every session reporting `Playing`; returns how many were paused by this call.
@@ -118,20 +138,28 @@ fn pause_playing(manager: &mut Option<Manager>, paused: &mut Vec<Session>, deadl
     let Some(sessions) = ensure_manager(manager).and_then(|m| m.GetSessions().ok()) else {
         return 0;
     };
+    pause_sessions(sessions, paused, deadline)
+}
+
+fn pause_sessions<S: Ctl>(sessions: impl IntoIterator<Item = S>, paused: &mut Vec<S>, deadline: Instant) -> usize {
     let mut count = 0;
     for s in sessions {
         // The caller has given up after the deadline; don't pause anything it won't resume.
         if Instant::now() >= deadline {
             break;
         }
-        if status_of(&s) != Some(Status::Playing) {
+        if s.status() != Some(Status::Playing) || !s.can_pause() {
             continue;
         }
-        let can_pause = s.GetPlaybackInfo().and_then(|i| i.Controls()).and_then(|c| c.IsPauseEnabled()).unwrap_or(true);
-        if !can_pause {
-            continue;
-        }
-        match s.TryPauseAsync().and_then(|op| op.join()) {
+        match s.pause() {
+            Ok(true) if Instant::now() >= deadline => {
+                // The app took too long: the caller already answered "nothing paused" and will
+                // never call `resume`, so undo this pause now instead of leaving media stopped.
+                crate::log_warn!("media: pause finished after the deadline; resuming it");
+                if let Err(e) = s.play() {
+                    crate::log_warn!("media: late-pause undo failed: {e}");
+                }
+            }
             Ok(true) => {
                 paused.push(s);
                 count += 1;
@@ -143,14 +171,14 @@ fn pause_playing(manager: &mut Option<Manager>, paused: &mut Vec<Session>, deadl
     count
 }
 
-fn resume_paused(paused: &mut Vec<Session>) {
+fn resume_paused<S: Ctl>(paused: &mut Vec<S>) {
     for s in paused.drain(..) {
         // Only sessions still paused: if the user pressed play (or closed the app) meanwhile,
         // leave them alone.
-        if status_of(&s) != Some(Status::Paused) {
+        if s.status() != Some(Status::Paused) {
             continue;
         }
-        if let Err(e) = s.TryPlayAsync().and_then(|op| op.join()) {
+        if let Err(e) = s.play() {
             crate::log_warn!("media: resume failed: {e}");
         }
     }
@@ -174,6 +202,106 @@ mod tests {
         assert!(paused.is_empty());
         assert!(manager.is_none(), "must not even touch WinRT after the deadline");
     }
+
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+
+    #[derive(Clone)]
+    struct Fake {
+        name: &'static str,
+        status: Rc<Cell<Status>>,
+        /// How long `pause` blocks, like a slow media app.
+        pause_delay: Duration,
+        can_pause: bool,
+        log: Rc<RefCell<Vec<String>>>,
+    }
+
+    impl Fake {
+        fn new(name: &'static str, status: Status, log: &Rc<RefCell<Vec<String>>>) -> Self {
+            Self { name, status: Rc::new(Cell::new(status)), pause_delay: Duration::ZERO, can_pause: true, log: log.clone() }
+        }
+    }
+
+    impl Ctl for Fake {
+        fn status(&self) -> Option<Status> {
+            Some(self.status.get())
+        }
+        fn can_pause(&self) -> bool {
+            self.can_pause
+        }
+        fn pause(&self) -> windows::core::Result<bool> {
+            std::thread::sleep(self.pause_delay);
+            self.log.borrow_mut().push(format!("pause {}", self.name));
+            self.status.set(Status::Paused);
+            Ok(true)
+        }
+        fn play(&self) -> windows::core::Result<bool> {
+            self.log.borrow_mut().push(format!("play {}", self.name));
+            self.status.set(Status::Playing);
+            Ok(true)
+        }
+    }
+
+    fn far() -> Instant {
+        Instant::now() + Duration::from_secs(60)
+    }
+
+    #[test]
+    fn pauses_only_playing_sessions_and_resumes_only_those() {
+        let log = Rc::default();
+        let a = Fake::new("a", Status::Playing, &log);
+        let b = Fake::new("b", Status::Paused, &log);
+        let c = Fake::new("c", Status::Stopped, &log);
+        let mut d = Fake::new("d", Status::Playing, &log);
+        d.can_pause = false;
+        let mut paused = Vec::new();
+        let n = pause_sessions([a.clone(), b.clone(), c.clone(), d.clone()], &mut paused, far());
+        assert_eq!(n, 1);
+        assert_eq!(*log.borrow(), ["pause a"]);
+        resume_paused(&mut paused);
+        assert_eq!(*log.borrow(), ["pause a", "play a"]);
+        assert_eq!(b.status.get(), Status::Paused, "never touched");
+        assert_eq!(c.status.get(), Status::Stopped);
+        assert_eq!(d.status.get(), Status::Playing);
+        assert!(paused.is_empty());
+    }
+
+    #[test]
+    fn resume_skips_sessions_the_user_restarted() {
+        let log = Rc::default();
+        let a = Fake::new("a", Status::Playing, &log);
+        let mut paused = Vec::new();
+        assert_eq!(pause_sessions([a.clone()], &mut paused, far()), 1);
+        a.status.set(Status::Playing); // user pressed play meanwhile
+        resume_paused(&mut paused);
+        assert_eq!(*log.borrow(), ["pause a"], "must not send a second play");
+    }
+
+    #[test]
+    fn late_pause_is_undone_because_the_caller_will_not_resume() {
+        let log = Rc::default();
+        let mut slow = Fake::new("slow", Status::Playing, &log);
+        slow.pause_delay = Duration::from_millis(60);
+        let mut paused = Vec::new();
+        let n = pause_sessions([slow.clone()], &mut paused, Instant::now() + Duration::from_millis(20));
+        assert_eq!(n, 0, "caller got `false`");
+        assert!(paused.is_empty());
+        assert_eq!(*log.borrow(), ["pause slow", "play slow"]);
+        assert_eq!(slow.status.get(), Status::Playing, "media left playing");
+    }
+
+    #[test]
+    fn deadline_stops_before_the_next_session() {
+        let log = Rc::default();
+        let mut slow = Fake::new("slow", Status::Playing, &log);
+        slow.pause_delay = Duration::from_millis(60);
+        let next = Fake::new("next", Status::Playing, &log);
+        let mut paused = Vec::new();
+        pause_sessions([slow, next.clone()], &mut paused, Instant::now() + Duration::from_millis(20));
+        assert_eq!(next.status.get(), Status::Playing);
+        assert!(!log.borrow().iter().any(|l| l == "pause next"));
+    }
+
 
     /// Never asserts that something was paused (nothing may be playing); checks timing and that
     /// resume is safe to call with nothing paused.
