@@ -70,6 +70,23 @@ fn url_like(w: &str) -> bool {
         && parts.next().is_some_and(|p| p.chars().count() >= 2)
 }
 
+/// Punctuation glued on both sides inside a URL, path or e-mail address ("example.com/a?x=1,2"):
+/// neither a sentence end nor a place to insert a space. Looks back a few glued tokens only.
+fn inside_url(toks: &[Tok<'_>], i: usize) -> bool {
+    if toks[i].ws != Ws::None || !toks.get(i + 1).is_some_and(|t| t.ws == Ws::None && t.is_word()) {
+        return false;
+    }
+    let mut j = i;
+    while j > 0 && i - j < 16 && toks[j].ws == Ws::None {
+        j -= 1;
+        let t = &toks[j];
+        if t.is_word() && (t.text.contains('/') || t.text.char_indices().any(|(k, c)| c == '@' && k > 0)) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Upper-case the first letter of a word that is all lower case. Returns None when the word
 /// must stay as is (mixed case such as "iPhone", URLs, numbers).
 fn capitalized(t: &Tok<'_>, turkish: bool) -> Option<String> {
@@ -145,6 +162,7 @@ pub fn repair(doc: &mut Doc<'_>, o: &RepairOpts) {
         }
         // "word,next" -> "word, next" for ASCII separators before a letter.
         if matches!(&*doc.toks[i].text, "," | ";" | "!" | "?")
+            && !inside_url(&doc.toks, i)
             && let Some(next) = doc.toks.get(i + 1)
             && next.is_word()
             && next.ws == Ws::None
@@ -163,7 +181,7 @@ pub fn repair(doc: &mut Doc<'_>, o: &RepairOpts) {
     for i in 0..doc.toks.len() {
         if doc.toks[i].kind == Kind::Punct {
             let t = &doc.toks[i];
-            if t.is_sentence_end() {
+            if t.is_sentence_end() && !inside_url(&doc.toks, i) {
                 let abbreviation = &*t.text == "."
                     && t.ws == Ws::None
                     && i > 0

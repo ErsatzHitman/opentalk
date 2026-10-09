@@ -647,3 +647,19 @@ fn fuzzy_keeps_plural_of_term() {
     c.dictionary = &dict;
     assert_eq!(process("Mahendras car is here", &c), "Mahendras car is here");
 }
+
+/// Punctuation glued inside a URL, path or e-mail address is neither a sentence end nor a
+/// place to add a space.
+#[test]
+fn url_punctuation_is_left_alone() {
+    for (raw, want) in [
+        ("Visit https://example.com/um?x=1 now.", "Visit https://example.com/um?x=1 now."),
+        ("See example.com/path?q=a,b and go! Then stop? yes.", "See example.com/path?q=a,b and go! Then stop? Yes."),
+        ("Email me at john.doe@gmail.com, thanks.", "Email me at john.doe@gmail.com, thanks."),
+        ("Ask @john?Sure.", "Ask @john? Sure."),
+        ("Hello!how are you", "Hello! How are you"),
+    ] {
+        assert_eq!(std_en(raw), want, "{raw}");
+        assert_eq!(process(raw, &ctx("auto", FillerMode::Standard)), want, "{raw}");
+    }
+}
