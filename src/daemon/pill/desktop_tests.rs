@@ -200,3 +200,38 @@ fn desktop_pill_frame_cost() {
     println!("full frame (render + upload + UpdateLayeredWindow): {per:.3} ms");
     assert!(per < if cfg!(debug_assertions) { 15.0 } else { 1.0 }, "frame cost {per:.3} ms");
 }
+
+#[test]
+#[ignore]
+fn desktop_pill_real_app_icon_bubble() {
+    let (w, _events) = make();
+    let hwnd = HWND(w.hwnd() as *mut core::ffi::c_void);
+    let icon = crate::daemon::appicon::load_path("C:/Windows/explorer.exe", 64).expect("explorer icon via the shared loader");
+    let scale = w.with(|i| i.st.scale);
+    let bubble = crate::daemon::pill::model::AppBubble::new(&icon.name, &icon.rgba, icon.size, scale).expect("bubble from loaded icon");
+    w.with(|i| {
+        i.set_app(Some(bubble));
+        i.set_mode(PillMode::Recording);
+    });
+    pump(900);
+    let (g, r) = w.with(|i| (i.st.geometry(i.now()), i.client_size()));
+    assert!(g.bubble_t > 0.99, "bubble fully in: {g:?}");
+    assert!((g.bubble.2 * 2.0 - 36.0).abs() < 0.01, "diameter == recording pill height");
+    // the bubble takes clicks (so it can be dragged and show its tooltip)
+    let w_rect = rect(hwnd);
+    let (bx, by) = ((g.bubble.0 * scale) as i32, (g.bubble.1 * scale) as i32);
+    assert_eq!(send(hwnd, WM_NCHITTEST, 0, lparam(w_rect.left + bx, w_rect.top + by)), HTCLIENT as isize);
+    // the icon actually drew non-background pixels inside the circle
+    let frame = w.with(|i| crate::daemon::pill::render::render(&i.st, i.now()));
+    let (cx, cy) = (bx.clamp(0, r.0 - 1) as u32, by.clamp(0, r.1 - 1) as u32);
+    let coloured = (0..11u32)
+        .flat_map(|dx| (0..11u32).map(move |dy| (dx, dy)))
+        .filter_map(|(dx, dy)| frame.pixel(cx + dx - 5, cy + dy - 5))
+        .filter(|p| p.alpha() > 200 && (p.red() as i32 - p.blue() as i32).abs() > 40)
+        .count();
+    assert!(coloured > 10, "icon colours present at the bubble centre ({coloured})");
+    // tooltip on bubble hover names the app
+    send(hwnd, MOVE, 0, lparam(bx, by));
+    assert!(w.with(|i| i.st.pointer().bubble));
+    send(hwnd, WM_MOUSELEAVE, 0, LPARAM(0));
+}

@@ -75,7 +75,7 @@ pub struct AnimTimer {
     start_evt: HANDLE,
     stop_evt: HANDLE,
     quit_evt: HANDLE,
-    active: AtomicBool,
+    active: Arc<AtomicBool>,
     pending: Arc<AtomicBool>,
     join: Option<std::thread::JoinHandle<()>>,
 }
@@ -93,11 +93,13 @@ impl AnimTimer {
         let pending = Arc::new(AtomicBool::new(false));
         let (h, s, st, q) = (SendHandle(hwnd.0 as isize), SendHandle(start_evt.0 as isize), SendHandle(stop_evt.0 as isize), SendHandle(quit_evt.0 as isize));
         let p = pending.clone();
+        let active = Arc::new(AtomicBool::new(false));
+        let a = active.clone();
         let join = std::thread::Builder::new()
             .name("pill-anim".into())
-            .spawn(move || anim_thread(h, s, st, q, p))
+            .spawn(move || anim_thread(h, s, st, q, p, a))
             .map_err(|e| e.to_string())?;
-        Ok(AnimTimer { start_evt, stop_evt, quit_evt, active: AtomicBool::new(false), pending, join: Some(join) })
+        Ok(AnimTimer { start_evt, stop_evt, quit_evt, active, pending, join: Some(join) })
     }
 
     pub fn start(&self) {
@@ -145,7 +147,7 @@ impl Drop for AnimTimer {
     }
 }
 
-fn anim_thread(hwnd: SendHandle, start: SendHandle, stop: SendHandle, quit: SendHandle, pending: Arc<AtomicBool>) {
+fn anim_thread(hwnd: SendHandle, start: SendHandle, stop: SendHandle, quit: SendHandle, pending: Arc<AtomicBool>, active: Arc<AtomicBool>) {
     let hwnd = HWND(hwnd.0 as *mut core::ffi::c_void);
     let (start, stop, quit) = (HANDLE(start.0 as *mut core::ffi::c_void), HANDLE(stop.0 as *mut core::ffi::c_void), HANDLE(quit.0 as *mut core::ffi::c_void));
     // SAFETY: handles stay valid until `AnimTimer::drop` joins this thread.
@@ -157,6 +159,11 @@ fn anim_thread(hwnd: SendHandle, start: SendHandle, stop: SendHandle, quit: Send
             let r = WaitForMultipleObjects(&[start, quit], false, INFINITE);
             if r.0 != WAIT_OBJECT_0.0 {
                 break;
+            }
+            // Auto-reset events coalesce: a start/stop/start burst leaves a stale start signal, so
+            // the shared flag, not the event, decides whether to run.
+            if !active.load(Ordering::Acquire) {
+                continue;
             }
             let due: i64 = -160_000; // 16 ms, relative
             if SetWaitableTimer(timer, &due, 16, None, None, false).is_err() {
@@ -172,6 +179,13 @@ fn anim_thread(hwnd: SendHandle, start: SendHandle, stop: SendHandle, quit: Send
                     }
                     1 => {
                         let _ = CancelWaitableTimer(timer);
+                        // stop followed by start before this thread ran: keep going
+                        if active.load(Ordering::Acquire) {
+                            let due: i64 = -160_000;
+                            if SetWaitableTimer(timer, &due, 16, None, None, false).is_ok() {
+                                continue;
+                            }
+                        }
                         break;
                     }
                     _ => {

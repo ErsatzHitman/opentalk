@@ -233,8 +233,8 @@ fn compute_layout(title: &str, desc: &str, retry: bool, scale: f32) -> CardLayou
         (0.0, content_w - 16.0)
     };
     let dev = |w: f32| w * s;
-    let title_lines = if title.is_empty() { vec![] } else { text::wrap(title, tf, dev(text_avail)) };
-    let desc_lines = if desc.is_empty() { vec![] } else { text::wrap(desc, df, dev(text_avail)) };
+    let title_lines = if title.is_empty() { vec![] } else { clamp_lines(text::wrap(&clamp_chars(title, MAX_TITLE_CHARS), tf, dev(text_avail)), MAX_TITLE_LINES) };
+    let desc_lines = if desc.is_empty() { vec![] } else { clamp_lines(text::wrap(&clamp_chars(desc, MAX_DESC_CHARS), df, dev(text_avail)), MAX_DESC_LINES) };
     let t_lh = TITLE_PX * LEADING_SNUG;
     let d_lh = DESC_PX * LEADING_SNUG;
     let title_h = t_lh * title_lines.len() as f32;
@@ -279,6 +279,34 @@ fn compute_layout(title: &str, desc: &str, retry: bool, scale: f32) -> CardLayou
 }
 
 const CARD_GAP: f32 = 8.0;
+
+/// Bounds for pathological messages (a raw provider body): keeps the window on screen and the
+/// per-word GDI measuring off the UI thread's critical path. Normal messages never reach them.
+const MAX_TITLE_CHARS: usize = 160;
+const MAX_DESC_CHARS: usize = 900;
+const MAX_TITLE_LINES: usize = 3;
+const MAX_DESC_LINES: usize = 10;
+
+/// At most `max` chars, ending in an ellipsis when cut.
+fn clamp_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+    out.push('\u{2026}');
+    out
+}
+
+/// At most `max` lines; the last kept line ends in an ellipsis when lines were dropped.
+fn clamp_lines(mut lines: Vec<String>, max: usize) -> Vec<String> {
+    if lines.len() > max {
+        lines.truncate(max);
+        if let Some(last) = lines.last_mut() {
+            last.push('\u{2026}');
+        }
+    }
+    lines
+}
 
 /// Static layer: shadow, surface, border, text and the button.
 pub fn draw_base(card: &ErrorCard, scale: f32, pal: &Palette) -> Pixmap {
@@ -453,6 +481,20 @@ pub fn linear_progress(card: &ErrorCard, now: f64) -> f32 {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn pathological_text_is_bounded() {
+        let huge = "word ".repeat(20_000);
+        let start = std::time::Instant::now();
+        let l = compute_layout(&"T".repeat(5000), &huge, true, 1.0);
+        assert!(l.desc.len() <= MAX_DESC_LINES && l.title.len() <= MAX_TITLE_LINES);
+        assert!(l.win_h < 480.0, "{}", l.win_h);
+        assert!(l.desc.last().is_some_and(|s| s.text.ends_with('\u{2026}')));
+        assert!(start.elapsed().as_secs() < 5);
+        // an ordinary message is untouched
+        let n = compute_layout("Transcription failed", "The speech provider rejected your API key.", true, 1.0);
+        assert!(n.desc.iter().all(|s| !s.text.ends_with('\u{2026}')));
+    }
     use super::*;
 
     #[test]
