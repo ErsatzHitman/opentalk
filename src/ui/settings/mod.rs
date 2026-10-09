@@ -117,6 +117,9 @@ pub struct SettingsState {
     pub secrets: SecretCache,
     /// (secret name, text being typed) for the API-key field currently in edit mode.
     pub key_edit: Option<(String, String)>,
+    /// Text typed into API-key fields that have no stored value yet, per secret name. Kept apart
+    /// from `key_edit` so two empty fields on one page (Corti, Bedrock) do not fight over it.
+    pub new_keys: HashMap<String, String>,
     pub prefs: preferences::PrefsState,
     pub hotkeys: hotkeys::HotkeyState,
     pub stt: stt::SttState,
@@ -130,6 +133,7 @@ impl SettingsState {
     pub fn on_close(&mut self, env_cmds: &mut Vec<Cmd>) {
         self.hotkeys.cancel(env_cmds);
         self.key_edit = None;
+        self.new_keys.clear();
     }
 }
 
@@ -297,36 +301,41 @@ pub fn api_key_field(ui: &mut Ui, env: &mut Env, st: &mut SettingsState, name: &
     });
     ui.add_space(6.0);
     if editing || stored.is_none() {
-        if !editing {
-            st.key_edit = Some((name.to_string(), String::new()));
-        }
         let mut done = false;
         let mut cancel = false;
-        if let Some((_, buf)) = st.key_edit.as_mut() {
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 8.0;
-                let wd = (ui.available_width() - 150.0).max(120.0);
-                let r = w::text_input(ui, &p, buf, "Paste your API key", wd, true);
-                if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                    done = true;
-                }
-                if w::button(ui, &p, Btn::new("Save", Variant::Primary).small().enabled(!buf.trim().is_empty())).clicked() {
-                    done = true;
-                }
-                if stored.is_some() && w::button(ui, &p, Btn::new("Cancel", Variant::Flat).small()).clicked() {
-                    cancel = true;
-                }
-            });
-        }
+        // An unset field owns a buffer of its own; an existing key being replaced uses `key_edit`.
+        let buf: &mut String = if editing {
+            match st.key_edit.as_mut() {
+                Some((_, b)) => b,
+                None => st.new_keys.entry(name.to_string()).or_default(),
+            }
+        } else {
+            st.new_keys.entry(name.to_string()).or_default()
+        };
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            let wd = (ui.available_width() - 150.0).max(120.0);
+            let r = w::text_input(ui, &p, buf, "Paste your API key", wd, true);
+            if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && !buf.trim().is_empty() {
+                done = true;
+            }
+            if w::button(ui, &p, Btn::new("Save", Variant::Primary).small().enabled(!buf.trim().is_empty())).clicked() {
+                done = true;
+            }
+            if stored.is_some() && w::button(ui, &p, Btn::new("Cancel", Variant::Flat).small()).clicked() {
+                cancel = true;
+            }
+        });
+        let typed = buf.trim().to_string();
         if done {
-            if let Some((n, v)) = st.key_edit.take() {
-                match st.secrets.set(&n, v.trim()) {
-                    Ok(()) => {
-                        saved = true;
-                        env.cmds.push(Cmd::Toast("API key saved".into()));
-                    }
-                    Err(e) => env.cmds.push(Cmd::Toast(format!("Could not save the key: {e}"))),
+            match st.secrets.set(name, &typed) {
+                Ok(()) => {
+                    saved = true;
+                    st.key_edit = None;
+                    st.new_keys.remove(name);
+                    env.cmds.push(Cmd::Toast("API key saved".into()));
                 }
+                Err(e) => env.cmds.push(Cmd::Toast(format!("Could not save the key: {e}"))),
             }
         } else if cancel {
             st.key_edit = None;

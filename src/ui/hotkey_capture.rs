@@ -266,7 +266,7 @@ mod sys {
     use windows::Win32::System::Threading::GetCurrentThreadId;
     use windows::Win32::UI::WindowsAndMessaging::{
         CallNextHookEx, DispatchMessageW, GetMessageW, KBDLLHOOKSTRUCT, MSG, PostThreadMessageW, SetWindowsHookExW,
-        TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP, WM_QUIT, WM_SYSKEYDOWN, WM_SYSKEYUP,
+        TranslateMessage, UnhookWindowsHookEx, PeekMessageW, PM_NOREMOVE, WM_USER, WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP, WM_QUIT, WM_SYSKEYDOWN, WM_SYSKEYUP,
     };
 
     const LLKHF_INJECTED: u32 = 0x10;
@@ -310,8 +310,11 @@ mod sys {
                             return;
                         }
                     };
-                    let _ = tx.send(Some(GetCurrentThreadId()));
                     let mut msg = MSG::default();
+                    // Create this thread's message queue before announcing its id, so an early
+                    // WM_QUIT from `Capture::drop` is queued instead of being dropped.
+                    let _ = PeekMessageW(&mut msg, None, WM_USER, WM_USER, PM_NOREMOVE);
+                    let _ = tx.send(Some(GetCurrentThreadId()));
                     while GetMessageW(&mut msg, None, 0, 0).as_bool() {
                         let _ = TranslateMessage(&msg);
                         DispatchMessageW(&msg);
@@ -456,6 +459,31 @@ mod tests {
         assert!(validate("F8").is_none());
         assert!(validate("A").is_some());
         assert!(validate("Control").is_some());
+    }
+
+    #[test]
+    fn every_nameable_key_is_accepted_by_the_daemon_parser() {
+        for vk in 0u32..=0xFF {
+            if modifier_of(vk).is_some() {
+                continue;
+            }
+            if let Some(name) = key_name(vk) {
+                let accel = format!("Control+{name}");
+                let spec = crate::daemon::hotkey::parse(&accel).unwrap_or_else(|e| panic!("vk {vk:#x} -> {accel}: {e}"));
+                assert!(spec.ctrl && spec.vk.is_some(), "{accel}");
+            }
+        }
+    }
+
+    #[test]
+    fn captured_combos_survive_a_parse_round_trip() {
+        let mut s = Shared::default();
+        press(&mut s, &[VK_LCONTROL, VK_LSHIFT, VK_LMENU, VK_LWIN, 0x41]);
+        let Some(Captured::Combo(a)) = s.done.clone() else { panic!("no combo") };
+        let spec = crate::daemon::hotkey::parse(&a).expect("daemon parses it");
+        assert!(spec.ctrl && spec.shift && spec.alt && spec.win);
+        assert_eq!(spec.vk, Some(0x41));
+        assert_eq!(validate(&a), None);
     }
 
     #[test]

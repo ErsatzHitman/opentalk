@@ -80,6 +80,10 @@ pub fn show(ui: &mut Ui, env: &mut Env, st: &mut SettingsState) -> bool {
                         *env.cfg = Config::default();
                         st.secrets.forget();
                         st.key_edit = None;
+                        st.new_keys.clear();
+                        // The saved startup entry belongs to the data being deleted.
+                        let _ = crate::ui::safe(|| crate::core::autostart::set_enabled(false));
+                        st.prefs.forget_autostart();
                         changed = true;
                         env.cmds.push(Cmd::ReloadHistory);
                         env.cmds.push(Cmd::Toast("App data reset".into()));

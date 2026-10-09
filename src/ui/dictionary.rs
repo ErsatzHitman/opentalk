@@ -668,10 +668,14 @@ fn snippet_edit_dialog(ctx: &egui::Context, env: &mut Env, st: &mut DictState) -
             let wd = ui.available_width();
             w::text_input(ui, &p, &mut trig, "Trigger phrase", wd, false);
             w::text_area(ui, &p, &mut repl, "Replacement text", 4, false);
+            if trigger_taken(&env.cfg.snippets, idx, &trig) {
+                w::text(ui, "Another snippet already uses that trigger.", 12.0, p.destructive);
+            }
             ui.add_space(4.0);
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 8.0;
-                let ok = !trig.trim().is_empty() && !repl.trim().is_empty();
+                let clash = trigger_taken(&env.cfg.snippets, idx, &trig);
+                let ok = !trig.trim().is_empty() && !repl.trim().is_empty() && !clash;
                 if w::button(ui, &p, Btn::new("Save", Variant::Primary).min_width(84.0).enabled(ok)).clicked() {
                     if let Some(s) = env.cfg.snippets.get_mut(idx) {
                         s.trigger = trig.trim().to_string();
@@ -692,6 +696,12 @@ fn snippet_edit_dialog(ctx: &egui::Context, env: &mut Env, st: &mut DictState) -
         st.edit_snip = Some((idx, trig, repl));
     }
     changed
+}
+
+/// True when another snippet (not `skip`) already uses `trigger` (case-insensitive).
+fn trigger_taken(snippets: &[Snippet], skip: usize, trigger: &str) -> bool {
+    let t = trigger.trim().to_lowercase();
+    !t.is_empty() && snippets.iter().enumerate().any(|(i, s)| i != skip && s.trigger.trim().to_lowercase() == t)
 }
 
 fn one_line(s: &str) -> String {
@@ -807,6 +817,14 @@ mod tests {
         assert_eq!(parse_import(&export_words_txt(&words)).0, words);
         let snips = vec![sn("t", "multi\nline")];
         assert_eq!(parse_import(&export_snippets_json(&snips)).1, snips);
+    }
+
+    #[test]
+    fn edited_trigger_may_not_clash_with_another_snippet() {
+        let list = vec![sn("my email", "a"), sn("sig", "b")];
+        assert!(trigger_taken(&list, 1, " My Email "));
+        assert!(!trigger_taken(&list, 0, "my email"), "a snippet may keep its own trigger");
+        assert!(!trigger_taken(&list, 0, "   "));
     }
 
     #[test]

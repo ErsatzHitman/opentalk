@@ -13,6 +13,13 @@ pub struct PrefsState {
     autostart: Option<bool>,
 }
 
+impl PrefsState {
+    /// Re-read the launch-at-login state next time the page is drawn.
+    pub fn forget_autostart(&mut self) {
+        self.autostart = None;
+    }
+}
+
 /// Keep-warm choices: (label, seconds).
 pub const WARM_CHOICES: &[(&str, u32)] = &[("Off", 0), ("30 seconds", 30), ("1 minute", 60), ("5 minutes", 300), ("15 minutes", 900)];
 
