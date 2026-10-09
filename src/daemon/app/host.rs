@@ -15,9 +15,9 @@ use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, KillTimer, MSG, PostMessageW,
-    PostQuitMessage, RegisterClassW, SetTimer, TranslateMessage, WINDOW_EX_STYLE, WM_DESTROY, WM_ENDSESSION, WM_TIMER,
-    WNDCLASSW, WS_POPUP,
+    ChangeWindowMessageFilterEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, KillTimer,
+    MSG, MSGFLT_ALLOW, PostMessageW, PostQuitMessage, RegisterClassW, SetTimer, TranslateMessage, WINDOW_EX_STYLE,
+    WM_DESTROY, WM_ENDSESSION, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSW, WS_POPUP,
 };
 use windows::core::{HSTRING, PCWSTR};
 
@@ -37,12 +37,25 @@ use crate::{log_err, log_info, log_warn};
 pub(super) const WM_HOTKEY_EVT: u32 = ipc::WM_OT_INTERNAL_BASE + 1;
 pub(super) const WM_PILL_EVT: u32 = ipc::WM_OT_INTERNAL_BASE + 2;
 pub(super) const WM_TRAY_EVT: u32 = ipc::WM_OT_INTERNAL_BASE + 3;
-pub(super) const WM_JOB_DONE: u32 = ipc::WM_OT_INTERNAL_BASE + 4;
+/// Helper threads posted notes into the dictation mailbox.
+pub(super) const WM_NOTE: u32 = ipc::WM_OT_INTERNAL_BASE + 4;
+/// The Settings child process exited (posted by its watcher thread).
+pub(super) const WM_SETTINGS_EXITED: u32 = ipc::WM_OT_INTERNAL_BASE + 5;
 
 pub(super) const TIMER_ARM: usize = 1;
 pub(super) const TIMER_CAP: usize = 2;
 const TIMER_PRUNE: usize = 3;
+const TIMER_SUSPEND: usize = 4;
 const PRUNE_EVERY_MS: u32 = 24 * 60 * 60 * 1000;
+/// Hotkeys suspended by a Settings hotkey capture come back by themselves after this long, in
+/// case the Settings process dies without resuming them (they also come back when it exits).
+const SUSPEND_LIMIT_MS: u32 = 2 * 60 * 1000;
+
+// Window messages without a constant in the enabled `windows` features.
+const WM_POWERBROADCAST: u32 = 0x0218;
+const PBT_APMRESUMEAUTOMATIC: usize = 0x12;
+const WM_WTSSESSION_CHANGE: u32 = 0x02B1;
+const WTS_SESSION_UNLOCK: usize = 0x8;
 
 /// The registered `TaskbarCreated` broadcast id (0 until the window exists).
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
@@ -64,6 +77,10 @@ pub struct App {
     pub seq: u64,
     /// When the hotkey press that is arming (hold mode) arrived.
     pub arm_t0: f64,
+    /// The dictation being transcribed was stopped by the recording cap (notice after the paste).
+    pub capped: bool,
+    /// Hotkeys are suspended for a Settings hotkey capture.
+    pub hotkeys_suspended: bool,
 }
 
 thread_local! {
@@ -135,10 +152,12 @@ impl App {
             rec: None,
             job: None,
             last_failed: None,
-            settings: SettingsProc::default(),
+            settings: SettingsProc::new(hwnd, WM_SETTINGS_EXITED),
             icon_hidden: false,
             seq: 0,
             arm_t0: 0.0,
+            capped: false,
+            hotkeys_suspended: false,
         })
     }
 
@@ -250,10 +269,17 @@ impl App {
             TIMER_CAP => {
                 self.kill_timer(TIMER_CAP);
                 log_warn!("recording hit the {} min safety cap; stopping", super::machine::MAX_RECORDING_MS / 60_000);
+                if let Some(rec) = self.rec.as_mut() {
+                    rec.capped = true;
+                }
                 let t0 = now_ms();
                 self.step(Input::CapTimer, t0);
             }
             TIMER_PRUNE => self.prune_history(),
+            TIMER_SUSPEND => {
+                log_warn!("hotkeys were suspended for {} s without a resume; resuming", SUSPEND_LIMIT_MS / 1000);
+                self.suspend_hotkeys(false);
+            }
             _ => {}
         }
     }
@@ -278,7 +304,7 @@ impl App {
     fn on_ipc(&mut self, msg: u32, wparam: usize, t0: f64) {
         match msg {
             ipc::WM_OT_RELOAD => self.reload(),
-            ipc::WM_OT_SUSPEND_HOTKEYS => hotkey::set_suspended(wparam != 0),
+            ipc::WM_OT_SUSPEND_HOTKEYS => self.suspend_hotkeys(wparam != 0),
             ipc::WM_OT_OPEN_SETTINGS => self.settings.open(settings::PAGE_HISTORY),
             ipc::WM_OT_TOGGLE => self.step(Input::Toggle, t0),
             ipc::WM_OT_CANCEL => self.step(Input::Cancel, t0),
@@ -286,6 +312,38 @@ impl App {
             ipc::WM_OT_QUIT => self.quit(),
             _ => {}
         }
+    }
+
+    /// Settings captures a new hotkey with its own hook: ours must not fire meanwhile.
+    fn suspend_hotkeys(&mut self, on: bool) {
+        hotkey::set_suspended(on);
+        self.hotkeys_suspended = on;
+        if on {
+            self.set_timer(TIMER_SUSPEND, SUSPEND_LIMIT_MS);
+        } else {
+            self.kill_timer(TIMER_SUSPEND);
+        }
+    }
+
+    /// The Settings process exited (its watcher thread posted this).
+    fn on_settings_exited(&mut self) {
+        let _ = self.settings.is_open(); // reaps the child
+        if self.hotkeys_suspended {
+            log_info!("settings closed during a hotkey capture; resuming hotkeys");
+            self.suspend_hotkeys(false);
+        }
+    }
+
+    /// Windows silently drops a low-level hook whose callback once took too long (typically
+    /// around sleep or under heavy load), so the hook is reinstalled after resume and unlock.
+    fn reinstall_hook(&mut self, why: &str) {
+        hotkey::stop();
+        match hotkey::start(self.hwnd, WM_HOTKEY_EVT, &self.cfg.hotkey) {
+            Ok(()) => log_info!("hotkey hook reinstalled ({why})"),
+            Err(e) => log_warn!("hotkey hook reinstall failed ({why}): {e}"),
+        }
+        hotkey::set_start_menu_mask(self.cfg.suppress_start_menu);
+        hotkey::set_esc_capture(self.machine.is_busy());
     }
 
     /// `config.json` changed (Settings saved it): re-apply everything that can change live.
@@ -311,6 +369,9 @@ impl App {
         }
         if self.cfg.pause_media && !old.pause_media {
             media::warm();
+        }
+        if self.cfg.audio_cues && !old.audio_cues {
+            sound::init();
         }
         if self.cfg.history_retention_days != old.history_retention_days {
             self.prune_history();
@@ -359,8 +420,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 a.on_pill_event(ev, t0);
             }
         })),
-        WM_JOB_DONE => Some(with_app(|a| a.on_job_done(wparam.0 as u64))),
+        WM_NOTE => Some(with_app(|a| a.on_notes())),
+        WM_SETTINGS_EXITED => Some(with_app(|a| a.on_settings_exited())),
         WM_TIMER => Some(with_app(|a| a.on_timer(wparam.0))),
+        WM_POWERBROADCAST if wparam.0 == PBT_APMRESUMEAUTOMATIC => Some(with_app(|a| a.reinstall_hook("resume"))),
+        WM_WTSSESSION_CHANGE if wparam.0 == WTS_SESSION_UNLOCK => Some(with_app(|a| a.reinstall_hook("unlock"))),
+        // The light/dark theme changed: re-add the tray icon so its glyph follows the taskbar
+        // (the pill window receives the broadcast itself).
+        WM_SETTINGCHANGE if is_color_set_change(lparam) => Some(with_app(|a| {
+            if let Some(t) = a.tray.as_mut() {
+                t.readd();
+            }
+        })),
         WM_TRAY_EVT => {
             on_tray_message(hwnd, lparam, t0);
             Some(true)
@@ -391,6 +462,55 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         // SAFETY: default handling of a message we do not own.
         None => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+    }
+}
+
+/// `WM_SETTINGCHANGE` with `lParam` = "ImmersiveColorSet" (light/dark theme switch).
+fn is_color_set_change(lparam: LPARAM) -> bool {
+    if lparam.0 == 0 {
+        return false;
+    }
+    // SAFETY: for WM_SETTINGCHANGE a non-null lParam points to a NUL-terminated UTF-16 string
+    // that stays valid for the duration of the call; `wide_eq` stops at the first mismatch or NUL.
+    unsafe { wide_eq(lparam.0 as *const u16, "ImmersiveColorSet") }
+}
+
+/// Compare a NUL-terminated UTF-16 string with `s`.
+///
+/// # Safety
+/// `p` must point to a readable NUL-terminated UTF-16 string.
+unsafe fn wide_eq(p: *const u16, s: &str) -> bool {
+    let mut i = 0;
+    for w in s.encode_utf16() {
+        // SAFETY: every unit read so far was non-NUL, so `p + i` is still inside the string.
+        if unsafe { *p.add(i) } != w {
+            return false;
+        }
+        i += 1;
+    }
+    // SAFETY: as above.
+    unsafe { *p.add(i) == 0 }
+}
+
+/// Let lower-integrity processes (a non-elevated second instance or Settings window while the
+/// daemon itself runs elevated) post our IPC messages, which UIPI would otherwise drop.
+fn allow_ipc_from_lower_integrity(hwnd: HWND) {
+    let taskbar = TASKBAR_CREATED.load(Ordering::Relaxed);
+    let msgs = (ipc::WM_OT_RELOAD..=ipc::WM_OT_QUIT).chain((taskbar != 0).then_some(taskbar));
+    for m in msgs {
+        // SAFETY: changes the message filter of our own window only.
+        if let Err(e) = unsafe { ChangeWindowMessageFilterEx(hwnd, m, MSGFLT_ALLOW, None) } {
+            log_warn!("cannot allow message {m:#x} from lower-integrity senders: {e}");
+        }
+    }
+}
+
+/// Session lock/unlock notifications (to reinstall the hook after an unlock).
+fn register_session_notifications(hwnd: HWND) {
+    use windows::Win32::System::RemoteDesktop::{NOTIFY_FOR_THIS_SESSION, WTSRegisterSessionNotification};
+    // SAFETY: registers our own window; the registration ends when the window is destroyed.
+    if let Err(e) = unsafe { WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION) } {
+        log_warn!("session notifications unavailable: {e}");
     }
 }
 
@@ -476,6 +596,8 @@ pub fn run(hidden: bool) -> i32 {
         }
     };
     TASKBAR_CREATED.store(crate::daemon::tray::taskbar_created_message(), Ordering::Relaxed);
+    allow_ipc_from_lower_integrity(hwnd_of(hwnd));
+    register_session_notifications(hwnd_of(hwnd));
 
     let first_run = needs_setup(&cfg);
     let mut app = match App::new(hwnd, cfg) {
@@ -508,12 +630,14 @@ pub fn run(hidden: bool) -> i32 {
     let mic = app.cfg.mic_device_id.clone();
     let pause_media = app.cfg.pause_media;
     let audio_cues = app.cfg.audio_cues;
+    let start_minimized = app.cfg.start_minimized;
     APP.with(|cell| *cell.borrow_mut() = Some(app));
 
-    // Warm-ups: none of these block message handling for long, and none opens the microphone.
-    audio::warmup();
-    if mic.is_some() {
-        audio::Recorder::prepare(mic.as_deref());
+    // Warm-ups: none of these block message handling for long, and none opens the microphone
+    // (a prepared stream is initialised but not started, so the mic indicator stays off).
+    match mic.as_deref() {
+        Some(id) => audio::Recorder::prepare(Some(id)),
+        None => audio::warmup(),
     }
     if pause_media {
         media::warm();
@@ -529,9 +653,13 @@ pub fn run(hidden: bool) -> i32 {
     unsafe {
         SetTimer(Some(hwnd_of(hwnd)), TIMER_PRUNE, PRUNE_EVERY_MS, None);
     }
-    if first_run && !hidden {
-        log_info!("no speech-to-text key yet: opening Settings");
-        with_app(|a| a.settings.open(settings::PAGE_STT));
+    if !hidden {
+        if first_run {
+            log_info!("no speech-to-text key yet: opening Settings");
+            with_app(|a| a.settings.open(settings::PAGE_STT));
+        } else if !start_minimized {
+            with_app(|a| a.settings.open(settings::PAGE_HISTORY));
+        }
     }
     log_info!("ready in {:.0} ms", now_ms());
 

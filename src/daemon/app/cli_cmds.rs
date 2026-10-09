@@ -7,7 +7,8 @@
 //! --bench latency [n]              print the daemon log's latency lines + median/p95 summary
 //! --bench toggle | cancel | quit | settings   one IPC message to the running daemon
 //! --bench wait-ready [secs]        block until the daemon window exists
-//! --bench mock-stt [--port P] [--delay-ms D] [--text T]   OpenAI-shaped local STT server
+//! --bench mock-stt [--port P] [--delay-ms D] [--text T]   local STT server: OpenAI/Deepgram REST
+//!                                  replies over HTTP, Deepgram live protocol over ws:// (same port)
 //! ```
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -260,6 +261,7 @@ pub fn summarize(samples: &[Sample]) -> Value {
         "paste": col(|s| s.paste),
         "total": col(|s| s.total),
         "local_overhead": col(|s| s.total - s.stt),
+        "local_before_paste": col(|s| s.prep + s.cleanup),
         "upload_bytes": col(|s| s.upload_bytes as f64),
         "provider": samples.last().map(|s| s.provider.clone()),
         "model": samples.last().map(|s| s.model.clone()),
@@ -298,13 +300,75 @@ fn bench_mock(args: &[String]) -> i32 {
     0
 }
 
-/// Accept connections forever; one thread per connection (keep-alive aware).
+/// Accept connections forever; one thread per connection (keep-alive aware). A WebSocket
+/// upgrade gets the Deepgram live protocol, anything else plain HTTP.
 pub fn serve_forever(listener: TcpListener, delay: Duration, text: Arc<String>) {
     for conn in listener.incoming().flatten() {
         let text = text.clone();
         std::thread::spawn(move || {
-            let _ = serve_connection(conn, delay, &text);
+            if is_websocket_upgrade(&conn) {
+                serve_ws(conn, delay, &text);
+            } else {
+                let _ = serve_connection(conn, delay, &text);
+            }
         });
+    }
+}
+
+/// Peek (without consuming) at the request head for `Upgrade: websocket`.
+fn is_websocket_upgrade(stream: &TcpStream) -> bool {
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    let mut buf = [0u8; 4096];
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let n = stream.peek(&mut buf).unwrap_or(0);
+        let head = String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase();
+        if head.contains("\r\n\r\n") || n == buf.len() || n == 0 || Instant::now() > deadline {
+            return head.contains("upgrade: websocket");
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+/// The reply body for a batch request: OpenAI-style `text` plus Deepgram REST `results`, so one
+/// mock serves either provider.
+fn batch_body(text: &str) -> String {
+    json!({ "text": text, "results": { "channels": [{ "alternatives": [{ "transcript": text }] }] } }).to_string()
+}
+
+/// Deepgram live (`/v1/listen`): interim `Results` while audio arrives, the full text as a final
+/// `from_finalize` result on `Finalize`, close on `CloseStream`.
+fn serve_ws(stream: TcpStream, delay: Duration, text: &str) {
+    use tungstenite::Message;
+    let _ = stream.set_read_timeout(None);
+    let Ok(mut ws) = tungstenite::accept(stream) else { return };
+    let result = |t: &str, fin: bool| {
+        json!({ "type": "Results", "is_final": fin, "from_finalize": fin, "channel": { "alternatives": [{ "transcript": t }] } }).to_string()
+    };
+    let first_words: String = text.split_whitespace().take(3).collect::<Vec<_>>().join(" ");
+    let mut bytes = 0usize;
+    let mut sent_interim = false;
+    loop {
+        match ws.read() {
+            Ok(Message::Binary(b)) => {
+                bytes += b.len();
+                // One interim result after ~1 s of audio (16 kHz mono i16).
+                if !sent_interim && bytes >= 32_000 {
+                    sent_interim = true;
+                    let _ = ws.send(Message::text(result(&first_words, false)));
+                }
+            }
+            Ok(Message::Text(t)) => {
+                if t.contains("\"Finalize\"") {
+                    std::thread::sleep(delay);
+                    let _ = ws.send(Message::text(result(if bytes > 0 { text } else { "" }, true)));
+                } else if t.contains("\"CloseStream\"") {
+                    let _ = ws.close(None);
+                }
+            }
+            Ok(Message::Close(_)) | Err(_) => break,
+            Ok(_) => {}
+        }
     }
 }
 
@@ -354,7 +418,7 @@ fn serve_connection(stream: TcpStream, delay: Duration, text: &str) -> std::io::
         }
         let body = if method == "POST" {
             std::thread::sleep(delay);
-            json!({ "text": text }).to_string()
+            batch_body(text)
         } else {
             String::new()
         };
@@ -425,6 +489,35 @@ mod tests {
     }
 
     #[test]
+    fn streaming_session_against_the_mock_feeds_the_cleanup_pipeline() {
+        // The daemon path for a streaming provider: session opened at the press, PCM pushed
+        // while recording, finish() at stop, then the same cleanup as batch.
+        let base = start_mock(5);
+        let ws = base.replacen("http://", "ws://", 1);
+        let mut cfg = Config::default();
+        cfg.stt.provider = SttProviderId::Deepgram;
+        cfg.stt.prefer_streaming = true;
+        let creds = Credentials { api_key: Some("dg-test-key-123456".into()), base_url: Some(ws), extra: vec![] };
+        let session = crate::stt::streaming::start_with(&cfg, |_| creds, |_| SttOptions { timeout_ms: 5_000, ..SttOptions::default() })
+            .expect("deepgram streams")
+            .expect("session");
+        let mut session = session;
+        let audio = fixture("tts_fillers.wav");
+        for chunk in audio.samples.chunks(1600) {
+            session.push(chunk);
+        }
+        let transcript = session.finish().expect("finish");
+        assert_eq!(transcript.text, FILLER_SENTENCE);
+        let cleaned = pipeline::clean(&cfg, &transcript, 4000);
+        assert!(cleaned.text.starts_with("So I think we should ship"), "{}", cleaned.text);
+        // The batch fallback for the same provider gets a Deepgram REST-shaped reply.
+        let opts = SttOptions { model: "nova-3".into(), timeout_ms: 5_000, ..SttOptions::default() };
+        let creds = Credentials { api_key: Some("dg-test-key-123456".into()), base_url: Some(base), extra: vec![] };
+        let batch = stt::transcribe_with(SttProviderId::Deepgram, &audio, &opts, &creds).expect("batch");
+        assert_eq!(batch.text, FILLER_SENTENCE);
+    }
+
+    #[test]
     fn silence_is_never_uploaded() {
         // No server at all: reaching the network would fail differently.
         let cfg = Config::default();
@@ -441,6 +534,7 @@ mod tests {
         assert_eq!(v["count"], 3);
         assert_eq!(v["stt"]["median"], 200.0);
         assert_eq!(v["local_overhead"]["median"], 35.0);
+        assert!(v["local_before_paste"].is_object());
         assert!(v["hotkey_audio"].is_null(), "negative (missing) values are skipped");
     }
 

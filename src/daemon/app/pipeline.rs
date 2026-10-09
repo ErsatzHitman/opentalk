@@ -75,22 +75,40 @@ pub fn clean_with(
     };
     let mut text = cleanup::process_pre_llm(&raw, &ctx);
     let mut ai_cleaned = false;
+    // Only-filler text is already empty here, so the model is never asked to polish nothing.
     if !text.is_empty() && cfg.ai_cleanup.enabled {
         let t = now_ms();
-        match llm(&text) {
-            Ok(polished) if !polished.trim().is_empty() => {
-                log_info!("ai cleanup ok in {:.0} ms", now_ms() - t);
-                text = polished.trim().to_string();
-                ai_cleaned = true;
-            }
-            Ok(_) => log_warn!("ai cleanup returned nothing; keeping the deterministic text"),
-            Err(e) => log_warn!("ai cleanup failed after {:.0} ms ({e}); keeping the deterministic text", now_ms() - t),
+        let reply = llm(&text);
+        let ms = now_ms() - t;
+        match &reply {
+            Ok(_) => log_info!("ai cleanup answered in {ms:.0} ms"),
+            Err(e) => log_warn!("ai cleanup failed after {ms:.0} ms ({e}); keeping the deterministic text"),
+        }
+        if let Some(polished) = choose_ai_text(&text, reply) {
+            text = polished;
+            ai_cleaned = true;
         }
     }
     if !text.is_empty() {
         text = dictionary::expand_snippets(&text, &cfg.snippets);
     }
     Cleaned { raw, text, ai_cleaned, cleanup_ms: now_ms() - t0 }
+}
+
+/// The AI cleanup reply to paste instead of the deterministic `text`, or None to keep `text`.
+///
+/// Never fails the paste: an error keeps the deterministic text, and so does an empty reply
+/// (`llm::validate_output` allows "" for short inputs, which would otherwise make a one- or
+/// two-word dictation such as "ok thanks" disappear). `text` is never empty here.
+pub fn choose_ai_text(text: &str, reply: Result<String, LlmError>) -> Option<String> {
+    match reply {
+        Ok(polished) if !polished.trim().is_empty() => Some(polished.trim().to_string()),
+        Ok(_) => {
+            log_warn!("ai cleanup returned nothing for {} chars; keeping the deterministic text", text.len());
+            None
+        }
+        Err(_) => None,
+    }
 }
 
 /// Dictations shorter than this much detected speech are treated as "nothing said".
@@ -212,6 +230,36 @@ mod tests {
             let r = transcribe_with(Some(Box::new(Fake(Err(SttError::new(code, "x"))))), || panic!("must not retry"));
             assert_eq!(r.unwrap_err().code, code);
         }
+    }
+
+    #[test]
+    fn empty_ai_reply_keeps_short_dictations() {
+        assert_eq!(choose_ai_text("Ok thanks", Ok(String::new())), None);
+        assert_eq!(choose_ai_text("Ok thanks", Ok(" \n ".into())), None);
+        assert_eq!(choose_ai_text("Ok thanks", Err(LlmError::Timeout)), None);
+        assert_eq!(choose_ai_text("ok thanks", Ok(" Okay, thanks.\n".into())).as_deref(), Some("Okay, thanks."));
+        let mut cfg = Config::default();
+        cfg.ai_cleanup.enabled = true;
+        let c = clean_with(&cfg, &t("ok thanks"), 900, &|_| Ok(String::new()));
+        assert_eq!((c.text.as_str(), c.ai_cleaned), ("Ok thanks", false));
+    }
+
+    #[test]
+    fn dropped_stream_falls_back_to_a_real_batch_request() {
+        // A stream that lost its socket mid-recording must not commit a truncated transcript:
+        // the full recording goes to the batch endpoint (here the in-repo mock server).
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", l.local_addr().unwrap());
+        let text = std::sync::Arc::new("the whole sentence".to_string());
+        std::thread::spawn(move || super::super::cli_cmds::serve_forever(l, std::time::Duration::ZERO, text));
+        let audio = Audio { samples: vec![500; 16_000], sample_rate: 16_000 };
+        let opts = stt::SttOptions { model: "whisper-1".into(), timeout_ms: 5_000, ..stt::SttOptions::default() };
+        let creds = stt::Credentials { api_key: Some("test-key-123456".into()), base_url: Some(base), extra: vec![] };
+        let lost = SttError::new(SttErrorCode::Unreachable, "connection lost while recording");
+        let r = transcribe_with(Some(Box::new(Fake(Err(lost)))), || {
+            stt::transcribe_with(crate::core::config::SttProviderId::Openai, &audio, &opts, &creds)
+        });
+        assert_eq!(r.unwrap().text, "the whole sentence");
     }
 
     #[test]

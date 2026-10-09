@@ -54,11 +54,20 @@ function Start-Mock([string]$exe, [int]$delayMs = 0) {
     return [pscustomobject]@{ Proc = $p; Url = $Matches[1] }
 }
 
+# Refuse to run next to another OpenTalk daemon (single-instance lock; we must not touch the user's own).
+function Assert-NoDaemon([string]$exe) {
+    if ((Invoke-Ot $exe @('--bench', 'wait-ready', '0.3') @{} 10).Code -eq 0) {
+        throw 'an OpenTalk daemon is already running; quit it first (the benchmarks and e2e tests need the single-instance lock)'
+    }
+}
+
 # Start the daemon and wait until its window exists. Returns the process.
 function Start-Daemon([string]$exe, [hashtable]$environment) {
+    Assert-NoDaemon $exe
     $p = Start-Ot $exe @('--hidden') $environment
     $r = Invoke-Ot $exe @('--bench', 'wait-ready', '15') $environment 30
     if ($r.Code -ne 0) { try { $p.Kill() } catch {}; throw "daemon did not become ready: $($r.Err)" }
+    if ($p.HasExited) { throw 'daemon exited right after start' }
     return $p
 }
 
@@ -190,6 +199,18 @@ public static class OtWin32 {
         return GetForegroundWindow() == h;
     }
     [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr h, uint msg, IntPtr w, IntPtr l);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr FindWindowEx(IntPtr parent, IntPtr after, string cls, string title);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr SendMessage(IntPtr h, uint msg, IntPtr w, System.Text.StringBuilder l);
+    [DllImport("user32.dll")] public static extern IntPtr SendMessage(IntPtr h, uint msg, IntPtr w, IntPtr l);
+    // Text of the first child window (a WinForms / Win32 edit control) via WM_GETTEXT.
+    public static string ChildText(IntPtr h) {
+        IntPtr c = FindWindowEx(h, IntPtr.Zero, null, null);
+        if (c == IntPtr.Zero) return null;
+        int n = (int)SendMessage(c, 0x000E, IntPtr.Zero, IntPtr.Zero);   // WM_GETTEXTLENGTH
+        var sb = new System.Text.StringBuilder(n + 1);
+        SendMessage(c, 0x000D, (IntPtr)(n + 1), sb);                       // WM_GETTEXT
+        return sb.ToString();
+    }
 }
 '@
 }
@@ -221,5 +242,7 @@ function Get-UiaText([IntPtr]$hwnd) {
         if ($el.TryGetCurrentPattern([Windows.Automation.TextPattern]::Pattern, [ref]$pat)) { return $pat.DocumentRange.GetText(-1) }
         if ($el.TryGetCurrentPattern([Windows.Automation.ValuePattern]::Pattern, [ref]$pat)) { return $pat.Current.Value }
     }
-    return $null
+    # WinForms edits often expose no UIA text patterns: read the child edit control directly.
+    Add-Win32
+    return [OtWin32]::ChildText($hwnd)
 }

@@ -1,21 +1,29 @@
-//! One dictation, start to finish: capture the target, start the recorder (and a streaming
-//! session when the provider streams), stop + VAD, then hand the audio to a worker thread that
-//! transcribes, cleans, pastes and records history. The worker reports back with a posted message.
+//! One dictation, start to finish. Nothing here blocks the UI thread for more than a few
+//! milliseconds: the hotkey handler only captures the target, shows the pill and spawns helpers.
+//!
+//! - start thread: `Recorder::start` (20 ms with a prepared stream, up to seconds cold or on a
+//!   hung driver), then the optional media pause (up to 120 ms);
+//! - icon thread: the active-app icon (`IShellItemImageFactory` can take tens of ms cold);
+//! - worker thread: stop + VAD + trim, STT (stream finish or batch), cleanup, paste, history.
+//!
+//! Helpers report back through [`MAILBOX`] + `WM_NOTE`; every note carries the dictation's `seq`,
+//! so a note for a dictation that was cancelled or stopped meanwhile is cleaned up, not applied.
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use super::host::{App, TIMER_CAP, WM_JOB_DONE, post};
+use super::host::{App, TIMER_CAP, WM_NOTE, post};
 use super::latency::{self, Sample};
 use super::machine::{Input, MAX_RECORDING_MS, Phase};
 use super::pipeline;
 use crate::core::config::Config;
 use crate::core::history::{self, Entry, Status};
 use crate::core::timing::{now_ms, unix_ms};
+use crate::daemon::appicon::{self, AppIcon};
 use crate::daemon::audio::{self, Recorder, vad};
 use crate::daemon::paste::{self, PasteOptions, PasteOutcome, Target};
 use crate::daemon::pill::PillMode;
-use crate::daemon::{appicon, media, sound};
-use crate::stt::{self, Audio, SttError, SttErrorCode, StreamingSession};
+use crate::daemon::{media, sound};
+use crate::stt::{self, Audio, StreamingSession, SttError, SttErrorCode};
 use crate::{log_info, log_warn};
 
 /// Shared slot for the streaming session: the capture thread feeds it, `stop` takes it.
@@ -32,8 +40,13 @@ pub struct AppInfo {
     pub exe: Option<String>,
 }
 
+/// The dictation that owns the microphone (from the hotkey press until stop or cancel).
 pub struct RecSession {
-    recorder: Recorder,
+    seq: u64,
+    /// None while the start thread is still bringing the stream up.
+    recorder: Option<Recorder>,
+    /// Stop was requested before the recorder came up: stop as soon as it does.
+    stop_pending: bool,
     target: Option<Target>,
     app: AppInfo,
     feed: Option<Feed>,
@@ -41,8 +54,9 @@ pub struct RecSession {
     first_audio: Arc<AtomicU64>,
     t_hotkey: f64,
     hotkey_pill: f64,
-    seq: u64,
     media_paused: bool,
+    /// The safety cap stopped this recording.
+    pub capped: bool,
 }
 
 pub struct ActiveJob {
@@ -65,27 +79,40 @@ pub enum Outcome {
     Cancelled,
 }
 
-struct JobResult {
-    id: u64,
-    outcome: Outcome,
+/// What a helper thread reports to the UI thread.
+enum Note {
+    RecStarted { seq: u64, result: Result<Recorder, String> },
+    MediaPaused { seq: u64 },
+    Icon { seq: u64, icon: AppIcon },
+    JobDone { seq: u64, outcome: Outcome },
 }
 
-/// Finished jobs waiting for the UI thread (`WM_JOB_DONE` carries the id).
-static MAILBOX: Mutex<Vec<JobResult>> = Mutex::new(Vec::new());
+/// Notes waiting for the UI thread (`WM_NOTE` wakes it).
+static MAILBOX: Mutex<Vec<Note>> = Mutex::new(Vec::new());
+
+fn notify(hwnd: isize, note: Note) {
+    MAILBOX.lock().unwrap_or_else(|e| e.into_inner()).push(note);
+    post(hwnd, WM_NOTE, 0);
+}
+
+/// Where the worker's audio comes from.
+enum Capture {
+    /// A live recorder: the worker stops it (stop + VAD + trim run off the UI thread).
+    Live { recorder: Recorder, first_audio: Arc<AtomicU64>, t_hotkey: f64 },
+    /// Audio kept from a failed attempt ("Retry").
+    Kept { audio: Audio, speech_ms: u64 },
+}
 
 struct Job {
     id: u64,
-    hwnd: isize,
     cfg: Config,
-    audio: Audio,
-    speech_ms: u64,
+    capture: Capture,
     stream: Option<Box<dyn StreamingSession>>,
     target: Option<Target>,
     app: AppInfo,
     cancel: Arc<AtomicBool>,
     t_stop: f64,
     hotkey_pill: f64,
-    hotkey_audio: f64,
 }
 
 /// Why dictation cannot start at all (nothing to record for).
@@ -105,6 +132,10 @@ fn friendly_exe(exe: &str) -> String {
     c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default()
 }
 
+fn app_info(target: Option<&Target>) -> AppInfo {
+    target.map(|t| AppInfo { exe: Some(t.exe_name.clone()), name: Some(friendly_exe(&t.exe_name)) }).unwrap_or_default()
+}
+
 fn error_title(code: SttErrorCode) -> &'static str {
     match code {
         SttErrorCode::AuthFailed => "Check your API key",
@@ -119,6 +150,18 @@ fn error_title(code: SttErrorCode) -> &'static str {
     }
 }
 
+fn take_session(feed: Option<Feed>) -> Option<Box<dyn StreamingSession>> {
+    feed.and_then(|f| f.lock().ok().and_then(|mut g| g.take()))
+}
+
+/// Stop a recorder nobody wants any more, off the UI thread (stopping waits for its capture loop).
+fn discard_recorder(recorder: Recorder) {
+    let spawned = std::thread::Builder::new().name("rec-discard".into()).spawn(move || recorder.cancel());
+    if let Err(e) = spawned {
+        log_warn!("cannot spawn a thread to stop the recorder: {e}");
+    }
+}
+
 impl App {
     /// Begin a dictation (state machine already moved to Recording). `t0` is when the trigger arrived.
     pub(super) fn start_recording(&mut self, t0: f64) {
@@ -129,10 +172,13 @@ impl App {
             self.pill.show_error(&title, &msg, false);
             return;
         }
+        // The paste target is the window that had focus when the hotkey went down.
         let target = paste::capture_foreground();
         self.pill.follow_cursor_display();
         self.pill.set_mode(PillMode::Preparing);
         let hotkey_pill = now_ms() - t0;
+        self.seq += 1;
+        let seq = self.seq;
         stt::prewarm(&cfg);
 
         let feed: Option<Feed> = match stt::start_stream(&cfg) {
@@ -161,124 +207,167 @@ impl App {
             })
         };
         self.level.store(0f32.to_bits(), Ordering::Relaxed);
-        let recorder = match Recorder::start(cfg.mic_device_id.as_deref(), self.level.clone(), Some(sink)) {
-            Ok(r) => r,
-            Err(e) => {
-                log_warn!("cannot start the microphone: {e}");
-                if let Some(session) = feed.and_then(|f| f.lock().ok().and_then(|mut g| g.take())) {
-                    session.cancel();
-                }
-                self.machine.step(Input::StartFailed);
-                self.set_idle();
-                self.pill.show_error("Microphone unavailable", "Check that a microphone is connected and not in use, then try again.", false);
-                return;
-            }
-        };
-        self.pill.set_mode(PillMode::Recording);
-        if cfg.audio_cues {
-            sound::play_start();
-        }
-        let media_paused = cfg.pause_media && media::pause_if_playing();
-        self.set_timer(TIMER_CAP, MAX_RECORDING_MS);
 
-        // The bubble fades in with the capsule expansion (>= 260 ms), so loading the icon here is free.
-        let mut app = AppInfo::default();
-        if let Some(t) = &target {
-            app.exe = Some(t.exe_name.clone());
-            app.name = Some(friendly_exe(&t.exe_name));
-            if cfg.show_app_bubble {
-                if let Some(icon) = appicon::load(t, APP_ICON_PX) {
-                    app.name = Some(icon.name.clone());
-                    self.pill.set_app(Some(icon));
-                }
+        // Bring the stream up off the UI thread, then pause media (both can block).
+        let (hwnd, level, device, pause) = (self.hwnd, self.level.clone(), cfg.mic_device_id.clone(), cfg.pause_media);
+        let spawned = std::thread::Builder::new().name("rec-start".into()).spawn(move || {
+            let result = Recorder::start(device.as_deref(), level, Some(sink));
+            let started = result.is_ok();
+            notify(hwnd, Note::RecStarted { seq, result });
+            if started && pause && media::pause_if_playing() {
+                notify(hwnd, Note::MediaPaused { seq });
+            }
+        });
+        if let Err(e) = spawned {
+            log_warn!("cannot spawn the recorder thread: {e}");
+            if let Some(s) = take_session(feed) {
+                s.cancel();
+            }
+            self.machine.step(Input::StartFailed);
+            self.set_idle();
+            self.pill.show_error("Something went wrong", "OpenTalk could not start recording.", false);
+            return;
+        }
+        if cfg.show_app_bubble {
+            if let Some(t) = target.clone() {
+                let hwnd = self.hwnd;
+                let _ = std::thread::Builder::new().name("app-icon".into()).spawn(move || {
+                    if let Some(icon) = appicon::load(&t, APP_ICON_PX) {
+                        notify(hwnd, Note::Icon { seq, icon });
+                    }
+                });
             }
         }
-        self.seq += 1;
-        log_info!(
-            "recording #{} started (pill {:.1} ms, mic {:.1} ms, stream={}, target={})",
-            self.seq,
-            hotkey_pill,
-            recorder.activation_ms(),
-            feed.is_some(),
-            app.exe.as_deref().unwrap_or("?")
-        );
+        self.set_timer(TIMER_CAP, MAX_RECORDING_MS);
         self.rec = Some(RecSession {
-            recorder,
+            seq,
+            recorder: None,
+            stop_pending: false,
+            app: app_info(target.as_ref()),
             target,
-            app,
             feed,
             first_audio,
             t_hotkey: t0,
             hotkey_pill,
-            seq: self.seq,
-            media_paused,
+            media_paused: false,
+            capped: false,
         });
     }
 
-    /// Stop capturing and hand the audio to the worker (state machine already moved to Thinking).
+    /// Everything the helper threads reported since the last `WM_NOTE`.
+    pub(super) fn on_notes(&mut self) {
+        let notes: Vec<Note> = std::mem::take(&mut *MAILBOX.lock().unwrap_or_else(|e| e.into_inner()));
+        for note in notes {
+            match note {
+                Note::RecStarted { seq, result } => self.on_rec_started(seq, result),
+                Note::MediaPaused { seq } => match self.rec.as_mut().filter(|r| r.seq == seq) {
+                    Some(rec) => rec.media_paused = true,
+                    // The dictation ended before the pause landed: undo it right away.
+                    None => media::resume(),
+                },
+                Note::Icon { seq, icon } => {
+                    let live = self.rec.as_ref().is_some_and(|r| r.seq == seq) || self.job.as_ref().is_some_and(|j| j.id == seq);
+                    if live {
+                        if let Some(rec) = self.rec.as_mut().filter(|r| r.seq == seq) {
+                            rec.app.name = Some(icon.name.clone());
+                        }
+                        self.pill.set_app(Some(icon));
+                    }
+                }
+                Note::JobDone { seq, outcome } => self.on_job_done(seq, outcome),
+            }
+        }
+    }
+
+    fn on_rec_started(&mut self, seq: u64, result: Result<Recorder, String>) {
+        let Some(rec) = self.rec.as_mut().filter(|r| r.seq == seq) else {
+            // Cancelled while the stream was coming up.
+            if let Ok(r) = result {
+                discard_recorder(r);
+            }
+            return;
+        };
+        match result {
+            Err(e) => {
+                log_warn!("cannot start the microphone: {e}");
+                let rec = self.rec.take();
+                if let Some(s) = take_session(rec.and_then(|r| r.feed)) {
+                    s.cancel();
+                }
+                self.kill_timer(TIMER_CAP);
+                // A stop that was already requested moved the machine to Thinking; reset it.
+                self.machine.step(Input::StartFailed);
+                if self.machine.phase == Phase::Thinking {
+                    self.machine.step(Input::JobDone);
+                }
+                crate::daemon::hotkey::set_esc_capture(self.machine.is_busy());
+                self.set_idle();
+                self.pill.show_error("Microphone unavailable", "Check that a microphone is connected and not in use, then try again.", false);
+            }
+            Ok(recorder) => {
+                log_info!(
+                    "recording #{seq} started (pill {:.1} ms, mic {:.1} ms, stream={}, target={})",
+                    rec.hotkey_pill,
+                    recorder.activation_ms(),
+                    rec.feed.is_some(),
+                    rec.app.exe.as_deref().unwrap_or("?")
+                );
+                rec.recorder = Some(recorder);
+                if rec.stop_pending {
+                    self.finish_stop();
+                    return;
+                }
+                self.pill.set_mode(PillMode::Recording);
+                // The start cue plays once the microphone is live, so it is never recorded late.
+                if self.cfg.audio_cues {
+                    sound::play_start();
+                }
+            }
+        }
+    }
+
+    /// Stop capturing (state machine already moved to Thinking).
     pub(super) fn stop_recording(&mut self) {
-        let Some(rec) = self.rec.take() else {
+        let Some(starting) = self.rec.as_ref().map(|r| r.recorder.is_none()) else {
             self.machine.step(Input::JobDone);
             self.set_idle();
             return;
         };
-        let t_stop = now_ms();
         self.kill_timer(TIMER_CAP);
         self.pill.set_mode(PillMode::Thinking);
+        if starting {
+            // Still starting: stop right after it comes up.
+            if let Some(rec) = self.rec.as_mut() {
+                rec.stop_pending = true;
+            }
+            return;
+        }
         if self.cfg.audio_cues {
             sound::play_stop();
         }
-        let RecSession { recorder, target, app, feed, first_audio, t_hotkey, hotkey_pill, seq, media_paused } = rec;
-        let (audio, stats) = recorder.stop_with_stats();
+        self.finish_stop();
+    }
+
+    /// Hand the live recorder to a worker that stops it and transcribes.
+    fn finish_stop(&mut self) {
+        let Some(rec) = self.rec.take() else { return };
+        let RecSession { seq, recorder, target, app, feed, first_audio, t_hotkey, hotkey_pill, media_paused, capped, .. } = rec;
+        let Some(recorder) = recorder else { return };
         if media_paused {
             media::resume();
         }
-        let first = f64::from_bits(first_audio.load(Ordering::Relaxed));
-        let hotkey_audio = if first > 0.0 { first - t_hotkey } else { -1.0 };
-        let stream = feed.and_then(|f| f.lock().ok().and_then(|mut g| g.take()));
-        let info = vad::analyze(&audio);
-        log_info!(
-            "recording #{seq} stopped: {} ms captured, {} ms speech, {} packets, device_lost={}",
-            audio.duration_ms(),
-            info.speech_ms,
-            stats.packets,
-            stats.device_lost
-        );
-        if pipeline::is_silent(&info) {
-            if let Some(s) = stream {
-                s.cancel();
-            }
-            self.nothing_said(&app, info.speech_ms);
-            return;
-        }
-        let trimmed = vad::trim(&audio, 150);
+        self.capped = capped;
         self.spawn_job(Job {
             id: seq,
-            hwnd: self.hwnd,
             cfg: self.cfg.clone(),
-            audio: trimmed,
-            speech_ms: info.speech_ms,
-            stream,
+            capture: Capture::Live { recorder, first_audio, t_hotkey },
+            stream: take_session(feed),
             target,
             app,
             cancel: Arc::new(AtomicBool::new(false)),
-            t_stop,
+            t_stop: now_ms(),
             hotkey_pill,
-            hotkey_audio,
         });
-    }
-
-    /// Silence: tell the user, optionally keep a "discarded" history row, and go back to idle.
-    fn nothing_said(&mut self, app: &AppInfo, speech_ms: u64) {
-        if self.cfg.save_discarded && self.cfg.history_enabled {
-            let entry = discarded_entry(&self.cfg, app, speech_ms);
-            if let Err(e) = history::append_new(entry) {
-                log_warn!("history: {e}");
-            }
-        }
-        self.machine.step(Input::JobDone);
-        self.set_idle();
-        self.pill.show_error(NO_SPEECH_TITLE, NO_SPEECH_BODY, false);
     }
 
     /// "Retry" on the last failed audio (pill card, tray or IPC).
@@ -292,33 +381,25 @@ impl App {
         let target = paste::capture_foreground();
         self.pill.follow_cursor_display();
         self.pill.set_mode(PillMode::Thinking);
-        let mut app = AppInfo::default();
-        if let Some(t) = &target {
-            app.exe = Some(t.exe_name.clone());
-            app.name = Some(friendly_exe(&t.exe_name));
-        }
         self.seq += 1;
         log_info!("retrying the last failed recording as #{}", self.seq);
-        let t_stop = now_ms();
+        self.capped = false;
         self.spawn_job(Job {
             id: self.seq,
-            hwnd: self.hwnd,
             cfg: self.cfg.clone(),
-            audio: failed.audio,
-            speech_ms: failed.speech_ms,
+            capture: Capture::Kept { audio: failed.audio, speech_ms: failed.speech_ms },
             stream: None,
+            app: app_info(target.as_ref()),
             target,
-            app,
             cancel: Arc::new(AtomicBool::new(false)),
-            t_stop,
+            t_stop: now_ms(),
             hotkey_pill: -1.0,
-            hotkey_audio: -1.0,
         });
     }
 
     fn spawn_job(&mut self, job: Job) {
         let id = job.id;
-        let hwnd = job.hwnd;
+        let hwnd = self.hwnd;
         self.job = Some(ActiveJob { id, cancel: job.cancel.clone() });
         let spawned = std::thread::Builder::new().name("dictation-worker".into()).spawn(move || {
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_job(job))).unwrap_or_else(|_| Outcome::Failed {
@@ -326,41 +407,43 @@ impl App {
                 message: "OpenTalk hit an internal error while processing that recording.".into(),
                 retry: None,
             });
-            MAILBOX.lock().unwrap_or_else(|e| e.into_inner()).push(JobResult { id, outcome });
-            post(hwnd, WM_JOB_DONE, id as usize);
+            notify(hwnd, Note::JobDone { seq: id, outcome });
         });
         if let Err(e) = spawned {
             log_warn!("cannot start the worker thread: {e}");
             self.job = None;
             self.machine.step(Input::JobDone);
+            crate::daemon::hotkey::set_esc_capture(false);
             self.set_idle();
             self.pill.show_error("Something went wrong", "OpenTalk could not start processing that recording.", false);
         }
     }
 
-    /// The worker finished (`WM_JOB_DONE`).
-    pub(super) fn on_job_done(&mut self, id: u64) {
-        let results: Vec<JobResult> = std::mem::take(&mut *MAILBOX.lock().unwrap_or_else(|e| e.into_inner()));
-        for r in results {
-            if self.job.as_ref().is_some_and(|j| j.id == r.id) {
-                self.job = None;
-                self.machine.step(Input::JobDone);
-                crate::daemon::hotkey::set_esc_capture(false);
-                self.apply_outcome(r.outcome);
-            } else {
-                log_info!("dropping the result of cancelled dictation #{}", r.id);
-            }
+    fn on_job_done(&mut self, seq: u64, outcome: Outcome) {
+        if !self.job.as_ref().is_some_and(|j| j.id == seq) {
+            log_info!("dropping the result of cancelled dictation #{seq}");
+            return;
         }
-        let _ = id;
+        self.job = None;
+        self.machine.step(Input::JobDone);
+        crate::daemon::hotkey::set_esc_capture(self.machine.is_busy());
+        self.apply_outcome(outcome);
     }
 
     fn apply_outcome(&mut self, outcome: Outcome) {
         self.set_idle();
+        let capped = std::mem::take(&mut self.capped);
         match outcome {
             Outcome::Done { note } => {
                 self.last_failed = None;
-                if let Some(reason) = note {
-                    self.pill.show_error("Couldn't paste", &reason, false);
+                match note {
+                    Some(reason) => self.pill.show_error("Couldn't paste", &reason, false),
+                    None if capped => self.pill.show_error(
+                        "Recording limit reached",
+                        &format!("OpenTalk stops a recording after {} minutes; everything up to then was transcribed.", MAX_RECORDING_MS / 60_000),
+                        false,
+                    ),
+                    None => {}
                 }
             }
             Outcome::Nothing => self.pill.show_error(NO_SPEECH_TITLE, NO_SPEECH_BODY, false),
@@ -378,13 +461,16 @@ impl App {
     pub(super) fn cancel_recording(&mut self) {
         self.kill_timer(TIMER_CAP);
         if let Some(rec) = self.rec.take() {
-            if let Some(session) = rec.feed.and_then(|f| f.lock().ok().and_then(|mut g| g.take())) {
+            if let Some(session) = take_session(rec.feed) {
                 session.cancel();
             }
             if rec.media_paused {
                 media::resume();
             }
-            rec.recorder.cancel();
+            // A recorder still starting is discarded when its note arrives (seq no longer matches).
+            if let Some(r) = rec.recorder {
+                discard_recorder(r);
+            }
             log_info!("recording #{} cancelled", rec.seq);
         }
         self.set_idle();
@@ -395,6 +481,7 @@ impl App {
             job.cancel.store(true, Ordering::Relaxed);
             log_info!("dictation #{} cancelled", job.id);
         }
+        self.capped = false;
         self.set_idle();
     }
 
@@ -433,13 +520,43 @@ fn log_history(cfg: &Config, entry: Entry) {
     }
 }
 
-/// The worker: STT -> cleanup -> paste -> history. Runs off the UI thread.
+/// The worker: stop + VAD -> STT -> cleanup -> paste -> history. Runs off the UI thread.
 fn run_job(job: Job) -> Outcome {
-    let Job { id, cfg, audio, speech_ms, stream, target, app, cancel, t_stop, hotkey_pill, hotkey_audio, .. } = job;
+    let Job { id, cfg, capture, stream, target, app, cancel, t_stop, hotkey_pill } = job;
     let cancelled = || cancel.load(Ordering::Relaxed);
+
+    let (audio, speech_ms, hotkey_audio, stream) = match capture {
+        Capture::Live { recorder, first_audio, t_hotkey } => {
+            let (audio, stats) = recorder.stop_with_stats();
+            let first = f64::from_bits(first_audio.load(Ordering::Relaxed));
+            let hotkey_audio = if first > 0.0 { first - t_hotkey } else { -1.0 };
+            let info = vad::analyze(&audio);
+            log_info!(
+                "recording #{id} stopped: {} ms captured, {} ms speech, {} packets, device_lost={}",
+                audio.duration_ms(),
+                info.speech_ms,
+                stats.packets,
+                stats.device_lost
+            );
+            if cancelled() || pipeline::is_silent(&info) {
+                if let Some(s) = stream {
+                    s.cancel();
+                }
+                if cancelled() {
+                    return Outcome::Cancelled;
+                }
+                if cfg.save_discarded {
+                    log_history(&cfg, discarded_entry(&cfg, &app, info.speech_ms));
+                }
+                return Outcome::Nothing;
+            }
+            (vad::trim(&audio, 150), info.speech_ms, hotkey_audio, stream)
+        }
+        Capture::Kept { audio, speech_ms } => (audio, speech_ms, -1.0, stream),
+    };
+
     let t_req = now_ms();
     let streamed = stream.is_some();
-
     let result = pipeline::transcribe(&cfg, &audio, stream);
     let stt_ms = now_ms() - t_req;
     if cancelled() {
@@ -531,6 +648,10 @@ mod tests {
         assert_eq!(friendly_exe("notepad.exe"), "Notepad");
         assert_eq!(friendly_exe("chrome.EXE"), "Chrome");
         assert_eq!(friendly_exe(""), "");
+        let t = Target { exe_name: "code.exe".into(), ..Target::default() };
+        let a = app_info(Some(&t));
+        assert_eq!((a.exe.as_deref(), a.name.as_deref()), (Some("code.exe"), Some("Code")));
+        assert!(app_info(None).exe.is_none());
     }
 
     #[test]

@@ -1,16 +1,18 @@
 # End-to-end dictation test: real daemon, real hotkey pipeline entry (IPC toggle), real paste into Notepad.
 #
-#   powershell -File tests\e2e.ps1 [-Exe path] [-Stt mock|openrouter] [-Llm] [-Model id]
+#   powershell -File tests\e2e.ps1 [-Exe path] [-Stt mock|mock-stream|openrouter] [-Llm] [-Model id]
 #
 # - isolated OPENTALK_HOME, OPENTALK_INJECT_WAV=tests\fixtures\tts_fillers.wav replaces the microphone
 # - -Stt mock        local OpenAI-shaped STT server returning the raw filler sentence (deterministic)
+# - -Stt mock-stream the same sentence over the Deepgram live protocol from the same local server
+#                    (streaming session fed while recording; asserts the dictation was streamed)
 # - -Stt openrouter  live OpenRouter, ":free" models only (key from -KeyFile, passed via env var only)
 # - -Llm             also enable AI cleanup through an OpenRouter ":free" text model
 # Opens Notepad, triggers dictation twice (start/stop) and asserts that Notepad receives the cleaned
 # text (fillers removed) and that history holds the entry. Cleans up everything it opened.
 param(
     [string]$Exe = (Join-Path $PSScriptRoot '..\target\release\opentalk.exe'),
-    [ValidateSet('mock', 'openrouter')][string]$Stt = 'mock',
+    [ValidateSet('mock', 'mock-stream', 'openrouter')][string]$Stt = 'mock',
     [switch]$Llm,
     [string]$Model = 'nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free',
     [string]$LlmModel = 'nvidia/nemotron-3.5-lightning:free',
@@ -49,6 +51,12 @@ try {
         $mock = Start-Mock $Exe 40
         $envv.OPENTALK_STT_BASE_URL = $mock.Url
         $envv.OPENTALK_SECRET_OPENAI = 'e2e-dummy-key-123456'
+    } elseif ($Stt -eq 'mock-stream') {
+        $mock = Start-Mock $Exe 40
+        $envv.OPENTALK_STT_BASE_URL = $mock.Url
+        $envv.OPENTALK_STT_WS_BASE_URL = $mock.Url -replace '^http://', 'ws://'
+        $envv.OPENTALK_SECRET_DEEPGRAM = 'e2e-dummy-key-123456'
+        $cfg.stt = @{ provider = 'deepgram'; prefer_streaming = $true; models = @{ deepgram = 'nova-3' } }
     } else {
         $key = Read-OpenRouterKey $KeyFile
         if (-not $key) { throw "no OpenRouter key at $KeyFile" }
@@ -129,7 +137,10 @@ try {
     if ($text -match '(?i)\byou know\b') { $errs += '"you know" left in the target' }
     if ($text -match '(?i)\bthe the\b') { $errs += 'stutter "the the" left in the target' }
     if ($text.TrimEnd() -ne ($entry.text.TrimEnd())) { $errs += 'target text differs from the history text' }
-    if ($Stt -eq 'mock' -and ($entry.raw -notmatch '^Um,')) { $errs += 'history raw text is not the recognizer output' }
+    if ($Stt -ne 'openrouter' -and ($entry.raw -notmatch '^Um,')) { $errs += 'history raw text is not the recognizer output' }
+    $latLine = Get-Content (Join-Path $home_ 'logs\daemon.log') -ErrorAction SilentlyContinue | Where-Object { $_ -match 'latency seq=' } | Select-Object -Last 1
+    $result.latency_line = "$latLine" -replace '^.*latency ', ''
+    if ($Stt -eq 'mock-stream' -and ("$latLine" -notmatch 'streamed=1')) { $errs += 'the dictation was not streamed' }
     if ($errs.Count -gt 0) { throw ($errs -join '; ') }
     $result.pass = $true
 }

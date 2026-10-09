@@ -170,3 +170,16 @@ fn desktop_e2e_notepad() {
         .expect("run powershell");
     assert!(status.success(), "tests/e2e.ps1 failed");
 }
+
+#[test]
+#[ignore = "desktop: like desktop_e2e_notepad, with the Deepgram live protocol from the local mock (tests/e2e.ps1 -Stt mock-stream)"]
+fn desktop_e2e_notepad_streaming() {
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/e2e.ps1");
+    let status = Command::new("powershell")
+        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+        .arg(script)
+        .args(["-Exe", EXE, "-Stt", "mock-stream"])
+        .status()
+        .expect("run powershell");
+    assert!(status.success(), "tests/e2e.ps1 -Stt mock-stream failed");
+}
