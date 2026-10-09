@@ -14,7 +14,7 @@ pub fn init(mode: &str) {
         let _ = std::fs::remove_file(&path);
     }
     if let Ok(f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-        *SINK.lock().unwrap() = Some(f);
+        *SINK.lock().unwrap_or_else(|p| p.into_inner()) = Some(f);
     }
     DEBUG.store(std::env::var("OPENTALK_LOG").map(|v| v == "debug").unwrap_or(false), std::sync::atomic::Ordering::Relaxed);
 }
@@ -23,7 +23,7 @@ pub fn debug_enabled() -> bool { DEBUG.load(std::sync::atomic::Ordering::Relaxed
 
 pub fn write(level: &str, msg: std::fmt::Arguments) {
     let line = format!("[{:>10.1}] {level} {msg}\n", super::timing::now_ms());
-    if let Some(f) = SINK.lock().unwrap().as_mut() {
+    if let Some(f) = SINK.lock().unwrap_or_else(|p| p.into_inner()).as_mut() {
         let _ = f.write_all(line.as_bytes());
     }
     if cfg!(debug_assertions) {
