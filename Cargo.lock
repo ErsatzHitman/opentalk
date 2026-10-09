@@ -1782,6 +1782,7 @@ dependencies = [
  "tungstenite",
  "ureq",
  "windows",
+ "windows-core",
 ]
 
 [[package]]
