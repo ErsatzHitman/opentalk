@@ -14,12 +14,13 @@ use eframe::egui::{self, Align, Color32, Layout, Margin, Sense, Stroke, Ui, vec2
 /// (case-insensitive, first spelling wins).
 pub fn parse_words(input: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     for part in input.split([',', ';', '\n', '\r']) {
         let t = part.trim();
         if t.is_empty() {
             continue;
         }
-        if !out.iter().any(|o| o.eq_ignore_ascii_case(t) || o.to_lowercase() == t.to_lowercase()) {
+        if seen.insert(t.to_lowercase()) {
             out.push(t.to_string());
         }
     }
@@ -28,9 +29,12 @@ pub fn parse_words(input: &str) -> Vec<String> {
 
 /// Add `new` to `words`, skipping case-insensitive duplicates. Returns how many were added.
 pub fn add_words(words: &mut Vec<String>, new: &[String]) -> usize {
+    // One lowercase set instead of a pairwise scan: a bulk import of thousands of words would
+    // otherwise allocate O(n^2) lowercase strings on the UI thread.
+    let mut seen: std::collections::HashSet<String> = words.iter().map(|o| o.to_lowercase()).collect();
     let mut added = 0;
     for n in new {
-        if !words.iter().any(|o| o.to_lowercase() == n.to_lowercase()) {
+        if seen.insert(n.to_lowercase()) {
             words.push(n.clone());
             added += 1;
         }
@@ -489,17 +493,11 @@ fn bulk_panel(ui: &mut Ui, env: &mut Env, st: &mut DictState) -> bool {
                     }
                     if w::button(ui, &p, Btn::new("From file...", Variant::Outline).icon(icons::FOLDER).small()).clicked() {
                         if let Some(path) = super::filedialog::open_file() {
-                            match std::fs::read_to_string(&path) {
+                            match read_import_file(&path) {
                                 Ok(txt) => {
                                     let (words, snips) = parse_import(&txt);
                                     let n = add_words(&mut env.cfg.dictionary, &words);
-                                    let mut s = 0;
-                                    for sn in snips {
-                                        if !env.cfg.snippets.iter().any(|o| o.trigger.eq_ignore_ascii_case(&sn.trigger)) {
-                                            env.cfg.snippets.push(sn);
-                                            s += 1;
-                                        }
-                                    }
+                                    let s = merge_snippets(&mut env.cfg.snippets, snips);
                                     st.bulk_open = false;
                                     env.cmds.push(Cmd::Toast(if s > 0 { format!("Imported {n} words and {s} snippets") } else { format!("Imported {n} words") }));
                                     changed |= n + s > 0;
@@ -512,6 +510,32 @@ fn bulk_panel(ui: &mut Ui, env: &mut Env, st: &mut DictState) -> bool {
             });
         });
     changed
+}
+
+/// Largest dictionary/snippet file we import (a real word list is a few KB).
+const MAX_IMPORT_BYTES: u64 = 4 * 1024 * 1024;
+
+fn read_import_file(path: &str) -> std::io::Result<String> {
+    let len = std::fs::metadata(path)?.len();
+    if len > MAX_IMPORT_BYTES {
+        return Err(std::io::Error::other("the file is larger than 4 MB"));
+    }
+    std::fs::read_to_string(path)
+}
+
+/// Append imported snippets, trimming triggers and skipping blank ones and triggers already in
+/// use (case-insensitive, as the editor enforces). Returns how many were added.
+pub fn merge_snippets(list: &mut Vec<Snippet>, new: Vec<Snippet>) -> usize {
+    let mut added = 0;
+    for sn in new {
+        let trigger = sn.trigger.trim().to_string();
+        if trigger.is_empty() || sn.replacement.trim().is_empty() || trigger_taken(list, usize::MAX, &trigger) {
+            continue;
+        }
+        list.push(Snippet { trigger, replacement: sn.replacement });
+        added += 1;
+    }
+    added
 }
 
 fn export_dictionary(env: &mut Env) {
@@ -724,6 +748,21 @@ mod tests {
     fn parse_words_splits_trims_and_dedupes() {
         assert_eq!(parse_words(" OpenAI, Priya ;kubectl\n\nopenai , "), vec!["OpenAI", "Priya", "kubectl"]);
         assert!(parse_words(" , ;\n").is_empty());
+    }
+
+    #[test]
+    fn merge_snippets_trims_and_skips_blank_or_taken_triggers() {
+        let mut list = vec![Snippet { trigger: "My Email".into(), replacement: "a@b.c".into() }];
+        let new = vec![
+            Snippet { trigger: "  sig  ".into(), replacement: "Best, A".into() },
+            Snippet { trigger: "   ".into(), replacement: "x".into() },
+            Snippet { trigger: "blank".into(), replacement: "  ".into() },
+            Snippet { trigger: "my email".into(), replacement: "dup".into() },
+            Snippet { trigger: "SIG".into(), replacement: "dup within import".into() },
+        ];
+        assert_eq!(merge_snippets(&mut list, new), 1);
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[1].trigger, "sig");
     }
 
     #[test]

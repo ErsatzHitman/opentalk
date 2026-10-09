@@ -80,6 +80,7 @@ impl Section {
 #[derive(Default)]
 pub struct SecretCache {
     masked: HashMap<String, Option<String>>,
+    env: HashMap<String, Option<String>>,
 }
 
 impl SecretCache {
@@ -105,8 +106,21 @@ impl SecretCache {
         }
     }
 
+    /// Environment variable that currently supplies `name` (it wins over the stored value, so
+    /// the UI cannot edit or remove it).
+    pub fn env_override(&mut self, name: &str) -> Option<String> {
+        self.env
+            .entry(name.to_string())
+            .or_insert_with(|| {
+                let var = crate::core::secrets::env_var_name(name);
+                std::env::var(&var).ok().filter(|v| !v.trim().is_empty()).map(|_| var)
+            })
+            .clone()
+    }
+
     pub fn forget(&mut self) {
         self.masked.clear();
+        self.env.clear();
     }
 }
 
@@ -341,6 +355,7 @@ pub fn api_key_field(ui: &mut Ui, env: &mut Env, st: &mut SettingsState, name: &
             st.key_edit = None;
         }
     } else if let Some(m) = stored {
+        let env_var = st.secrets.env_override(name);
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
             let wd = (ui.available_width() - 150.0).max(120.0);
@@ -348,6 +363,13 @@ pub fn api_key_field(ui: &mut Ui, env: &mut Env, st: &mut SettingsState, name: &
             ui.painter().rect_filled(rect, cr(6.0), if p.dark { p.surface1 } else { p.muted });
             ui.painter().rect_stroke(rect, cr(6.0), Stroke::new(1.0, p.input_border()), StrokeKind::Inside);
             ui.painter().text(pos2(rect.min.x + 10.0, rect.center().y), Align2::LEFT_CENTER, m, fonts::regular(13.0), p.muted_a(90));
+            if let Some(var) = &env_var {
+                // Set by the environment: Edit/Remove would change only the stored copy, which
+                // the variable overrides, so say where the key comes from instead.
+                ui.painter().text(pos2(rect.max.x - 10.0, rect.center().y), Align2::RIGHT_CENTER, "\u{25CF} from environment", fonts::regular(11.0), p.success);
+                w::text(ui, format!("Set by {var}"), 11.5, p.muted_a(80));
+                return;
+            }
             ui.painter().text(pos2(rect.max.x - 10.0, rect.center().y), Align2::RIGHT_CENTER, "\u{25CF} saved", fonts::regular(11.0), p.success);
             if w::button(ui, &p, Btn::new("Edit", Variant::Outline).small()).clicked() {
                 st.key_edit = Some((name.to_string(), String::new()));

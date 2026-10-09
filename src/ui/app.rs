@@ -133,6 +133,11 @@ impl eframe::App for App {
         }
         if !focused && self.was_focused {
             self.trim_at = Some(ctx.input(|i| i.time) + 0.5);
+            // The capture hook is global: once the user is in another window it would swallow
+            // their typing there, so a capture only lives while this window has focus.
+            if self.settings.hotkeys.capturing() {
+                self.settings.hotkeys.cancel(&mut self.cmds);
+            }
         }
         self.was_focused = focused;
         if let Some(t) = self.trim_at {
