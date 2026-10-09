@@ -173,9 +173,11 @@ fn pause_sessions<S: Ctl>(sessions: impl IntoIterator<Item = S>, paused: &mut Ve
 
 fn resume_paused<S: Ctl>(paused: &mut Vec<S>) {
     for s in paused.drain(..) {
-        // Only sessions still paused: if the user pressed play (or closed the app) meanwhile,
-        // leave them alone.
-        if s.status() != Some(Status::Paused) {
+        // `Paused` is the normal case. `Playing` is allowed too: the status property lags the
+        // pause by ~20 ms, so a quick tap would otherwise never resume, and `play` on a session
+        // that is already playing (user pressed play) is a no-op. Anything else (stopped,
+        // closed, app gone) was changed by the user: leave it alone.
+        if !matches!(s.status(), Some(Status::Paused | Status::Playing)) {
             continue;
         }
         if let Err(e) = s.play() {
@@ -267,14 +269,28 @@ mod tests {
     }
 
     #[test]
-    fn resume_skips_sessions_the_user_restarted() {
+    fn resume_skips_sessions_the_user_stopped_or_closed() {
+        let log = Rc::default();
+        let a = Fake::new("a", Status::Playing, &log);
+        let b = Fake::new("b", Status::Playing, &log);
+        let mut paused = Vec::new();
+        assert_eq!(pause_sessions([a.clone(), b.clone()], &mut paused, far()), 2);
+        a.status.set(Status::Stopped); // user stopped it meanwhile
+        b.status.set(Status::Closed); // app went away
+        resume_paused(&mut paused);
+        assert_eq!(*log.borrow(), ["pause a", "pause b"], "must not start stopped media");
+    }
+
+    #[test]
+    fn resume_works_while_status_is_still_stale_playing() {
+        // WinRT keeps reporting Playing for ~20 ms after TryPauseAsync returns.
         let log = Rc::default();
         let a = Fake::new("a", Status::Playing, &log);
         let mut paused = Vec::new();
         assert_eq!(pause_sessions([a.clone()], &mut paused, far()), 1);
-        a.status.set(Status::Playing); // user pressed play meanwhile
+        a.status.set(Status::Playing);
         resume_paused(&mut paused);
-        assert_eq!(*log.borrow(), ["pause a"], "must not send a second play");
+        assert_eq!(*log.borrow(), ["pause a", "play a"]);
     }
 
     #[test]
@@ -303,6 +319,39 @@ mod tests {
     }
 
 
+    fn playing_apps() -> Vec<String> {
+        // SAFETY: plain COM init for the test thread.
+        let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+        let Ok(m) = Manager::RequestAsync().and_then(|op| op.join()) else { return Vec::new() };
+        let Ok(list) = m.GetSessions() else { return Vec::new() };
+        list.into_iter()
+            .filter(|s| Ctl::status(s) == Some(Status::Playing))
+            .filter_map(|s| s.SourceAppUserModelId().ok().map(|h| h.to_string()))
+            .collect()
+    }
+
+    /// Whatever is playing is paused and, even for a quick resume (the status property lags the pause by ~20 ms),
+    /// playing again afterwards. Passes trivially when nothing is playing.
+    #[test]
+    #[ignore = "desktop: pauses and resumes whatever media is playing"]
+    fn desktop_media_roundtrip_restores_playback() {
+        warm();
+        std::thread::sleep(Duration::from_millis(500));
+        let before = playing_apps();
+        println!("playing before: {before:?}");
+        for gap_ms in [60u64, 400] {
+            let paused = pause_if_playing();
+            assert_eq!(paused, !before.is_empty(), "pause result vs {before:?}");
+            std::thread::sleep(Duration::from_millis(gap_ms));
+            if paused {
+                assert!(playing_apps().iter().all(|a| !before.contains(a)), "still playing after pause");
+            }
+            resume();
+            std::thread::sleep(Duration::from_millis(500));
+            assert_eq!(playing_apps(), before, "playback not restored (gap {gap_ms} ms)");
+        }
+    }
+
     /// Never asserts that something was paused (nothing may be playing); checks timing and that
     /// resume is safe to call with nothing paused.
     #[test]
@@ -315,6 +364,7 @@ mod tests {
         let took = t.elapsed();
         println!("pause_if_playing -> {paused} in {took:?}");
         assert!(took < Duration::from_millis(150), "blocked {took:?}");
+        std::thread::sleep(Duration::from_millis(60)); // a real dictation lasts longer than the status lag
         resume();
         std::thread::sleep(Duration::from_millis(300));
         // Nothing left to resume: a second resume is a no-op.
