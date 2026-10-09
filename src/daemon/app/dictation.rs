@@ -490,6 +490,12 @@ impl App {
     }
 
     pub(super) fn cancel_job(&mut self) {
+        // A stop that arrived while the microphone was still coming up leaves the session here
+        // (`stop_pending`) with no job yet: drop it too, or its recorder would start the job late
+        // and paste after the user cancelled.
+        if self.rec.is_some() {
+            self.cancel_recording();
+        }
         if let Some(job) = self.job.take() {
             job.cancel.store(true, Ordering::Relaxed);
             log_info!("dictation #{} cancelled", job.id);

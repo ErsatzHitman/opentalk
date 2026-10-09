@@ -183,3 +183,74 @@ fn desktop_e2e_notepad_streaming() {
         .expect("run powershell");
     assert!(status.success(), "tests/e2e.ps1 -Stt mock-stream failed");
 }
+
+/// Post one IPC message (`core::ipc`: WM_APP + 4 toggle, + 5 cancel) straight to the daemon window,
+/// so several land in its queue back to back.
+fn post_to_daemon(msg: u32) -> bool {
+    use windows::Win32::Foundation::{LPARAM, WPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, PostMessageW};
+    // SAFETY: plain window lookup and post; a missing window just fails.
+    unsafe {
+        let Ok(hwnd) = FindWindowW(windows::core::w!("OpenTalkDaemon"), None) else { return false };
+        PostMessageW(Some(hwnd), msg, WPARAM(0), LPARAM(0)).is_ok()
+    }
+}
+
+/// Stop then Esc/cancel while the microphone is still coming up must drop the dictation: before
+/// the fix the recorder arrived after the cancel, started the job anyway and reported (and, with
+/// speech, pasted) a result the user had cancelled.
+#[test]
+#[ignore = "desktop: starts the real daemon (single-instance lock), injected WAV, local mock STT"]
+fn desktop_cancel_while_the_mic_starts_drops_the_dictation() {
+    const WM_OT_TOGGLE: u32 = 0x8000 + 4;
+    const WM_OT_CANCEL: u32 = 0x8000 + 5;
+    let mock = Mock::start();
+    let home = Home::new("cancel-pending");
+    let cfg = serde_json::json!({
+        "audio_cues": false, "auto_paste": false, "keep_in_clipboard": true, "history_enabled": true,
+        "save_discarded": true, "show_app_bubble": false, "start_minimized": true, "stt": { "provider": "openai" }
+    });
+    std::fs::write(home.0.join("config.json"), cfg.to_string()).expect("config");
+    let mut daemon = Command::new(EXE)
+        .arg("--hidden")
+        .env("OPENTALK_HOME", &home.0)
+        .env("OPENTALK_INJECT_WAV", fixture("tts_fillers.wav"))
+        .env("OPENTALK_STT_BASE_URL", &mock.url)
+        .env("OPENTALK_SECRET_OPENAI", "e2e-dummy-key-123456")
+        .spawn()
+        .expect("start daemon");
+    let ready = (0..300).any(|_| {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        unsafe { windows::Win32::UI::WindowsAndMessaging::FindWindowW(windows::core::w!("OpenTalkDaemon"), None) }.is_ok()
+    });
+    let posted = ready && post_to_daemon(WM_OT_TOGGLE) && post_to_daemon(WM_OT_TOGGLE) && post_to_daemon(WM_OT_CANCEL);
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    let history = std::fs::read_to_string(home.0.join("history.jsonl")).unwrap_or_default();
+    let log = std::fs::read_to_string(home.0.join("logs").join("daemon.log")).unwrap_or_default();
+    let _ = Command::new(EXE).args(["--bench", "quit"]).env("OPENTALK_HOME", &home.0).status();
+    if daemon.wait_timeout_ms(5000).is_none() {
+        let _ = daemon.kill();
+        let _ = daemon.wait();
+    }
+    assert!(ready && posted, "daemon window never appeared (another daemon running?)");
+    assert!(log.contains("recording #1 cancelled"), "the pending recording was not cancelled:\n{log}");
+    assert!(!log.contains("recording #1 stopped"), "a cancelled recording reached the worker:\n{log}");
+    assert!(history.trim().is_empty(), "a cancelled dictation wrote history: {history}");
+}
+
+trait WaitTimeout {
+    fn wait_timeout_ms(&mut self, ms: u64) -> Option<std::process::ExitStatus>;
+}
+
+impl WaitTimeout for Child {
+    fn wait_timeout_ms(&mut self, ms: u64) -> Option<std::process::ExitStatus> {
+        let t0 = std::time::Instant::now();
+        while t0.elapsed().as_millis() < u128::from(ms) {
+            if let Ok(Some(s)) = self.try_wait() {
+                return Some(s);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        None
+    }
+}

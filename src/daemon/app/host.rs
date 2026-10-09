@@ -400,6 +400,11 @@ impl App {
     }
 }
 
+/// True when `OPENTALK_HOME` redirects the app's files (a test or benchmark instance).
+fn isolated_home() -> bool {
+    std::env::var_os("OPENTALK_HOME").is_some_and(|v| !v.is_empty())
+}
+
 /// Drop history entries older than `days` (0 = keep forever). Blocking; call off the UI thread.
 fn prune_history_now(days: u32) {
     if days == 0 {
@@ -661,8 +666,12 @@ pub fn run(hidden: bool) -> i32 {
         if audio_cues {
             sound::init();
         }
-        if let Err(e) = autostart::sync() {
-            log_warn!("autostart sync failed: {e}");
+        // An isolated instance (tests, benchmarks: OPENTALK_HOME set) must never re-point the
+        // user's real launch-at-login entry at its own executable.
+        if !isolated_home() {
+            if let Err(e) = autostart::sync() {
+                log_warn!("autostart sync failed: {e}");
+            }
         }
         prune_history_now(retention);
     });
