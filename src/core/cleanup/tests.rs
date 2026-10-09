@@ -527,7 +527,8 @@ fn process_1000_words_is_fast() {
     samples.sort();
     let median = samples[0];
     eprintln!("cleanup::process on {words} words: best {median:?}, median {:?}", samples[samples.len() / 2]);
-    let limit = if cfg!(debug_assertions) { std::time::Duration::from_millis(60) } else { std::time::Duration::from_millis(1) };
+    let limit = if cfg!(debug_assertions) { std::time::Duration::from_millis(60) } else { std::time::Duration::from_millis(3) };
+    // (Measured ~0.35 ms alone; 3 ms keeps the test stable while 24 other test threads compete.)
     assert!(median < limit, "process() on {words} words took {median:?} at best (limit {limit:?})");
 
     // A big personal dictionary and snippet list must not change that: indexes are cached per list.
