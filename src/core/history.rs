@@ -7,6 +7,9 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicI64, Ordering};
 
 use serde::{Deserialize, Serialize};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_ABANDONED, WAIT_OBJECT_0};
+use windows::Win32::System::Threading::{CreateMutexW, ReleaseMutex, WaitForSingleObject};
+use windows::core::HSTRING;
 
 use super::{paths, timing};
 
@@ -96,8 +99,48 @@ pub fn stats() -> (usize, u64, u64) {
     stats_of(&load_all())
 }
 
-fn lock() -> std::sync::MutexGuard<'static, ()> {
-    FILE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+/// Cross-process name: the daemon appends while the settings process may rewrite the file.
+const CROSS_PROCESS_MUTEX: &str = r"Local\OpenTalk.History";
+
+/// In-process lock plus a named mutex shared with the other OpenTalk process, so an append
+/// can't land between a rewrite's read and its rename (which would silently drop the entry).
+/// The wait is bounded; on any failure we proceed unlocked rather than block dictation.
+struct Lock {
+    _local: std::sync::MutexGuard<'static, ()>,
+    held: Option<HANDLE>,
+}
+
+fn lock() -> Lock {
+    let local = FILE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // SAFETY: the HSTRING outlives the call; the handle is closed in `Drop`, on this same thread
+    // (mutex ownership is thread-affine, and `Lock` holds a `!Send` guard).
+    let held = unsafe {
+        match CreateMutexW(None, false, &HSTRING::from(CROSS_PROCESS_MUTEX)) {
+            Ok(h) => {
+                let r = WaitForSingleObject(h, 2000);
+                if r == WAIT_OBJECT_0 || r == WAIT_ABANDONED {
+                    Some(h)
+                } else {
+                    let _ = CloseHandle(h);
+                    None
+                }
+            }
+            Err(_) => None,
+        }
+    };
+    Lock { _local: local, held }
+}
+
+impl Drop for Lock {
+    fn drop(&mut self) {
+        if let Some(h) = self.held.take() {
+            // SAFETY: `h` is the mutex we waited on, owned by this thread, released once.
+            unsafe {
+                let _ = ReleaseMutex(h);
+                let _ = CloseHandle(h);
+            }
+        }
+    }
 }
 
 fn append_to(path: &Path, entry: &Entry) -> io::Result<()> {
@@ -138,6 +181,8 @@ fn read_bytes(path: &Path) -> Vec<u8> {
 
 fn parse_line(line: &[u8]) -> Option<Entry> {
     let line = line.strip_suffix(b"\r").unwrap_or(line);
+    // A hand-edited file may start with a UTF-8 BOM.
+    let line = line.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(line);
     if line.iter().all(u8::is_ascii_whitespace) {
         return None;
     }
@@ -458,6 +503,32 @@ mod tests {
         let no_latency = entry(4, 4, "six");
         assert_eq!(stats_of(&[a, b, failed, no_latency]), (3, 6, 600));
         assert_eq!(stats_of(&[]), (0, 0, 0));
+    }
+
+    #[test]
+    fn utf8_bom_on_first_line_is_tolerated() {
+        let p = temp_file("bom");
+        let line = serde_json::to_string(&entry(1, 10, "a")).unwrap();
+        std::fs::write(&p, format!("\u{feff}{line}\n")).unwrap();
+        assert_eq!(load_from(&p).len(), 1);
+    }
+
+    #[test]
+    fn named_mutex_blocks_other_holders_until_dropped() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let t = std::thread::spawn(move || {
+            let g = lock();
+            tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            drop(g);
+        });
+        rx.recv().unwrap();
+        let start = std::time::Instant::now();
+        drop(lock());
+        assert!(start.elapsed() >= std::time::Duration::from_millis(150), "second lock waited");
+        t.join().unwrap();
+        // Reusable after release.
+        drop(lock());
     }
 
     #[test]
