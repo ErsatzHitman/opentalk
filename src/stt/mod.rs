@@ -237,7 +237,7 @@ pub fn provider_for(id: SttProviderId) -> &'static dyn BatchProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use providers::testutil::{self, Resp};
+    use providers::testutil::{self, Parts, Resp};
 
     #[test]
     fn dispatch_trims_the_transcript() {
@@ -307,5 +307,132 @@ mod tests {
         let b = Audio::from_wav(&a.to_wav()).unwrap();
         assert_eq!(b.samples, a.samples);
         assert_eq!(b.sample_rate, 16000);
+    }
+
+    /// Serializes tests that touch process-global env vars.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_env<R>(vars: &[(&str, Option<&str>)], f: impl FnOnce() -> R) -> R {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved: Vec<_> = vars.iter().map(|(k, _)| (*k, std::env::var(k).ok())).collect();
+        // SAFETY: serialized by ENV_LOCK; only STT tests touch these variables.
+        unsafe {
+            for (k, v) in vars {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+        let out = f();
+        // SAFETY: as above.
+        unsafe {
+            for (k, v) in saved {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn credentials_trim_the_secret_and_resolve_base_overrides() {
+        let mut cfg = Config::default();
+        cfg.stt.provider = SttProviderId::Groq;
+        with_env(&[("OPENTALK_SECRET_GROQ", Some("  gsk_abcdef123456
+")), (ENV_BASE_URL, None)], || {
+            let c = credentials(&cfg);
+            assert_eq!(c.api_key.as_deref(), Some("gsk_abcdef123456"));
+            assert_eq!(c.base_url, None);
+            assert!(c.extra.is_empty());
+        });
+        with_env(&[("OPENTALK_SECRET_GROQ", Some("gsk_abcdef123456")), (ENV_BASE_URL, Some(" http://127.0.0.1:9 "))], || {
+            assert_eq!(credentials(&cfg).base_url.as_deref(), Some("http://127.0.0.1:9"));
+        });
+        // Custom takes its endpoint from the config; the test env var still wins.
+        cfg.stt.provider = SttProviderId::Custom;
+        cfg.stt.custom_base_url = " https://stt.example.com/v1 ".into();
+        with_env(&[(ENV_BASE_URL, None)], || {
+            assert_eq!(credentials(&cfg).base_url.as_deref(), Some("https://stt.example.com/v1"));
+        });
+        with_env(&[(ENV_BASE_URL, Some("http://127.0.0.1:7"))], || {
+            assert_eq!(credentials(&cfg).base_url.as_deref(), Some("http://127.0.0.1:7"));
+        });
+        // Other providers ignore the Custom endpoint.
+        cfg.stt.provider = SttProviderId::Openai;
+        with_env(&[(ENV_BASE_URL, None)], || assert_eq!(credentials(&cfg).base_url, None));
+    }
+
+    #[test]
+    fn corti_credentials_carry_target_and_secret() {
+        let mut cfg = Config::default();
+        cfg.stt.provider = SttProviderId::Corti;
+        cfg.stt.corti_environment = " EU ".into();
+        cfg.stt.corti_tenant = " acme ".into();
+        let c = with_env(
+            &[("OPENTALK_SECRET_CORTI_CLIENT_ID", Some("cid")), ("OPENTALK_SECRET_CORTI_CLIENT_SECRET", Some("csecret")), (ENV_BASE_URL, None)],
+            || credentials(&cfg),
+        );
+        assert_eq!(c.api_key.as_deref(), Some("cid"));
+        let get = |k: &str| c.extra.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+        assert_eq!((get("environment"), get("tenant"), get("client_secret")), (Some("eu"), Some("acme"), Some("csecret")));
+    }
+
+    #[test]
+    fn options_follow_config() {
+        let mut cfg = Config::default();
+        cfg.stt.provider = SttProviderId::Groq;
+        cfg.stt.models.insert(SttProviderId::Groq, "whisper-large-v3".into());
+        cfg.stt.timeout_ms = 1234;
+        cfg.language = "auto".into();
+        cfg.dictionary = vec!["Priya".into(), "priya".into(), " OpenTalk ".into()];
+        cfg.snippets = vec![crate::core::config::Snippet { trigger: "my sig".into(), replacement: "Regards".into() }];
+        let o = options(&cfg);
+        assert_eq!((o.model.as_str(), o.language.clone(), o.timeout_ms), ("whisper-large-v3", None, 1234));
+        assert_eq!(o.hints, ["Priya", "OpenTalk", "my sig"]);
+        cfg.language = "en-US".into();
+        assert_eq!(options(&cfg).language.as_deref(), Some("en-US"));
+        cfg.language = "  ".into();
+        assert_eq!(options(&cfg).language, None);
+    }
+
+    #[test]
+    fn transcribe_dispatches_through_config_and_env() {
+        let mock = testutil::serve(vec![Resp::json(200, r#"{"text":" via config "}"#)]);
+        let mut cfg = Config::default();
+        cfg.stt.provider = SttProviderId::Groq;
+        let t = with_env(&[("OPENTALK_SECRET_GROQ", Some("gsk_abcdef123456")), (ENV_BASE_URL, Some(mock.url.as_str()))], || {
+            transcribe(&cfg, &testutil::audio()).unwrap()
+        });
+        assert_eq!(t.text, "via config");
+        let r = mock.one();
+        assert_eq!(r.header("authorization"), Some("Bearer gsk_abcdef123456"));
+        assert_eq!(r.multipart().text("model"), ["whisper-large-v3-turbo"]);
+    }
+
+    #[test]
+    fn dictionary_echo_is_no_speech_but_real_text_passes() {
+        let mut o = testutil::opts("whisper-large-v3");
+        o.hints = vec!["Priya".into(), "OpenTalk".into(), "Kubernetes".into()];
+        for echo in ["Priya, OpenTalk, Kubernetes.", "priya opentalk kubernetes"] {
+            let mock = testutil::serve(vec![Resp::json(200, &format!(r#"{{"text":"{echo}"}}"#))]);
+            let e = transcribe_with(SttProviderId::Groq, &testutil::audio(), &o, &testutil::creds(&mock, "gsk_abcdef123456")).unwrap_err();
+            assert_eq!(e.code, SttErrorCode::NoSpeech, "{echo}");
+        }
+        let mock = testutil::serve(vec![Resp::json(200, r#"{"text":"Please ask Priya to deploy it on Kubernetes tomorrow."}"#)]);
+        let t = transcribe_with(SttProviderId::Groq, &testutil::audio(), &o, &testutil::creds(&mock, "gsk_abcdef123456")).unwrap();
+        assert!(t.text.starts_with("Please ask Priya"));
+    }
+
+    #[test]
+    fn prewarm_skips_streaming_models_and_never_needs_a_key() {
+        let mut cfg = Config::default();
+        cfg.stt.provider = SttProviderId::Assemblyai;
+        prewarm(&cfg); // streaming only: must return without touching secrets or the network
+        cfg.stt.provider = SttProviderId::Custom;
+        cfg.stt.custom_base_url = String::new();
+        prewarm(&cfg); // no endpoint: nothing to warm
     }
 }

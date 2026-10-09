@@ -300,7 +300,8 @@ pub fn redact(text: &str) -> String {
             let ws = run_len(b, i + word, |c| c.is_ascii_whitespace());
             if ws > 0 {
                 let n = run_len(b, i + word + ws, |c| c.is_ascii_alphanumeric() || b"._~+/=-".contains(&c));
-                if n >= 4 {
+                // "Token" is also an ordinary word ("Token limit reached"): only long runs are keys.
+                if n >= if word == 6 { 4 } else { 16 } {
                     hit = Some((i + word + ws + n, if word == 6 { "Bearer [redacted]" } else { "Token [redacted]" }));
                 }
             }
@@ -422,6 +423,7 @@ mod tests {
         assert!(r.contains("Bearer [redacted]"));
         assert!(r.contains("Token [redacted]"));
         assert!(redact("sk-abc").contains("sk-abc"), "too short to be a key");
+        assert_eq!(redact("Token limit reached for this request"), "Token limit reached for this request");
         assert_eq!(redact("task-based desk-1234567"), "task-based desk-1234567", "needs a word boundary");
     }
 

@@ -4,7 +4,7 @@
 use super::{api_key, base_lang, base_url, join_prompt, model_or, timeout};
 use crate::core::config::SttProviderId;
 use crate::core::http;
-use crate::stt::errors::{self, SttError, SttErrorCode};
+use crate::stt::errors::{self, SttError};
 use crate::stt::{Audio, BatchProvider, Credentials, SttOptions, Transcript};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -125,7 +125,20 @@ pub fn clean_transcript(raw: &str) -> String {
             break;
         }
     }
-    if is_placeholder(&t) { String::new() } else { t }
+    if is_placeholder(&t) || is_refusal(&t) { String::new() } else { t }
+}
+
+/// A chat model that never received the audio (or declined) answers "I'm sorry, but I can't
+/// transcribe the audio." in prose; pasting that as dictation would be worse than an error.
+/// Deliberately narrow: a short apology/refusal that names transcribing or missing audio.
+fn is_refusal(t: &str) -> bool {
+    let lower = t.trim().to_lowercase().replace('\u{2019}', "'");
+    if lower.chars().count() > 240 {
+        return false;
+    }
+    let opens = ["i'm sorry", "i am sorry", "sorry,", "sorry!", "i can't", "i cannot", "i'm unable", "i am unable", "unfortunately"];
+    let about_audio = ["transcrib", "no audio", "audio was provided", "audio file", "audio content", "didn't receive any audio", "did not receive any audio"];
+    opens.iter().any(|o| lower.starts_with(o)) && about_audio.iter().any(|a| lower.contains(a))
 }
 
 /// Chat models answer silence with a bracketed note such as `(No output)` or `[silence]`;
@@ -147,6 +160,7 @@ fn is_placeholder(t: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stt::SttErrorCode;
     use crate::stt::providers::testutil::*;
 
     const OK: &str = r#"{"id":"gen-1","choices":[{"message":{"role":"assistant","content":"Hey, can you send the report?"}}]}"#;
@@ -220,6 +234,11 @@ mod tests {
             ("(No audio provided)", ""),
             ("[silence]", ""),
             ("*inaudible*", ""),
+            ("I\u{2019}m sorry, but I can\u{2019}t transcribe the audio.", ""),
+            ("I'm sorry, but I can't transcribe the audio because no audio was provided.", ""),
+            ("Unfortunately there is no audio file attached.", ""),
+            ("I'm sorry I can't make the meeting tomorrow.", "I'm sorry I can't make the meeting tomorrow."),
+            ("I can't believe we shipped it.", "I can't believe we shipped it."),
             ("(laughs) that was great", "(laughs) that was great"),
             ("(Please send the report) ok", "(Please send the report) ok"),
             ("", ""),
