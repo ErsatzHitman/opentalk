@@ -20,6 +20,8 @@ const MAX_GAIN: f64 = 0.2;
 const MIN_GAIN: f64 = 0.0001;
 
 struct Cues {
+    /// 20 ms of silence, played once by [`init`] to load winmm and open the audio path.
+    warmup: Vec<u8>,
     start: Vec<u8>,
     stop: Vec<u8>,
 }
@@ -28,14 +30,19 @@ static CUES: OnceLock<Cues> = OnceLock::new();
 
 fn cues() -> &'static Cues {
     CUES.get_or_init(|| Cues {
+        warmup: wav_bytes(&[0i16; 882], SAMPLE_RATE),
         start: wav_bytes(&synth(&START_NOTES, SAMPLE_RATE), SAMPLE_RATE),
         stop: wav_bytes(&synth(&STOP_NOTES, SAMPLE_RATE), SAMPLE_RATE),
     })
 }
 
-/// Render both cues now so the first hotkey press does no synthesis work.
+/// Render both cues now and play 20 ms of silence so the first hotkey press neither synthesises
+/// nor pays PlaySound's one-time cost (loading winmm, opening the device: ~12 ms measured).
+/// Call once at start-up; it blocks for that one-time cost.
 pub fn init() {
-    cues();
+    static WARMED: std::sync::Once = std::sync::Once::new();
+    let c = cues();
+    WARMED.call_once(|| play(&c.warmup));
 }
 
 pub fn play_start() {
@@ -247,7 +254,12 @@ mod tests {
     #[ignore = "desktop: plays both cues through the default audio device"]
     fn desktop_sound_plays() {
         init();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let t = std::time::Instant::now();
         play_start();
+        let took = t.elapsed();
+        // init() paid the one-time winmm/device cost (~12 ms); a cue on the hotkey path must not.
+        assert!(took < std::time::Duration::from_millis(5), "first cue blocked {took:?}");
         std::thread::sleep(std::time::Duration::from_millis(400));
         play_stop();
         std::thread::sleep(std::time::Duration::from_millis(400));
