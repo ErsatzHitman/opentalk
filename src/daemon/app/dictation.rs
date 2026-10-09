@@ -322,6 +322,11 @@ impl App {
                 );
                 rec.recorder = Some(recorder);
                 if rec.stop_pending {
+                    // The stop landed while the mic was opening: honour it now, with its cue
+                    // (OpenWhispr plays the stop cue for a stop requested mid-start too).
+                    if self.cfg.audio_cues {
+                        sound::play_stop();
+                    }
                     self.finish_stop();
                     return;
                 }
