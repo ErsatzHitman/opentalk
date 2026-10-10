@@ -1,8 +1,9 @@
 //! Global hotkey via WH_KEYBOARD_LL on a dedicated thread. TASK win-input implements.
 //! Port of OpenWhispr resources/windows-key-listener.c matching (modifier superset, any press
 //! order, missed key-up self-heal, left/right Win) plus: ignore LLKHF_INJECTED, swallow Esc only
-//! while `set_esc_capture(true)`, Start-menu suppression for combos containing Win (send mask key
-//! VK 0xE8 down/up before the Win key-up passes through), suspend during hotkey capture.
+//! while `set_esc_capture(true)`, swallow the main key of a matched combo (down, repeats and
+//! up) so it never reaches the focused app, Start-menu / menu-bar suppression (send mask key
+//! VK 0xE8 down/up before a Win or Alt key-up passes through), suspend during hotkey capture.
 //!
 //! Layout: [`parse`]/[`label`] (accelerator text), [`Matcher`] (pure state machine, unit-tested
 //! with an injected [`KeyState`]), and the thin Win32 shell (hook thread, `PostMessageW`, mask
@@ -444,9 +445,10 @@ fn mod_bit(vk: u32) -> u8 {
 pub struct Outcome {
     events: [Option<HotkeyEvent>; 2],
     n: u8,
-    /// Eat the key event (Esc while capture is on).
+    /// Eat the key event (Esc while capture is on; the main key of a matched combo).
     pub swallow: bool,
-    /// Inject the Start-menu mask key before this Win key-up is passed on.
+    /// Inject the mask key before this Win or Alt key-up is passed on (cancels the Start menu /
+    /// the menu-bar activation a lone release would trigger).
     pub mask: bool,
 }
 
@@ -477,6 +479,12 @@ pub struct Matcher<K: KeyState = SysKeys> {
     allow_injected: bool,
     /// The combo fired while a Win key was held; the Win key-up needs the mask.
     win_used: bool,
+    /// The main key was swallowed while an Alt key was held; the Alt key-up needs the mask or
+    /// Windows activates the menu bar (Alt then nothing else seen).
+    alt_used: bool,
+    /// The main key-down of the current press was swallowed, so its repeats and key-up must be
+    /// too (even when a modifier already ended the press).
+    main_swallowed: bool,
     /// The Esc key-down was swallowed, so its key-up (and repeats) must be too.
     esc_swallowed: bool,
     /// VK of the most recent non-modifier key-down (0 = none); modifiers count only when they
@@ -498,6 +506,8 @@ impl<K: KeyState> Matcher<K> {
             mask_enabled: true,
             allow_injected: false,
             win_used: false,
+            alt_used: false,
+            main_swallowed: false,
             esc_swallowed: false,
             last_down: 0,
         }
@@ -539,6 +549,8 @@ impl<K: KeyState> Matcher<K> {
     fn reset(&mut self) -> Option<HotkeyEvent> {
         let was_active = std::mem::take(&mut self.active);
         self.win_used = false;
+        self.alt_used = false;
+        self.main_swallowed = false;
         self.esc_swallowed = false;
         self.last_down = 0;
         self.mods = 0;
@@ -646,7 +658,16 @@ impl<K: KeyState> Matcher<K> {
                     }
                 }
                 Some(t) if vk == t => {
+                    // A modifier as main key (RightAlt, RightWin...) must reach the OS or the
+                    // modifier state of every other app desyncs, so only real keys are eaten.
+                    let eatable = mod_bit(t) == 0;
                     if down {
+                        // A swallowed key that another key went down after lost its key-up
+                        // (Win+L secure desktop): this down is a new press, not a repeat.
+                        if self.main_swallowed && prev_down != t {
+                            self.main_swallowed = false;
+                        }
+                        let repeat_of_swallowed = self.main_swallowed;
                         // Active and the last key down: auto-repeat, ignored. Active after some
                         // other key went down: the key-up was missed (e.g. released on the Win+L
                         // secure desktop), so this is a new press.
@@ -658,9 +679,20 @@ impl<K: KeyState> Matcher<K> {
                             self.active = true;
                             out.push(HotkeyEvent::Down);
                         }
-                    } else if self.active {
-                        self.active = false;
-                        out.push(HotkeyEvent::Up);
+                        // Matched (down or repeat), or repeating a down already eaten.
+                        if eatable && (self.active || repeat_of_swallowed) {
+                            out.swallow = true;
+                            self.main_swallowed = true;
+                        }
+                    } else {
+                        if self.active {
+                            self.active = false;
+                            out.push(HotkeyEvent::Up);
+                        }
+                        if self.main_swallowed {
+                            self.main_swallowed = false;
+                            out.swallow = true;
+                        }
                     }
                 }
                 Some(_) => {}
@@ -669,14 +701,27 @@ impl<K: KeyState> Matcher<K> {
             if self.active && self.combo_has_win() && self.mods & WIN_MASK != 0 {
                 self.win_used = true;
             }
+            // Swallowing the main key hides it from the OS, so a held Win/Alt would look like a
+            // lone tap on release (Start menu / menu bar).
+            if out.swallow {
+                if self.mods & WIN_MASK != 0 {
+                    self.win_used = true;
+                }
+                if self.mods & ALT_MASK != 0 {
+                    self.alt_used = true;
+                }
+            }
         }
 
-        // The Win key goes up after a Win combo fired: cancel the Start menu.
-        if bit & WIN_MASK != 0 && !down && self.win_used && self.mask_enabled {
+        // A Win (or Alt) key goes up after a combo fired: cancel the Start menu (menu bar).
+        if !down && self.mask_enabled && (bit & WIN_MASK != 0 && self.win_used || bit & ALT_MASK != 0 && self.alt_used) {
             out.mask = true;
         }
         if self.mods & WIN_MASK == 0 {
             self.win_used = false;
+        }
+        if self.mods & ALT_MASK == 0 {
+            self.alt_used = false;
         }
         out
     }
@@ -1235,14 +1280,168 @@ mod tests {
     }
 
     #[test]
-    fn main_key_not_swallowed() {
+    fn single_key_main_key_swallowed() {
         let mut h = harness("F8");
-        assert!(!h.press(0x77).1);
-        assert!(!h.release(0x77).1);
+        assert_eq!(h.press(0x77), (vec![D], true));
+        // Auto-repeats are eaten too.
+        assert_eq!(h.press(0x77), (vec![], true));
+        assert_eq!(h.press(0x77), (vec![], true));
+        assert_eq!(h.release(0x77), (vec![U], true));
+        // Unrelated keys and a second press cycle.
+        assert_eq!(h.press(0x78), (vec![], false));
+        assert_eq!(h.release(0x78), (vec![], false));
+        assert_eq!(h.press(0x77), (vec![D], true));
+        assert_eq!(h.release(0x77), (vec![U], true));
+    }
+
+    #[test]
+    fn compound_main_key_swallowed_modifiers_pass() {
         let mut h = harness("Control+Shift+Space");
-        h.press_ev(VK_LCONTROL);
-        h.press_ev(VK_LSHIFT);
-        assert!(!h.press(VK_SPACE).1);
+        assert_eq!(h.press(VK_LCONTROL), (vec![], false));
+        assert_eq!(h.press(VK_LSHIFT), (vec![], false));
+        assert_eq!(h.press(VK_SPACE), (vec![D], true));
+        assert_eq!(h.press(VK_SPACE), (vec![], true));
+        assert_eq!(h.press(VK_SPACE), (vec![], true));
+        assert_eq!(h.release(VK_SPACE), (vec![U], true));
+        assert_eq!(h.release(VK_LSHIFT), (vec![], false));
+        assert_eq!(h.release(VK_LCONTROL), (vec![], false));
+        // Space alone is typed normally again.
+        assert_eq!(h.press(VK_SPACE), (vec![], false));
+        assert_eq!(h.release(VK_SPACE), (vec![], false));
+    }
+
+    #[test]
+    fn main_key_without_all_modifiers_not_swallowed() {
+        let mut h = harness("Control+Shift+Space");
+        h.press(VK_LCONTROL);
+        assert_eq!(h.press(VK_SPACE), (vec![], false));
+        assert_eq!(h.release(VK_SPACE), (vec![], false));
+        h.release(VK_LCONTROL);
+        assert_eq!(h.press(VK_SPACE), (vec![], false));
+        assert_eq!(h.release(VK_SPACE), (vec![], false));
+    }
+
+    #[test]
+    fn modifier_released_first_still_swallows_repeat_and_up() {
+        let mut h = harness("Control+Space");
+        h.press(VK_LCONTROL);
+        assert_eq!(h.press(VK_SPACE), (vec![D], true));
+        assert_eq!(h.release(VK_LCONTROL), (vec![U], false));
+        // Space is still held: its repeats and key-up must not type a space.
+        assert_eq!(h.press(VK_SPACE), (vec![], true));
+        assert_eq!(h.release(VK_SPACE), (vec![], true));
+        assert_eq!(h.press(VK_SPACE), (vec![], false));
+    }
+
+    #[test]
+    fn missed_swallowed_key_up_does_not_swallow_next_plain_press() {
+        let mut h = harness("Control+Space");
+        h.press(VK_LCONTROL);
+        assert_eq!(h.press(VK_SPACE), (vec![D], true));
+        // Key-ups missed (secure desktop); the user later types normally.
+        h.down.borrow_mut().clear();
+        h.press(b'A' as u32);
+        h.release(b'A' as u32);
+        assert_eq!(h.press(VK_SPACE), (vec![], false));
+        assert_eq!(h.release(VK_SPACE), (vec![], false));
+    }
+
+    #[test]
+    fn modifier_only_and_modifier_main_keys_never_swallowed() {
+        let mut h = harness("Control+Super");
+        assert_eq!(h.press(VK_LCONTROL), (vec![], false));
+        assert_eq!(h.press(VK_LWIN), (vec![D], false));
+        assert_eq!(h.press(b'A' as u32), (vec![], false));
+        let mut h = harness("RightAlt");
+        assert_eq!(h.press(VK_RMENU), (vec![D], false));
+        assert_eq!(h.press(VK_RMENU), (vec![], false));
+        assert_eq!(h.release(VK_RMENU), (vec![U], false));
+    }
+
+    #[test]
+    fn suspended_never_swallows_main_key() {
+        let mut h = harness("F8");
+        h.m.set_suspended(true);
+        assert_eq!(h.press(0x77), (vec![], false));
+        assert_eq!(h.release(0x77), (vec![], false));
+        h.m.set_suspended(false);
+        assert_eq!(h.press(0x77), (vec![D], true));
+    }
+
+    #[test]
+    fn suspending_mid_press_lets_main_key_up_through() {
+        let mut h = harness("F8");
+        h.press(0x77);
+        assert_eq!(h.m.set_suspended(true), Some(U));
+        assert_eq!(h.release(0x77), (vec![], false));
+    }
+
+    #[test]
+    fn alt_combo_swallows_main_key_and_masks_alt_up() {
+        let mut h = harness("Alt+F9");
+        let o = h.step_full(VK_LMENU, true);
+        assert!(!o.swallow && !o.mask);
+        let o = h.step_full(0x78, true);
+        assert_eq!(o.events().collect::<Vec<_>>(), vec![D]);
+        assert!(o.swallow && !o.mask);
+        let o = h.step_full(0x78, false);
+        assert_eq!(o.events().collect::<Vec<_>>(), vec![U]);
+        assert!(o.swallow && !o.mask);
+        // The Alt key-up passes, preceded by the mask, so the menu bar stays closed.
+        let o = h.step_full(VK_LMENU, false);
+        assert!(o.mask && !o.swallow);
+        // A later plain Alt tap is left alone.
+        h.step_full(VK_LMENU, true);
+        assert!(!h.step_full(VK_LMENU, false).mask);
+    }
+
+    #[test]
+    fn alt_up_before_main_key_up_still_masked() {
+        let mut h = harness("Alt+F9");
+        h.step_full(VK_LMENU, true);
+        assert!(h.step_full(0x78, true).swallow);
+        let o = h.step_full(VK_LMENU, false);
+        assert!(o.mask);
+        assert!(h.step_full(0x78, false).swallow);
+    }
+
+    #[test]
+    fn win_held_with_plain_hotkey_masks_win_up() {
+        let mut h = harness("F8");
+        h.step_full(VK_LWIN, true);
+        assert!(h.step_full(0x77, true).swallow);
+        h.step_full(0x77, false);
+        assert!(h.step_full(VK_LWIN, false).mask);
+    }
+
+    #[test]
+    fn no_mask_without_alt_in_chord() {
+        let mut h = harness("Control+Shift+Space");
+        h.step_full(VK_LCONTROL, true);
+        h.step_full(VK_LSHIFT, true);
+        h.step_full(VK_SPACE, true);
+        h.step_full(VK_SPACE, false);
+        assert!(!h.step_full(VK_LSHIFT, false).mask);
+        assert!(!h.step_full(VK_LCONTROL, false).mask);
+    }
+
+    #[test]
+    fn alt_tap_not_masked_when_nothing_swallowed() {
+        let mut h = harness("Alt+F9");
+        h.step_full(VK_LMENU, true);
+        h.step_full(b'A' as u32, true);
+        h.step_full(b'A' as u32, false);
+        assert!(!h.step_full(VK_LMENU, false).mask);
+    }
+
+    #[test]
+    fn mask_disabled_covers_alt_too() {
+        let mut h = harness("Alt+F9");
+        h.m.set_start_menu_mask(false);
+        h.step_full(VK_LMENU, true);
+        h.step_full(0x78, true);
+        h.step_full(0x78, false);
+        assert!(!h.step_full(VK_LMENU, false).mask);
     }
 
     #[test]
@@ -1517,10 +1716,22 @@ mod tests {
         let mut h = harness("Control+Shift+Space");
         h.step_full(VK_LWIN, true);
         h.step_full(VK_LCONTROL, true);
-        h.step_full(VK_LSHIFT, true);
+        // Shift missing: Space does not match, nothing is swallowed, no mask needed.
         h.step_full(VK_SPACE, true);
         h.step_full(VK_SPACE, false);
         assert!(!h.step_full(VK_LWIN, false).mask);
+    }
+
+    #[test]
+    fn mask_sent_when_swallowed_main_key_had_win_held() {
+        let mut h = harness("Control+Shift+Space");
+        h.step_full(VK_LWIN, true);
+        h.step_full(VK_LCONTROL, true);
+        h.step_full(VK_LSHIFT, true);
+        // The OS never sees this Space, so releasing Win alone would open Start.
+        assert!(h.step_full(VK_SPACE, true).swallow);
+        h.step_full(VK_SPACE, false);
+        assert!(h.step_full(VK_LWIN, false).mask);
     }
 
     #[test]
@@ -1798,6 +2009,133 @@ mod tests {
             set_allow_injected(false);
             // SAFETY: destroying the window created above on this thread.
             unsafe {
+                let _ = DestroyWindow(hwnd);
+            }
+        }
+
+        /// Pump every message of the calling thread for `ms` (an EDIT control needs its own).
+        fn pump_thread(ms: u64) {
+            let end = Instant::now() + Duration::from_millis(ms);
+            let mut msg = windows::Win32::UI::WindowsAndMessaging::MSG::default();
+            while Instant::now() < end {
+                // SAFETY: standard PeekMessage pump for windows owned by this thread.
+                unsafe {
+                    while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                        let _ = windows::Win32::UI::WindowsAndMessaging::TranslateMessage(&msg);
+                        DispatchMessageW(&msg);
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+
+        /// Top-level EDIT control that owns the keyboard focus; `None` if Windows refuses to
+        /// hand it the foreground (locked session, focus-stealing prevention).
+        fn make_focused_edit() -> Option<HWND> {
+            use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
+            use windows::Win32::UI::WindowsAndMessaging::{SetForegroundWindow, WS_BORDER, WS_POPUP, WS_VISIBLE};
+            // SAFETY: creating, focusing and later destroying a window on this thread.
+            unsafe {
+                let hi = GetModuleHandleW(None).ok()?;
+                let edit = CreateWindowExW(
+                    WINDOW_EX_STYLE(0),
+                    w!("EDIT"),
+                    w!(""),
+                    WS_POPUP | WS_VISIBLE | WS_BORDER,
+                    200,
+                    200,
+                    300,
+                    80,
+                    None,
+                    None,
+                    Some(hi.into()),
+                    None,
+                )
+                .ok()?;
+                use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+                use windows::Win32::UI::WindowsAndMessaging::{GetWindowThreadProcessId, SwitchToThisWindow};
+                for _ in 0..5 {
+                    // A bare Alt tap lifts the foreground lock; attaching to the current
+                    // foreground thread's input queue lets SetForegroundWindow succeed.
+                    send(&[(VK_MENU, false), (VK_MENU, true)]);
+                    let fg_thread = GetWindowThreadProcessId(GetForegroundWindow(), None);
+                    let me = GetCurrentThreadId();
+                    let attached = fg_thread != 0 && fg_thread != me && AttachThreadInput(me, fg_thread, true).as_bool();
+                    SwitchToThisWindow(edit, true);
+                    let _ = SetForegroundWindow(edit);
+                    let _ = SetFocus(Some(edit));
+                    if attached {
+                        let _ = AttachThreadInput(me, fg_thread, false);
+                    }
+                    pump_thread(250);
+                    if GetForegroundWindow() == edit {
+                        return Some(edit);
+                    }
+                }
+                let _ = DestroyWindow(edit);
+                None
+            }
+        }
+
+        fn edit_text(edit: HWND) -> String {
+            let mut buf = [0u16; 64];
+            // SAFETY: buffer is valid for the call; `edit` is our own window.
+            let n = unsafe { windows::Win32::UI::WindowsAndMessaging::GetWindowTextW(edit, &mut buf) };
+            String::from_utf16_lossy(&buf[..n.max(0) as usize])
+        }
+
+        /// Types `combo` then a letter into a focused EDIT and returns what the control got.
+        fn typed_after_combo(edit: HWND, release_main_first: bool) -> String {
+            send(&[(VK_LCONTROL, false), (VK_LSHIFT, false), (VK_SPACE, false)]);
+            pump_thread(60);
+            send(&[(VK_SPACE, false), (VK_SPACE, false)]); // two auto-repeats
+            pump_thread(60);
+            if release_main_first {
+                send(&[(VK_SPACE, true), (VK_LSHIFT, true), (VK_LCONTROL, true)]);
+            } else {
+                send(&[(VK_LSHIFT, true), (VK_LCONTROL, true), (VK_SPACE, true)]);
+            }
+            pump_thread(60);
+            send(&[(b'X' as u32, false), (b'X' as u32, true)]);
+            pump_thread(150);
+            edit_text(edit)
+        }
+
+        /// Ctrl+Shift+Space must fire the hotkey without the focused app ever seeing the space.
+        /// Uses a focused Win32 EDIT in this process (modern Notepad exposes no readable text).
+        #[test]
+        #[ignore = "desktop: installs a real WH_KEYBOARD_LL hook, takes the foreground and injects keys"]
+        fn desktop_main_key_not_typed_into_focused_app() {
+            let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            let hwnd = make_window();
+            let Some(edit) = make_focused_edit() else {
+                eprintln!("skipped: could not take the foreground");
+                // SAFETY: destroying the window created above on this thread.
+                unsafe {
+                    let _ = DestroyWindow(hwnd);
+                }
+                return;
+            };
+            set_allow_injected(true);
+            start(hwnd.0 as isize, WM_APP + 7, "Control+Shift+Space").expect("hook installs");
+            SEEN.lock().unwrap().clear();
+
+            for release_main_first in [true, false] {
+                // SAFETY: clearing our own EDIT's text.
+                unsafe {
+                    let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowTextW(edit, w!(""));
+                }
+                let text = typed_after_combo(edit, release_main_first);
+                let seen = pump_until(hwnd, 2, 500);
+                assert_eq!(text, "x", "edit got more than the control letter (release_main_first={release_main_first})");
+                assert_eq!(seen, vec![HotkeyEvent::Down, HotkeyEvent::Up], "hotkey events");
+            }
+
+            stop();
+            set_allow_injected(false);
+            // SAFETY: destroying the windows created above on this thread.
+            unsafe {
+                let _ = DestroyWindow(edit);
                 let _ = DestroyWindow(hwnd);
             }
         }
