@@ -1587,7 +1587,7 @@ mod tests {
                 assert!(OpenClipboard(Some(hwnd)).is_ok());
                 let _ = EmptyClipboard();
                 for i in 0..RENDER_FORMATS {
-                    let name: Vec<u16> = format!("OpenTalkDelayed{i} ").encode_utf16().collect();
+                    let name: Vec<u16> = format!("OpenTalkDelayed{i}\0").encode_utf16().collect();
                     let fmt = RegisterClipboardFormatW(PCWSTR(name.as_ptr()));
                     // A NULL handle promises the data later (WM_RENDERFORMAT).
                     let _ = SetClipboardData(fmt, None);
