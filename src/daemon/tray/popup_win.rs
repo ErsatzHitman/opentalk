@@ -112,8 +112,13 @@ thread_local! {
 /// The popup window, for workers that deliver results (0 when closed).
 static POPUP_HWND: AtomicIsize = AtomicIsize::new(0);
 static TEST_RESULTS: Mutex<Vec<TestResult>> = Mutex::new(Vec::new());
-/// The two functions that start and stop the daemon's hotkey capture.
-type CaptureHooks = (fn(), fn());
+/// The functions that start, stop and re-arm the daemon's hotkey capture.
+#[derive(Clone, Copy)]
+struct CaptureHooks {
+    begin: fn(),
+    end: fn(),
+    rearm: fn(),
+}
 /// Start / stop the daemon's in-process hotkey capture; set by the host at startup.
 static CAPTURE_HOOKS: Mutex<Option<CaptureHooks>> = Mutex::new(None);
 
@@ -132,16 +137,28 @@ pub fn is_open() -> bool {
     POPUP.with(|c| c.try_borrow().map(|b| b.is_some()).unwrap_or(true))
 }
 
-/// Register the functions that start and stop the in-daemon hotkey capture (`hotkey::begin_capture`
-/// / `hotkey::end_capture`). Until then a hotkey field simply shows "Press the keys" and waits.
-pub fn set_capture_hooks(begin: fn(), end: fn()) {
-    *CAPTURE_HOOKS.lock().unwrap_or_else(|e| e.into_inner()) = Some((begin, end));
+/// Register the functions that start, stop and re-arm the in-daemon hotkey capture
+/// (`hotkey::begin_capture` / `end_capture` / `capture_rearm`). Until then a hotkey field simply
+/// shows "Press the keys" and waits.
+pub fn set_capture_hooks(begin: fn(), end: fn(), rearm: fn()) {
+    *CAPTURE_HOOKS.lock().unwrap_or_else(|e| e.into_inner()) = Some(CaptureHooks { begin, end, rearm });
 }
 
-fn capture_hook(begin: bool) {
+#[derive(Clone, Copy)]
+enum Hook {
+    Begin,
+    End,
+    Rearm,
+}
+
+fn capture_hook(which: Hook) {
     let hooks = *CAPTURE_HOOKS.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((b, e)) = hooks {
-        if begin { b() } else { e() }
+    if let Some(h) = hooks {
+        match which {
+            Hook::Begin => (h.begin)(),
+            Hook::End => (h.end)(),
+            Hook::Rearm => (h.rearm)(),
+        }
     }
 }
 
@@ -160,12 +177,19 @@ pub fn activate(req: Request) {
 pub fn open_route(req: Request) {
     if is_open() {
         let route = req.route;
-        with(|p| {
+        let showing = with(|p| {
             p.content = req.content;
             p.texts = req.texts;
             p.layout = popup::layout(&p.content);
+            match &p.pager {
+                Some(pg) => pg.route() == Some(route),
+                None => route == Route::Home,
+            }
         });
-        navigate(route);
+        // Already on that page (a repeated `--settings <page>`): keep its scroll and edits.
+        if showing != Some(true) {
+            navigate(route);
+        }
     } else {
         open(req);
     }
@@ -253,15 +277,16 @@ pub fn capture_update(text: String) {
 pub fn capture_done(accel: String) {
     with(|p| {
         let mut clip = WinClip;
-        let was_capturing = std::mem::take(&mut p.capturing);
         if let Some(pg) = p.pager.as_mut() {
             let r = pg.capture_done(accel, &p.metrics, &mut clip);
             apply(p, r);
         }
-        // The hook stays in capture mode until told otherwise: end it, unless the page started a
-        // new capture (a rejected combination asks for another one).
-        if was_capturing && !p.capturing {
-            capture_hook(false);
+        // The hook stays in capture mode until told otherwise: end it, unless the page asked for
+        // another capture (a rejected combination re-arms it).
+        let page_capturing = p.pager.as_ref().is_some_and(Pager::capturing);
+        if p.capturing && !page_capturing {
+            p.capturing = false;
+            capture_hook(Hook::End);
         }
     });
 }
@@ -292,7 +317,7 @@ pub fn close() {
             apply_outs(&mut p, r);
         }
         if std::mem::take(&mut p.capturing) {
-            capture_hook(false);
+            capture_hook(Hook::End);
         }
         LAST_CLOSED.with(|c| c.set(Some(tick())));
         // A closed popup holds no bitmaps: the cached card and body pixmaps go with the window.
@@ -543,7 +568,7 @@ fn go_home(p: &mut Popup) {
         apply_outs(p, r);
     }
     if std::mem::take(&mut p.capturing) {
-        capture_hook(false);
+        capture_hook(Hook::End);
     }
     p.nav = Nav::default();
     // SAFETY: our window.
@@ -628,12 +653,14 @@ fn apply_outs(p: &mut Popup, r: PResp) {
                 }
             }
             Outward::BeginCapture => {
+                // Already capturing (a rejected combination, or a second click on the field):
+                // record again without forgetting keys that are still held.
+                capture_hook(if p.capturing { Hook::Rearm } else { Hook::Begin });
                 p.capturing = true;
-                capture_hook(true);
             }
             Outward::EndCapture => {
                 if std::mem::take(&mut p.capturing) {
-                    capture_hook(false);
+                    capture_hook(Hook::End);
                 }
             }
             Outward::ToastTimer(arm) => {
@@ -867,9 +894,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let vk = wparam.0 as u32;
             if with(|p| p.pager.is_some()).unwrap_or(false) {
                 let k = key_from_vk(vk, ctrl).or_else(|| (alt && vk == 0x25).then_some(K::Left));
-                if let Some(k) = k {
-                    on_pager(|pg, m, clip| pg.key(KeyEv { k, shift, ctrl, alt }, m, clip));
-                } else if msg == WM_SYSKEYDOWN {
+                let handled = k.and_then(|k| {
+                    with(|p| {
+                        let mut clip = WinClip;
+                        let pg = p.pager.as_mut()?;
+                        let r = pg.key(KeyEv { k, shift, ctrl, alt }, &p.metrics, &mut clip);
+                        let handled = r.handled;
+                        apply(p, r);
+                        Some(handled)
+                    })
+                    .flatten()
+                });
+                if msg == WM_SYSKEYDOWN && handled != Some(true) {
                     // An Alt combination the page does not use keeps its system meaning (Alt+F4).
                     // SAFETY: default handling of a message for our own window.
                     return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };

@@ -241,6 +241,7 @@ impl Editor {
         self.chars.iter().collect()
     }
 
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.chars.len()
     }

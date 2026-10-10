@@ -84,6 +84,7 @@ pub fn dump(title: &str, items: &[Item]) -> String {
         let line = match it {
             Item::Group(s) => format!("\n## {s}"),
             Item::Note(s) => format!("  note: {s}"),
+            Item::Text(s) => format!("  text: {s}"),
             Item::Banner { tone: t, text } => format!("  banner[{}]: {text}", tone(*t)),
             Item::Toggle { id, label, desc, on } => format!("  [{}] #{id} {label}{}", if *on { "x" } else { " " }, tail(desc)),
             Item::Segmented { id, label, options, sel } => {

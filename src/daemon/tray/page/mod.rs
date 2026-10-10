@@ -139,6 +139,8 @@ pub enum Item {
     Group(String),
     /// Muted explanatory text (wrapped).
     Note(String),
+    /// Read-only content in the body text colour (wrapped; keeps line breaks), e.g. a transcript.
+    Text(String),
     /// Coloured notice (wrapped).
     Banner { tone: Tone, text: String },
     /// Label + description + on/off switch. Emits `Toggled(new)`.
@@ -247,8 +249,6 @@ pub enum ConfirmId {
     ResetApp,
     /// Remove a stored API key (page-private numbering).
     RemoveKey(u16),
-    /// Page-private confirmation.
-    Custom(u16),
 }
 
 /// What a model asks the popup to do. Applied in order after each event.
@@ -295,8 +295,6 @@ pub enum PopupAction {
     HistoryDelete(i64),
     /// Delete all history.
     HistoryClear,
-    /// Prune history older than N days (0 = keep forever means no-op); runs on a worker.
-    HistoryPrune(u32),
     /// Launch at login on/off (registry Run key; not part of `Config`).
     Autostart(bool),
     /// Reset app data: config, history, secrets, autostart.
@@ -324,7 +322,8 @@ pub mod mailbox {
         QUEUE.lock().unwrap_or_else(|e| e.into_inner()).drain(..).collect()
     }
 
-    /// Drop everything queued (tests, shutdown).
+    /// Drop everything queued (tests).
+    #[cfg(test)]
     pub fn clear() {
         QUEUE.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
@@ -349,8 +348,6 @@ pub struct Cx<'a> {
     /// The popup's working copy of the config. Mutate it and answer `Effect::Saved`; the daemon's
     /// copy is replaced on apply, and a fresh one arrives with each state sync.
     pub cfg: &'a mut Config,
-    /// Dark theme in effect (resolved from `cfg.theme` at open).
-    pub dark: bool,
     /// Wall clock, unix ms, sampled when the popup handles the input (pure models use it for
     /// "Today / Yesterday" and relative times).
     pub now_ms: i64,
@@ -359,8 +356,8 @@ pub struct Cx<'a> {
 }
 
 impl<'a> Cx<'a> {
-    pub fn new(cfg: &'a mut Config, dark: bool, now_ms: i64) -> Cx<'a> {
-        Cx { cfg, dark, now_ms, waker: noop_waker() }
+    pub fn new(cfg: &'a mut Config, now_ms: i64) -> Cx<'a> {
+        Cx { cfg, now_ms, waker: noop_waker() }
     }
 }
 
@@ -424,17 +421,20 @@ pub fn model_for(route: &Route) -> Option<Box<dyn PageModel>> {
     })
 }
 
-/// Placeholder page used by the stub constructors until a page is implemented.
+/// The smallest page (one Note): exercises the trait's default hooks in tests.
+#[cfg(test)]
 pub struct Placeholder {
     title: String,
 }
 
+#[cfg(test)]
 impl Placeholder {
     pub fn boxed(title: impl Into<String>) -> Box<dyn PageModel> {
         Box::new(Placeholder { title: title.into() })
     }
 }
 
+#[cfg(test)]
 impl PageModel for Placeholder {
     fn title(&self) -> String {
         self.title.clone()
@@ -472,7 +472,7 @@ mod tests {
         let mut cfg = Config::default();
         for r in all_routes() {
             let mut m = model_for(&r).unwrap_or_else(|| panic!("{r:?}"));
-            let mut cx = Cx::new(&mut cfg, false, 0);
+            let mut cx = Cx::new(&mut cfg, 0);
             m.enter(&mut cx);
             assert!(!m.title().is_empty(), "{r:?}");
             assert!(!m.items(&cx).is_empty(), "{r:?}");
@@ -506,7 +506,7 @@ mod tests {
     #[test]
     fn default_model_hooks_are_inert() {
         let mut cfg = Config::default();
-        let mut cx = Cx::new(&mut cfg, true, 7);
+        let mut cx = Cx::new(&mut cfg, 7);
         let mut m = Placeholder::boxed("X");
         assert!(m.virtual_rows().is_none());
         assert!(m.tail_items(&cx).is_empty());

@@ -248,7 +248,7 @@ mod tests {
     }
 
     fn on_ids(p: &PickerPage, cfg: &mut Config) -> Vec<ItemId> {
-        let cx = Cx::new(cfg, false, 0);
+        let cx = Cx::new(cfg, 0);
         p.items(&cx).iter().filter_map(|i| match i {
             Item::Radio { id, on: true, .. } => Some(*id),
             _ => None,
@@ -260,7 +260,7 @@ mod tests {
         let mut cfg = Config::default();
         for (name, id) in [("picker_warm", PickerId::MicWarm), ("picker_retention", PickerId::Retention), ("picker_stt_provider", PickerId::SttProvider), ("picker_llm_provider", PickerId::LlmProvider), ("picker_llm_model", PickerId::LlmModel), ("picker_devices", PickerId::InputDevice)] {
             let p = picker(id);
-            let cx = Cx::new(&mut cfg, false, 0);
+            let cx = Cx::new(&mut cfg, 0);
             let text = dump(&p.title(), &p.items(&cx));
             match name {
                 "picker_warm" => snapshot!("picker_warm", text),
@@ -272,7 +272,7 @@ mod tests {
             }
         }
         let p = picker(PickerId::Language);
-        let cx = Cx::new(&mut cfg, false, 0);
+        let cx = Cx::new(&mut cfg, 0);
         let text: String = dump(&p.title(), &p.items(&cx)).lines().take(6).collect::<Vec<_>>().join("\n");
         snapshot!("picker_language_head", text);
     }
@@ -283,7 +283,7 @@ mod tests {
         let cases: [(PickerId, usize); 6] = [(PickerId::Language, 15), (PickerId::MicWarm, 3), (PickerId::Retention, 2), (PickerId::SttProvider, 1), (PickerId::LlmProvider, 4), (PickerId::LlmModel, 1)];
         for (id, idx) in cases {
             let mut p = picker(id);
-            let mut cx = Cx::new(&mut cfg, false, 0);
+            let mut cx = Cx::new(&mut cfg, 0);
             let fx = p.event(ID_OPT0 + idx as ItemId, Event::Activated, &mut cx);
             assert_eq!(fx, vec![Effect::Saved, Effect::Back], "{id:?}");
         }
@@ -310,7 +310,7 @@ mod tests {
     fn language_filter_narrows_the_list_and_selection_maps_back_to_the_code() {
         let mut cfg = Config::default();
         let mut p = picker(PickerId::Language);
-        let mut cx = Cx::new(&mut cfg, false, 0);
+        let mut cx = Cx::new(&mut cfg, 0);
         assert!(p.event(ID_FILTER, Event::Edited("ger".into()), &mut cx).is_empty());
         let radios: Vec<_> = p.items(&cx).into_iter().filter_map(|i| match i {
             Item::Radio { id, label, .. } => Some((id, label)),
@@ -332,7 +332,7 @@ mod tests {
         let mut p = picker(PickerId::InputDevice);
         assert_eq!(on_ids(&p, &mut cfg), vec![ID_OPT0], "system default");
         {
-            let mut cx = Cx::new(&mut cfg, false, 0);
+            let mut cx = Cx::new(&mut cfg, 0);
             assert_eq!(p.event(ID_OPT0 + 2, Event::Activated, &mut cx), vec![Effect::Saved, Effect::Back]);
             assert_eq!(cx.cfg.mic_device_id.as_deref(), Some("{0.0.1}.b"));
             assert_eq!(cx.cfg.mic_device_label.as_deref(), Some("Studio USB"));
@@ -341,11 +341,11 @@ mod tests {
         cfg.mic_device_id = Some("{unplugged}".into());
         cfg.mic_device_label = Some("Old Headset".into());
         let items = {
-            let cx = Cx::new(&mut cfg, false, 0);
+            let cx = Cx::new(&mut cfg, 0);
             p.items(&cx)
         };
         assert!(items.iter().any(|i| matches!(i, Item::Radio { label, on: true, .. } if label == "Old Headset (not connected)")));
-        let mut cx = Cx::new(&mut cfg, false, 0);
+        let mut cx = Cx::new(&mut cfg, 0);
         assert_eq!(p.event(ID_OPT0, Event::Activated, &mut cx), vec![Effect::Saved, Effect::Back]);
         assert_eq!((cx.cfg.mic_device_id.clone(), cx.cfg.mic_device_label.clone()), (None, None));
         // A row that no longer exists (stale event after a refresh) is ignored.
@@ -356,7 +356,7 @@ mod tests {
     fn device_list_loads_on_a_worker_and_wake_picks_it_up() {
         let mut cfg = Config::default();
         let mut p = PickerPage::new(PickerId::InputDevice, fake_devices);
-        let mut cx = Cx::new(&mut cfg, false, 0);
+        let mut cx = Cx::new(&mut cfg, 0);
         let woken = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let w = woken.clone();
         cx.waker = Arc::new(move || w.store(true, std::sync::atomic::Ordering::SeqCst));
@@ -380,7 +380,7 @@ mod tests {
     #[test]
     fn non_device_pickers_do_not_start_workers() {
         let mut cfg = Config::default();
-        let mut cx = Cx::new(&mut cfg, false, 0);
+        let mut cx = Cx::new(&mut cfg, 0);
         let mut p = PickerPage::new(PickerId::MicWarm, || panic!("must not list devices"));
         p.enter(&mut cx);
         assert!(p.devices.is_none() && p.slot.lock().unwrap().is_none());
@@ -391,7 +391,7 @@ mod tests {
         let mut cfg = Config::default();
         cfg.ai_cleanup.provider = LlmProviderId::Custom;
         let p = picker(PickerId::LlmModel);
-        let cx = Cx::new(&mut cfg, false, 0);
+        let cx = Cx::new(&mut cfg, 0);
         assert!(p.items(&cx).iter().any(|i| matches!(i, Item::Note(n) if n.contains("no suggestions"))));
     }
 
@@ -400,7 +400,7 @@ mod tests {
         let mut cfg = Config::default();
         for id in PickerId::ALL {
             let p = picker(id);
-            let cx = Cx::new(&mut cfg, false, 0);
+            let cx = Cx::new(&mut cfg, 0);
             let mut ids: Vec<ItemId> = p.items(&cx).iter().filter_map(Item::id).collect();
             let n = ids.len();
             ids.sort_unstable();

@@ -523,7 +523,7 @@ impl App {
         match msg {
             ipc::WM_OT_RELOAD => self.reload(),
             // The popup captures hotkeys inside this process now; the message id stays reserved.
-            ipc::WM_OT_SUSPEND_HOTKEYS => log_info!("ignored SuspendHotkeys({}) (the tray popup captures hotkeys itself)", wparam != 0),
+            ipc::WM_OT_SUSPEND_HOTKEYS => log_info!("ignored SuspendHotkeys({}) from an older build (the popup captures hotkeys itself)", wparam != 0),
             ipc::WM_OT_TOGGLE => self.step(Input::Toggle, t0),
             ipc::WM_OT_START => self.step(Input::Start, t0),
             ipc::WM_OT_STOP => self.step(Input::Stop, t0),
@@ -653,12 +653,6 @@ impl App {
                     log_warn!("history: cannot clear: {e}");
                 }
                 self.sync_tray_popup();
-            }
-            PopupAction::HistoryPrune(days) => {
-                let spawned = std::thread::Builder::new().name("history-prune".into()).spawn(move || prune_history_now(days));
-                if let Err(e) = spawned {
-                    log_warn!("history: cannot start the prune thread: {e}");
-                }
             }
             PopupAction::Autostart(on) => {
                 if let Err(e) = autostart::set_enabled(on) {
@@ -1041,7 +1035,7 @@ pub fn run(hidden: bool, initial: Option<Route>) -> i32 {
     }
     hotkey::set_start_menu_mask(app.cfg.suppress_start_menu);
     // A hotkey field in the popup records the next combination through the same hook.
-    crate::daemon::tray::set_hotkey_capture_hooks(hotkey::begin_capture, hotkey::end_capture);
+    crate::daemon::tray::set_hotkey_capture_hooks(hotkey::begin_capture, hotkey::end_capture, hotkey::capture_rearm);
     crate::daemon::tray::sync_config(&app.cfg);
     app.sync_foreground();
     let mic = app.cfg.mic_device_id.clone();

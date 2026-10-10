@@ -1,7 +1,7 @@
 //! Settings > Preferences: theme, dictation behaviour, floating icon, language, startup, microphone.
 use super::kit::{ToggleDef, apply_toggle, choice, group, note, saved, segmented};
 use crate::core::config::{Config, Theme};
-use crate::core::settings_logic::{LANGUAGES, POSITIONS, WARM_CHOICES, label_of, position_index, warm_index};
+use crate::core::settings_logic::{POSITIONS, WARM_CHOICES, label_of, position_index, warm_index};
 use crate::daemon::tray::page::{Cx, Effect, Event, Item, ItemId, PageModel, PickerId, PopupAction, Route};
 
 pub const ID_THEME: ItemId = 1;
@@ -123,11 +123,6 @@ impl PageModel for PrefsPage {
     }
 }
 
-/// Language code at `LANGUAGES[i]` (used by the picker).
-pub fn language_code(i: usize) -> &'static str {
-    LANGUAGES.get(i).map_or("auto", |(c, _)| c)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -138,14 +133,14 @@ mod tests {
     }
 
     fn toggled(p: &mut PrefsPage, cfg: &mut Config, id: ItemId, on: bool) -> Vec<Effect> {
-        let mut cx = Cx::new(cfg, false, 0);
+        let mut cx = Cx::new(cfg, 0);
         p.event(id, Event::Toggled(on), &mut cx)
     }
 
     #[test]
     fn page_text_snapshot() {
         let (p, mut cfg) = page();
-        let cx = Cx::new(&mut cfg, false, 0);
+        let cx = Cx::new(&mut cfg, 0);
         snapshot!("prefs", dump(&p.title(), &p.items(&cx)));
     }
 
@@ -182,7 +177,7 @@ mod tests {
     fn theme_segmented_maps_both_ways() {
         let (mut p, mut cfg) = page();
         for (i, t) in [(0, Theme::Light), (1, Theme::Dark), (2, Theme::Auto)] {
-            let mut cx = Cx::new(&mut cfg, false, 0);
+            let mut cx = Cx::new(&mut cfg, 0);
             assert_eq!(p.event(ID_THEME, Event::Picked(i), &mut cx), vec![Effect::Saved]);
             assert_eq!(cx.cfg.theme, t);
             let sel = match p.items(&cx).iter().find(|it| matches!(it, Item::Segmented { id: ID_THEME, .. })) {
@@ -197,12 +192,12 @@ mod tests {
     fn start_position_segmented_maps_every_position() {
         let (mut p, mut cfg) = page();
         for (i, (_, pos)) in POSITIONS.iter().enumerate() {
-            let mut cx = Cx::new(&mut cfg, false, 0);
+            let mut cx = Cx::new(&mut cfg, 0);
             assert_eq!(p.event(ID_POSITION, Event::Picked(i), &mut cx), vec![Effect::Saved]);
             assert_eq!(cx.cfg.panel_position, *pos);
         }
         // An out-of-range index from a stale event cannot panic.
-        let mut cx = Cx::new(&mut cfg, false, 0);
+        let mut cx = Cx::new(&mut cfg, 0);
         p.event(ID_POSITION, Event::Picked(99), &mut cx);
         p.event(ID_THEME, Event::Picked(99), &mut cx);
     }
@@ -213,7 +208,7 @@ mod tests {
         let fx = toggled(&mut p, &mut cfg, ID_AUTOSTART, true);
         assert_eq!(fx, vec![Effect::Do(PopupAction::Autostart(true))]);
         assert_eq!(cfg, Config::default(), "config untouched");
-        let cx = Cx::new(&mut cfg, false, 0);
+        let cx = Cx::new(&mut cfg, 0);
         assert!(p.items(&cx).iter().any(|i| matches!(i, Item::Toggle { id: ID_AUTOSTART, on: true, .. })));
     }
 
@@ -224,7 +219,7 @@ mod tests {
         cfg.mic_device_id = Some("dev1".into());
         cfg.mic_device_label = Some("USB Mic".into());
         cfg.mic_warm_hold_secs = 100; // unlisted: shows the nearest choice
-        let mut cx = Cx::new(&mut cfg, false, 0);
+        let mut cx = Cx::new(&mut cfg, 0);
         let items = p.items(&cx);
         let value = |id| items.iter().find_map(|i| match i {
             Item::Choice { id: x, value, .. } if *x == id => Some(value.clone()),
@@ -251,7 +246,7 @@ mod tests {
     #[test]
     fn unrelated_events_do_nothing() {
         let (mut p, mut cfg) = page();
-        let mut cx = Cx::new(&mut cfg, false, 0);
+        let mut cx = Cx::new(&mut cfg, 0);
         assert!(p.event(999, Event::Pressed, &mut cx).is_empty());
         assert!(p.event(2, Event::Pressed, &mut cx).is_empty(), "a toggle ignores non-toggle events");
         assert_eq!(*cx.cfg, Config::default());

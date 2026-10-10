@@ -126,7 +126,7 @@ mod tests {
     #[test]
     fn page_text_snapshot() {
         let mut cfg = Config::default();
-        let cx = Cx::new(&mut cfg, false, 0);
+        let cx = Cx::new(&mut cfg, 0);
         let p = HotkeysPage::default();
         snapshot!("hotkeys", dump(&p.title(), &p.items(&cx)));
     }
@@ -135,7 +135,7 @@ mod tests {
     fn click_starts_capture_on_the_hotkey_item() {
         let mut cfg = Config::default();
         let mut p = HotkeysPage { error: Some("old".into()) };
-        let mut cx = Cx::new(&mut cfg, false, 0);
+        let mut cx = Cx::new(&mut cfg, 0);
         assert_eq!(p.event(ID_HOTKEY, Event::Activated, &mut cx), vec![Effect::BeginHotkeyCapture(ID_HOTKEY)]);
         assert!(p.error.is_none(), "a new attempt clears the old message");
     }
@@ -144,7 +144,7 @@ mod tests {
     fn a_valid_capture_is_applied_and_ends_capture() {
         let mut cfg = Config::default();
         let mut p = HotkeysPage::default();
-        let mut cx = Cx::new(&mut cfg, false, 0);
+        let mut cx = Cx::new(&mut cfg, 0);
         assert!(p.event(ID_HOTKEY, Event::CaptureUpdate("Control".into()), &mut cx).is_empty());
         let fx = p.event(ID_HOTKEY, Event::CaptureDone("Control+Shift+Space".into()), &mut cx);
         assert_eq!(fx, vec![Effect::EndHotkeyCapture, Effect::Saved]);
@@ -158,7 +158,7 @@ mod tests {
     fn function_keys_alone_are_accepted() {
         let mut cfg = Config::default();
         let mut p = HotkeysPage::default();
-        let mut cx = Cx::new(&mut cfg, false, 0);
+        let mut cx = Cx::new(&mut cfg, 0);
         assert_eq!(p.event(ID_HOTKEY, Event::CaptureDone("F8".into()), &mut cx), vec![Effect::EndHotkeyCapture, Effect::Saved]);
         assert_eq!(cx.cfg.hotkey, "F8");
     }
@@ -167,7 +167,7 @@ mod tests {
     fn a_refused_capture_shows_the_reason_and_listens_again() {
         let mut cfg = Config::default();
         let mut p = HotkeysPage::default();
-        let mut cx = Cx::new(&mut cfg, false, 0);
+        let mut cx = Cx::new(&mut cfg, 0);
         for bad in ["A", "Control", "Space"] {
             let fx = p.event(ID_HOTKEY, Event::CaptureDone(bad.into()), &mut cx);
             assert_eq!(fx, vec![Effect::BeginHotkeyCapture(ID_HOTKEY)], "{bad}");
@@ -185,7 +185,7 @@ mod tests {
     fn reset_restores_ctrl_win_and_is_disabled_at_the_default() {
         let mut cfg = Config { hotkey: "F8".into(), ..Config::default() };
         let mut p = HotkeysPage::default();
-        let mut cx = Cx::new(&mut cfg, false, 0);
+        let mut cx = Cx::new(&mut cfg, 0);
         let enabled = |p: &HotkeysPage, cx: &Cx| p.items(cx).iter().find_map(|i| match i {
             Item::Button { id: ID_RESET, enabled, .. } => Some(*enabled),
             _ => None,
@@ -200,7 +200,7 @@ mod tests {
     fn activation_mode_radios_are_exclusive() {
         let mut cfg = Config::default();
         let mut p = HotkeysPage::default();
-        let mut cx = Cx::new(&mut cfg, false, 0);
+        let mut cx = Cx::new(&mut cfg, 0);
         assert!(p.event(ID_TAP, Event::Toggled(true), &mut cx).is_empty(), "already tap");
         assert_eq!(p.event(ID_HOLD, Event::Toggled(true), &mut cx), vec![Effect::Saved]);
         assert_eq!(cx.cfg.activation_mode, ActivationMode::Hold);
@@ -218,7 +218,7 @@ mod tests {
         let mut cfg = Config::default();
         assert!(cfg.suppress_start_menu);
         let mut p = HotkeysPage::default();
-        let mut cx = Cx::new(&mut cfg, false, 0);
+        let mut cx = Cx::new(&mut cfg, 0);
         assert_eq!(p.event(ID_START_MENU, Event::Toggled(false), &mut cx), vec![Effect::Saved]);
         assert!(!cx.cfg.suppress_start_menu);
     }

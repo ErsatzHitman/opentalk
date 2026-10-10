@@ -44,10 +44,8 @@ pub struct PResp {
     pub home: bool,
     /// `cx.cfg` was saved: re-theme if the theme changed.
     pub saved: bool,
-    /// The key was consumed.
+    /// The key was consumed (an unused Alt combination keeps its system meaning).
     pub handled: bool,
-    /// The card height changed (never for now; reserved for status-strip relayout).
-    pub relayout: bool,
 }
 
 /// A pending confirmation.
@@ -116,15 +114,11 @@ impl Pager {
         Pager { cfg, dark, card_h, stack: Vec::new(), toast: None, confirm: None, back_hover: false, back_down: false, waker, now: None }
     }
 
-    /// Fix the clock the models see (tests).
-    pub fn set_now(&mut self, ms: i64) {
-        self.now = Some(ms);
-    }
-
     pub fn body_h(&self) -> f32 {
         self.card_h - PAGE_HEADER_H - if self.toast.is_some() { STRIP_H } else { 0.0 }
     }
 
+    #[cfg(test)]
     pub fn depth(&self) -> usize {
         self.stack.len()
     }
@@ -133,10 +127,7 @@ impl Pager {
         self.stack.last()
     }
 
-    pub fn title(&self) -> String {
-        self.top().map(|s| s.model.title()).unwrap_or_default()
-    }
-
+    /// The route of the page on top (`None` on Home).
     pub fn route(&self) -> Option<Route> {
         self.top().map(|s| s.route)
     }
@@ -148,13 +139,13 @@ impl Pager {
         self.top().map_or(CursorKind::Arrow, Session::cursor)
     }
 
-    fn cx<'a>(cfg: &'a mut Config, dark: bool, waker: &Waker, now: Option<i64>) -> Cx<'a> {
-        Cx { cfg, dark, now_ms: now.unwrap_or_else(unix_ms), waker: waker.clone() }
+    fn cx<'a>(cfg: &'a mut Config, waker: &Waker, now: Option<i64>) -> Cx<'a> {
+        Cx { cfg, now_ms: now.unwrap_or_else(unix_ms), waker: waker.clone() }
     }
 
     fn rebuild_top(&mut self, m: &dyn TextMetrics) {
         let bh = self.body_h();
-        let cx = Self::cx(&mut self.cfg, self.dark, &self.waker, self.now);
+        let cx = Self::cx(&mut self.cfg, &self.waker, self.now);
         if let Some(s) = self.stack.last_mut() {
             s.scroll.view_h = bh;
             s.rebuild(&cx, m);
@@ -187,7 +178,7 @@ impl Pager {
     fn drop_top(&mut self, m: &dyn TextMetrics, r: &mut PResp) -> Vec<Effect> {
         let mut fx = Vec::new();
         {
-            let mut cx = Self::cx(&mut self.cfg, self.dark, &self.waker, self.now);
+            let mut cx = Self::cx(&mut self.cfg, &self.waker, self.now);
             if let Some(s) = self.stack.last_mut() {
                 fx = s.flush(&mut cx, m);
                 s.model.leave(&mut cx);
@@ -209,7 +200,7 @@ impl Pager {
     pub fn push_model(&mut self, route: Route, model: Box<dyn super::PageModel>, m: &dyn TextMetrics, r: &mut PResp) -> Vec<Effect> {
         let mut fx = Vec::new();
         let bh = self.body_h();
-        let mut cx = Self::cx(&mut self.cfg, self.dark, &self.waker, self.now);
+        let mut cx = Self::cx(&mut self.cfg, &self.waker, self.now);
         if let Some(s) = self.stack.last_mut() {
             fx = s.flush(&mut cx, m).into_iter().filter(side_effect).collect();
             s.hover = None;
@@ -236,7 +227,7 @@ impl Pager {
             r.home = true;
         } else {
             let bh = self.body_h();
-            let mut cx = Self::cx(&mut self.cfg, self.dark, &self.waker, self.now);
+            let mut cx = Self::cx(&mut self.cfg, &self.waker, self.now);
             if let Some(s) = self.stack.last_mut() {
                 s.scroll.view_h = bh;
                 s.model.enter(&mut cx);
@@ -354,7 +345,7 @@ impl Pager {
                 }
                 Effect::Do(a) => r.out.push(Outward::Post(a)),
                 Effect::Focus(id) => {
-                    let mut cx = Self::cx(&mut self.cfg, self.dark, &self.waker, self.now);
+                    let mut cx = Self::cx(&mut self.cfg, &self.waker, self.now);
                     if let Some(s) = self.stack.last_mut() {
                         let fx = s.focus_item(id, &mut cx, m);
                         for f in fx.into_iter().rev() {
@@ -389,7 +380,7 @@ impl Pager {
     }
 
     fn with_session<T>(&mut self, m: &dyn TextMetrics, clip: &mut dyn Clip, f: impl FnOnce(&mut Session, &mut Env) -> T) -> Option<T> {
-        let mut cx = Self::cx(&mut self.cfg, self.dark, &self.waker, self.now);
+        let mut cx = Self::cx(&mut self.cfg, &self.waker, self.now);
         let s = self.stack.last_mut()?;
         let mut env = Env { cx: &mut cx, m, clip };
         Some(f(s, &mut env))
@@ -493,7 +484,7 @@ impl Pager {
         let mut r = PResp { redraw: true, ..PResp::default() };
         if accept {
             let fx = {
-                let mut cx = Self::cx(&mut self.cfg, self.dark, &self.waker, self.now);
+                let mut cx = Self::cx(&mut self.cfg, &self.waker, self.now);
                 self.stack.last_mut().map(|s| s.model.confirmed(c.on_confirm, &mut cx)).unwrap_or_default()
             };
             self.run(fx, m, clip, &mut r);
@@ -548,7 +539,7 @@ impl Pager {
 
     pub fn wake(&mut self, m: &dyn TextMetrics) -> PResp {
         {
-            let mut cx = Self::cx(&mut self.cfg, self.dark, &self.waker, self.now);
+            let mut cx = Self::cx(&mut self.cfg, &self.waker, self.now);
             if let Some(s) = self.stack.last_mut() {
                 s.model.wake(&mut cx);
             }
@@ -559,7 +550,7 @@ impl Pager {
 
     pub fn test_done(&mut self, result: TestResult, m: &dyn TextMetrics) -> PResp {
         {
-            let mut cx = Self::cx(&mut self.cfg, self.dark, &self.waker, self.now);
+            let mut cx = Self::cx(&mut self.cfg, &self.waker, self.now);
             if let Some(s) = self.stack.last_mut() {
                 s.model.test_done(result, &mut cx);
             }

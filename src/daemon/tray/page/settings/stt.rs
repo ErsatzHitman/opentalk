@@ -257,7 +257,7 @@ mod tests {
 
     fn snap(name: &str, cfg: &mut Config, store: Fake) -> String {
         let p = page(cfg, store);
-        let cx = Cx::new(cfg, false, 0);
+        let cx = Cx::new(cfg, 0);
         let _ = name;
         dump(&p.title(), &p.items(&cx))
     }
@@ -277,7 +277,7 @@ mod tests {
     fn provider_choice_opens_the_picker() {
         let mut cfg = Config::default();
         let mut p = page(&cfg, Fake::default());
-        let mut cx = Cx::new(&mut cfg, false, 0);
+        let mut cx = Cx::new(&mut cfg, 0);
         assert_eq!(p.event(ID_PROVIDER, Event::Activated, &mut cx), vec![Effect::Navigate(Route::Picker(PickerId::SttProvider))]);
     }
 
@@ -285,7 +285,7 @@ mod tests {
     fn model_radios_select_exactly_one_and_save() {
         let mut cfg = Config::default();
         let mut p = page(&cfg, Fake::default());
-        let mut cx = Cx::new(&mut cfg, false, 0);
+        let mut cx = Cx::new(&mut cfg, 0);
         let on = |p: &SttPage, cx: &Cx| p.items(cx).iter().filter_map(|i| match i {
             Item::Radio { id, on: true, .. } => Some(*id),
             _ => None,
@@ -302,7 +302,7 @@ mod tests {
     fn streaming_toggle_only_shows_when_a_model_streams() {
         let mut cfg = Config::default();
         let mut p = page(&cfg, Fake::default());
-        let mut cx = Cx::new(&mut cfg, false, 0);
+        let mut cx = Cx::new(&mut cfg, 0);
         assert!(p.items(&cx).iter().any(|i| matches!(i, Item::Toggle { id: ID_STREAMING, .. })));
         assert_eq!(p.event(ID_STREAMING, Event::Toggled(true), &mut cx), vec![Effect::Saved]);
         assert!(cx.cfg.stt.prefer_streaming);
@@ -316,7 +316,7 @@ mod tests {
         let mut cfg = Config::default();
         cfg.stt.provider = SttProviderId::Corti;
         let mut p = page(&cfg, Fake::default());
-        let mut cx = Cx::new(&mut cfg, false, 0);
+        let mut cx = Cx::new(&mut cfg, 0);
         let items = p.items(&cx);
         let secrets = items.iter().filter(|i| matches!(i, Item::Field { kind: crate::daemon::tray::page::FieldKind::Secret, .. })).count();
         assert_eq!(secrets, 2);
@@ -333,7 +333,7 @@ mod tests {
         let mut cfg = Config::default();
         cfg.stt.provider = SttProviderId::Custom;
         let mut p = page(&cfg, Fake::default());
-        let mut cx = Cx::new(&mut cfg, false, 0);
+        let mut cx = Cx::new(&mut cfg, 0);
         assert!(p.event(ID_CUSTOM_URL, Event::Edited("http://x".into()), &mut cx).is_empty(), "typing alone saves nothing");
         assert_eq!(p.event(ID_CUSTOM_URL, Event::Committed(" http://localhost:8000/v1 ".into()), &mut cx), vec![Effect::Saved]);
         assert_eq!(cx.cfg.stt.custom_base_url, "http://localhost:8000/v1");
@@ -345,7 +345,7 @@ mod tests {
     fn test_button_needs_a_key_then_runs_and_shows_the_result() {
         let mut cfg = Config::default();
         let mut p = page(&cfg, Fake::default());
-        let mut cx = Cx::new(&mut cfg, false, 0);
+        let mut cx = Cx::new(&mut cfg, 0);
         let enabled = |p: &SttPage, cx: &Cx| p.items(cx).iter().find_map(|i| match i {
             Item::Button { id: ID_TEST, enabled, .. } => Some(*enabled),
             _ => None,
@@ -370,7 +370,7 @@ mod tests {
     fn a_changed_setting_discards_the_old_result_and_busy_state() {
         let mut cfg = Config::default();
         let mut p = page(&cfg, Fake::with("openai", "sk-...abcd"));
-        let mut cx = Cx::new(&mut cfg, false, 0);
+        let mut cx = Cx::new(&mut cfg, 0);
         p.event(ID_TEST, Event::Pressed, &mut cx);
         assert!(p.busy);
         p.event(ID_MODEL0 + 1, Event::Activated, &mut cx);
@@ -389,7 +389,7 @@ mod tests {
     fn llm_results_are_ignored_here() {
         let mut cfg = Config::default();
         let mut p = page(&cfg, Fake::default());
-        let mut cx = Cx::new(&mut cfg, false, 0);
+        let mut cx = Cx::new(&mut cfg, 0);
         p.test_done(TestResult { kind: TestKind::Llm, ok: true, badge: String::new(), text: String::new() }, &mut cx);
         assert!(p.result.is_none());
     }
@@ -398,7 +398,7 @@ mod tests {
     fn removing_a_key_is_confirmed_and_clears_the_result() {
         let mut cfg = Config::default();
         let mut p = page(&cfg, Fake::with("openai", "sk-...abcd"));
-        let mut cx = Cx::new(&mut cfg, false, 0);
+        let mut cx = Cx::new(&mut cfg, 0);
         let fx = p.event(KEY_A + 6, Event::Pressed, &mut cx);
         assert!(matches!(&fx[0], Effect::Confirm { on_confirm: ConfirmId::RemoveKey(KEY_A), .. }));
         let fx = p.confirmed(ConfirmId::RemoveKey(KEY_A), &mut cx);
@@ -413,7 +413,7 @@ mod tests {
             cfg.stt.provider = pi.id;
             cfg.stt.custom_base_url = "http://x".into();
             let p = page(&cfg, Fake::default());
-            let cx = Cx::new(&mut cfg, false, 0);
+            let cx = Cx::new(&mut cfg, 0);
             let mut ids: Vec<ItemId> = p.items(&cx).iter().filter_map(Item::id).collect();
             let n = ids.len();
             ids.sort_unstable();

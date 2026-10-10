@@ -449,7 +449,7 @@ mod tests {
     }
 
     fn snap(cfg: &mut Config, p: &CleanupPage) -> String {
-        let cx = Cx::new(cfg, false, 0);
+        let cx = Cx::new(cfg, 0);
         dump(&p.title(), &p.items(&cx))
     }
 
@@ -474,7 +474,7 @@ mod tests {
     fn ai_rewrite_is_the_first_group() {
         let mut cfg = Config::default();
         let p = page(LlmProviderId::Openrouter, Fake::default());
-        let cx = Cx::new(&mut cfg, false, 0);
+        let cx = Cx::new(&mut cfg, 0);
         let items = p.items(&cx);
         assert_eq!(items[0], Item::Group("AI rewrite".into()));
         assert!(matches!(items.iter().find_map(Item::id), Some(ID_RW_TOGGLE)), "the toggle is the first control");
@@ -484,7 +484,7 @@ mod tests {
     fn rewrite_toggle_saves_and_hides_the_trigger_field() {
         let mut cfg = Config::default();
         let mut p = page(LlmProviderId::Openrouter, Fake::default());
-        let mut cx = Cx::new(&mut cfg, false, 0);
+        let mut cx = Cx::new(&mut cfg, 0);
         let has_field = |p: &CleanupPage, cx: &Cx| p.items(cx).iter().any(|i| matches!(i, Item::Field { id: ID_RW_TRIGGER, .. }));
         assert!(has_field(&p, &cx));
         assert_eq!(p.event(ID_RW_TOGGLE, Event::Toggled(false), &mut cx), vec![Effect::Saved]);
@@ -497,7 +497,7 @@ mod tests {
     fn trigger_commit_normalises_validates_and_saves() {
         let mut cfg = Config::default();
         let mut p = page(LlmProviderId::Openrouter, Fake::default());
-        let mut cx = Cx::new(&mut cfg, false, 0);
+        let mut cx = Cx::new(&mut cfg, 0);
         let fx = p.event(ID_RW_TRIGGER, Event::Committed("  make   this\tshort  ".into()), &mut cx);
         assert_eq!(fx, vec![Effect::Saved]);
         assert_eq!(cx.cfg.rewrite_trigger, "make this short");
@@ -510,8 +510,8 @@ mod tests {
     fn invalid_triggers_are_refused_with_a_reason_and_the_draft_is_kept() {
         let mut cfg = Config::default();
         let mut p = page(LlmProviderId::Openrouter, Fake::default());
-        let mut cx = Cx::new(&mut cfg, false, 0);
-        for (bad, why) in [("rewrite", "at least two words"), ("a b c", "longer phrase"), (&"word ".repeat(30), "at most 80")] {
+        let mut cx = Cx::new(&mut cfg, 0);
+        for (bad, why) in [("rewrite", "at least two words"), ("a b c", "six letters"), (&"word ".repeat(30), "at most 80")] {
             assert!(p.event(ID_RW_TRIGGER, Event::Committed(bad.to_string()), &mut cx).is_empty(), "{bad}");
             assert_eq!(cx.cfg.rewrite_trigger, DEFAULT_REWRITE_TRIGGER, "an invalid phrase never replaces the stored one");
             assert!(p.error.as_deref().is_some_and(|e| e.contains(why)), "{bad}: {:?}", p.error);
@@ -531,7 +531,7 @@ mod tests {
     fn an_empty_trigger_turns_the_rewrite_off_and_is_kept_as_written() {
         let mut cfg = Config::default();
         let mut p = page(LlmProviderId::Openrouter, Fake::default());
-        let mut cx = Cx::new(&mut cfg, false, 0);
+        let mut cx = Cx::new(&mut cfg, 0);
         assert_eq!(p.event(ID_RW_TRIGGER, Event::Committed("   ".into()), &mut cx), vec![Effect::Saved]);
         assert_eq!(cx.cfg.rewrite_trigger, "");
         assert!(cx.cfg.rewrite_trigger_effective().is_none());
@@ -547,7 +547,7 @@ mod tests {
         let mut cfg = Config::default();
         let mut p = page(LlmProviderId::Openrouter, Fake::default());
         let reset_enabled = |p: &CleanupPage, cfg: &mut Config| {
-            let cx = Cx::new(cfg, false, 0);
+            let cx = Cx::new(cfg, 0);
             p.items(&cx).iter().find_map(|i| match i {
                 Item::Button { id: ID_RW_RESET, enabled, .. } => Some(*enabled),
                 _ => None,
@@ -564,7 +564,7 @@ mod tests {
     #[test]
     fn warning_banner_follows_the_provider_state() {
         let banner = |p: &CleanupPage, cfg: &mut Config| {
-            let cx = Cx::new(cfg, false, 0);
+            let cx = Cx::new(cfg, 0);
             p.items(&cx).iter().any(|i| matches!(i, Item::Banner { tone: Tone::Warn, .. }))
         };
         let mut cfg = Config::default();
@@ -574,7 +574,7 @@ mod tests {
         assert!(!banner(&p, &mut cfg), "key + default model: ready");
         let mut p = page(LlmProviderId::Openrouter, Fake::with("openrouter", "sk-...abcd"));
         {
-            let mut cx = Cx::new(&mut cfg, false, 0);
+            let mut cx = Cx::new(&mut cfg, 0);
             p.event(ID_RW_TRIGGER, Event::Committed("".into()), &mut cx);
         }
         assert!(!banner(&p, &mut cfg), "no trigger, no rewrite, no warning");
@@ -587,7 +587,7 @@ mod tests {
     #[test]
     fn the_banner_names_what_is_missing() {
         let text = |p: &CleanupPage, cfg: &mut Config| {
-            let cx = Cx::new(cfg, false, 0);
+            let cx = Cx::new(cfg, 0);
             p.items(&cx).iter().find_map(|i| match i {
                 Item::Banner { text, .. } => Some(text.clone()),
                 _ => None,
@@ -604,7 +604,7 @@ mod tests {
     #[test]
     fn the_provider_group_follows_a_rewrite_that_can_fire() {
         let groups = |p: &CleanupPage, cfg: &mut Config| {
-            let cx = Cx::new(cfg, false, 0);
+            let cx = Cx::new(cfg, 0);
             p.items(&cx).iter().filter_map(|i| if let Item::Group(g) = i { Some(g.clone()) } else { None }).collect::<Vec<_>>()
         };
         let p = page(LlmProviderId::Openrouter, Fake::default());
@@ -644,7 +644,7 @@ mod tests {
     fn filler_segmented_maps_modes() {
         let mut cfg = Config::default();
         let mut p = page(LlmProviderId::Openrouter, Fake::default());
-        let mut cx = Cx::new(&mut cfg, false, 0);
+        let mut cx = Cx::new(&mut cfg, 0);
         for (i, m) in [(0, FillerMode::Off), (1, FillerMode::Standard), (2, FillerMode::Aggressive)] {
             assert_eq!(p.event(ID_FILLER, Event::Picked(i), &mut cx), vec![Effect::Saved]);
             assert_eq!(cx.cfg.filler_mode, m);
@@ -655,7 +655,7 @@ mod tests {
     fn option_toggles_save_their_fields() {
         let mut cfg = Config::default();
         let mut p = page(LlmProviderId::Openrouter, Fake::default());
-        let mut cx = Cx::new(&mut cfg, false, 0);
+        let mut cx = Cx::new(&mut cfg, 0);
         assert_eq!(p.event(ID_FUZZY, Event::Toggled(false), &mut cx), vec![Effect::Saved]);
         assert_eq!(p.event(ID_LINEBREAKS, Event::Toggled(true), &mut cx), vec![Effect::Saved]);
         assert_eq!(p.event(ID_AI_ENABLE, Event::Toggled(true), &mut cx), vec![Effect::Saved]);
@@ -666,7 +666,7 @@ mod tests {
     fn provider_section_appears_when_cleanup_or_rewrite_needs_it() {
         let has = |cfg: &mut Config| {
             let p = page(LlmProviderId::Openrouter, Fake::default());
-            let cx = Cx::new(cfg, false, 0);
+            let cx = Cx::new(cfg, 0);
             p.items(&cx).iter().any(|i| matches!(i, Item::Group(g) if g == "AI provider"))
         };
         let mut cfg = Config::default();
@@ -682,7 +682,7 @@ mod tests {
         let mut cfg = Config::default();
         cfg.ai_cleanup.enabled = true;
         let mut p = page(LlmProviderId::Openrouter, Fake::default());
-        let mut cx = Cx::new(&mut cfg, false, 0);
+        let mut cx = Cx::new(&mut cfg, 0);
         assert!(p.event(ID_PROMPT, Event::Committed("DEFAULT PROMPT\n".into()), &mut cx).is_empty(), "the default text is not a custom prompt");
         assert_eq!(p.event(ID_PROMPT, Event::Committed("Be terse.".into()), &mut cx), vec![Effect::Saved]);
         assert_eq!(cx.cfg.ai_cleanup.custom_prompt, "Be terse.");
@@ -699,7 +699,7 @@ mod tests {
     fn model_field_sets_the_per_provider_model_and_empty_restores_the_default() {
         let mut cfg = Config::default();
         let mut p = page(LlmProviderId::Openrouter, Fake::default());
-        let mut cx = Cx::new(&mut cfg, false, 0);
+        let mut cx = Cx::new(&mut cfg, 0);
         assert_eq!(p.event(ID_AI_MODEL, Event::Committed(" meta/llama ".into()), &mut cx), vec![Effect::Saved]);
         assert_eq!(cx.cfg.llm_model(), "meta/llama");
         p.event(ID_AI_MODEL, Event::Committed("".into()), &mut cx);
@@ -712,7 +712,7 @@ mod tests {
     fn provider_specific_fields_commit_to_their_config_fields() {
         let mut cfg = Config::default();
         let mut p = page(LlmProviderId::Openrouter, Fake::default());
-        let mut cx = Cx::new(&mut cfg, false, 0);
+        let mut cx = Cx::new(&mut cfg, 0);
         type Getter = fn(&Config) -> String;
         let cases: [(ItemId, Getter); 8] = [
             (ID_BASE_URL, |c| c.ai_cleanup.custom_base_url.clone()),
@@ -735,7 +735,7 @@ mod tests {
         let mut cfg = Config::default();
         cfg.ai_cleanup.enabled = true;
         let mut p = page(LlmProviderId::Openrouter, Fake::with("openrouter", "sk-...abcd"));
-        let mut cx = Cx::new(&mut cfg, false, 0);
+        let mut cx = Cx::new(&mut cfg, 0);
         assert_eq!(p.event(ID_TEST, Event::Pressed, &mut cx), vec![Effect::Saved, Effect::RunTest(TestKind::Llm)]);
         assert!(p.event(ID_TEST, Event::Pressed, &mut cx).is_empty());
         p.test_done(TestResult { kind: TestKind::Stt, ok: true, badge: "x".into(), text: "ignored".into() }, &mut cx);
@@ -788,7 +788,7 @@ mod tests {
             cfg.ai_cleanup.enabled = true;
             cfg.ai_cleanup.provider = pi.id;
             let p = page(pi.id, Fake::default());
-            let cx = Cx::new(&mut cfg, false, 0);
+            let cx = Cx::new(&mut cfg, 0);
             let mut ids: Vec<ItemId> = p.items(&cx).iter().filter_map(Item::id).collect();
             let n = ids.len();
             ids.sort_unstable();

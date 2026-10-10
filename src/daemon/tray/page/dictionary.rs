@@ -620,7 +620,7 @@ mod tests {
     }
 
     fn cx(cfg: &mut Config) -> Cx<'_> {
-        Cx::new(cfg, false, 0)
+        Cx::new(cfg, 0)
     }
 
     fn input_field(p: &DictionaryPage, cfg: &mut Config) -> Item {

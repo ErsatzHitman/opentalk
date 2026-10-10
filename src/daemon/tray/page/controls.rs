@@ -6,13 +6,8 @@
 
 use super::metrics::TextMetrics;
 use super::{BtnStyle, Tone};
-use crate::daemon::pill::kit::{Canvas, Font, Rect, Rgba, content_height, sd_round_box, sd_segment, text_mask};
-use crate::daemon::tray::popup::R;
+use crate::daemon::pill::kit::{Canvas, Font, Rect, Rgba, content_height, sd_segment, text_mask};
 use crate::daemon::tray::popup_draw::{Theme, WHITE, rr, ring};
-
-pub fn rect(r: R) -> Rect {
-    Rect::new(r.l, r.t, r.r, r.b)
-}
 
 /// Colour of a tone.
 pub fn tone_color(th: &Theme, tone: Tone) -> Rgba {
@@ -38,10 +33,6 @@ pub struct Painter<'a, 'b> {
 impl<'a, 'b> Painter<'a, 'b> {
     pub fn new(cv: Canvas<'a>, th: Theme, text: bool, m: &'b dyn TextMetrics) -> Painter<'a, 'b> {
         Painter { cv, th, text, m, clip: None }
-    }
-
-    pub fn scale(&self) -> f32 {
-        self.cv.scale
     }
 
     /// Text with its glyph cell centred on `cy`, left edge at `x`.
@@ -150,11 +141,7 @@ pub fn fit_text(s: &str, max_w: f32, width: &dyn Fn(&str) -> f32) -> String {
 pub enum Glyph {
     ChevronRight,
     ChevronLeft,
-    Check,
     Close,
-    Trash,
-    Plus,
-    Search,
 }
 
 const GSW: f32 = 1.5;
@@ -172,20 +159,7 @@ pub fn glyph_sd(g: Glyph, x: f32, y: f32) -> f32 {
     match g {
         Glyph::ChevronRight => poly(x, y, &[(6.0, 3.5), (10.5, 8.0), (6.0, 12.5)]),
         Glyph::ChevronLeft => poly(x, y, &[(10.0, 3.5), (5.5, 8.0), (10.0, 12.5)]),
-        Glyph::Check => poly(x, y, &[(3.2, 8.4), (6.6, 11.8), (12.8, 4.6)]),
         Glyph::Close => poly(x, y, &[(4.0, 4.0), (12.0, 12.0)]).min(poly(x, y, &[(12.0, 4.0), (4.0, 12.0)])),
-        Glyph::Plus => poly(x, y, &[(8.0, 3.5), (8.0, 12.5)]).min(poly(x, y, &[(3.5, 8.0), (12.5, 8.0)])),
-        Glyph::Trash => {
-            let lid = poly(x, y, &[(3.2, 4.6), (12.8, 4.6)]);
-            let handle = poly(x, y, &[(6.2, 4.6), (6.2, 3.0), (9.8, 3.0), (9.8, 4.6)]);
-            let body = poly(x, y, &[(4.6, 6.0), (5.2, 12.8), (10.8, 12.8), (11.4, 6.0)]);
-            let ribs = poly(x, y, &[(7.0, 7.6), (7.0, 11.2)]).min(poly(x, y, &[(9.0, 7.6), (9.0, 11.2)]));
-            lid.min(handle).min(body).min(ribs)
-        }
-        Glyph::Search => {
-            let lens = ((x - 7.0).hypot(y - 7.0) - 4.2).abs() - GSW * 0.5;
-            lens.min(poly(x, y, &[(10.2, 10.2), (13.2, 13.2)]))
-        }
     }
 }
 
@@ -337,11 +311,6 @@ impl Painter<'_, '_> {
     }
 }
 
-/// Rounded-box coverage helper for tests and goldens.
-pub fn round_box(x: f32, y: f32, r: Rect, radius: f32) -> f32 {
-    sd_round_box(x, y, r.cx(), r.cy(), r.w() * 0.5, r.h() * 0.5, radius)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -364,7 +333,7 @@ mod tests {
 
     #[test]
     fn every_glyph_draws_inside_its_box() {
-        for g in [Glyph::ChevronRight, Glyph::ChevronLeft, Glyph::Check, Glyph::Close, Glyph::Trash, Glyph::Plus, Glyph::Search] {
+        for g in [Glyph::ChevronRight, Glyph::ChevronLeft, Glyph::Close] {
             let mut pm = Pixmap::new(24, 24).unwrap();
             paint(&mut pm, false).glyph(g, 4.0, 12.0, WHITE, 1.0);
             assert!(lit(&pm) > 14, "{g:?} draws ({} px)", lit(&pm));

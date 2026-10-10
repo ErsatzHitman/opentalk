@@ -41,7 +41,7 @@ pub const ROW_BTN: f32 = 26.0;
 /// Gap under a card-like item (radio, banner, result).
 pub const CARD_GAP: f32 = 6.0;
 /// Space above the first item and below the last.
-pub const PAD_TOP: f32 = 4.0;
+pub const PAD_TOP: f32 = 12.0;
 pub const PAD_BOTTOM: f32 = 12.0;
 
 /// Text measure: `(text, logical px, weight) -> logical width`.
@@ -161,6 +161,10 @@ fn slot(item: &Item, width: f32, measure: Measure) -> (f32, R, Vec<String>) {
         Item::Note(t) => {
             let lines = wrap_lines(t, FS_SMALL, 400, width, measure);
             (lines.len() as f32 * LINE_SMALL + 10.0, z, lines)
+        }
+        Item::Text(t) => {
+            let lines = wrap_lines(t, FS_BODY, 400, width, measure);
+            (lines.len() as f32 * LINE_BODY + 10.0, z, lines)
         }
         Item::Banner { text, .. } => {
             let lines = wrap_lines(text, FS_SMALL, 400, width - 28.0, measure);

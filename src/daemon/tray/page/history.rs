@@ -561,15 +561,15 @@ impl PageModel for EntryPage {
         }
         if !e.text.trim().is_empty() {
             v.push(Item::Group("Text".into()));
-            v.push(Item::Note(e.text.trim().to_string()));
+            v.push(Item::Text(e.text.trim().to_string()));
         }
         if e.rewritten {
             v.push(Item::Group("Before the rewrite".into()));
-            v.push(Item::Note(e.original.as_deref().map(str::trim).filter(|s| !s.is_empty()).unwrap_or("(not saved)").to_string()));
+            v.push(Item::Text(e.original.as_deref().map(str::trim).filter(|s| !s.is_empty()).unwrap_or("(not saved)").to_string()));
         }
         if let Some(raw) = Self::raw_extra(e) {
             v.push(Item::Group("Raw transcript".into()));
-            v.push(Item::Note(raw.trim().to_string()));
+            v.push(Item::Text(raw.trim().to_string()));
         } else if e.raw.trim().is_empty() && e.text.trim().is_empty() && e.status != Status::Discarded {
             v.push(Item::Note("No transcript was recorded.".into()));
         }
@@ -646,6 +646,7 @@ pub(super) mod testkit {
         match it {
             Item::Group(t) => format!("== {t}"),
             Item::Note(t) => format!("note: {t}"),
+            Item::Text(t) => format!("text: {t}"),
             Item::Banner { tone, text } => format!("banner[{tone:?}]: {text}"),
             Item::Toggle { id, label, desc, on } => format!("#{id} toggle {label} [{}] ({desc})", if *on { "on" } else { "off" }),
             Item::Segmented { id, label, options, sel } => format!("#{id} segmented {label} {options:?} sel={sel}"),
@@ -784,7 +785,7 @@ mod tests {
 
     fn entered(store: Arc<Fake>, cfg: &mut Config) -> HistoryPage {
         let mut p = new_page(store);
-        p.enter(&mut Cx::new(cfg, false, now()));
+        p.enter(&mut Cx::new(cfg, now()));
         p
     }
 
@@ -796,7 +797,7 @@ mod tests {
     fn list_snapshot_shows_stats_search_toggle_rows_and_clear() {
         let mut cfg = Config::default();
         let p = entered(Fake::new(sample()), &mut cfg);
-        let cx = Cx::new(&mut cfg, false, now());
+        let cx = Cx::new(&mut cfg, now());
         let snap = snapshot(&p, &cx);
         println!("{snap}");
         let want = [
@@ -821,7 +822,7 @@ mod tests {
         let mut cfg = Config::default();
         let mut p = entered(Fake::new(sample()), &mut cfg);
         assert_eq!(rows(&p), vec![5, 4, 2, 1]);
-        let mut cx = Cx::new(&mut cfg, false, now());
+        let mut cx = Cx::new(&mut cfg, now());
         assert!(p.event(T_DISCARDED, Event::Toggled(true), &mut cx).is_empty());
         assert_eq!(rows(&p), vec![5, 4, 3, 2, 1]);
         let r = p.row(2);
@@ -838,7 +839,7 @@ mod tests {
         let mut cfg = Config::default();
         let fake = Fake::new(sample());
         let mut p = entered(fake.clone(), &mut cfg);
-        let mut cx = Cx::new(&mut cfg, false, now());
+        let mut cx = Cx::new(&mut cfg, now());
         p.event(F_SEARCH, Event::Edited("slack".into()), &mut cx);
         assert_eq!(rows(&p), vec![5]);
         p.event(F_SEARCH, Event::Edited("report TOMORROW".into()), &mut cx);
@@ -868,9 +869,9 @@ mod tests {
         assert!(p.more);
         // The totals worker (inline here) has already delivered the whole-file numbers.
         assert_eq!(p.stats_note().unwrap(), "450 dictations \u{b7} 900 words \u{b7} avg 840 ms");
-        let cx = Cx::new(&mut cfg, false, now());
+        let cx = Cx::new(&mut cfg, now());
         assert!(p.tail_items(&cx).iter().any(|i| matches!(i, Item::Button { id: B_MORE, .. })));
-        let mut cx = Cx::new(&mut cfg, false, now());
+        let mut cx = Cx::new(&mut cfg, now());
         p.event(B_MORE, Event::Pressed, &mut cx);
         assert_eq!(p.pool.len(), 400);
         p.event(B_MORE, Event::Pressed, &mut cx);
@@ -886,7 +887,7 @@ mod tests {
         let mut cfg = Config::default();
         let fake = Fake::new(many(MAX_LOADED as i64 + 300));
         let mut p = entered(fake.clone(), &mut cfg);
-        let mut cx = Cx::new(&mut cfg, false, now());
+        let mut cx = Cx::new(&mut cfg, now());
         while p.can_load_more() {
             p.event(B_MORE, Event::Pressed, &mut cx);
         }
@@ -907,7 +908,7 @@ mod tests {
     fn a_search_with_more_matches_than_the_cap_says_so() {
         let mut cfg = Config::default();
         let mut p = entered(Fake::new(many(MAX_LOADED as i64 + 50)), &mut cfg);
-        let mut cx = Cx::new(&mut cfg, false, now());
+        let mut cx = Cx::new(&mut cfg, now());
         p.event(F_SEARCH, Event::Committed("body".into()), &mut cx);
         p.wake(&mut cx);
         assert_eq!(p.view.len(), MAX_LOADED);
@@ -920,7 +921,7 @@ mod tests {
         let mut p = new_page(Fake::new(many(300)));
         static JOBS: Mutex<Vec<Box<dyn FnOnce() + Send>>> = Mutex::new(Vec::new());
         p.env.spawn = |job| JOBS.lock().unwrap().push(job);
-        let mut cx = Cx::new(&mut cfg, false, now());
+        let mut cx = Cx::new(&mut cfg, now());
         p.enter(&mut cx);
         assert_eq!(JOBS.lock().unwrap().len(), 1, "300 entries: part of the file is loaded, the totals need a scan");
         p.confirmed(ConfirmId::HistoryClear, &mut cx);
@@ -936,7 +937,7 @@ mod tests {
         let mut p = new_page(Fake::new(sample()));
         static RAN: Mutex<usize> = Mutex::new(0);
         p.env.spawn = |_job| *RAN.lock().unwrap() += 1;
-        p.enter(&mut Cx::new(&mut cfg, false, now()));
+        p.enter(&mut Cx::new(&mut cfg, now()));
         assert_eq!(*RAN.lock().unwrap(), 0);
         assert!(p.stats_note().is_some());
     }
@@ -946,7 +947,7 @@ mod tests {
         let mut cfg = Config::default();
         let mut p = new_page(Fake::new(many(300)));
         p.env.spawn = |_job| {}; // the totals worker never finishes
-        p.enter(&mut Cx::new(&mut cfg, false, now()));
+        p.enter(&mut Cx::new(&mut cfg, now()));
         assert_eq!(p.stats_note().unwrap(), "Newest 200 entries \u{b7} 200 dictations \u{b7} 400 words \u{b7} avg 840 ms");
     }
 
@@ -955,7 +956,7 @@ mod tests {
         let mut cfg = Config::default();
         let fake = Fake::new(many(450));
         let mut p = entered(fake.clone(), &mut cfg);
-        let mut cx = Cx::new(&mut cfg, false, now());
+        let mut cx = Cx::new(&mut cfg, now());
         // Live filtering only sees the loaded 200 (ids 251..450): nothing there matches.
         p.event(F_SEARCH, Event::Edited("note007".into()), &mut cx);
         assert!(rows(&p).is_empty());
@@ -993,7 +994,7 @@ mod tests {
                 j();
             }
         };
-        let mut cx = Cx::new(&mut cfg, false, now());
+        let mut cx = Cx::new(&mut cfg, now());
         p.enter(&mut cx);
         run_all();
         p.event(F_SEARCH, Event::Committed("note001".into()), &mut cx);
@@ -1017,7 +1018,7 @@ mod tests {
     fn row_events_open_the_detail_or_copy() {
         let mut cfg = Config::default();
         let mut p = entered(Fake::new(sample()), &mut cfg);
-        let mut cx = Cx::new(&mut cfg, false, now());
+        let mut cx = Cx::new(&mut cfg, now());
         assert_eq!(p.row_event(0, Event::Activated, &mut cx), vec![Effect::Navigate(Route::HistoryEntry(5))]);
         assert_eq!(p.row_event(0, Event::Copy, &mut cx), vec![Effect::CopyText("Ship it on Friday.".into()), Effect::Toast("Copied to clipboard".into())]);
         assert_eq!(p.row_event(2, Event::Activated, &mut cx), vec![Effect::Navigate(Route::HistoryEntry(2))], "index is into the visible rows");
@@ -1030,8 +1031,8 @@ mod tests {
         let store = Fake::new(sample());
         let e = env(store.clone());
         let mut list = HistoryPage::new(e.clone());
-        list.enter(&mut Cx::new(&mut cfg, false, now()));
-        list.row_event(0, Event::Activated, &mut Cx::new(&mut cfg, false, now()));
+        list.enter(&mut Cx::new(&mut cfg, now()));
+        list.row_event(0, Event::Activated, &mut Cx::new(&mut cfg, now()));
         // The file no longer has it (e.g. it was far back and the store would have to scan for it).
         store.entries.lock().unwrap().clear();
         let mut p = EntryPage::new(e.clone(), 5);
@@ -1047,7 +1048,7 @@ mod tests {
     fn clear_all_confirms_then_asks_the_daemon_and_empties_the_page() {
         let mut cfg = Config::default();
         let mut p = entered(Fake::new(sample()), &mut cfg);
-        let mut cx = Cx::new(&mut cfg, false, now());
+        let mut cx = Cx::new(&mut cfg, now());
         let fx = p.event(B_CLEAR, Event::Pressed, &mut cx);
         assert!(matches!(&fx[..], [Effect::Confirm { destructive: true, on_confirm: ConfirmId::HistoryClear, .. }]));
         assert_eq!(p.pool.len(), 5, "nothing happens before the confirmation");
@@ -1070,7 +1071,7 @@ mod tests {
     fn history_off_shows_a_banner_and_the_empty_state_says_so() {
         let mut cfg = Config { history_enabled: false, ..Config::default() };
         let p = entered(Fake::new(Vec::new()), &mut cfg);
-        let cx = Cx::new(&mut cfg, false, now());
+        let cx = Cx::new(&mut cfg, now());
         let snap = snapshot(&p, &cx);
         println!("{snap}");
         assert!(snap.contains("banner[Warn]: History is off"), "{snap}");
@@ -1083,7 +1084,7 @@ mod tests {
         let mut cfg = Config::default();
         let only = vec![Entry { status: Status::Discarded, ..e(1, 10, "") }];
         let p = entered(Fake::new(only), &mut cfg);
-        let cx = Cx::new(&mut cfg, false, now());
+        let cx = Cx::new(&mut cfg, now());
         assert!(p.items(&cx).iter().any(|i| matches!(i, Item::Note(n) if n.contains("Show discarded"))));
     }
 
@@ -1101,7 +1102,7 @@ mod tests {
     fn row_ids_are_unique_and_do_not_collide_with_page_items() {
         let mut cfg = Config::default();
         let p = entered(Fake::new(many(150)), &mut cfg);
-        let cx = Cx::new(&mut cfg, false, now());
+        let cx = Cx::new(&mut cfg, now());
         let fixed: Vec<ItemId> = p.items(&cx).iter().chain(p.tail_items(&cx).iter()).filter_map(Item::id).collect();
         let mut seen = HashSet::new();
         for i in 0..p.view.len() {
@@ -1117,7 +1118,7 @@ mod tests {
     }
 
     fn open(p: &mut EntryPage, cfg: &mut Config) {
-        p.enter(&mut Cx::new(cfg, false, now()));
+        p.enter(&mut Cx::new(cfg, now()));
     }
 
     #[test]
@@ -1125,18 +1126,18 @@ mod tests {
         let mut cfg = Config::default();
         let mut p = detail(2, sample());
         open(&mut p, &mut cfg);
-        let snap = dump(&p.items(&Cx::new(&mut cfg, false, now())));
+        let snap = dump(&p.items(&Cx::new(&mut cfg, now())));
         println!("{snap}");
         let want = [
             "note: Oct 2, 2026, 08:00 \u{b7} Outlook",
             "note: Groq \u{b7} whisper-large-v3-turbo \u{b7} 840 ms",
             "banner[Info]: Rewritten by AI because the dictation ended with the rewrite phrase. The text below is the concise version.",
             "== Text",
-            "note: Send the report tomorrow.",
+            "text: Send the report tomorrow.",
             "== Before the rewrite",
-            "note: send the report tomorrow morning if possible thanks",
+            "text: send the report tomorrow morning if possible thanks",
             "== Raw transcript",
-            "note: send the report tomorrow morning if possible thanks rewrite this concisely",
+            "text: send the report tomorrow morning if possible thanks rewrite this concisely",
             "space 6",
             "#1 button Copy text [Primary]",
             "#2 button Copy raw transcript [Outline]",
@@ -1145,7 +1146,7 @@ mod tests {
         ]
         .join("\n");
         assert_eq!(snap, want);
-        let mut cx = Cx::new(&mut cfg, false, now());
+        let mut cx = Cx::new(&mut cfg, now());
         assert_eq!(p.event(B_COPY_ORIGINAL, Event::Pressed, &mut cx), vec![Effect::CopyText("send the report tomorrow morning if possible thanks".into()), Effect::Toast("Copied to clipboard".into())]);
         assert_eq!(p.event(B_COPY_RAW, Event::Pressed, &mut cx)[0], Effect::CopyText("send the report tomorrow morning if possible thanks rewrite this concisely".into()));
         assert_eq!(p.event(B_COPY, Event::Pressed, &mut cx)[0], Effect::CopyText("Send the report tomorrow.".into()));
@@ -1157,8 +1158,8 @@ mod tests {
         let old = Entry { rewritten: true, original: None, ..e(1, now() - 1000, "Short.") };
         let mut p = detail(1, vec![old]);
         open(&mut p, &mut cfg);
-        let snap = dump(&p.items(&Cx::new(&mut cfg, false, now())));
-        assert!(snap.contains("== Before the rewrite\nnote: (not saved)") && !snap.contains("Copy text before"), "{snap}");
+        let snap = dump(&p.items(&Cx::new(&mut cfg, now())));
+        assert!(snap.contains("== Before the rewrite\ntext: (not saved)") && !snap.contains("Copy text before"), "{snap}");
     }
 
     #[test]
@@ -1166,9 +1167,9 @@ mod tests {
         let mut cfg = Config::default();
         let mut p = detail(1, sample());
         open(&mut p, &mut cfg);
-        let snap = dump(&p.items(&Cx::new(&mut cfg, false, now())));
+        let snap = dump(&p.items(&Cx::new(&mut cfg, now())));
         assert!(!snap.contains("Raw transcript") && !snap.contains("Before the rewrite") && !snap.contains("Retry"), "{snap}");
-        assert!(snap.contains("Dec 31, 2025, 23:00") && snap.contains("== Text\nnote: Happy new year"), "{snap}");
+        assert!(snap.contains("Dec 31, 2025, 23:00") && snap.contains("== Text\ntext: Happy new year"), "{snap}");
     }
 
     #[test]
@@ -1176,8 +1177,8 @@ mod tests {
         let mut cfg = Config::default();
         let mut p = detail(5, sample());
         open(&mut p, &mut cfg);
-        let snap = dump(&p.items(&Cx::new(&mut cfg, false, now())));
-        assert!(snap.contains("banner[Info]: Cleaned up by AI.") && snap.contains("== Raw transcript\nnote: uh ship it on friday"), "{snap}");
+        let snap = dump(&p.items(&Cx::new(&mut cfg, now())));
+        assert!(snap.contains("banner[Info]: Cleaned up by AI.") && snap.contains("== Raw transcript\ntext: uh ship it on friday"), "{snap}");
         assert!(snap.contains("Oct 9, 2026, 11:30 \u{b7} Slack"), "{snap}");
     }
 
@@ -1187,23 +1188,23 @@ mod tests {
         let list = vec![Entry { status: Status::Failed, error: Some("timeout".into()), text: String::new(), raw: String::new(), ..e(9, now() - 1000, "") }, e(8, now() - 5000, "older")];
         let mut p = detail(9, list);
         open(&mut p, &mut cfg);
-        let snap = dump(&p.items(&Cx::new(&mut cfg, false, now())));
+        let snap = dump(&p.items(&Cx::new(&mut cfg, now())));
         println!("{snap}");
         assert!(snap.starts_with("banner[Err]: timeout"), "{snap}");
         assert!(snap.contains("#4 button Retry transcription [Outline]") && !snap.contains("Copy text"), "{snap}");
         assert!(snap.contains("note: No transcript was recorded."));
-        let fx = p.event(B_RETRY, Event::Pressed, &mut Cx::new(&mut cfg, false, now()));
+        let fx = p.event(B_RETRY, Event::Pressed, &mut Cx::new(&mut cfg, now()));
         assert_eq!(fx, vec![Effect::Do(PopupAction::Retry), Effect::Toast("Retrying the last dictation".into()), Effect::Back]);
         // Without the kept recording there is nothing to retry, and the button is gone.
         cfg.keep_failed_audio = false;
-        assert!(!dump(&p.items(&Cx::new(&mut cfg, false, now()))).contains("Retry"));
-        assert!(p.event(B_RETRY, Event::Pressed, &mut Cx::new(&mut cfg, false, now())).is_empty());
+        assert!(!dump(&p.items(&Cx::new(&mut cfg, now()))).contains("Retry"));
+        assert!(p.event(B_RETRY, Event::Pressed, &mut Cx::new(&mut cfg, now())).is_empty());
         // An older failed entry cannot be retried even with the recording kept.
         cfg.keep_failed_audio = true;
         let older_failed = vec![e(10, now(), "newer"), Entry { status: Status::Failed, ..e(9, now() - 1000, "") }];
         let mut q = detail(9, older_failed);
         open(&mut q, &mut cfg);
-        assert!(!dump(&q.items(&Cx::new(&mut cfg, false, now()))).contains("Retry"));
+        assert!(!dump(&q.items(&Cx::new(&mut cfg, now()))).contains("Retry"));
     }
 
     #[test]
@@ -1211,7 +1212,7 @@ mod tests {
         let mut cfg = Config::default();
         let mut p = detail(3, vec![Entry { status: Status::Discarded, duration_ms: 400, ..e(3, now() - 1000, "") }]);
         open(&mut p, &mut cfg);
-        let snap = dump(&p.items(&Cx::new(&mut cfg, false, now())));
+        let snap = dump(&p.items(&Cx::new(&mut cfg, now())));
         assert!(snap.contains("banner[Warn]: Discarded") && snap.contains("Recover recording") && snap.contains("400 ms of speech"), "{snap}");
         assert!(!snap.contains("No transcript was recorded"), "a discarded recording has no transcript by design");
     }
@@ -1223,9 +1224,9 @@ mod tests {
         let tomb: Arc<Mutex<Tombstones>> = Arc::default();
         let mk = |tomb: &Arc<Mutex<Tombstones>>| Env { store: fake.clone(), spawn: inline, tomb: tomb.clone(), handoff: Arc::default(), offset_of: utc };
         let mut list = HistoryPage::new(mk(&tomb));
-        list.enter(&mut Cx::new(&mut cfg, false, now()));
+        list.enter(&mut Cx::new(&mut cfg, now()));
         let mut d = EntryPage::new(mk(&tomb), 2);
-        let mut cx = Cx::new(&mut cfg, false, now());
+        let mut cx = Cx::new(&mut cfg, now());
         d.enter(&mut cx);
         let fx = d.event(B_DELETE, Event::Pressed, &mut cx);
         assert!(matches!(&fx[..], [Effect::Confirm { destructive: true, on_confirm: ConfirmId::HistoryDelete(2), .. }]));
@@ -1246,7 +1247,7 @@ mod tests {
         let mut cfg = Config::default();
         let mut p = detail(404, sample());
         open(&mut p, &mut cfg);
-        let mut cx = Cx::new(&mut cfg, false, now());
+        let mut cx = Cx::new(&mut cfg, now());
         assert_eq!(dump(&p.items(&cx)), "note: This dictation is no longer in your history.");
         assert!(p.event(B_DELETE, Event::Pressed, &mut cx).is_empty());
     }
@@ -1254,7 +1255,7 @@ mod tests {
     #[test]
     fn real_constructors_build_pages_that_survive_an_empty_or_missing_history() {
         let mut cfg = Config::default();
-        let mut cx = Cx::new(&mut cfg, false, now());
+        let mut cx = Cx::new(&mut cfg, now());
         let mut m = model();
         m.enter(&mut cx);
         assert_eq!(m.title(), "History");

@@ -58,7 +58,7 @@ mod tests {
         for r in routes {
             let mut cfg = Config::default();
             let mut m = crate::daemon::tray::page::model_for(&r).unwrap();
-            let mut cx = Cx::new(&mut cfg, false, 0);
+            let mut cx = Cx::new(&mut cfg, 0);
             m.enter(&mut cx);
             let ids: Vec<ItemId> = m.items(&cx).iter().filter_map(Item::id).collect();
             let mut sorted = ids.clone();
@@ -76,7 +76,7 @@ mod tests {
         for s in Section::ALL {
             let mut cfg = Config::default();
             let mut m = model(s);
-            let mut cx = Cx::new(&mut cfg, false, 0);
+            let mut cx = Cx::new(&mut cfg, 0);
             for ev in [Event::Pressed, Event::Activated, Event::Toggled(true), Event::Picked(7), Event::Committed("x".into()), Event::Deleted, Event::Copy] {
                 assert!(m.event(60000, ev, &mut cx).is_empty(), "{s:?}");
             }
@@ -90,7 +90,7 @@ mod tests {
     fn navigation_targets_exist() {
         let mut cfg = Config::default();
         let mut m = index_model();
-        let mut cx = Cx::new(&mut cfg, false, 0);
+        let mut cx = Cx::new(&mut cfg, 0);
         let ids: Vec<ItemId> = m.items(&cx).iter().filter_map(Item::id).collect();
         for id in ids {
             for fx in m.event(id, Event::Activated, &mut cx) {

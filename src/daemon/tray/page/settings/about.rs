@@ -77,7 +77,7 @@ mod tests {
     #[test]
     fn page_text_snapshot() {
         let mut cfg = Config::default();
-        let cx = Cx::new(&mut cfg, false, 0);
+        let cx = Cx::new(&mut cfg, 0);
         let text = dump("About", &AboutPage.items(&cx))
             .lines()
             .map(|l| if l.contains("live in ") { "  note: Settings, history and logs live in <data folder>".to_string() } else { l.replace(env!("CARGO_PKG_VERSION"), "<version>") })
@@ -89,7 +89,7 @@ mod tests {
     #[test]
     fn folders_open_through_the_shell() {
         let mut cfg = Config::default();
-        let mut cx = Cx::new(&mut cfg, false, 0);
+        let mut cx = Cx::new(&mut cfg, 0);
         assert_eq!(AboutPage.event(ID_OPEN_DATA, Event::Pressed, &mut cx), vec![Effect::OpenPath(crate::core::paths::app_dir())]);
         assert_eq!(AboutPage.event(ID_OPEN_LOGS, Event::Pressed, &mut cx), vec![Effect::OpenPath(crate::core::paths::log_dir())]);
     }
@@ -98,7 +98,7 @@ mod tests {
     fn reset_asks_first_then_resets_the_daemon_and_this_copy() {
         let mut cfg = Config { hotkey: "F8".into(), ..Config::default() };
         let mut p = AboutPage;
-        let mut cx = Cx::new(&mut cfg, false, 0);
+        let mut cx = Cx::new(&mut cfg, 0);
         let fx = p.event(ID_RESET, Event::Pressed, &mut cx);
         assert!(matches!(&fx[0], Effect::Confirm { destructive: true, on_confirm: ConfirmId::ResetApp, .. }));
         assert_eq!(cx.cfg.hotkey, "F8", "nothing changes before the confirmation");
@@ -112,7 +112,7 @@ mod tests {
     #[test]
     fn version_row_shows_the_package_version() {
         let mut cfg = Config::default();
-        let cx = Cx::new(&mut cfg, false, 0);
+        let cx = Cx::new(&mut cfg, 0);
         assert!(AboutPage.items(&cx).iter().any(|i| matches!(i, Item::Row(r) if matches!(&r.trailing, Trailing::Badge { text, .. } if text == &format!("v{}", env!("CARGO_PKG_VERSION"))))));
     }
 }

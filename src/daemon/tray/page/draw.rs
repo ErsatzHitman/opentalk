@@ -284,6 +284,11 @@ fn draw_item(p: &mut Painter, o: Off, item: &Item, pl: &Placed, st: &St) {
                 p.text(l, FS_SMALL, 400, o.x(rc.l), o.y(rc.t + 2.0 + LINE_SMALL * (i as f32 + 0.5)), th.muted, 1.0);
             }
         }
+        Item::Text(_) => {
+            for (i, l) in pl.lines.iter().enumerate() {
+                p.text(l, FS_BODY, 400, o.x(rc.l), o.y(rc.t + 2.0 + LINE_BODY * (i as f32 + 0.5)), th.fg, 1.0);
+            }
+        }
         Item::Banner { tone, text: _ } => {
             let c = tone_color(&th, *tone);
             let card = Rect::new(o.x(rc.l), o.y(rc.t), o.x(rc.r), o.y(rc.b - layout::CARD_GAP));
@@ -613,6 +618,29 @@ fn preview_model(_name: &str) -> Option<Box<dyn super::PageModel>> {
     None
 }
 
+/// The route a `--page` name names: everything `Route::parse` accepts, plus the routes no launch
+/// argument reaches: `entry:<id>` (a history entry), `picker:<name>` (`language`, `inputdevice`,
+/// `micwarm`, `retention`, `sttprovider`, `llmprovider`, `llmmodel`), `snippet:new` and
+/// `snippet:<index>`.
+fn cli_route(name: &str) -> super::Route {
+    use super::{PickerId, Route};
+    let lower = name.trim().to_ascii_lowercase();
+    if let Some(id) = lower.strip_prefix("entry:").and_then(|n| n.parse().ok()) {
+        return Route::HistoryEntry(id);
+    }
+    if let Some(p) = lower.strip_prefix("picker:") {
+        if let Some(id) = PickerId::ALL.iter().find(|id| format!("{id:?}").eq_ignore_ascii_case(p)) {
+            return Route::Picker(*id);
+        }
+    }
+    match lower.strip_prefix("snippet:") {
+        Some("new") => return Route::SnippetEdit(None),
+        Some(i) if i.parse::<usize>().is_ok() => return Route::SnippetEdit(i.parse().ok()),
+        _ => {}
+    }
+    Route::parse(Some(name))
+}
+
 /// Options of a page render beyond `--dark` / `--scale` / `--no-text`.
 #[derive(Default)]
 pub struct PageCli {
@@ -646,14 +674,17 @@ pub fn render_page_cli(name: &str, o: &PageCli) -> Result<Pixmap, String> {
     let (route, model) = match preview_model(name) {
         Some(model) => (Route::SettingsIndex, model),
         None => {
-            let route = Route::parse(Some(name));
+            let route = cli_route(name);
             match super::model_for(&route) {
                 Some(model) => (route, model),
                 None => return Err(format!("no page '{name}'")),
             }
         }
     };
-    let mut pg = Pager::new(crate::core::config::Config::default(), o.dark, o.card_h, noop_waker());
+    // A seeded data directory (`OPENTALK_HOME`) supplies the config, so pages show real words,
+    // snippets and keys; otherwise the defaults keep every render deterministic.
+    let cfg = if std::env::var_os("OPENTALK_HOME").is_some() { crate::core::config::Config::load() } else { crate::core::config::Config::default() };
+    let mut pg = Pager::new(cfg, o.dark, o.card_h, noop_waker());
     let mut clip = MemClip::default();
     let mut r = PResp::default();
     pg.push_model(route, model, m, &mut r);
@@ -676,7 +707,7 @@ pub fn render_page_cli(name: &str, o: &PageCli) -> Result<Pixmap, String> {
         pg.pointer(Some((x, y)), false, m, &mut clip);
     }
     if let Some(id) = o.focus {
-        let mut cx = super::Cx::new(&mut pg.cfg, o.dark, 0);
+        let mut cx = super::Cx::new(&mut pg.cfg, 0);
         if let Some(s) = pg.stack.last_mut() {
             s.focus_item(id, &mut cx, m);
         }

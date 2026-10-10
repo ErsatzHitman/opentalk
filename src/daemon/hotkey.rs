@@ -665,11 +665,6 @@ pub fn validate(accel: &str) -> Option<&'static str> {
     }
 }
 
-/// The keys of an accelerator as separate label parts, for key caps ("Control+Super" -> Ctrl, Win).
-pub fn label_parts(accel: &str) -> Vec<String> {
-    label(accel).split(" + ").filter(|s| !s.is_empty()).map(str::to_string).collect()
-}
-
 /// Outcome of a finished capture.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Captured {
@@ -915,6 +910,7 @@ impl<K: KeyState> Matcher<K> {
         self.reset()
     }
 
+    #[cfg(test)]
     pub fn capture_active(&self) -> bool {
         self.cap.active
     }
@@ -1419,10 +1415,6 @@ pub fn end_capture() {
     }
 }
 
-pub fn capture_active() -> bool {
-    lock_matcher().capture_active()
-}
-
 /// The accelerator typed so far ("" when nothing usable yet).
 pub fn capture_preview() -> String {
     lock_matcher().capture_preview()
@@ -1458,7 +1450,8 @@ pub fn capture_msg(ev: HotkeyEvent) -> Option<CaptureMsg> {
     }
 }
 
-/// Record again after a rejected combination.
+/// Record again after a rejected combination: capture stays on, keys of the rejected gesture that
+/// are still down stay swallowed until released.
 pub fn capture_rearm() {
     lock_matcher().capture_rearm();
 }
@@ -3157,9 +3150,8 @@ mod capture_tests {
     }
 
     #[test]
-    fn labels_parts_and_validation() {
+    fn labels_and_validation() {
         assert_eq!(label("Control+Super"), "Ctrl + Win");
-        assert_eq!(label_parts("Control+Super"), vec!["Ctrl", "Win"]);
         assert!(validate("Control+Super").is_none());
         assert!(validate("F8").is_none());
         assert!(validate("A").is_some());

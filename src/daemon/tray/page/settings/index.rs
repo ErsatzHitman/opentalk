@@ -90,19 +90,19 @@ mod tests {
     #[test]
     fn page_text_snapshot() {
         let mut cfg = Config::default();
-        let cx = Cx::new(&mut cfg, false, 0);
+        let cx = Cx::new(&mut cfg, 0);
         snapshot!("index", dump("Settings", &IndexPage.items(&cx)));
         cfg.ai_cleanup.rewrite_enabled = false;
         cfg.hotkey = "F8".into();
         cfg.stt.provider = crate::core::config::SttProviderId::Groq;
-        let cx = Cx::new(&mut cfg, false, 0);
+        let cx = Cx::new(&mut cfg, 0);
         snapshot!("index_rewrite_off", dump("Settings", &IndexPage.items(&cx)));
     }
 
     #[test]
     fn every_section_has_exactly_one_row_that_opens_it() {
         let mut cfg = Config::default();
-        let mut cx = Cx::new(&mut cfg, false, 0);
+        let mut cx = Cx::new(&mut cfg, 0);
         let mut p = IndexPage;
         for s in Section::ALL {
             let rows = p.items(&cx).into_iter().filter(|i| matches!(i, Item::Row(r) if r.primary == s.label())).count();
@@ -114,7 +114,7 @@ mod tests {
     #[test]
     fn rewrite_shortcut_jumps_to_the_trigger_field() {
         let mut cfg = Config::default();
-        let mut cx = Cx::new(&mut cfg, false, 0);
+        let mut cx = Cx::new(&mut cfg, 0);
         let mut p = IndexPage;
         assert_eq!(p.event(ID_REWRITE, Event::Activated, &mut cx), vec![Effect::Navigate(Route::Settings(Section::Cleanup)), Effect::Focus(ID_RW_TRIGGER)]);
         cx.cfg.ai_cleanup.rewrite_enabled = false;
@@ -125,7 +125,7 @@ mod tests {
     fn rewrite_row_shows_the_phrase_or_why_it_is_off() {
         let mut cfg = Config::default();
         let secondary = |cfg: &mut Config| {
-            let cx = Cx::new(cfg, false, 0);
+            let cx = Cx::new(cfg, 0);
             IndexPage.items(&cx).into_iter().find_map(|i| match i {
                 Item::Row(r) if r.id == ID_REWRITE => Some(r.secondary),
                 _ => None,
@@ -141,7 +141,7 @@ mod tests {
     #[test]
     fn rows_that_show_a_setting_follow_the_config() {
         let mut cfg = Config { hotkey: "Control+Shift+Space".into(), ..Config::default() };
-        let cx = Cx::new(&mut cfg, false, 0);
+        let cx = Cx::new(&mut cfg, 0);
         let items = IndexPage.items(&cx);
         let trailing = |label: &str| items.iter().find_map(|i| match i {
             Item::Row(r) if r.primary == label => Some(r.trailing.clone()),
@@ -155,7 +155,7 @@ mod tests {
     #[test]
     fn unknown_ids_and_other_events_do_nothing() {
         let mut cfg = Config::default();
-        let mut cx = Cx::new(&mut cfg, false, 0);
+        let mut cx = Cx::new(&mut cfg, 0);
         assert!(IndexPage.event(99, Event::Activated, &mut cx).is_empty());
         assert!(IndexPage.event(ID_SECTION0, Event::Pressed, &mut cx).is_empty());
     }

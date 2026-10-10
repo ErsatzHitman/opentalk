@@ -252,7 +252,7 @@ mod tests {
     #[test]
     fn the_gallery_reacts_to_events() {
         let mut cfg = Config::default();
-        let mut cx = Cx::new(&mut cfg, false, 0);
+        let mut cx = Cx::new(&mut cfg, 0);
         let mut g = gallery_model();
         g.event(2, Event::Toggled(true), &mut cx);
         g.event(4, Event::Picked(0), &mut cx);
@@ -270,7 +270,7 @@ mod tests {
     #[test]
     fn the_long_list_is_virtual() {
         let mut cfg = Config::default();
-        let cx = Cx::new(&mut cfg, false, 0);
+        let cx = Cx::new(&mut cfg, 0);
         let m = long_list_model();
         let v = m.virtual_rows().unwrap();
         assert_eq!((v.count, v.row_h), (500, 64.0));

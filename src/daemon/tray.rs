@@ -150,10 +150,11 @@ pub fn popup_test_done(result: page::TestResult) {
     popup_win::deliver_test(result);
 }
 
-/// Register `hotkey::begin_capture` / `hotkey::end_capture`; the popup calls them when a hotkey
-/// field starts or ends capturing (and on close, so a capture can never outlive the popup).
-pub fn set_hotkey_capture_hooks(begin: fn(), end: fn()) {
-    popup_win::set_capture_hooks(begin, end);
+/// Register `hotkey::begin_capture` / `end_capture` / `capture_rearm`; the popup calls them when
+/// a hotkey field starts, ends or restarts capturing (and on close, so a capture can never outlive
+/// the popup).
+pub fn set_hotkey_capture_hooks(begin: fn(), end: fn(), rearm: fn()) {
+    popup_win::set_capture_hooks(begin, end, rearm);
 }
 
 /// Is the popup open right now?

@@ -68,6 +68,7 @@ pub struct KeyEv {
 }
 
 impl KeyEv {
+    #[cfg(test)]
     pub fn plain(k: K) -> KeyEv {
         KeyEv { k, shift: false, ctrl: false, alt: false }
     }
@@ -212,11 +213,6 @@ impl Session {
     /// it positions clamped to the body while the button stays down.
     pub fn dragging(&self) -> bool {
         self.scroll.dragging() || self.edit.as_ref().is_some_and(|fe| fe.dragging)
-    }
-
-    pub fn set_view_h(&mut self, h: f32) {
-        self.scroll.resize(h, self.layout.content_h);
-        self.refresh_hover();
     }
 
     /// The item of a focus target (a virtual row is built on demand).
@@ -819,13 +815,13 @@ mod tests {
         let model = Rec { items, log: log.clone(), rows, row_log: row_log.clone(), reply: Vec::new() };
         let mut s = Session::new(Route::SettingsIndex, Box::new(model), VIEW_H);
         let mut cfg = Config::default();
-        s.rebuild(&Cx::new(&mut cfg, false, 0), &FixedMetrics);
+        s.rebuild(&Cx::new(&mut cfg, 0), &FixedMetrics);
         T { s, cfg, clip: MemClip::default(), log, rows: row_log }
     }
 
     impl T {
         fn env<R>(&mut self, f: impl FnOnce(&mut Session, &mut Env) -> R) -> R {
-            let mut cx = Cx::new(&mut self.cfg, false, 0);
+            let mut cx = Cx::new(&mut self.cfg, 0);
             let mut env = Env { cx: &mut cx, m: &FixedMetrics, clip: &mut self.clip };
             f(&mut self.s, &mut env)
         }
@@ -978,7 +974,7 @@ mod tests {
         let mut t = setup(vec![field(1, "x", FieldKind::Text)], 0);
         t.click_item(1);
         t.type_text("!");
-        let mut cx = Cx::new(&mut t.cfg, false, 0);
+        let mut cx = Cx::new(&mut t.cfg, 0);
         let fx = t.s.flush(&mut cx, &FixedMetrics);
         assert!(fx.is_empty());
         assert!(t.log.borrow().contains(&(1, Event::Committed("x!".into()))));
@@ -1235,7 +1231,7 @@ mod tests {
         // Rebuild with the field gone.
         let model = Rec { items: vec![toggle(2)], log: t.log.clone(), rows: 0, row_log: t.rows.clone(), reply: Vec::new() };
         t.s.model = Box::new(model);
-        t.s.rebuild(&Cx::new(&mut cfg, false, 0), &FixedMetrics);
+        t.s.rebuild(&Cx::new(&mut cfg, 0), &FixedMetrics);
         assert_eq!(t.s.focus, None);
         assert!(t.s.edit.is_none());
     }
