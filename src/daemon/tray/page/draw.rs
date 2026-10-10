@@ -16,7 +16,7 @@ use super::metrics::TextMetrics;
 use super::pager::{Confirm, BACK, Pager, STRIP_H, confirm_geo};
 use super::scroll::BAR_W;
 use super::session::{FieldEdit, Session, text_area, text_origin};
-use super::{BtnStyle, CARD_W_PAGE, FieldKind, Item, PAGE_HEADER_H, Row, Tone, Trailing};
+use super::{BtnStyle, CARD_W_PAGE, FieldKind, Item, Lead, PAGE_HEADER_H, Row, Tone, ToolTone, Trailing};
 use crate::daemon::pill::kit::{Canvas, Rect, Rgba, sd_round_box};
 use crate::daemon::tray::popup::{MARGIN, R, RADIUS};
 use crate::daemon::tray::popup_draw::{Icon, Theme, WHITE, draw_icon, rr, theme};
@@ -277,6 +277,10 @@ fn draw_item(p: &mut Painter, o: Off, item: &Item, pl: &Placed, st: &St) {
     let wide = |r: R| R::new(r.l - 6.0, r.t, r.r + 6.0, r.b);
     match item {
         Item::Group(t) => {
+            // a hairline opens every section but the first, so the page reads as clear blocks
+            if rc.t > layout::PAD_TOP + 0.5 {
+                p.hline(o.x(rc.l), o.x(rc.r), o.y(rc.t + 5.0), th.border, 1.0);
+            }
             p.text(t, FS_GROUP, 600, o.x(rc.l), o.y(rc.t + 21.0), th.muted, 1.0);
         }
         Item::Note(_) => {
@@ -350,35 +354,38 @@ fn draw_item(p: &mut Painter, o: Off, item: &Item, pl: &Placed, st: &St) {
                 p.focus_ring(row, 8.0);
             }
         }
-        Item::Radio { label, on, .. } => {
-            let card = Rect::new(o.x(rc.l), o.y(rc.t), o.x(rc.r), o.y(rc.b - layout::CARD_GAP));
+        Item::Radio { label, desc, on, .. } => {
+            let row = o.r(wide(rc).inflate(-1.0));
             if *on {
-                p.fill(card, 8.0, th.primary, 0.08);
-                p.stroke(card, 8.0, 1.5, th.primary, 1.0);
-            } else {
-                if hovered || pressed {
-                    p.wash(card, 8.0, pressed);
-                }
-                p.stroke(card, 8.0, 1.0, th.border_hover, 1.0);
+                p.fill(row, 8.0, th.primary, 0.08);
+            } else if hovered || pressed {
+                p.wash(row, 8.0, pressed);
             }
-            let has_desc = !pl.lines.is_empty();
-            let cy = if has_desc { card.t + 11.0 + LINE_BODY * 0.5 } else { card.cy() };
-            p.radio_dot(card.l + 19.0, cy, *on);
-            let label = p.fit(label, FS_BODY, if *on { 600 } else { 400 }, rc.w() - 52.0);
-            p.text(&label, FS_BODY, if *on { 600 } else { 400 }, card.l + 38.0, cy, th.fg, 1.0);
-            for (i, l) in pl.lines.iter().enumerate() {
-                p.text(l, FS_SMALL, 400, card.l + 38.0, card.t + 11.0 + LINE_BODY + 1.0 + LINE_SMALL * (i as f32 + 0.5), th.muted, 1.0);
+            let cy = row.cy();
+            p.radio_dot(o.x(rc.l) + 9.0, cy, *on);
+            let wt = if *on { 600 } else { 400 };
+            let x0 = rc.l + 26.0;
+            let label = p.fit(label, FS_BODY, wt, rc.r - x0 - 8.0);
+            let lw = p.width(&label, FS_BODY, wt);
+            p.text(&label, FS_BODY, wt, o.x(x0), cy, th.fg, 1.0);
+            let room = rc.r - (x0 + lw + 10.0) - 4.0;
+            if !desc.is_empty() && room > 40.0 {
+                let d = p.fit(desc, FS_SMALL, 400, room);
+                p.text(&d, FS_SMALL, 400, o.x(x0 + lw + 10.0), cy, th.muted, 1.0);
             }
             if st.ring {
-                p.focus_ring(card, 8.0);
+                p.focus_ring(row, 8.0);
             }
         }
         Item::Field { label, hint, value, kind, error, .. } => {
             if !label.is_empty() {
                 p.text(label, 12.5, 400, o.x(rc.l), o.y(rc.t + 2.0 + LINE_BODY * 0.5), th.fg, 0.88);
             }
-            let ctl = o.r(pl.ctl);
+            let ctl = o.r(layout::field_frame(pl.ctl, *kind));
             p.input_box(ctl, hovered && st.edit.is_none(), st.edit.is_some() || st.capture.is_some() || (st.focused && st.ring), error.is_some());
+            if *kind == FieldKind::Search {
+                draw_icon(&mut p.cv, Icon::Search, ctl.l + 8.0, ctl.cy(), th.muted, 1.0);
+            }
             match kind {
                 FieldKind::Hotkey => draw_hotkey(p, o, pl.ctl, value, hint, st),
                 _ => draw_field_text(p, o, pl.ctl, value, hint, *kind, st),
@@ -392,6 +399,66 @@ fn draw_item(p: &mut Painter, o: Off, item: &Item, pl: &Placed, st: &St) {
         }
         Item::Button { label, style, enabled, .. } => {
             p.button(o.r(pl.ctl), label, *style, *enabled, hovered && *enabled, pressed && *enabled, st.ring);
+        }
+        Item::Tools { label, sub, tools, .. } => {
+            let row = o.r(wide(rc));
+            if st.hover == Some(Part::Body) || st.press == Some(Part::Body) {
+                p.wash(row, 8.0, st.press == Some(Part::Body));
+            }
+            let max_w = (pl.ctl.l - 12.0 - rc.l).max(40.0);
+            let cy = if sub.is_empty() { rc.cy() } else { rc.cy() - 8.0 };
+            let label = p.fit(label, FS_BODY, 400, max_w);
+            p.text(&label, FS_BODY, 400, o.x(rc.l), o.y(cy), th.fg, 1.0);
+            // the hovered button says what it does where the second line is
+            let hov = match st.hover {
+                Some(Part::Seg(i)) => tools.get(i).map(|t| t.tip.as_str()),
+                _ => None,
+            };
+            let second = hov.unwrap_or(sub);
+            if !second.is_empty() {
+                let t = p.fit(second, FS_SMALL, 400, max_w);
+                let y = if sub.is_empty() { rc.cy() } else { rc.cy() + 9.0 };
+                if sub.is_empty() {
+                    // no second line: the tip sits right of the label
+                    let lw = p.width(&label, FS_BODY, 400);
+                    let tw = p.width(&t, FS_SMALL, 400);
+                    if rc.l + lw + 16.0 + tw <= pl.ctl.l - 8.0 {
+                        p.text(&t, FS_SMALL, 400, o.x(pl.ctl.l - 8.0 - tw), o.y(y), th.muted, 1.0);
+                    }
+                } else {
+                    p.text(&t, FS_SMALL, 400, o.x(rc.l), o.y(y), th.muted, 1.0);
+                }
+            }
+            for (i, t) in tools.iter().enumerate() {
+                let r = o.r(layout::tool_rect(pl.ctl, i));
+                let (h, pr) = (st.hover == Some(Part::Seg(i)) && t.enabled, st.press == Some(Part::Seg(i)) && t.enabled);
+                let dim = if t.enabled { 1.0 } else { 0.38 };
+                let icon_c = match t.tone {
+                    ToolTone::Primary => {
+                        p.fill(r, 8.0, th.primary, dim * if pr { 0.8 } else if h { 0.9 } else { 1.0 });
+                        Rgba::hex(0xffffff)
+                    }
+                    ToolTone::Danger => {
+                        if h || pr {
+                            p.fill(r, 8.0, th.destructive, if pr { 0.2 } else { 0.12 });
+                        } else {
+                            p.stroke(r, 8.0, 1.0, th.border, 1.0);
+                        }
+                        th.destructive
+                    }
+                    ToolTone::Plain => {
+                        if h || pr {
+                            p.wash(r, 8.0, pr);
+                        }
+                        p.stroke(r, 8.0, 1.0, if h { th.border_hover } else { th.border }, 1.0);
+                        th.fg
+                    }
+                };
+                draw_icon(&mut p.cv, t.icon, r.cx() - 8.0, r.cy(), icon_c, dim * 0.9);
+            }
+            if st.ring {
+                p.focus_ring(row, 8.0);
+            }
         }
         Item::Result { ok, badge, .. } => {
             let c = if *ok { th.success } else { th.destructive };
@@ -522,9 +589,24 @@ fn draw_row(p: &mut Painter, o: Off, row: &Row, rc: R, btn: R, st: &St) {
         p.wash(full, 7.0, pressed && st.press != Some(Part::Trailing));
     }
     let trailing_w = layout::row_trailing_w(row, &|s, px, w| p.m.width(s, px, w));
-    let text_l = rc.l;
+    let lead_w = if row.lead == Lead::None { 0.0 } else { layout::LEAD_W };
+    let text_l = rc.l + lead_w;
     let text_r = rc.r - trailing_w - 2.0;
     let cy = rc.cy();
+    let app_row = matches!(row.lead, Lead::App { .. });
+    match &row.lead {
+        Lead::None => {}
+        Lead::Icon(ic) => draw_icon(&mut p.cv, *ic, o.x(rc.l) + 1.0, o.y(cy), th.fg, 0.75),
+        Lead::App { path, exe, name } => {
+            // beside the first line of a tall row, centred in a short one
+            let icy = if row.height >= 56.0 { rc.t + 22.0 } else { cy };
+            draw_app_icon(p, o.x(rc.l), o.y(icy), path.as_deref(), exe.as_deref(), name);
+        }
+    }
+    if app_row {
+        // list rows are separated by a hairline from the text edge to the right
+        p.hline(o.x(text_l), o.x(rc.r), o.y(rc.b - 0.5), th.border, 0.7);
+    }
 
     // Trailing content.
     match &row.trailing {
@@ -560,27 +642,30 @@ fn draw_row(p: &mut Painter, o: Off, row: &Row, rc: R, btn: R, st: &St) {
     if !row.meta.is_empty() && row.height >= 56.0 {
         let t = p.fit(&row.meta, 11.0, 400, 150.0);
         meta_w = p.width(&t, 11.0, 400);
-        p.text(&t, 11.0, 400, o.x(text_r) - meta_w, o.y(rc.t + 15.0), th.muted, 1.0);
+        p.text(&t, 11.0, 400, o.x(text_r) - meta_w, o.y(rc.t + if app_row { 12.0 } else { 15.0 }), th.muted, 1.0);
     }
 
     // Chips share the first line with the primary text.
     let chips_w: f32 = row.chips.iter().map(|(t, _)| p.width(t, 10.5, 600) + 12.0 + 4.0).sum();
     if row.height >= 56.0 {
+        // app rows (History): a small muted time line, the transcript in the body colour under it
+        let (y1, y2, step, pw8, pfs, pwt, pc) =
+            if app_row { (rc.t + 12.0, rc.t + 29.0, 15.5, 6.0, 11.5, 400, th.muted) } else { (rc.t + 15.0, rc.t + 33.0, 16.0, 8.0, 12.5, 600, th.fg) };
         let line1_r = text_r - if meta_w > 0.0 { meta_w + 10.0 } else { 0.0 };
         let pmax = (line1_r - text_l - chips_w).max(60.0);
-        let primary = p.fit(&row.primary, 12.5, 600, pmax);
-        let pw = p.width(&primary, 12.5, 600);
-        p.text(&primary, 12.5, 600, o.x(text_l), o.y(rc.t + 15.0), th.fg, 1.0);
-        let mut x = text_l + pw + 8.0;
+        let primary = p.fit(&row.primary, pfs, pwt, pmax);
+        let pw = p.width(&primary, pfs, pwt);
+        p.text(&primary, pfs, pwt, o.x(text_l), o.y(y1), pc, 1.0);
+        let mut x = text_l + pw + pw8;
         for (t, tone) in &row.chips {
-            x += p.chip(o.x(x), o.y(rc.t + 15.0), t, *tone) + 4.0;
+            x += p.chip(o.x(x), o.y(y1), t, *tone) + 4.0;
         }
         // Two lines of the transcript, the second cut with an ellipsis.
         let lines = layout::wrap_lines(&row.secondary, FS_SMALL + 0.5, 400, text_r - text_l, &|s, px, w| p.m.width(s, px, w));
         for (i, l) in lines.iter().take(2).enumerate() {
             let last = i == 1 && lines.len() > 2;
             let l = if last { p.fit(&format!("{l} \u{2026}"), FS_SMALL + 0.5, 400, text_r - text_l) } else { l.clone() };
-            p.text(&l, FS_SMALL + 0.5, 400, o.x(text_l), o.y(rc.t + 33.0 + i as f32 * 16.0), th.fg, 0.82);
+            p.text(&l, FS_SMALL + 0.5, 400, o.x(text_l), o.y(y2 + i as f32 * step), th.fg, if app_row { 0.95 } else { 0.82 });
         }
     } else if !row.secondary.is_empty() {
         let primary = p.fit(&row.primary, FS_BODY, 600, text_r - text_l - chips_w);
@@ -1055,4 +1140,44 @@ mod tests {
         }
         assert!(failures.is_empty(), "tray page golden mismatches:\n{}", failures.join("\n"));
     }
+}
+
+/// A 20 px app icon with its left edge at `x`, centred on `cy` (canvas logical px): the app's own
+/// icon, scaled to the device pixels, or a monogram of its name.
+fn draw_app_icon(p: &mut Painter, x: f32, cy: f32, path: Option<&str>, exe: Option<&str>, name: &str) {
+    const SIZE: f32 = 20.0;
+    let th = p.th;
+    let top = cy - SIZE * 0.5;
+    if let Some(ic) = super::appicons::get(path, exe) {
+        let s = p.cv.scale;
+        let n = (SIZE * s).round().max(1.0) as i32;
+        let (ox, oy) = ((x * s).round() as i32, (top * s).round() as i32);
+        let src = ic.size as f32;
+        let k = src / n as f32;
+        let at = |sx: i32, sy: i32, c: usize| -> f32 {
+            let (sx, sy) = (sx.clamp(0, ic.size as i32 - 1), sy.clamp(0, ic.size as i32 - 1));
+            ic.rgba[((sy * ic.size as i32 + sx) * 4) as usize + c] as f32 / 255.0
+        };
+        for dy in 0..n {
+            for dx in 0..n {
+                // bilinear sample of the premultiplied source at the device pixel's centre
+                let (fx, fy) = ((dx as f32 + 0.5) * k - 0.5, (dy as f32 + 0.5) * k - 0.5);
+                let (x0, y0) = (fx.floor() as i32, fy.floor() as i32);
+                let (tx, ty) = (fx - x0 as f32, fy - y0 as f32);
+                let mut px = [0.0f32; 4];
+                for (c, v) in px.iter_mut().enumerate() {
+                    let a = at(x0, y0, c) * (1.0 - tx) + at(x0 + 1, y0, c) * tx;
+                    let b = at(x0, y0 + 1, c) * (1.0 - tx) + at(x0 + 1, y0 + 1, c) * tx;
+                    *v = a * (1.0 - ty) + b * ty;
+                }
+                p.cv.blend(ox + dx, oy + dy, px);
+            }
+        }
+        return;
+    }
+    let r = Rect::new(x, top, x + SIZE, top + SIZE);
+    p.fill(r, 5.0, th.fg, 0.10);
+    let letter: String = name.chars().find(|c| c.is_alphanumeric()).map(|c| c.to_uppercase().collect()).unwrap_or_else(|| "?".into());
+    let w = p.width(&letter, 11.0, 600);
+    p.text(&letter, 11.0, 600, r.cx() - w * 0.5, r.cy(), th.fg, 0.8);
 }

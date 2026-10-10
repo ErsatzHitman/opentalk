@@ -7,8 +7,8 @@
 //! change); the field updates its masked view optimistically and re-reads the store on `refresh`.
 use std::path::PathBuf;
 
-use super::kit::{button, note};
-use crate::daemon::tray::page::{BtnStyle, ConfirmId, Effect, Event, FieldKind, Item, ItemId, PopupAction, Row, Tone, Trailing};
+use super::kit::note;
+use crate::daemon::tray::page::{ConfirmId, Effect, Event, FieldKind, Icon, Item, ItemId, PopupAction, Row, Tone, Tool, ToolTone, Trailing};
 
 /// Where the field reads secrets from (the real store, or a fake in tests).
 pub trait SecretStore {
@@ -123,32 +123,43 @@ impl KeyField {
             }));
             v.push(note(&format!("Set by {var}. Remove the variable to manage this key here.")));
         } else if self.input_visible() {
+            // the label line carries the actions, the input sits under it
+            let tools = self.input_tools().into_iter().map(|(_, t)| t).collect();
+            v.push(Item::Tools { id: base + OFF_SAVE, label: self.label.into(), sub: String::new(), tools });
             v.push(Item::Field {
                 id: base + OFF_FIELD,
-                label: self.label.into(),
+                label: String::new(),
                 hint: self.hint.into(),
                 value: self.buf.clone(),
                 kind: FieldKind::Secret,
                 error: None,
                 max_chars: 0,
             });
-            v.push(button(base + OFF_SAVE, &format!("Save {}", self.noun), BtnStyle::Primary, !self.buf.trim().is_empty()));
-            if self.stored.is_some() {
-                v.push(button(base + OFF_CANCEL, "Cancel", BtnStyle::Outline, true));
-            }
-            if !self.key_url.is_empty() {
-                v.push(button(base + OFF_GET, "Get a key", BtnStyle::Link, true));
-            }
         } else if let Some(m) = &self.stored {
-            v.push(Item::Row(Row {
-                trailing: Trailing::Badge { text: "Saved".into(), tone: Tone::Ok },
-                secondary: m.clone(),
-                ..Row::new(base + OFF_ROW, self.label, 44.0)
-            }));
-            v.push(button(base + OFF_REPLACE, &format!("Replace {}", self.noun), BtnStyle::Outline, true));
-            v.push(button(base + OFF_REMOVE, &format!("Remove {}", self.noun), BtnStyle::Destructive, true));
+            v.push(Item::Tools {
+                id: base + OFF_ROW,
+                label: self.label.into(),
+                sub: m.clone(),
+                tools: vec![
+                    Tool::new(Icon::Pencil, &format!("Replace {}", self.noun), ToolTone::Plain, true),
+                    Tool::new(Icon::Trash, &format!("Remove {}", self.noun), ToolTone::Danger, true),
+                ],
+            });
         }
         v
+    }
+
+    /// The icon buttons under the input, with the offset of the button each one stands for.
+    fn input_tools(&self) -> Vec<(ItemId, Tool)> {
+        let mut t = Vec::new();
+        if !self.key_url.is_empty() {
+            t.push((OFF_GET, Tool::new(Icon::Link, "Get a key", ToolTone::Plain, true)));
+        }
+        if self.stored.is_some() {
+            t.push((OFF_CANCEL, Tool::new(Icon::Close, "Cancel", ToolTone::Plain, true)));
+        }
+        t.push((OFF_SAVE, Tool::new(Icon::Check, &format!("Save {}", self.noun), ToolTone::Primary, !self.buf.trim().is_empty())));
+        t
     }
 
     /// The noun for toasts: "API key" for the plain case, else the page's own ("Client ID").
@@ -164,6 +175,16 @@ impl KeyField {
     pub fn event(&mut self, base: ItemId, id: ItemId, ev: Event) -> KeyOutcome {
         let mut out = KeyOutcome::default();
         let Some(off) = id.checked_sub(base) else { return out };
+        // the icon buttons stand for the buttons they replaced
+        let (off, ev) = match (off, ev) {
+            (OFF_ROW, Event::Picked(0)) => (OFF_REPLACE, Event::Pressed),
+            (OFF_ROW, Event::Picked(_)) => (OFF_REMOVE, Event::Pressed),
+            (OFF_SAVE, Event::Picked(i)) => match self.input_tools().get(i) {
+                Some((o, t)) if t.enabled => (*o, Event::Pressed),
+                _ => return out,
+            },
+            other => other,
+        };
         match (off, ev) {
             (OFF_FIELD, Event::Edited(t) | Event::Committed(t)) => self.buf = t,
             (OFF_SAVE, Event::Pressed) => {
@@ -254,7 +275,7 @@ pub mod tests {
         let it = f.items(100);
         assert_eq!(ids(&it), vec![100, 101, 103], "field, save, get-key (no cancel without a stored key)");
         assert!(matches!(&it[0], Item::Field { kind: FieldKind::Secret, value, .. } if value.is_empty()));
-        assert!(matches!(&it[1], Item::Button { enabled: false, style: BtnStyle::Primary, .. }));
+        assert!(matches!(&it[1], Item::Tools { tools, .. } if !tools.last().unwrap().enabled));
     }
 
     #[test]

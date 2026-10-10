@@ -8,7 +8,7 @@ use super::edit::{EditKey, Editor, LINE_H, NavKey};
 use super::layout::{self, CONTENT_W, Foc, Layout, Part};
 use super::metrics::TextMetrics;
 use super::scroll::{BAR_HIT_W, Scroll};
-use super::{CARD_W_PAGE, Cx, Effect, Event, FieldKind, Item, ItemId, PageModel, Route, Row, Trailing};
+use super::{CARD_W_PAGE, Cx, Effect, Event, FieldKind, Item, ItemId, PageModel, Route, Row, ToolTone, Trailing};
 use crate::daemon::tray::popup::R;
 
 /// The system clipboard as the session sees it.
@@ -360,6 +360,19 @@ impl Session {
                 }
                 Event::Pressed
             }
+            Item::Tools { tools, .. } => match part {
+                Part::Seg(i) => {
+                    if !tools.get(i).is_some_and(|t| t.enabled) {
+                        return None;
+                    }
+                    Event::Picked(i)
+                }
+                // Enter, or a tap on the label: the primary button, else the first safe one
+                _ => {
+                    let pick = |f: &dyn Fn(&super::Tool) -> bool| tools.iter().position(|t| t.enabled && f(t));
+                    Event::Picked(pick(&|t| t.tone == ToolTone::Primary).or_else(|| pick(&|t| t.tone != ToolTone::Danger)).or_else(|| pick(&|_| true))?)
+                }
+            },
             Item::Row(r) => match (part, r.trailing) {
                 (Part::Trailing, Trailing::Delete) => Event::Deleted,
                 (Part::Trailing, Trailing::Copy) => Event::Copy,

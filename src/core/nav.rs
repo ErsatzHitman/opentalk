@@ -107,7 +107,7 @@ pub enum Route {
     Snippets,
     /// Edit snippet `Some(index in Config.snippets)`, or `None` for a new one.
     SnippetEdit(Option<usize>),
-    /// The list of Settings sections (plus the "Rewrite trigger" shortcut row).
+    /// The list of Settings sections.
     SettingsIndex,
     Settings(Section),
     Picker(PickerId),

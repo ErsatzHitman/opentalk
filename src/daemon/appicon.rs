@@ -135,6 +135,21 @@ pub fn load_path(path: &str, px: u32) -> Option<AppIcon> {
     Some(icon)
 }
 
+/// Icon for an exe path without the shell-factory last resort (the History page's app icons: never
+/// worth +17 MB of shell DLLs for a list row). Cached like [`load`].
+pub fn load_cheap(path: &str, px: u32) -> Option<AppIcon> {
+    if path.is_empty() {
+        return None;
+    }
+    let key = key_of(path, px);
+    if let Some(hit) = lock_cache().get(&key) {
+        return Some(hit.clone());
+    }
+    let icon = extract_with(path, 0, key.1, &cheap_backend, &|_, _| None, &packaged_backend)?;
+    remember(key, &icon);
+    Some(icon)
+}
+
 /// Which extraction strategy a target takes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Route {

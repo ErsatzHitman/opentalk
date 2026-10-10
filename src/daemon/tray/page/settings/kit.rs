@@ -3,7 +3,7 @@
 //! `snapshots/`, so wording, ordering and consistency can be read without a screenshot. Set
 //! `OPENTALK_UPDATE_SNAPSHOTS=1` to rewrite the files after an intended change.
 use crate::core::config::Config;
-use crate::daemon::tray::page::{BtnStyle, Effect, Event, FieldKind, Item, ItemId};
+use crate::daemon::tray::page::{BtnStyle, Effect, Event, FieldKind, Icon, Item, ItemId, Tool, ToolTone};
 
 pub fn group(s: &str) -> Item {
     Item::Group(s.into())
@@ -31,6 +31,22 @@ pub fn radio(id: ItemId, label: &str, desc: &str, on: bool) -> Item {
 
 pub fn button(id: ItemId, label: &str, style: BtnStyle, enabled: bool) -> Item {
     Item::Button { id, label: label.into(), style, enabled }
+}
+
+/// A test line: what it checks (or why it cannot run yet) and a play button that emits `Picked(0)`.
+pub fn test_line(id: ItemId, label: &str, sub: &str, busy: bool, ready: bool) -> Item {
+    let tip = if busy { "Testing\u{2026}" } else { "Run the test" };
+    Item::Tools { id, label: label.into(), sub: if busy { "Testing\u{2026}".into() } else { sub.into() }, tools: vec![Tool::new(Icon::Play, tip, ToolTone::Primary, ready && !busy)] }
+}
+
+/// A line with one icon button that emits `Picked(0)`.
+pub fn icon_line(id: ItemId, label: &str, sub: &str, icon: Icon, tip: &str, tone: ToolTone) -> Item {
+    Item::Tools { id, label: label.into(), sub: sub.into(), tools: vec![Tool::new(icon, tip, tone, true)] }
+}
+
+/// `Picked(0)` from an [`icon_line`] counts as a press.
+pub fn pressed(ev: Event) -> Event {
+    if ev == Event::Picked(0) { Event::Pressed } else { ev }
 }
 
 /// A plain single-line text field.
@@ -99,6 +115,7 @@ pub fn dump(title: &str, items: &[Item]) -> String {
                     FieldKind::Secret => "secret".to_string(),
                     FieldKind::Multiline { rows } => format!("multiline x{rows}"),
                     FieldKind::Hotkey => "hotkey".to_string(),
+                    FieldKind::Search => "search".to_string(),
                 };
                 let shown = if matches!(kind, FieldKind::Secret) && !value.is_empty() { "*".repeat(value.chars().count().min(12)) } else { value.clone() };
                 let mut s = format!("  field #{id} {label} [{k}] = \"{shown}\" (hint \"{hint}\"");
@@ -112,6 +129,10 @@ pub fn dump(title: &str, items: &[Item]) -> String {
                 s
             }
             Item::Button { id, label, style, enabled } => format!("  button #{id} {label} <{style:?}>{}", if *enabled { "" } else { " (disabled)" }),
+            Item::Tools { id, label, sub, tools } => {
+                let t: Vec<String> = tools.iter().map(|t| format!("[{}{}]", t.tip, if t.enabled { "" } else { " (disabled)" })).collect();
+                format!("  tools #{id} {label}{} {}", tail(sub), t.join(" "))
+            }
             Item::Result { ok, badge, text } => format!("  result[{}] {badge}: {text}", if *ok { "ok" } else { "error" }),
             Item::Row(r) => {
                 let trailing = match &r.trailing {

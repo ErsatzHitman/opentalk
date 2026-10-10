@@ -12,32 +12,32 @@ pub const ID_MIC: ItemId = 13;
 pub const ID_WARM: ItemId = 14;
 
 const DICTATION: &[ToggleDef] = &[
-    ToggleDef { id: 2, label: "Dictation sounds", desc: "Play a short cue when recording starts and stops.", get: |c| c.audio_cues, set: |c, v| c.audio_cues = v },
-    ToggleDef { id: 3, label: "Pause media while dictating", desc: "Pause music and video when you start, resume afterwards.", get: |c| c.pause_media, set: |c, v| c.pause_media = v },
+    ToggleDef { id: 2, label: "Dictation sounds", desc: "A short cue on start and stop", get: |c| c.audio_cues, set: |c, v| c.audio_cues = v },
+    ToggleDef { id: 3, label: "Pause media while dictating", desc: "Resumes afterwards", get: |c| c.pause_media, set: |c, v| c.pause_media = v },
     ToggleDef {
         id: 4,
         label: "Mute system audio while dictating",
-        desc: "Silence your speakers while you record so nothing leaks into the microphone.",
+        desc: "Speakers are silent while you record",
         get: |c| c.mute_system_audio,
         set: |c, v| c.mute_system_audio = v,
     },
-    ToggleDef { id: 5, label: "Automatic pasting", desc: "Paste the text into the app you were using. When off, it is only copied.", get: |c| c.auto_paste, set: |c, v| c.auto_paste = v },
+    ToggleDef { id: 5, label: "Automatic pasting", desc: "Into the app you were using", get: |c| c.auto_paste, set: |c, v| c.auto_paste = v },
     ToggleDef {
         id: 6,
         label: "Keep transcription in clipboard",
-        desc: "Leave the text on the clipboard instead of restoring what you had copied.",
+        desc: "Instead of restoring what you had copied",
         get: |c| c.keep_in_clipboard,
         set: |c, v| c.keep_in_clipboard = v,
     },
-    ToggleDef { id: 7, label: "Smart spacing", desc: "Add a space before the text when it continues a sentence.", get: |c| c.smart_spacing, set: |c, v| c.smart_spacing = v },
+    ToggleDef { id: 7, label: "Smart spacing", desc: "Add a space when continuing a sentence", get: |c| c.smart_spacing, set: |c, v| c.smart_spacing = v },
 ];
 
 const ICON: &[ToggleDef] = &[
-    ToggleDef { id: 8, label: "Auto-hide when idle", desc: "Show the icon only while recording or transcribing.", get: |c| c.floating_icon_auto_hide, set: |c, v| c.floating_icon_auto_hide = v },
+    ToggleDef { id: 8, label: "Auto-hide when idle", desc: "Only while recording or transcribing", get: |c| c.floating_icon_auto_hide, set: |c, v| c.floating_icon_auto_hide = v },
     ToggleDef {
         id: 10,
         label: "Show app bubble",
-        desc: "A round icon of the app you are dictating into, beside the indicator.",
+        desc: "The app you are dictating into",
         get: |c| c.show_app_bubble,
         set: |c, v| c.show_app_bubble = v,
     },
@@ -88,13 +88,13 @@ impl PageModel for PrefsPage {
         v.push(ICON[1].item(cfg));
         v.push(group("Language"));
         v.push(choice(ID_LANGUAGE, "Transcription language", label_of(&cfg.language)));
-        v.push(note("Auto-detect works for most speech. Pick a language for better accuracy."));
+        v.push(note("Pick one for better accuracy"));
         v.push(group("Startup"));
         v.push(super::kit::toggle(ID_AUTOSTART, "Launch at login", "Start OpenTalk in the tray when you sign in to Windows.", self.autostart.unwrap_or(false)));
         v.push(group("Microphone"));
         v.push(choice(ID_MIC, "Input device", &device_label(cfg)));
         v.push(choice(ID_WARM, "Keep microphone warm", WARM_CHOICES[warm_index(cfg.mic_warm_hold_secs)].0));
-        v.push(note("Keeping the stream open after a dictation makes the next start instant, but the Windows microphone indicator stays on."));
+        v.push(note("Instant next start; the Windows mic indicator stays on"));
         v
     }
 

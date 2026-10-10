@@ -4,7 +4,7 @@ use super::keyfield::{KeyField, SecretStore, SysSecrets};
 use super::kit::{choice, group, note, radio, saved, segmented, text_field};
 use crate::core::config::SttProviderId;
 use crate::core::secrets::SecretName;
-use crate::daemon::tray::page::{BtnStyle, ConfirmId, Cx, Effect, Event, Item, ItemId, PageModel, PickerId, Route, TestKind, TestResult};
+use crate::daemon::tray::page::{ConfirmId, Cx, Effect, Event, Item, ItemId, PageModel, PickerId, Route, TestKind, TestResult};
 use crate::stt::registry::{self, ProviderInfo};
 
 pub const ID_PROVIDER: ItemId = 1;
@@ -85,7 +85,8 @@ impl SttPage {
                 } else if m.streaming {
                     tags.push("Streaming");
                 }
-                let desc = if tags.is_empty() { m.description.to_string() } else { format!("{} · {}", m.description, tags.join(" · ")) };
+                // tags first: the line is cut to fit, and they matter most
+                let desc = if tags.is_empty() { m.description.to_string() } else { format!("{} · {}", tags.join(" · "), m.description) };
                 radio(ID_MODEL0 + i as ItemId, m.name, &desc, m.id == active)
             })
             .collect()
@@ -110,10 +111,7 @@ impl PageModel for SttPage {
         let cfg = &*cx.cfg;
         let provider = cfg.stt.provider;
         let info = registry::provider(provider);
-        let mut v = vec![group("Provider")];
-        v.push(choice(ID_PROVIDER, "Speech provider", info.name));
-        v.push(note("Audio is sent to the provider you choose, using your own API key."));
-        v.push(group(if provider == SttProviderId::Corti { "Credentials" } else { "API key" }));
+        let mut v = vec![choice(ID_PROVIDER, "Provider", info.name)];
         for (i, k) in self.keys.iter().enumerate() {
             v.extend(k.items(Self::key_base(i)));
         }
@@ -123,7 +121,7 @@ impl PageModel for SttPage {
         match provider {
             SttProviderId::Custom => {
                 v.push(group("Custom endpoint"));
-                v.push(note("Any server that implements the OpenAI /audio/transcriptions API, including Azure OpenAI deployments. The path /audio/transcriptions is added to the base URL."));
+                v.push(note("Any OpenAI-compatible /audio/transcriptions server (Azure OpenAI too)."));
                 v.push(text_field(ID_CUSTOM_URL, "Base URL", "https://api.example.com/v1", &cfg.stt.custom_base_url));
                 v.push(text_field(ID_CUSTOM_MODEL, "Model", "whisper-1", &cfg.stt.custom_model));
             }
@@ -139,25 +137,20 @@ impl PageModel for SttPage {
             v.extend(self.model_radios(info, &cfg.stt_model()));
         }
         if info.models.iter().any(|m| m.streaming) {
-            v.push(group("Transport"));
-            v.push(super::kit::toggle(
-                ID_STREAMING,
-                "Prefer streaming",
-                "Send audio while you speak so the text is ready sooner. Falls back to a single upload when the model does not stream.",
-                cfg.stt.prefer_streaming,
-            ));
+            v.push(super::kit::toggle(ID_STREAMING, "Prefer streaming", "Text is ready sooner", cfg.stt.prefer_streaming));
         }
         v.push(group("Test"));
-        v.push(note("Transcribes a short built-in sample with the settings above, so you can check the key and measure latency."));
         let ready = self.ready(cx);
-        v.push(super::kit::button(ID_TEST, if self.busy { "Testing..." } else { "Test transcription" }, BtnStyle::Primary, ready && !self.busy));
-        if !ready {
-            v.push(note(match provider {
-                SttProviderId::Custom => "Enter the base URL first.",
-                SttProviderId::Corti => "Save the client ID and secret first.",
-                _ => "Save an API key first.",
-            }));
-        }
+        let sub = if ready {
+            "Transcribes a short sample"
+        } else {
+            match provider {
+                SttProviderId::Custom => "Enter the base URL first",
+                SttProviderId::Corti => "Save the client ID and secret first",
+                _ => "Save an API key first",
+            }
+        };
+        v.push(super::kit::test_line(ID_TEST, "Test transcription", sub, self.busy, ready));
         if let Some(r) = &self.result {
             v.push(Item::Result { ok: r.ok, badge: r.badge.clone(), text: r.text.clone() });
         }
@@ -212,7 +205,7 @@ impl PageModel for SttPage {
                 self.invalidate();
                 saved()
             }
-            (ID_TEST, Event::Pressed) if self.ready(cx) && !self.busy => {
+            (ID_TEST, Event::Pressed | Event::Picked(0)) if self.ready(cx) && !self.busy => {
                 self.busy = true;
                 self.result = None;
                 // Saved first: the worker tests the config the daemon holds, which must be this one.

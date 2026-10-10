@@ -19,7 +19,7 @@
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use super::{BtnStyle, ConfirmId, Cx, Effect, Event, FieldKind, Item, ItemId, PageModel, PopupAction, ROW_H_HISTORY, Route, Row, Tone, Trailing, VirtualRows};
+use super::{BtnStyle, ConfirmId, action_line, picked_action, Cx, Effect, Event, FieldKind, Icon, Item, ItemId, Lead, PageModel, PopupAction, ROW_H_HISTORY, Route, Row, Tone, Tool, ToolTone, Trailing, VirtualRows};
 use crate::core::dictview::{one_line, truncate};
 use crate::core::histview::{self, Stats};
 use crate::core::history::{self, Entry, Status};
@@ -316,13 +316,11 @@ impl HistoryPage {
 
     fn row(&self, i: usize) -> Row {
         let e = &self.source()[self.view[i]];
-        let when = timefmt::when_label(e.ts, self.now_ms, &self.env.offset_of);
-        let primary = match app_of(e) {
-            Some(app) => format!("{when} \u{b7} {app}"),
-            None => when,
-        };
+        // the app is its icon; the first line is just the time
+        let primary = timefmt::when_label(e.ts, self.now_ms, &self.env.offset_of);
         let id = ROW_BASE + i.min(usize::from(u16::MAX - ROW_BASE)) as u16;
         let mut r = Row::new(id, primary, ROW_H_HISTORY);
+        r.lead = Lead::App { path: e.app_path.clone(), exe: e.app_exe.clone(), name: app_of(e).unwrap_or_default().to_string() };
         r.secondary = match e.status {
             Status::Failed => e.error.as_deref().map(one_line).filter(|s| !s.is_empty()).unwrap_or_else(|| "Transcription failed.".into()),
             _ => {
@@ -343,7 +341,7 @@ impl HistoryPage {
         if e.rewritten {
             r.chips.push(("Rewritten".into(), Tone::Info));
         } else if e.ai_cleaned {
-            r.chips.push(("AI cleaned".into(), Tone::Info));
+            r.chips.push(("AI".into(), Tone::Info));
         }
         r.trailing = if e.status == Status::Ok && !e.text.trim().is_empty() { Trailing::Copy } else { Trailing::Chevron };
         r
@@ -369,14 +367,14 @@ impl PageModel for HistoryPage {
         }
         v.push(Item::Field {
             id: F_SEARCH,
-            label: "Search".into(),
-            hint: "Words from the text, app or provider".into(),
+            label: String::new(),
+            hint: "Search".into(),
             value: self.query.clone(),
-            kind: FieldKind::Text,
+            kind: FieldKind::Search,
             error: None,
             max_chars: 200,
         });
-        v.push(Item::Toggle { id: T_DISCARDED, label: "Show discarded".into(), desc: "Recordings too short or silent to paste".into(), on: self.show_discarded });
+        v.push(Item::Toggle { id: T_DISCARDED, label: "Show discarded".into(), desc: String::new(), on: self.show_discarded });
         if let Some(n) = self.empty_note(cx.cfg.history_enabled) {
             v.push(Item::Note(n));
         }
@@ -401,7 +399,8 @@ impl PageModel for HistoryPage {
             v.push(Item::Note(format!("Showing the newest {}. Search to find older dictations.", histview::thousands(MAX_LOADED))));
         }
         v.push(Item::Space(4.0));
-        v.push(Item::Button { id: B_CLEAR, label: "Clear all".into(), style: BtnStyle::Destructive, enabled: !self.pool.is_empty() || self.more });
+        let any = !self.pool.is_empty() || self.more;
+        v.push(Item::Tools { id: B_CLEAR, label: "Clear history".into(), sub: String::new(), tools: vec![Tool::new(Icon::Trash, "Clear all", ToolTone::Danger, any)] });
         v
     }
 
@@ -443,7 +442,7 @@ impl PageModel for HistoryPage {
                 self.reload(keep);
                 self.refresh_view();
             }
-            (B_CLEAR, Event::Pressed) => {
+            (B_CLEAR, Event::Pressed | Event::Picked(0)) => {
                 return vec![Effect::Confirm {
                     title: "Clear history?".into(),
                     body: "This permanently deletes all saved dictations. It cannot be undone.".into(),
@@ -512,6 +511,17 @@ impl EntryPage {
         EntryPage { env, id, entry: None, newest: false }
     }
 
+    /// The buttons at the bottom: retry (when possible) and delete.
+    fn actions(&self, cx: &Cx, e: &Entry) -> Vec<(ItemId, Tool)> {
+        let mut a = Vec::new();
+        if self.can_retry(cx) {
+            let tip = if e.status == Status::Discarded { "Recover recording" } else { "Retry transcription" };
+            a.push((B_RETRY, Tool::new(Icon::Retry, tip, ToolTone::Plain, true)));
+        }
+        a.push((B_DELETE, Tool::new(Icon::Trash, "Delete", ToolTone::Danger, true)));
+        a
+    }
+
     fn can_retry(&self, cx: &Cx) -> bool {
         self.newest && cx.cfg.keep_failed_audio && self.entry.as_ref().is_some_and(|e| e.status != Status::Ok)
     }
@@ -555,39 +565,29 @@ impl PageModel for EntryPage {
             v.push(Item::Note(meta));
         }
         if e.rewritten {
-            v.push(Item::Banner { tone: Tone::Info, text: "Rewritten by AI because the dictation ended with the rewrite phrase. The text below is the concise version.".into() });
+            v.push(Item::Banner { tone: Tone::Info, text: "Rewritten by AI: you ended with the rewrite phrase.".into() });
         } else if e.ai_cleaned {
             v.push(Item::Banner { tone: Tone::Info, text: "Cleaned up by AI.".into() });
         }
+        // each text has its own copy button on its heading line
+        let copy = |id: ItemId, label: &str, tip: &str| Item::Tools { id, label: label.into(), sub: String::new(), tools: vec![Tool::new(Icon::Copy, tip, ToolTone::Plain, true)] };
         if !e.text.trim().is_empty() {
-            v.push(Item::Group("Text".into()));
+            v.push(copy(B_COPY, "Text", "Copy text"));
             v.push(Item::Text(e.text.trim().to_string()));
         }
         if e.rewritten {
-            v.push(Item::Group("Before the rewrite".into()));
-            v.push(Item::Text(e.original.as_deref().map(str::trim).filter(|s| !s.is_empty()).unwrap_or("(not saved)").to_string()));
+            let original = e.original.as_deref().map(str::trim).filter(|s| !s.is_empty());
+            v.push(if original.is_some() { copy(B_COPY_ORIGINAL, "Before the rewrite", "Copy text before the rewrite") } else { Item::Group("Before the rewrite".into()) });
+            v.push(Item::Text(original.unwrap_or("(not saved)").to_string()));
         }
         if let Some(raw) = Self::raw_extra(e) {
-            v.push(Item::Group("Raw transcript".into()));
+            v.push(copy(B_COPY_RAW, "Raw transcript", "Copy raw transcript"));
             v.push(Item::Text(raw.trim().to_string()));
         } else if e.raw.trim().is_empty() && e.text.trim().is_empty() && e.status != Status::Discarded {
             v.push(Item::Note("No transcript was recorded.".into()));
         }
-        v.push(Item::Space(6.0));
-        if !e.text.trim().is_empty() {
-            v.push(Item::Button { id: B_COPY, label: "Copy text".into(), style: BtnStyle::Primary, enabled: true });
-        }
-        if Self::raw_extra(e).is_some() {
-            v.push(Item::Button { id: B_COPY_RAW, label: "Copy raw transcript".into(), style: BtnStyle::Outline, enabled: true });
-        }
-        if e.rewritten && e.original.as_deref().is_some_and(|o| !o.trim().is_empty()) {
-            v.push(Item::Button { id: B_COPY_ORIGINAL, label: "Copy text before the rewrite".into(), style: BtnStyle::Outline, enabled: true });
-        }
-        if self.can_retry(cx) {
-            let label = if e.status == Status::Discarded { "Recover recording" } else { "Retry transcription" };
-            v.push(Item::Button { id: B_RETRY, label: label.into(), style: BtnStyle::Outline, enabled: true });
-        }
-        v.push(Item::Button { id: B_DELETE, label: "Delete".into(), style: BtnStyle::Destructive, enabled: true });
+        v.push(Item::Divider);
+        v.push(action_line("", "", &self.actions(cx, e)));
         v
     }
 
@@ -599,9 +599,13 @@ impl PageModel for EntryPage {
 
     fn event(&mut self, id: ItemId, ev: Event, cx: &mut Cx) -> Vec<Effect> {
         let Some(e) = &self.entry else { return Vec::new() };
-        if ev != Event::Pressed {
-            return Vec::new();
-        }
+        let id = match picked_action(&self.actions(cx, e), id, &ev) {
+            Some(a) => a,
+            // a copy button on a heading line
+            None if ev == Event::Picked(0) && matches!(id, B_COPY | B_COPY_RAW | B_COPY_ORIGINAL) => id,
+            None if ev == Event::Pressed => id,
+            None => return Vec::new(),
+        };
         match id {
             B_COPY => vec![Effect::CopyText(e.text.trim().to_string()), clipboard_toast()],
             B_COPY_RAW => vec![Effect::CopyText(e.raw.trim().to_string()), clipboard_toast()],
@@ -658,10 +662,15 @@ pub(super) mod testkit {
                     FieldKind::Secret => "secret".into(),
                     FieldKind::Multiline { rows } => format!("multiline{rows}"),
                     FieldKind::Hotkey => "hotkey".into(),
+                    FieldKind::Search => "search".into(),
                 };
                 format!("#{id} field {label} [{k}] value={value:?} hint={hint:?} max={max_chars}{}", error.as_ref().map(|e| format!(" ERROR={e}")).unwrap_or_default())
             }
             Item::Button { id, label, style, enabled } => format!("#{id} button {label} [{style:?}]{}", if *enabled { "" } else { " (disabled)" }),
+            Item::Tools { id, label, sub, tools } => {
+                let t: Vec<String> = tools.iter().map(|t| format!("{}{}", t.tip, if t.enabled { "" } else { " (disabled)" })).collect();
+                format!("#{id} tools {label} | {sub} | {t:?}")
+            }
             Item::Result { ok, badge, text } => format!("result[{ok}] {badge}: {text}"),
             Item::Row(r) => {
                 let t = match &r.trailing {
@@ -1057,7 +1066,7 @@ mod tests {
         assert!(p.virtual_rows().is_none());
         let items = p.items(&cx);
         assert!(items.iter().any(|i| matches!(i, Item::Note(n) if n.starts_with("No dictations yet"))), "{}", dump(&items));
-        assert!(matches!(p.tail_items(&cx).last(), Some(Item::Button { id: B_CLEAR, enabled: false, .. })));
+        assert!(matches!(p.tail_items(&cx).last(), Some(Item::Tools { id: B_CLEAR, tools, .. }) if !tools[0].enabled));
         // The daemon has not rewritten the file yet: coming back to the page must not resurrect rows.
         p.enter(&mut cx);
         assert!(p.pool.is_empty());

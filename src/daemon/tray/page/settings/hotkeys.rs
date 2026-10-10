@@ -16,7 +16,7 @@ pub const DEFAULT_HOTKEY: &str = "Control+Super";
 const BEHAVIOUR: &[ToggleDef] = &[ToggleDef {
     id: ID_START_MENU,
     label: "Suppress the Start menu",
-    desc: "When the hotkey includes the Windows key, stop Windows from opening the Start menu after you release it.",
+    desc: "When the hotkey uses the Windows key",
     get: |c| c.suppress_start_menu,
     set: |c, v| c.suppress_start_menu = v,
 }];
@@ -41,7 +41,7 @@ impl PageModel for HotkeysPage {
     fn items(&self, cx: &Cx) -> Vec<Item> {
         let cfg = &*cx.cfg;
         let mut v = vec![group("Dictation hotkey")];
-        v.push(note("Press it anywhere in Windows to start and stop dictation. Modifier-only combinations such as Ctrl + Win work."));
+        v.push(note("Works anywhere in Windows"));
         v.push(Item::Field {
             id: ID_HOTKEY,
             label: "Hotkey".into(),
@@ -53,16 +53,16 @@ impl PageModel for HotkeysPage {
         });
         v.push(super::kit::button(ID_RESET, "Reset to Ctrl + Win", BtnStyle::Link, cfg.hotkey != DEFAULT_HOTKEY));
         v.push(group("Activation"));
-        v.push(super::kit::radio(ID_TAP, "Tap to talk", "Press the hotkey once to start recording and again to stop.", cfg.activation_mode == ActivationMode::Tap));
+        v.push(super::kit::radio(ID_TAP, "Tap to talk", "Press once to start, again to stop", cfg.activation_mode == ActivationMode::Tap));
         v.push(super::kit::radio(
             ID_HOLD,
             "Push to talk",
-            "Hold the hotkey while you speak and release to stop. A quick tap cancels.",
+            "Hold while you speak",
             cfg.activation_mode == ActivationMode::Hold,
         ));
         v.push(group("Behaviour"));
         v.extend(BEHAVIOUR.iter().map(|d| d.item(cfg)));
-        v.push(note("Press Esc while recording or transcribing to discard the dictation."));
+        v.push(note("Esc discards a dictation"));
         v
     }
 

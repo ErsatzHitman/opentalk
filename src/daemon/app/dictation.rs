@@ -41,6 +41,8 @@ const NO_SPEECH_BODY: &str = "Try speaking a little closer to the microphone.";
 pub struct AppInfo {
     pub name: Option<String>,
     pub exe: Option<String>,
+    /// Full exe path (History shows the app's icon from it).
+    pub path: Option<String>,
 }
 
 /// The dictation that owns the microphone (from the hotkey press until stop or cancel).
@@ -149,7 +151,9 @@ fn friendly_exe(exe: &str) -> String {
 }
 
 fn app_info(target: Option<&Target>) -> AppInfo {
-    target.map(|t| AppInfo { exe: Some(t.exe_name.clone()), name: Some(friendly_exe(&t.exe_name)) }).unwrap_or_default()
+    target
+        .map(|t| AppInfo { exe: Some(t.exe_name.clone()), name: Some(friendly_exe(&t.exe_name)), path: Some(t.exe_path.clone()).filter(|p| !p.is_empty()) })
+        .unwrap_or_default()
 }
 
 /// The paste goes to the app the bubble shows *now*: the window in front when the text is ready (or,
@@ -856,6 +860,7 @@ fn base_entry(cfg: &Config, app: &AppInfo) -> Entry {
         ts: unix_ms(),
         app_name: app.name.clone(),
         app_exe: app.exe.clone(),
+        app_path: app.path.clone(),
         provider: provider_name(cfg),
         model: cfg.stt_model(),
         ..Entry::default()

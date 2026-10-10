@@ -24,6 +24,7 @@ pub const LINE_SMALL: f32 = 15.5;
 
 pub const H_GROUP: f32 = 32.0;
 pub const H_CHOICE: f32 = 44.0;
+pub const H_RADIO: f32 = 36.0;
 pub const H_TOGGLE_MIN: f32 = 44.0;
 pub const H_SEGMENTED: f32 = 62.0;
 pub const H_SEGMENTED_BARE: f32 = 40.0;
@@ -38,6 +39,16 @@ pub const SWITCH_W: f32 = 36.0;
 pub const SWITCH_H: f32 = 20.0;
 /// Size of a row's trailing "x" / copy button.
 pub const ROW_BTN: f32 = 26.0;
+/// Icon buttons of an [`Item::Tools`] line: size and gap.
+pub const TOOL_W: f32 = 30.0;
+pub const TOOL_GAP: f32 = 4.0;
+/// A tools line without / with its muted second line.
+pub const H_TOOLS: f32 = 40.0;
+pub const H_TOOLS_SUB: f32 = 46.0;
+/// Room for the magnifier at the left of a search box (the text starts after it).
+pub const SEARCH_INSET: f32 = 24.0;
+/// Width a row's leading icon takes, including the gap after it.
+pub const LEAD_W: f32 = 30.0;
 /// Gap under a card-like item (radio, banner, result).
 pub const CARD_GAP: f32 = 6.0;
 /// Space above the first item and below the last.
@@ -103,6 +114,7 @@ pub fn focusable(item: &Item) -> bool {
     match item {
         Item::Toggle { .. } | Item::Segmented { .. } | Item::Choice { .. } | Item::Radio { .. } | Item::Field { .. } | Item::Row(_) => true,
         Item::Button { enabled, .. } => *enabled,
+        Item::Tools { tools, .. } => tools.iter().any(|t| t.enabled),
         _ => false,
     }
 }
@@ -183,11 +195,8 @@ fn slot(item: &Item, width: f32, measure: Measure) -> (f32, R, Vec<String>) {
             }
         }
         Item::Choice { .. } => (H_CHOICE, z, Vec::new()),
-        Item::Radio { desc, .. } => {
-            let lines = if desc.is_empty() { Vec::new() } else { wrap_lines(desc, FS_SMALL, 400, width - 52.0, measure) };
-            let card = if lines.is_empty() { 46.0 } else { (22.0 + LINE_BODY + 1.0 + lines.len() as f32 * LINE_SMALL).max(46.0) };
-            (card + CARD_GAP, z, lines)
-        }
+        // one compact line: dot, label, the description muted after it (cut to fit)
+        Item::Radio { .. } => (H_RADIO, z, Vec::new()),
         Item::Field { label, kind, error, .. } => {
             let top = 2.0 + if label.is_empty() { 0.0 } else { LINE_BODY + 4.0 };
             let box_h = match kind {
@@ -197,7 +206,9 @@ fn slot(item: &Item, width: f32, measure: Measure) -> (f32, R, Vec<String>) {
             };
             let lines = error.as_deref().map(|e| wrap_lines(e, FS_SMALL, 400, width, measure)).unwrap_or_default();
             let err_h = if lines.is_empty() { 0.0 } else { 3.0 + lines.len() as f32 * LINE_SMALL };
-            (top + box_h + err_h + 10.0, R::new(l, top, r, top + box_h), lines)
+            // a search box's control starts after its magnifier, so the text does too
+            let cl = if *kind == FieldKind::Search { l + SEARCH_INSET } else { l };
+            (top + box_h + err_h + 10.0, R::new(cl, top, r, top + box_h), lines)
         }
         Item::Button { label, style, .. } => {
             let link = matches!(style, BtnStyle::Link);
@@ -208,6 +219,12 @@ fn slot(item: &Item, width: f32, measure: Measure) -> (f32, R, Vec<String>) {
                 (H_BUTTON, R::new(l, 6.0, l + (tw + 28.0).max(BTN_MIN_W), 6.0 + BTN_H), Vec::new())
             }
         }
+        Item::Tools { sub, tools, .. } => {
+            let h = if sub.is_empty() { H_TOOLS } else { H_TOOLS_SUB };
+            let n = tools.len() as f32;
+            let w = n * TOOL_W + (n - 1.0).max(0.0) * TOOL_GAP;
+            (h, R::new(r - w, (h - TOOL_W) * 0.5, r, (h + TOOL_W) * 0.5), Vec::new())
+        }
         Item::Result { text, .. } => {
             let lines = wrap_lines(text, FS_SMALL, 400, width - 24.0, measure);
             (16.0 + LINE_BODY + lines.len() as f32 * LINE_SMALL + CARD_GAP, z, lines)
@@ -216,6 +233,17 @@ fn slot(item: &Item, width: f32, measure: Measure) -> (f32, R, Vec<String>) {
         Item::Divider => (H_DIVIDER, z, Vec::new()),
         Item::Space(h) => (h.max(0.0), z, Vec::new()),
     }
+}
+
+/// Icon button `i` of a tools line whose buttons occupy `ctl`.
+pub fn tool_rect(ctl: R, i: usize) -> R {
+    let l = ctl.l + i as f32 * (TOOL_W + TOOL_GAP);
+    R::new(l, ctl.t, l + TOOL_W, ctl.b)
+}
+
+/// The box a field draws: its control, widened back over a search box's magnifier.
+pub fn field_frame(ctl: R, kind: FieldKind) -> R {
+    if kind == FieldKind::Search { R::new(ctl.l - SEARCH_INSET, ctl.t, ctl.r, ctl.b) } else { ctl }
 }
 
 /// The trailing delete / copy button of a row in its slot (`R::ZERO` for other trailings).
@@ -389,6 +417,8 @@ impl Layout {
                 Item::Segmented { .. } => return None,
                 Item::Toggle { .. } if p.ctl.inflate(6.0).contains(x, y) => Part::Trailing,
                 Item::Row(_) if p.ctl.contains(x, y) => Part::Trailing,
+                Item::Tools { tools, .. } => (0..tools.len()).find(|&i| tool_rect(p.ctl, i).inflate(2.0).contains(x, y)).map_or(Part::Body, Part::Seg),
+                Item::Field { kind, .. } if field_frame(p.ctl, *kind).contains(x, y) => Part::Body,
                 Item::Field { .. } | Item::Button { .. } if !p.ctl.contains(x, y) => return None,
                 _ => Part::Body,
             };

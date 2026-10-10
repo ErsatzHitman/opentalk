@@ -20,7 +20,7 @@
 //! applying it (otherwise the user clicks into the field).
 use std::cell::RefCell;
 
-use super::{BtnStyle, ConfirmId, Cx, Effect, Event, FieldKind, Item, ItemId, PageModel, ROW_H_SNIPPET, ROW_H_WORD, Route, Row, Tone, Trailing, VirtualRows};
+use super::{ConfirmId, Cx, Effect, Event, FieldKind, Icon, Item, ItemId, PageModel, ROW_H_SNIPPET, ROW_H_WORD, Route, Row, Tone, Tool, ToolTone, Trailing, VirtualRows, action_line, picked_action};
 use crate::core::config::{Config, Snippet};
 use crate::core::dictview::{
     MAX_IMPORT_BYTES, add_words, budget_warning, export_snippets_json, export_words_json, filter_words, hint_words, merge_snippets, one_line, parse_import, parse_words, prompt_chars,
@@ -35,6 +35,15 @@ const FILTER_MIN_WORDS: usize = 8;
 const MAX_FIELD_CHARS: usize = 4000;
 const MAX_TRIGGER_CHARS: usize = 120;
 const SNIPPET_PREVIEW_CHARS: usize = 160;
+
+/// Import / copy / clear buttons of the Dictionary and Snippets pages (`has`: the list is not empty).
+fn manage_actions(import: ItemId, copy: ItemId, clear: ItemId, has: bool) -> Vec<(ItemId, Tool)> {
+    vec![
+        (import, Tool::new(Icon::Download, "Import from clipboard", ToolTone::Plain, true)),
+        (copy, Tool::new(Icon::Copy, "Copy as JSON", ToolTone::Plain, has)),
+        (clear, Tool::new(Icon::Trash, "Clear all", ToolTone::Danger, has)),
+    ]
+}
 
 /// Reads the clipboard text (tests replace it).
 type Clipboard = fn() -> Option<String>;
@@ -202,7 +211,7 @@ impl DictionaryPage {
     fn count_note(&self, cfg: &Config, shown: usize) -> String {
         let n = cfg.dictionary.len();
         if n == 0 {
-            return "Names, products and jargon your speech provider gets wrong go here. They are sent along as hints with every dictation.".into();
+            return "Names and jargon your speech provider gets wrong. Sent as hints with every dictation.".into();
         }
         let chars = prompt_chars(&hint_words(&cfg.dictionary, &cfg.snippets));
         let base = format!("{} \u{b7} {} in the speech prompt", plural(n, "word", "words"), plural(chars, "character", "characters"));
@@ -238,15 +247,23 @@ impl PageModel for DictionaryPage {
             error: self.error.clone(),
             max_chars: MAX_FIELD_CHARS,
         });
-        v.push(Item::Button { id: B_ADD, label: if editing { "Save word".into() } else { "Add".into() }, style: BtnStyle::Primary, enabled: !parse_words(&self.input).is_empty() });
-        v.push(Item::Note(self.count_note(cx.cfg, shown)));
+        let can_add = !parse_words(&self.input).is_empty();
+        let add = if editing { Tool::new(Icon::Check, "Save word", ToolTone::Primary, can_add) } else { Tool::new(Icon::Plus, "Add", ToolTone::Primary, can_add) };
+        if cx.cfg.dictionary.is_empty() {
+            v.push(Item::Tools { id: B_ADD, label: "No words yet".into(), sub: String::new(), tools: vec![add] });
+            v.push(Item::Note(self.count_note(cx.cfg, shown)));
+        } else {
+            let note = self.count_note(cx.cfg, shown);
+            let (label, sub) = note.split_once(" \u{b7} ").map_or((note.clone(), String::new()), |(a, b)| (a.to_string(), b.to_string()));
+            v.push(Item::Tools { id: B_ADD, label, sub, tools: vec![add] });
+        }
         if n > FILTER_MIN_WORDS || !self.filter.is_empty() {
             v.push(Item::Field {
                 id: F_FILTER,
-                label: "Filter".into(),
-                hint: "Show only words containing\u{2026}".into(),
+                label: String::new(),
+                hint: "Filter".into(),
                 value: self.filter.clone(),
-                kind: FieldKind::Text,
+                kind: FieldKind::Search,
                 error: None,
                 max_chars: 200,
             });
@@ -273,13 +290,7 @@ impl PageModel for DictionaryPage {
     }
 
     fn tail_items(&self, cx: &Cx) -> Vec<Item> {
-        let has = !cx.cfg.dictionary.is_empty();
-        vec![
-            Item::Divider,
-            Item::Button { id: B_IMPORT, label: "Import from clipboard".into(), style: BtnStyle::Outline, enabled: true },
-            Item::Button { id: B_COPY, label: "Copy as JSON".into(), style: BtnStyle::Outline, enabled: has },
-            Item::Button { id: B_CLEAR, label: "Clear all".into(), style: BtnStyle::Destructive, enabled: has },
-        ]
+        vec![Item::Divider, action_line("Import / export", "", &manage_actions(B_IMPORT, B_COPY, B_CLEAR, !cx.cfg.dictionary.is_empty()))]
     }
 
     fn enter(&mut self, _cx: &mut Cx) {
@@ -287,6 +298,11 @@ impl PageModel for DictionaryPage {
     }
 
     fn event(&mut self, id: ItemId, ev: Event, cx: &mut Cx) -> Vec<Effect> {
+        let (id, ev) = match picked_action(&manage_actions(B_IMPORT, B_COPY, B_CLEAR, !cx.cfg.dictionary.is_empty()), id, &ev) {
+            Some(a) => (a, Event::Pressed),
+            None if id == B_ADD && ev == Event::Picked(0) => (B_ADD, Event::Pressed),
+            None => (id, ev),
+        };
         match (id, ev) {
             (C_SNIPPETS, Event::Activated) => vec![Effect::Navigate(Route::Snippets)],
             (i, Event::Edited(t)) if self.is_input(i) => {
@@ -388,12 +404,9 @@ impl PageModel for SnippetsPage {
         if let Some(w) = budget_warning(cx.cfg) {
             v.push(Item::Banner { tone: Tone::Warn, text: w });
         }
-        v.push(Item::Button { id: S_NEW, label: "New snippet".into(), style: BtnStyle::Primary, enabled: true });
-        v.push(Item::Note(if cx.cfg.snippets.is_empty() {
-            "Say a short trigger while dictating and OpenTalk pastes the longer text you saved for it, like an email address or a sign-off.".into()
-        } else {
-            format!("{}. Say a trigger while dictating to paste its text.", plural(cx.cfg.snippets.len(), "snippet", "snippets"))
-        }));
+        let label = if cx.cfg.snippets.is_empty() { "No snippets yet".to_string() } else { plural(cx.cfg.snippets.len(), "snippet", "snippets") };
+        v.push(Item::Tools { id: S_NEW, label, sub: String::new(), tools: vec![Tool::new(Icon::Plus, "New snippet", ToolTone::Primary, true)] });
+        v.push(Item::Note("Say a trigger while dictating to paste its text.".into()));
         v
     }
 
@@ -414,19 +427,16 @@ impl PageModel for SnippetsPage {
     }
 
     fn tail_items(&self, cx: &Cx) -> Vec<Item> {
-        let has = !cx.cfg.snippets.is_empty();
-        vec![
-            Item::Divider,
-            Item::Button { id: S_IMPORT, label: "Import from clipboard".into(), style: BtnStyle::Outline, enabled: true },
-            Item::Button { id: S_COPY, label: "Copy as JSON".into(), style: BtnStyle::Outline, enabled: has },
-            Item::Button { id: S_CLEAR, label: "Clear all".into(), style: BtnStyle::Destructive, enabled: has },
-        ]
+        vec![Item::Divider, action_line("Import / export", "", &manage_actions(S_IMPORT, S_COPY, S_CLEAR, !cx.cfg.snippets.is_empty()))]
     }
 
     fn event(&mut self, id: ItemId, ev: Event, cx: &mut Cx) -> Vec<Effect> {
-        if ev != Event::Pressed {
-            return Vec::new();
-        }
+        let id = match picked_action(&manage_actions(S_IMPORT, S_COPY, S_CLEAR, !cx.cfg.snippets.is_empty()), id, &ev) {
+            Some(a) => a,
+            None if id == S_NEW && ev == Event::Picked(0) => S_NEW,
+            None if ev == Event::Pressed => id,
+            None => return Vec::new(),
+        };
         match id {
             S_NEW => vec![Effect::Navigate(Route::SnippetEdit(None))],
             S_IMPORT => import_clipboard(self.clipboard, cx.cfg),
@@ -505,6 +515,16 @@ impl SnippetEditPage {
         trigger_taken(&cfg.snippets, self.skip(), &self.trigger)
     }
 
+    /// The buttons under the fields: delete (an existing snippet) and save.
+    fn actions(&self, cx: &Cx) -> Vec<(ItemId, Tool)> {
+        let mut a = Vec::new();
+        if self.index.is_some() {
+            a.push((E_DELETE, Tool::new(Icon::Trash, "Delete snippet", ToolTone::Danger, true)));
+        }
+        a.push((E_SAVE, Tool::new(Icon::Check, "Save", ToolTone::Primary, self.valid(cx.cfg))));
+        a
+    }
+
     fn valid(&self, cfg: &Config) -> bool {
         !self.trigger.trim().is_empty() && !self.replacement.trim().is_empty() && !self.clash(cfg)
     }
@@ -535,12 +555,9 @@ impl PageModel for SnippetEditPage {
                 error: None,
                 max_chars: MAX_FIELD_CHARS,
             },
-            Item::Note("The trigger is matched as whole words and ignores capitals. A trigger inside a longer phrase is replaced there too.".into()),
-            Item::Button { id: E_SAVE, label: "Save".into(), style: BtnStyle::Primary, enabled: self.valid(cx.cfg) },
+            Item::Note("Matched as whole words, ignoring capitals.".into()),
+            action_line("", "", &self.actions(cx)),
         ]
-        .into_iter()
-        .chain(self.index.map(|_| Item::Button { id: E_DELETE, label: "Delete snippet".into(), style: BtnStyle::Destructive, enabled: true }))
-        .collect()
     }
 
     fn enter(&mut self, cx: &mut Cx) {
@@ -554,6 +571,10 @@ impl PageModel for SnippetEditPage {
     }
 
     fn event(&mut self, id: ItemId, ev: Event, cx: &mut Cx) -> Vec<Effect> {
+        let (id, ev) = match picked_action(&self.actions(cx), id, &ev) {
+            Some(a) => (a, Event::Pressed),
+            None => (id, ev),
+        };
         match (id, ev) {
             (E_TRIGGER, Event::Edited(t) | Event::Committed(t)) => self.trigger = t,
             (E_REPLACEMENT, Event::Edited(t) | Event::Committed(t)) => self.replacement = t,

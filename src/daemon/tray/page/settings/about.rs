@@ -1,7 +1,7 @@
 //! Settings > About: version, data and log folders, reset app data.
-use super::kit::{button, group, note};
+use super::kit::{group, icon_line, pressed};
 use crate::core::config::Config;
-use crate::daemon::tray::page::{BtnStyle, ConfirmId, Cx, Effect, Event, Item, ItemId, PageModel, PopupAction, Row, Tone, Trailing};
+use crate::daemon::tray::page::{ConfirmId, Cx, Effect, Event, Icon, Item, ItemId, PageModel, PopupAction, Row, Tone, ToolTone, Trailing};
 
 pub const ID_VERSION: ItemId = 1;
 pub const ID_OPEN_DATA: ItemId = 2;
@@ -26,23 +26,19 @@ impl PageModel for AboutPage {
         vec![
             group("OpenTalk"),
             Item::Row(Row {
-                secondary: "Personal dictation for Windows.".into(),
                 trailing: Trailing::Badge { text: format!("v{}", env!("CARGO_PKG_VERSION")), tone: Tone::Info },
-                ..Row::new(ID_VERSION, "Version", 44.0)
+                ..Row::new(ID_VERSION, "Version", 40.0)
             }),
             group("Folders"),
-            note(&format!("Settings, history and logs live in {}", crate::core::paths::app_dir().display())),
-            button(ID_OPEN_DATA, "Open data folder", BtnStyle::Outline, true),
-            button(ID_OPEN_LOGS, "Open logs folder", BtnStyle::Outline, true),
-            note("Diagnostic logs never contain API keys or your text."),
+            icon_line(ID_OPEN_DATA, "Data folder", &crate::core::paths::app_dir().display().to_string(), Icon::Link, "Open data folder", ToolTone::Plain),
+            icon_line(ID_OPEN_LOGS, "Logs", "Never contain API keys or your text", Icon::Link, "Open logs folder", ToolTone::Plain),
             group("Reset"),
-            note("Delete settings, history and saved API keys, and start fresh."),
-            button(ID_RESET, "Reset app data...", BtnStyle::Destructive, true),
+            icon_line(ID_RESET, "Reset app data", "Settings, history and API keys", Icon::Trash, "Reset app data", ToolTone::Danger),
         ]
     }
 
     fn event(&mut self, id: ItemId, ev: Event, _cx: &mut Cx) -> Vec<Effect> {
-        match (id, ev) {
+        match (id, pressed(ev)) {
             (ID_OPEN_DATA, Event::Pressed) => vec![Effect::OpenPath(crate::core::paths::app_dir())],
             (ID_OPEN_LOGS, Event::Pressed) => vec![Effect::OpenPath(crate::core::paths::log_dir())],
             (ID_RESET, Event::Pressed) => vec![Effect::Confirm {

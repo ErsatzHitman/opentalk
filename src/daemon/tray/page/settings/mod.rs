@@ -20,8 +20,8 @@ pub mod stt;
 
 use super::{PageModel, PickerId, Section};
 
-/// The Settings index (`Route::SettingsIndex`): one row per section plus a "Rewrite trigger"
-/// shortcut row that jumps to the trigger field on the Cleanup & AI page.
+/// The Settings index (`Route::SettingsIndex`): one compact row per section (the rewrite trigger
+/// is set on the Cleanup & AI page).
 pub fn index_model() -> Box<dyn PageModel> {
     index::IndexPage::boxed()
 }

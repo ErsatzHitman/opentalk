@@ -33,6 +33,9 @@ pub struct Entry {
     /// Target app (friendly name, exe file name).
     pub app_name: Option<String>,
     pub app_exe: Option<String>,
+    /// Full path of the target app's executable (its icon in History); absent in older entries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_path: Option<String>,
     pub provider: String,
     pub model: String,
     /// Speech duration (ms) and end-to-end latency stop->paste (ms).
@@ -530,6 +533,7 @@ mod tests {
             error: Some("boom".into()),
             app_name: Some("Notepad".into()),
             app_exe: Some("notepad.exe".into()),
+            app_path: Some(r"C:\Windows\notepad.exe".into()),
             provider: "openai".into(),
             model: "whisper-1".into(),
             duration_ms: 1234,

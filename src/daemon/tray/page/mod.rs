@@ -17,6 +17,7 @@
 //! Data flow of one interaction: input -> renderer finds the item -> `model.event(id, ev, cx)`
 //! -> `Vec<Effect>` -> renderer re-asks `model.items(cx)` and re-lays-out.
 
+pub mod appicons;
 pub mod controls;
 pub mod dictionary;
 pub mod draw;
@@ -37,6 +38,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::core::config::Config;
 pub use crate::core::nav::{PickerId, Route, Section};
+pub use crate::daemon::tray::popup_draw::Icon;
 
 // ---------------------------------------------------------------------------------------------
 // Metrics shared by models and the renderer (logical px at 1x)
@@ -50,7 +52,7 @@ pub const PAGE_MAX_H: f32 = 600.0;
 pub const PAGE_HEADER_H: f32 = 48.0;
 /// Fixed `Row` heights of the virtualised lists (the model puts the right one in `Row::height`
 /// and `VirtualRows::row_h`; the renderer turns scroll offset into a row index by division).
-pub const ROW_H_HISTORY: f32 = 64.0;
+pub const ROW_H_HISTORY: f32 = 58.0;
 pub const ROW_H_WORD: f32 = 32.0;
 pub const ROW_H_SNIPPET: f32 = 44.0;
 
@@ -82,6 +84,8 @@ pub enum FieldKind {
     /// Key-combination capture box: no typing; click starts capture (`Effect::BeginHotkeyCapture`),
     /// the value shows the accelerator or the live preview.
     Hotkey,
+    /// Single-line search box: a magnifier inside on the left, no label.
+    Search,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -109,10 +113,21 @@ pub enum Trailing {
     Copy,
 }
 
+/// Left edge of a [`Row`]: nothing, a line icon, or the icon of the app a dictation went to.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Lead {
+    None,
+    Icon(Icon),
+    /// The app's own icon (resolved from `path`, else from the icon cache by `exe`), or a monogram
+    /// of `name` when there is none.
+    App { path: Option<String>, exe: Option<String>, name: String },
+}
+
 /// A fixed-height list row: settings index entries, history entries, dictionary words, snippets.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Row {
     pub id: ItemId,
+    pub lead: Lead,
     /// First line (e.g. app + clock, the word, the snippet trigger).
     pub primary: String,
     /// Second line, cut to the row width (e.g. the transcript text); empty = single-line row.
@@ -128,7 +143,46 @@ pub struct Row {
 
 impl Row {
     pub fn new(id: ItemId, primary: impl Into<String>, height: f32) -> Row {
-        Row { id, primary: primary.into(), secondary: String::new(), meta: String::new(), chips: Vec::new(), trailing: Trailing::None, height }
+        Row { id, lead: Lead::None, primary: primary.into(), secondary: String::new(), meta: String::new(), chips: Vec::new(), trailing: Trailing::None, height }
+    }
+}
+
+/// How an icon button of [`Item::Tools`] is coloured.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolTone {
+    Plain,
+    /// Filled with the accent colour (the one thing to do next).
+    Primary,
+    /// Red on hover (remove, clear).
+    Danger,
+}
+
+/// One icon button of [`Item::Tools`]. `tip` names it (shown on hover, read by tests).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Tool {
+    pub icon: Icon,
+    pub tip: String,
+    pub tone: ToolTone,
+    pub enabled: bool,
+}
+
+impl Tool {
+    pub fn new(icon: Icon, tip: &str, tone: ToolTone, enabled: bool) -> Tool {
+        Tool { icon, tip: tip.into(), tone, enabled }
+    }
+}
+
+/// A tools line whose buttons stand for actions with ids of their own (the line takes the first
+/// action's id). Pair with [`picked_action`] in `event`.
+pub fn action_line(label: &str, sub: &str, actions: &[(ItemId, Tool)]) -> Item {
+    Item::Tools { id: actions.first().map_or(0, |a| a.0), label: label.into(), sub: sub.into(), tools: actions.iter().map(|a| a.1.clone()).collect() }
+}
+
+/// The action a `Picked(i)` on an [`action_line`] built from `actions` stands for (enabled ones only).
+pub fn picked_action(actions: &[(ItemId, Tool)], id: ItemId, ev: &Event) -> Option<ItemId> {
+    match ev {
+        Event::Picked(i) if actions.first().is_some_and(|a| a.0 == id) => actions.get(*i).filter(|a| a.1.enabled).map(|a| a.0),
+        _ => None,
     }
 }
 
@@ -158,6 +212,10 @@ pub enum Item {
     Field { id: ItemId, label: String, hint: String, value: String, kind: FieldKind, error: Option<String>, max_chars: usize },
     /// Button. Emits `Pressed` when enabled.
     Button { id: ItemId, label: String, style: BtnStyle, enabled: bool },
+    /// A compact line: `label` (and a muted `sub` under it) on the left, small icon buttons on the
+    /// right. Emits `Picked(i)` for `tools[i]` (Enter, or a tap on the label, picks the primary one,
+    /// else the first that is not destructive).
+    Tools { id: ItemId, label: String, sub: String, tools: Vec<Tool> },
     /// Outcome line of a test (badge such as "OK 840 ms" + the text).
     Result { ok: bool, badge: String, text: String },
     /// Fixed-height list row (see [`Row`]); `Activated` on tap/Enter, `Deleted`/`Copy` from its trailing buttons.
@@ -176,7 +234,8 @@ impl Item {
             | Item::Choice { id, .. }
             | Item::Radio { id, .. }
             | Item::Field { id, .. }
-            | Item::Button { id, .. } => Some(*id),
+            | Item::Button { id, .. }
+            | Item::Tools { id, .. } => Some(*id),
             Item::Row(r) => Some(r.id),
             _ => None,
         }

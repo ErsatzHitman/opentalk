@@ -1,8 +1,8 @@
 //! Settings > Privacy & Data: history, retention, failed recordings, discarded dictations,
 //! the data folder and clearing history.
-use super::kit::{ToggleDef, apply_toggle, button, choice, group, note, saved};
+use super::kit::{ToggleDef, apply_toggle, choice, group, icon_line, note, pressed, saved};
 use crate::core::settings_logic::{RETENTION, retention_index};
-use crate::daemon::tray::page::{BtnStyle, ConfirmId, Cx, Effect, Event, Item, ItemId, PageModel, PickerId, PopupAction, Route};
+use crate::daemon::tray::page::{ConfirmId, Cx, Effect, Event, Icon, Item, ItemId, PageModel, PickerId, PopupAction, Route, ToolTone};
 
 pub const ID_RETENTION: ItemId = 2;
 pub const ID_OPEN_DATA: ItemId = 10;
@@ -12,21 +12,21 @@ const TOGGLES: &[ToggleDef] = &[
     ToggleDef {
         id: 1,
         label: "Save history",
-        desc: "Keep a list of your dictations in History. Turn off to save nothing.",
+        desc: "Keep a list of your dictations",
         get: |c| c.history_enabled,
         set: |c, v| c.history_enabled = v,
     },
     ToggleDef {
         id: 3,
         label: "Keep the last failed recording",
-        desc: "Hold it in memory so you can retry after a network or key error. Cleared when OpenTalk exits.",
+        desc: "In memory only, to retry after an error",
         get: |c| c.keep_failed_audio,
         set: |c, v| c.keep_failed_audio = v,
     },
     ToggleDef {
         id: 4,
         label: "Save discarded dictations",
-        desc: "Also list dictations that were cancelled or contained no speech, under \"Show discarded\" in History.",
+        desc: "Cancelled or silent ones too",
         get: |c| c.save_discarded,
         set: |c, v| c.save_discarded = v,
     },
@@ -51,7 +51,7 @@ impl PageModel for PrivacyPage {
         let kept = &RETENTION[retention_index(cfg.history_retention_days)];
         let mut v = vec![
             group("History"),
-            note("Your dictations are stored only on this PC."),
+            note("Stored only on this PC"),
             TOGGLES[0].item(cfg),
             choice(ID_RETENTION, "Keep transcripts for", kept.0),
         ];
@@ -65,9 +65,8 @@ impl PageModel for PrivacyPage {
             TOGGLES[1].item(cfg),
             TOGGLES[2].item(cfg),
             group("Your data"),
-            note(&format!("Everything lives in {}", crate::core::paths::app_dir().display())),
-            button(ID_OPEN_DATA, "Open data folder", BtnStyle::Outline, true),
-            button(ID_CLEAR, "Clear history...", BtnStyle::Destructive, true),
+            icon_line(ID_OPEN_DATA, "Data folder", &crate::core::paths::app_dir().display().to_string(), Icon::Link, "Open data folder", ToolTone::Plain),
+            icon_line(ID_CLEAR, "Clear history", "", Icon::Trash, "Clear history", ToolTone::Danger),
         ]);
         v
     }
@@ -76,7 +75,7 @@ impl PageModel for PrivacyPage {
         if apply_toggle(TOGGLES, id, &ev, cx.cfg) {
             return saved();
         }
-        match (id, ev) {
+        match (id, pressed(ev)) {
             (ID_RETENTION, Event::Activated) => vec![Effect::Navigate(Route::Picker(PickerId::Retention))],
             (ID_OPEN_DATA, Event::Pressed) => vec![Effect::OpenPath(crate::core::paths::app_dir())],
             (ID_CLEAR, Event::Pressed) => vec![Effect::Confirm {

@@ -1,12 +1,12 @@
 //! Settings > Cleanup & AI: the AI rewrite trigger (first group), on-device cleanup options,
 //! the AI cleanup provider (also used by the rewrite) and the prompt editor.
 use super::keyfield::{KeyField, SecretStore, SysSecrets};
-use super::kit::{ToggleDef, apply_toggle, button, choice, group, note, saved, segmented, text_field};
+use super::kit::{ToggleDef, apply_toggle, choice, group, note, saved, segmented, text_field};
 use crate::core::config::{Config, DEFAULT_REWRITE_TRIGGER, FillerMode, LlmProviderId};
 use crate::core::rewrite;
 use crate::core::secrets::SecretName;
 use crate::core::settings_logic::{editor_text, filler_from_index, filler_index, stored_prompt};
-use crate::daemon::tray::page::{BtnStyle, ConfirmId, Cx, Effect, Event, FieldKind, Item, ItemId, PageModel, PickerId, Route, TestKind, TestResult};
+use crate::daemon::tray::page::{ConfirmId, Cx, Effect, Event, FieldKind, Icon, Item, ItemId, PageModel, PickerId, Route, TestKind, TestResult, Tool, ToolTone};
 use crate::llm::registry::{self, LlmProviderInfo};
 
 // AI rewrite
@@ -44,28 +44,28 @@ const OPTIONS: &[ToggleDef] = &[
     ToggleDef {
         id: ID_FUZZY,
         label: "Fuzzy dictionary correction",
-        desc: "Fix near-misses of your dictionary words, for example \"open whisper\" to \"OpenWhispr\".",
+        desc: "Fix near-misses of dictionary words",
         get: |c| c.fuzzy_dictionary,
         set: |c, v| c.fuzzy_dictionary = v,
     },
     ToggleDef {
         id: ID_LINEBREAKS,
         label: "Spoken line breaks",
-        desc: "Turn \"new line\" and \"new paragraph\" into real line breaks.",
+        desc: "Say \u{201c}new line\u{201d} or \u{201c}new paragraph\u{201d}",
         get: |c| c.spoken_line_breaks,
         set: |c, v| c.spoken_line_breaks = v,
     },
     ToggleDef {
         id: ID_AI_ENABLE,
         label: "Enable AI cleanup",
-        desc: "Send the transcript (never the audio) to the model below. It adds a moment of latency; a failure falls back to the on-device result.",
+        desc: "Sends the text (never audio) to the model below",
         get: |c| c.ai_cleanup.enabled,
         set: |c, v| c.ai_cleanup.enabled = v,
     },
     ToggleDef {
         id: ID_RW_TOGGLE,
         label: "Enable AI rewrite",
-        desc: "Uses the AI provider below, even when AI cleanup is off.",
+        desc: "Uses the AI provider below",
         get: |c| c.ai_cleanup.rewrite_enabled,
         set: |c, v| c.ai_cleanup.rewrite_enabled = v,
     },
@@ -231,34 +231,31 @@ impl PageModel for CleanupPage {
         let rewrite_toggle = a.rewrite_enabled;
         let rewrite_live = Self::rewrite_on(cfg);
         let mut v = vec![group("AI rewrite")];
-        v.push(note("Say a trigger phrase at the end of a dictation. The text before it is rewritten concisely by your AI provider and pasted instead."));
         v.push(toggle(ID_RW_TOGGLE));
         if rewrite_toggle {
+            let can_reset = cfg.rewrite_trigger != DEFAULT_REWRITE_TRIGGER || self.draft.is_some();
+            v.push(Item::Tools { id: ID_RW_RESET, label: "Trigger phrase".into(), sub: String::new(), tools: vec![Tool::new(Icon::Retry, "Reset to default", ToolTone::Plain, can_reset)] });
             v.push(Item::Field {
                 id: ID_RW_TRIGGER,
-                label: "Trigger phrase".into(),
+                label: String::new(),
                 hint: DEFAULT_REWRITE_TRIGGER.into(),
                 value: self.draft.clone().unwrap_or_else(|| cfg.rewrite_trigger.clone()),
                 kind: FieldKind::Text,
                 error: self.error.clone(),
                 max_chars: TRIGGER_MAX_CHARS,
             });
-            v.push(button(ID_RW_RESET, "Reset to default", BtnStyle::Link, cfg.rewrite_trigger != DEFAULT_REWRITE_TRIGGER || self.draft.is_some()));
-            v.push(note("Pick words you would not say otherwise; leave it empty to turn the rewrite off. Avoid digits and filler words such as \"um\"."));
+            v.push(note("End a dictation with this phrase to paste a concise rewrite."));
             if rewrite_live && let Some(gap) = self.setup_gap(cfg) {
                 v.push(Item::Banner { tone: crate::daemon::tray::page::Tone::Warn, text: gap.into() });
             }
         }
 
         v.push(group("On-device cleanup"));
-        v.push(note("Always on and instant: runs on your device before anything is pasted."));
-        v.push(segmented(ID_FILLER, "Filler word removal", &["Off", "Standard", "Aggressive"], filler_index(cfg.filler_mode)));
-        v.push(note("Removes um, uh, stutters and false starts. Aggressive also drops \"basically\", \"actually\" and similar."));
+        v.push(segmented(ID_FILLER, "Filler words", &["Off", "Standard", "Aggressive"], filler_index(cfg.filler_mode)));
         v.push(toggle(ID_FUZZY));
         v.push(toggle(ID_LINEBREAKS));
 
         v.push(group("AI cleanup"));
-        v.push(note("An optional language model polishes punctuation and grammar after the on-device pass."));
         v.push(toggle(ID_AI_ENABLE));
 
         if a.enabled || rewrite_live {
@@ -268,22 +265,25 @@ impl PageModel for CleanupPage {
         if a.enabled {
             v.push(group("Prompt Studio"));
             let custom = !a.custom_prompt.trim().is_empty();
-            v.push(note(if custom { "Using your custom prompt." } else { "Using the built-in prompt. Edit it to change tone or rules." }));
+            v.push(Item::Tools {
+                id: ID_PROMPT_RESET,
+                label: "Cleanup prompt".into(),
+                sub: if custom { "Custom" } else { "Built-in" }.into(),
+                tools: vec![Tool::new(Icon::Retry, "Reset to default", ToolTone::Plain, custom)],
+            });
             v.push(Item::Field {
                 id: ID_PROMPT,
-                label: "Cleanup prompt".into(),
+                label: String::new(),
                 hint: String::new(),
                 value: editor_text(&a.custom_prompt, &self.default_prompt),
                 kind: FieldKind::Multiline { rows: 8 },
                 error: None,
                 max_chars: 0,
             });
-            v.push(button(ID_PROMPT_RESET, "Reset to default", BtnStyle::Link, custom));
         }
         if a.enabled || rewrite_live {
             v.push(group("Test"));
-            v.push(note("Runs a built-in rough sentence through the model above."));
-            v.push(button(ID_TEST, if self.busy { "Running..." } else { "Run on sample" }, BtnStyle::Primary, self.ai_ready(cfg) && !self.busy));
+            v.push(super::kit::test_line(ID_TEST, "Run on a sample", "Polishes a rough sentence", self.busy, self.ai_ready(cfg)));
             if let Some(r) = &self.result {
                 v.push(Item::Result { ok: r.ok, badge: r.badge.clone(), text: r.text.clone() });
             }
@@ -331,7 +331,7 @@ impl PageModel for CleanupPage {
                 cx.cfg.rewrite_trigger = norm;
                 saved()
             }
-            (ID_RW_RESET, Event::Pressed) => {
+            (ID_RW_RESET, Event::Pressed | Event::Picked(0)) => {
                 self.draft = None;
                 self.error = None;
                 cx.cfg.rewrite_trigger = DEFAULT_REWRITE_TRIGGER.into();
@@ -401,11 +401,11 @@ impl PageModel for CleanupPage {
                 ai.custom_prompt = new;
                 saved()
             }
-            (ID_PROMPT_RESET, Event::Pressed) => {
+            (ID_PROMPT_RESET, Event::Pressed | Event::Picked(0)) => {
                 ai.custom_prompt.clear();
                 saved()
             }
-            (ID_TEST, Event::Pressed) if !self.busy && self.ai_ready(cx.cfg) => {
+            (ID_TEST, Event::Pressed | Event::Picked(0)) if !self.busy && self.ai_ready(cx.cfg) => {
                 self.busy = true;
                 self.result = None;
                 vec![Effect::Saved, Effect::RunTest(TestKind::Llm)]
@@ -549,7 +549,7 @@ mod tests {
         let reset_enabled = |p: &CleanupPage, cfg: &mut Config| {
             let cx = Cx::new(cfg, 0);
             p.items(&cx).iter().find_map(|i| match i {
-                Item::Button { id: ID_RW_RESET, enabled, .. } => Some(*enabled),
+                Item::Tools { id: ID_RW_RESET, tools, .. } => Some(tools[0].enabled),
                 _ => None,
             })
         };
