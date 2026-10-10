@@ -292,7 +292,7 @@ fn tls_connector() -> Result<native_tls::TlsConnector, native_tls::Error> {
 }
 
 fn open(name: &str, spec: &ConnectSpec, shared: &Shared, secrets: &[String]) -> Result<WebSocket<Stream>, SttError> {
-    let bad = |what: &str| util::err(SttErrorCode::Other, format!("{name} streaming URL is invalid."), what.to_string());
+    let bad = |what: &str| util::err(SttErrorCode::Other, format!("{name} streaming URL is invalid."), util::scrub(what, secrets));
     let mut request = spec.url.as_str().into_client_request().map_err(|e| bad(&e.to_string()))?;
     for (k, v) in &spec.headers {
         let k = HeaderName::from_bytes(k.as_bytes()).map_err(|_| bad("bad header name"))?;

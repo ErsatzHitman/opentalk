@@ -743,6 +743,18 @@ mod tests {
     }
 
     #[test]
+    fn short_secret_redaction_is_safe_on_non_ascii_and_edges() {
+        let key = "k9x2Q";
+        assert_eq!(redact_with("Ünï cödé → key=k9x2Q ✓ Bearer k9x2Q", &[key]), "Ünï cödé → key=[redacted] ✓ Bearer [redacted]");
+        assert_eq!(redact_with("key=k9x2Q", &[key]), "key=[redacted]");
+        assert_eq!(redact_with("key=", &[key]), "key=");
+        assert_eq!(redact_with("Bearer ", &[key]), "Bearer ");
+        assert_eq!(redact_with("{\"key\":\"k9x2Q\"}", &[key]), "{\"key\":\"[redacted]\"}");
+        // a secret that is a prefix of another short secret: the longer one wins
+        assert_eq!(redact_with("key=k9x2Qab", &[key, "k9x2Qab"]), "key=[redacted]");
+    }
+
+    #[test]
     fn key_cut_by_the_length_bound_cannot_survive() {
         // Redaction runs before truncation, so a key straddling the 500-char cut is gone.
         let body = format!("{}{KEY}", "x".repeat(MAX_DETAIL_CHARS - 10));
