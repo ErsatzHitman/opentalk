@@ -39,6 +39,11 @@ pub struct Entry {
     pub duration_ms: u64,
     pub latency_ms: u64,
     pub ai_cleaned: bool,
+    /// The dictation ended with the rewrite phrase and `text` is the concise rewrite.
+    pub rewritten: bool,
+    /// For a rewritten entry: the deterministic text (trigger removed) before the rewrite.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub original: Option<String>,
 }
 
 const DAY_MS: i64 = 86_400_000;
@@ -386,6 +391,8 @@ mod tests {
             duration_ms: 1234,
             latency_ms: 567,
             ai_cleaned: true,
+            rewritten: true,
+            original: Some("hello world, before the rewrite".into()),
         };
         append_to(&p, &entry(1001, 1000, "older")).unwrap();
         append_to(&p, &full).unwrap();
@@ -605,5 +612,20 @@ mod tests {
         e.id = next_id(e.ts);
         append_to(&p, &e).unwrap();
         assert_eq!(load_from(&p)[0], e);
+    }
+
+    #[test]
+    fn rewrite_fields_default_and_round_trip() {
+        // A line written before voice rewrite existed loads as "not rewritten, no original".
+        let old: Entry = serde_json::from_str(r#"{"id":1,"ts":2,"text":"hi","raw":"hi","ai_cleaned":true}"#).unwrap();
+        assert!(!old.rewritten && old.original.is_none() && old.ai_cleaned);
+        // `original` is omitted from the line when absent.
+        assert!(!serde_json::to_string(&old).unwrap().contains("original"));
+        let p = temp_file("rewritten");
+        let e = Entry { id: 7, text: "Ship Friday.".into(), raw: "ship it on friday rewrite this concisely".into(), rewritten: true, original: Some("ship it on friday".into()), ..Default::default() };
+        append_to(&p, &e).unwrap();
+        let back = &load_from(&p)[0];
+        assert_eq!(back, &e);
+        assert!(back.rewritten && back.original.as_deref() == Some("ship it on friday"));
     }
 }
