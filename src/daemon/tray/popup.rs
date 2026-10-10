@@ -535,6 +535,20 @@ mod tests {
     }
 
     #[test]
+    fn a_phase_change_keeps_the_card_size_so_an_open_popup_refreshes_in_place() {
+        for base in [Content::default(), full()] {
+            let sizes: Vec<_> = [Phase::Ready, Phase::Recording, Phase::Transcribing]
+                .into_iter()
+                .map(|phase| {
+                    let l = layout(&Content { phase, ..base.clone() });
+                    (l.card_h, l.rows.len())
+                })
+                .collect();
+            assert!(sizes.windows(2).all(|w| w[0] == w[1]), "{sizes:?}");
+        }
+    }
+
+    #[test]
     fn transcribing_disables_the_dictation_row() {
         let l = layout(&Content { phase: Phase::Transcribing, ..Content::default() });
         let row = &l.rows[1];

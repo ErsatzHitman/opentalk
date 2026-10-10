@@ -162,7 +162,8 @@ pub fn button(ui: &mut Ui, p: &Palette, b: Btn) -> Response {
 }
 
 pub fn with_alpha_mul(c: Color32, k: f32) -> Color32 {
-    Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), (c.a() as f32 * k) as u8)
+    let [r, g, b, a] = c.to_srgba_unmultiplied();
+    Color32::from_rgba_unmultiplied(r, g, b, (a as f32 * k) as u8)
 }
 
 /// Square/circle icon button (history row actions, window chrome, etc.).

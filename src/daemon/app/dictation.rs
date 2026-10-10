@@ -479,6 +479,7 @@ impl App {
                 Note::JobDone { seq, outcome } => self.on_job_done(seq, outcome),
             }
         }
+        self.sync_tray_popup();
     }
 
     fn on_rec_started(&mut self, seq: u64, result: Result<Recorder, String>) {

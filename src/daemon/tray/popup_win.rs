@@ -78,7 +78,6 @@ fn with<R>(f: impl FnOnce(&mut Popup) -> R) -> Option<R> {
     POPUP.with(|c| c.try_borrow_mut().ok().and_then(|mut b| b.as_mut().map(f)))
 }
 
-#[cfg(test)]
 pub fn is_open() -> bool {
     POPUP.with(|c| c.try_borrow().map(|b| b.is_some()).unwrap_or(true))
 }
@@ -90,6 +89,32 @@ pub fn activate(req: Request) {
         Decision::Open => open(req),
         Decision::Close => close(),
         Decision::Ignore => {}
+    }
+}
+
+/// The daemon's state changed while the popup is open (a hotkey press started or stopped a
+/// dictation, a transcription finished): show the new state in place, so the Start / Stop row never
+/// lies. A change that would resize the card (a Retry or recent row appearing) closes the popup
+/// instead; the next click opens it with the new rows.
+pub fn refresh(content: Content, texts: Vec<String>) {
+    let resized = with(|p| {
+        if p.content == content && p.texts == texts {
+            return false;
+        }
+        let layout = popup::layout(&content);
+        if layout.card_h != p.layout.card_h || layout.rows.len() != p.layout.rows.len() {
+            return true;
+        }
+        if p.nav.active.is_some_and(|i| !layout.rows[i].selectable()) {
+            p.nav.active = None;
+            p.nav.pressed = false;
+        }
+        (p.content, p.texts, p.layout) = (content, texts, layout);
+        present(p);
+        false
+    });
+    if resized == Some(true) {
+        close();
     }
 }
 

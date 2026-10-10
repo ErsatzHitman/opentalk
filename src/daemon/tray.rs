@@ -127,6 +127,16 @@ pub fn activate(owner: isize, act: Activation, state: &TrayState) {
     });
 }
 
+/// Is the popup open right now?
+pub fn popup_is_open() -> bool {
+    popup_win::is_open()
+}
+
+/// Show `state` in the open popup (no-op when it is closed).
+pub fn refresh_popup(state: &TrayState) {
+    popup_win::refresh(state.content(), state.recent.clone());
+}
+
 // ---------------------------------------------------------------------------------------------
 // Commands
 // ---------------------------------------------------------------------------------------------

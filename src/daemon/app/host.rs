@@ -401,6 +401,16 @@ impl App {
             Action::CancelJob => self.cancel_job(),
         }
         hotkey::set_esc_capture(self.machine.is_busy());
+        self.sync_tray_popup();
+    }
+
+    /// Keep an open tray popup's Start / Stop row and status in step with the dictation (it can
+    /// change under the popup through the hotkey or a finished transcription). Nothing runs, and
+    /// the history file is not read, while the popup is closed.
+    pub(super) fn sync_tray_popup(&self) {
+        if crate::daemon::tray::popup_is_open() {
+            crate::daemon::tray::refresh_popup(&self.tray_state());
+        }
     }
 
     fn on_timer(&mut self, id: usize) {
