@@ -108,6 +108,10 @@ impl Protocol for LiveProto {
         vec![Message::text(self.setup.to_string())]
     }
 
+    fn credentials(&self) -> Vec<String> {
+        vec![self.key.clone()]
+    }
+
     fn ready(&self) -> bool {
         self.ready
     }
@@ -163,7 +167,7 @@ impl Protocol for LiveProto {
             1011 => (SttErrorCode::Unavailable, "Gemini Live is temporarily unavailable."),
             _ => (SttErrorCode::Unreachable, "Gemini closed the connection."),
         };
-        self.err = Some(util::err(kind, msg, format!("close {code}: {}", util::scrub(reason, &self.key))));
+        self.err = Some(util::err(kind, msg, format!("close {code}: {}", util::scrub(reason, &self.credentials()))));
     }
 
     fn finalize(&mut self) -> Vec<Message> {

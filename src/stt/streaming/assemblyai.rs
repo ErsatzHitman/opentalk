@@ -61,6 +61,8 @@ struct Turn {
 #[derive(Default)]
 struct AssemblyProto {
     key: String,
+    /// The temporary streaming token once minted; it rides in the socket URL's query.
+    token: String,
     token_url: String,
     ws_base: String,
     model: String,
@@ -82,14 +84,24 @@ fn normalize(text: &str) -> String {
 }
 
 impl AssemblyProto {
+    /// Everything that must never reach an error text: the account API key and, once minted,
+    /// the temporary token (a server may echo either).
+    fn secrets(&self) -> Vec<&str> {
+        let mut v = vec![self.key.as_str()];
+        if !self.token.is_empty() {
+            v.push(self.token.as_str());
+        }
+        v
+    }
+
     fn mint_token(&self) -> Result<String, SttError> {
         let resp = http::get(&self.token_url, &[("Authorization", self.key.as_str())], TOKEN_TIMEOUT).map_err(|e| match e {
             http::HttpError::Timeout => util::err(SttErrorCode::Timeout, "AssemblyAI did not answer the token request.", ""),
-            http::HttpError::Network(m) => util::err(SttErrorCode::Unreachable, "Could not reach AssemblyAI.", util::scrub(&m, &self.key)),
+            http::HttpError::Network(m) => util::err(SttErrorCode::Unreachable, "Could not reach AssemblyAI.", util::scrub(&m, &self.secrets())),
         })?;
         if !resp.ok() {
             let detail = resp.json().ok().and_then(|v| v["error"].as_str().map(String::from)).unwrap_or(resp.body.clone());
-            return Err(util::status_error(NAME, resp.status, &detail, &self.key));
+            return Err(util::status_error(NAME, resp.status, &detail, &self.secrets()));
         }
         resp.json()
             .ok()
@@ -154,7 +166,12 @@ impl Protocol for AssemblyProto {
 
     fn connect_spec(&mut self) -> Result<ConnectSpec, SttError> {
         let token = self.mint_token()?;
+        self.token = token.clone();
         Ok(ConnectSpec { url: format!("{}?{}", self.ws_base, ws_query(&token, &self.model, &self.keyterms)), headers: Vec::new() })
+    }
+
+    fn credentials(&self) -> Vec<String> {
+        self.secrets().into_iter().map(String::from).collect()
     }
 
     fn ready(&self) -> bool {
@@ -184,7 +201,7 @@ impl Protocol for AssemblyProto {
             }
             Some("Error") => {
                 let msg = v["error"].as_str().or_else(|| v["message"].as_str()).unwrap_or("AssemblyAI error");
-                self.err = Some(util::err(SttErrorCode::Other, "AssemblyAI reported an error.", util::scrub(msg, &self.key)));
+                self.err = Some(util::err(SttErrorCode::Other, "AssemblyAI reported an error.", util::scrub(msg, &self.secrets())));
                 true
             }
             _ => false,
@@ -197,7 +214,7 @@ impl Protocol for AssemblyProto {
             self.err = Some(util::err(
                 SttErrorCode::Unreachable,
                 "AssemblyAI closed the connection.",
-                format!("close {code}: {}", util::scrub(reason, &self.key)),
+                format!("close {code}: {}", util::scrub(reason, &self.secrets())),
             ));
         }
     }
