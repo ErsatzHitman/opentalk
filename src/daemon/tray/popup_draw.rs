@@ -15,11 +15,14 @@ use tiny_skia::Pixmap;
 pub struct Theme {
     pub popover: Rgba,
     pub border: Rgba,
+    pub border_hover: Rgba,
     pub fg: Rgba,
     pub muted: Rgba,
     pub primary: Rgba,
     pub destructive: Rgba,
     pub success: Rgba,
+    /// Amber for warnings (banners, chips).
+    pub warn: Rgba,
     /// Colour drawn over a row for hover; pressed doubles its strength.
     pub overlay: Rgba,
     pub hover_alpha: f32,
@@ -31,11 +34,13 @@ pub fn theme(dark: bool) -> Theme {
     Theme {
         popover: pal.popover,
         border: pal.border,
+        border_hover: pal.border_hover,
         fg: pal.fg,
         muted: pal.muted_fg,
         primary: if dark { Rgba::hex(0x3e89ff) } else { Rgba::hex(0x4577e9) },
         destructive: if dark { Rgba::hex(0xee343b) } else { Rgba::hex(0xdc2626) },
         success: if dark { Rgba::hex(0x45ba50) } else { Rgba::hex(0x16a34a) },
+        warn: if dark { Rgba::hex(0xf0a23a) } else { Rgba::hex(0xc2750a) },
         overlay: if dark { Rgba::hex(0xffffff) } else { Rgba::hex(0x000000) },
         hover_alpha: if dark { 0.08 } else { 0.055 },
         shadow_alpha: if dark { 0.55 } else { 0.16 },
@@ -59,15 +64,15 @@ pub fn pixel_size(layout: &Layout, scale: f32) -> (u32, u32) {
     ((w * scale).ceil() as u32, (h * scale).ceil() as u32)
 }
 
-const WHITE: Rgba = Rgba::new(1.0, 1.0, 1.0, 1.0);
+pub(crate) const WHITE: Rgba = Rgba::new(1.0, 1.0, 1.0, 1.0);
 
-fn rr(cv: &mut Canvas, r: Rect, radius: f32, color: Rgba, alpha: f32) {
+pub(crate) fn rr(cv: &mut Canvas, r: Rect, radius: f32, color: Rgba, alpha: f32) {
     let (cx, cy, hw, hh) = (r.cx(), r.cy(), r.w() * 0.5, r.h() * 0.5);
     cv.fill_sdf(r.inflate(1.0), color, alpha, |x, y| sd_round_box(x, y, cx, cy, hw, hh, radius));
 }
 
 /// An inside stroke of width `sw` along a rounded rect.
-fn ring(cv: &mut Canvas, r: Rect, radius: f32, sw: f32, color: Rgba, alpha: f32) {
+pub(crate) fn ring(cv: &mut Canvas, r: Rect, radius: f32, sw: f32, color: Rgba, alpha: f32) {
     let c = r.inflate(-sw * 0.5);
     let (cx, cy, hw, hh) = (c.cx(), c.cy(), c.w() * 0.5, c.h() * 0.5);
     let rad = (radius - sw * 0.5).max(0.0);
@@ -205,7 +210,7 @@ fn icon_sd(icon: Icon, x: f32, y: f32) -> f32 {
     }
 }
 
-fn draw_icon(cv: &mut Canvas, icon: Icon, x: f32, cy: f32, color: Rgba, alpha: f32) {
+pub(crate) fn draw_icon(cv: &mut Canvas, icon: Icon, x: f32, cy: f32, color: Rgba, alpha: f32) {
     let top = cy - 8.0;
     if icon == Icon::Retry {
         let scale = cv.scale;
@@ -356,16 +361,64 @@ fn draw_primary(cv: &mut Canvas, v: &View, th: &Theme, row: &Row, rect: Rect, ac
 
 const SAMPLE_RECENT: [&str; 2] = ["Send the revised budget to Priya before the Thursday review.", "Remind me to renew the domain and check the DNS records."];
 
+/// `--render-tray-popup <out.png> --page <route>`: a page of the popup in a chosen state.
+fn cli_render_page(out: &str, page: &str, args: &[String]) -> i32 {
+    let flag = |f: &str| args.iter().any(|a| a == f);
+    let value = |f: &str| args.iter().position(|a| a == f).and_then(|i| args.get(i + 1)).cloned();
+    let opts = super::page::draw::PageCli {
+        dark: flag("--dark"),
+        scale: value("--scale").and_then(|s| s.parse().ok()).unwrap_or(1.0f32).clamp(0.5, 8.0),
+        text: !flag("--no-text"),
+        card_h: value("--height").and_then(|s| s.parse().ok()).unwrap_or(super::page::PAGE_MAX_H).clamp(super::popup::PAGE_MIN_H, 2000.0),
+        scroll: value("--scroll").and_then(|s| s.parse().ok()).unwrap_or(0.0),
+        hover: value("--hover"),
+        focus: value("--focus").and_then(|s| s.parse().ok()),
+        edit: value("--edit").and_then(|s| s.parse().ok()),
+        select_all: flag("--select-all"),
+        type_text: value("--type"),
+        toast: value("--toast"),
+        confirm: flag("--confirm"),
+    };
+    let mut pm = match super::page::draw::render_page_cli(page, &opts) {
+        Ok(pm) => pm,
+        Err(e) => {
+            eprintln!("{e}");
+            return 2;
+        }
+    };
+    if !flag("--transparent") {
+        let desk = if opts.dark { [0x10u8, 0x12, 0x15] } else { [0xe9, 0xeb, 0xf0] };
+        for p in pm.data_mut().chunks_exact_mut(4) {
+            let k = 255 - p[3] as u32;
+            for c in 0..3 {
+                p[c] = (p[c] as u32 + (desk[c] as u32 * k + 127) / 255).min(255) as u8;
+            }
+            p[3] = 255;
+        }
+    }
+    match pm.save_png(out) {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("could not write {out}: {e}");
+            1
+        }
+    }
+}
+
 /// `--render-tray-popup <out.png> [--dark] [--recording|--transcribing] [--recent] [--retry]
 /// [--pill-hidden] [--hover <row label>] [--focus] [--scale s] [--transparent] [--no-text]`.
 /// Without `--transparent` the popup is composited over a flat desktop colour so the shadow shows.
 pub fn cli_render(args: &[String]) -> i32 {
     let Some(out) = args.iter().find(|a| !a.starts_with("--")).cloned() else {
         eprintln!("usage: --render-tray-popup <out.png> [--dark] [--recording|--transcribing] [--recent] [--retry] [--pill-hidden] [--hover <label>] [--focus] [--scale s] [--transparent] [--no-text]");
+        eprintln!("       --render-tray-popup <out.png> --page <route|gallery|gallery-list> [--height h] [--scroll px] [--hover id|row:N] [--focus id] [--edit id] [--type text] [--select-all] [--toast text] [--confirm] [--dark] [--scale s] [--transparent] [--no-text]");
         return 2;
     };
     let flag = |f: &str| args.iter().any(|a| a == f);
     let value = |f: &str| args.iter().position(|a| a == f).and_then(|i| args.get(i + 1)).cloned();
+    if let Some(page) = value("--page") {
+        return cli_render_page(&out, &page, args);
+    }
     let content = Content {
         phase: if flag("--recording") {
             Phase::Recording

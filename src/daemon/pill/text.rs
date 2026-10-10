@@ -141,6 +141,54 @@ pub fn measure(text: &str, font: Font) -> f32 {
     v
 }
 
+/// Cumulative advance in device px before each character of `text` (`chars + 1` entries: 0 first,
+/// the full width last), from ONE `GetTextExtentExPointW` call at 4x. This is what places a text
+/// caret or a click without measuring O(n) prefixes (which would flood the `measure` cache).
+pub fn prefix_widths(text: &str, font: Font) -> Vec<f32> {
+    let units = wide(text);
+    let mut out = vec![0.0f32];
+    if units.is_empty() {
+        return out;
+    }
+    let mut dx = vec![0i32; units.len()];
+    let mut size = windows::Win32::Foundation::SIZE::default();
+    let mut ok = false;
+    if let Some(g) = Gdi::new(big(font)) {
+        // SAFETY: `units` and `dx` outlive the call and are `units.len()` long; the DC is valid.
+        ok = unsafe {
+            let mut fit = 0i32;
+            windows::Win32::Graphics::Gdi::GetTextExtentExPointW(
+                g.dc,
+                PCWSTR(units.as_ptr()),
+                units.len() as i32,
+                i32::MAX,
+                Some(&mut fit),
+                Some(dx.as_mut_ptr()),
+                &mut size,
+            )
+        }
+        .as_bool();
+    }
+    if !ok {
+        dx.iter_mut().for_each(|v| *v = 0);
+    }
+    out.extend(char_prefixes(text, &dx, SS as f32));
+    out
+}
+
+/// Per-char cumulative widths from per-UTF-16-unit cumulative extents `dx` (a surrogate pair takes
+/// the extent of its second unit), divided by `div`. `text.chars().count()` entries.
+pub fn char_prefixes(text: &str, dx: &[i32], div: f32) -> Vec<f32> {
+    let mut out = Vec::with_capacity(text.chars().count());
+    let mut unit = 0usize;
+    for ch in text.chars() {
+        unit += ch.len_utf16();
+        let v = dx.get(unit.wrapping_sub(1)).copied().unwrap_or_else(|| dx.last().copied().unwrap_or(0));
+        out.push(v as f32 / div);
+    }
+    out
+}
+
 /// Ascent + descent of the font in device px (cached).
 pub fn content_height(font: Font) -> f32 {
     static H: std::sync::OnceLock<Mutex<HashMap<Font, f32>>> = std::sync::OnceLock::new();
@@ -352,6 +400,31 @@ mod tests {
         let c = measure("Ctrl + Win", f20);
         assert!((c - a * 2.0).abs() < 1.0, "{a} {c}");
         assert_eq!(measure("", f10), 0.0);
+    }
+
+    #[test]
+    fn char_prefixes_map_utf16_units_to_chars() {
+        // "a" + U+1F600 (two units) + "b": extents per unit 10, 20, 30, 40.
+        let dx = [10, 20, 30, 40];
+        assert_eq!(char_prefixes("a\u{1F600}b", &dx, 1.0), vec![10.0, 30.0, 40.0]);
+        assert_eq!(char_prefixes("ab", &[8, 16], 4.0), vec![2.0, 4.0]);
+        assert!(char_prefixes("", &[], 4.0).is_empty());
+        // A short extents array (GDI refused) never panics.
+        assert_eq!(char_prefixes("ab", &[], 4.0), vec![0.0, 0.0]);
+    }
+
+    #[test]
+    fn prefix_widths_are_monotonic_and_end_at_the_full_width() {
+        let f = Font::new(13.0, 1.0, 400);
+        let w = prefix_widths("Hello world", f);
+        assert_eq!(w.len(), 12);
+        assert_eq!(w[0], 0.0);
+        assert!(w.windows(2).all(|p| p[1] >= p[0]));
+        assert!(w[11] > 30.0);
+        assert!((w[11] - measure("Hello world", f)).abs() < 1.5, "{} vs {}", w[11], measure("Hello world", f));
+        assert_eq!(prefix_widths("", f), vec![0.0]);
+        // One entry per character, not per UTF-16 unit.
+        assert_eq!(prefix_widths("a\u{1F600}b", f).len(), 4);
     }
 
     #[test]
