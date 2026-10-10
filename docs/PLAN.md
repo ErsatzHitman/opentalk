@@ -91,7 +91,7 @@ src/daemon/paste.rs    clipboard snapshot/restore, SendInput, terminal detection
 src/daemon/tray.rs     Shell_NotifyIcon + menu
 src/daemon/sound.rs    synthesized cues → in-memory WAV → PlaySound
 src/ui/…               egui app: shell, theme tokens, widgets, history, dictionary, settings
-tools/mock_stt.py      local mock for every provider's wire format (contract tests)
+`--bench mock-stt`      in-repo mock STT server (Rust, replaces the planned tools/mock_stt.py); per-provider wire-format mocks are in-process test servers
 bench/bench.ps1        CPU/RAM/latency benchmark harness
 ```
 
@@ -297,7 +297,7 @@ OpenWhispr already has History (its Home page) and a Dictionary page with Snippe
 | Layer | Method |
 |---|---|
 | Unit | `cargo test`: cleanup pipeline (all ported OpenWhispr fixtures plus new ones), snippets, dictionary prompt caps, echo filter, hotkey parser and matcher, provider request builders (golden multipart bodies), response parsers, error classifier, config migration. |
-| Provider contracts | `tools/mock_stt.py` replays each provider's documented request and response shape (OpenAI SSE, xAI, Mistral, Gemini JSON, Deepgram REST and WS, AssemblyAI WS, Corti flow). Every provider's request is asserted byte-for-byte against OpenWhispr's format. No real keys are needed. |
+| Provider contracts | In-process Rust mock servers (`std::net::TcpListener`, plus `opentalk --bench mock-stt` for the e2e and bench runs; they replace the planned `tools/mock_stt.py`) replay each provider's documented request and response shape (OpenAI SSE, xAI, Mistral, Gemini JSON, Deepgram REST and WS, AssemblyAI WS, Corti flow). Every provider's request is asserted byte-for-byte against OpenWhispr's format. No real keys are needed. |
 | Live STT | **Best effort, reported honestly; not an exit gate.** OpenRouter lists exactly three `:free` models with audio input (re-checked 2026-10-10): `thinkingmachines/inkling-small:free` and `inkling:free` (403 "only available on agentic harnesses") and `nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free`. The last mostly answers 502 ResourceExhausted; when it answers, `usage.prompt_tokens_details.audio_tokens` is 0 and the model says it needs the audio file, so the free NVIDIA endpoint discards the audio (our `input_audio`/wav request shape is correct). No free model currently yields a transcript, so live STT is **UNVERIFIED** and STT correctness rests on the mock contract tests. The `live_*` tests print `VERIFIED` (a transcript with the spoken words), `UNVERIFIED` (limits, gated model, audio dropped) or `FAILED` (bad key or request, always a failure). `OPENTALK_LIVE_REQUIRE=1` turns `UNVERIFIED` into a failure, for runs that have a model able to verify. Retries and backoff on 429/5xx. |
 | Live cleanup LLM | OpenRouter `:free` text models (`nvidia/nemotron-3.5-lightning:free`, `google/gemma-4-31b-it:free`, `liquid/lfm-2.5-2.6b:free`). Check output validation and the 4 s timeout fallback. |
 | End-to-end | `opentalk.exe --transcribe-file x.wav` runs the full pipeline headless. A scripted dictation sends `SendInput` of the hotkey, plays TTS into the mic (or uses `--inject-wav` to bypass the mic), and pastes into Notepad. Assert the Notepad text. |

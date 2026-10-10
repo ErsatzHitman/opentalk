@@ -22,10 +22,11 @@ fn main() {
     // Anchor the monotonic clock at process start so logged times measure from launch.
     core::timing::now_ms();
     let args: Vec<String> = std::env::args().skip(1).collect();
-    // Daemon modes (no argument, or --hidden from launch-at-login) share one log file.
+    // Helper modes log to their own file; every daemon launch (no argument, --hidden from
+    // launch-at-login, or an unrecognised argument) shares `daemon.log`.
     let log_name = match args.first().map(String::as_str) {
-        None | Some("--hidden") => "daemon",
-        Some(other) => other,
+        Some(mode @ ("--settings" | "--transcribe-file" | "--render-pill" | "--bench")) => mode,
+        _ => "daemon",
     };
     core::logging::init(log_name);
     let code = match args.first().map(String::as_str) {
