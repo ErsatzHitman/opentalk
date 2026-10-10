@@ -311,6 +311,20 @@ mod tests {
         assert_eq!(back.ai_cleanup.azure_model, "gpt-5");
     }
     #[test]
+    fn reduce_transparency_defaults_off_for_old_files() {
+        // A config written before the glass Settings UI (no `reduce_transparency`) loads with it off,
+        // keeps every other field, and the new field round-trips once set.
+        let c: Config = serde_json::from_str(r#"{"version":1,"theme":"dark","audio_cues":false}"#).unwrap();
+        assert!(!c.reduce_transparency);
+        assert_eq!(c.theme, Theme::Dark);
+        assert!(!c.audio_cues);
+        assert!(!Config::default().reduce_transparency);
+        let mut m = c;
+        m.reduce_transparency = true;
+        let back: Config = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
+        assert!(back.reduce_transparency);
+    }
+    #[test]
     fn roundtrip() {
         let c = Config::default();
         let s = serde_json::to_string(&c).unwrap();

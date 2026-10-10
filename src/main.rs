@@ -15,6 +15,8 @@ mod core;
 mod daemon;
 mod llm;
 mod stt;
+#[cfg(test)]
+mod testenv;
 mod ui;
 
 fn main() {

@@ -1271,8 +1271,38 @@ mod tests {
 
     #[test]
     fn friendly_name_from_version_info() {
-        let n = friendly_name(&system_exe("notepad.exe"));
+        let path = system_exe("notepad.exe");
+        let n = friendly_name(&path);
+        if n.is_none() {
+            // Wine's builtin notepad.exe carries a version resource without a FileDescription; Windows'
+            // own always has one, so this skip can never trigger on Windows
+            if let Some(v) = crate::testenv::wine_version() {
+                if !version_info_has(&path, "FileDescription") {
+                    println!("SKIPPED (Wine: the notepad.exe of Wine {v} has no FileDescription in its version resource)");
+                    return;
+                }
+            }
+        }
         assert!(n.is_some_and(|s| !s.is_empty()));
+    }
+
+    /// Whether the file's version resource contains the string key `key` at all (raw UTF-16 search).
+    fn version_info_has(path: &str, key: &str) -> bool {
+        let wpath = wide(path);
+        // SAFETY: the buffer is sized from the API's own length report.
+        let data = unsafe {
+            let size = GetFileVersionInfoSizeW(PCWSTR(wpath.as_ptr()), None);
+            if size == 0 {
+                return false;
+            }
+            let mut data = vec![0u8; size as usize];
+            if GetFileVersionInfoW(PCWSTR(wpath.as_ptr()), None, size, data.as_mut_ptr() as *mut c_void).is_err() {
+                return false;
+            }
+            data
+        };
+        let needle: Vec<u8> = key.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        data.windows(needle.len()).any(|w| w == needle.as_slice())
     }
 
     /// Run alone (`--ignored`): loading a Win32 exe's icon must not drag the shell DLLs (the source of
