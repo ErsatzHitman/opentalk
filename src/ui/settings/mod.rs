@@ -11,10 +11,10 @@ pub mod system;
 
 use super::fonts;
 use super::icons;
-use super::theme::{Palette, mix};
+use super::theme::{Palette, mix, with_alpha};
 use super::widgets::{self as w, Btn, Variant, cr};
 use super::{Cmd, Env};
-use eframe::egui::{self, Align, Align2, Color32, Layout, Rect, Sense, Stroke, Ui, UiBuilder, pos2, vec2};
+use eframe::egui::{self, Align, Align2, Color32, CornerRadius, Layout, Rect, Sense, Stroke, StrokeKind, Ui, UiBuilder, pos2, vec2};
 use std::collections::HashMap;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -165,15 +165,23 @@ pub fn show(ctx: &egui::Context, env: &mut Env, st: &mut SettingsState) -> Modal
     let mut out = ModalOut { changed: false, close: false };
     let sidebar_w = if width < 700.0 { 56.0 } else { 208.0 };
 
-    // Modal tier (docs/GLASS.md): scrim + frosted glass surface; everything inside is a child of
-    // glass, so the sidebar and its items paint washes only.
-    let modal = w::glass_modal(ctx, &p, egui::Id::new("settings-modal"), 0, |ui| {
+    let frame = egui::Frame::new()
+        .fill(if p.dark { p.surface1 } else { p.background })
+        .stroke(Stroke::new(1.0, if p.dark { p.border_subtle } else { p.border }))
+        .corner_radius(cr(12.0))
+        .shadow(egui::Shadow { offset: [0, 25], blur: 50, spread: 0, color: Color32::from_black_alpha(if p.dark { 130 } else { 64 }) });
+    let modal = egui::Modal::new(egui::Id::new("settings-modal"))
+        .backdrop_color(Color32::from_black_alpha(if p.dark { 150 } else { 70 }))
+        .frame(frame)
+        .show(ctx, |ui| {
             ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
             let (rect, _) = ui.allocate_exact_size(vec2(width, height), Sense::hover());
             let side_rect = Rect::from_min_size(rect.min, vec2(sidebar_w, height));
             let main_rect = Rect::from_min_max(pos2(rect.min.x + sidebar_w, rect.min.y), rect.max);
             // Sidebar background + divider.
-            ui.painter().line_segment([side_rect.right_top() + vec2(0.0, 20.0), side_rect.right_bottom() - vec2(0.0, 20.0)], Stroke::new(1.0, p.divider()));
+            let r = CornerRadius { nw: 12, sw: 12, ne: 0, se: 0 };
+            ui.painter().rect_filled(side_rect.shrink(0.5), r, if p.dark { p.surface0 } else { p.surface1 });
+            ui.painter().line_segment([side_rect.right_top(), side_rect.right_bottom()], Stroke::new(1.0, if p.dark { p.border_subtle } else { p.border_a(70) }));
             let mut side = ui.new_child(UiBuilder::new().max_rect(side_rect).layout(Layout::top_down(Align::Min)));
             sidebar(&mut side, &p, st, sidebar_w < 100.0);
 
@@ -192,7 +200,7 @@ pub fn show(ctx: &egui::Context, env: &mut Env, st: &mut SettingsState) -> Modal
             let resp = ui.interact(cr_, ui.id().with("settings-close"), Sense::click());
             w::pointer(&resp);
             let hov = w::hover_anim(ui, resp.id.with("h"), resp.hovered());
-            ui.painter().rect_filled(cr_, cr(14.0), mix(Color32::TRANSPARENT, p.wash(1), hov));
+            ui.painter().rect_filled(cr_, cr(6.0), mix(Color32::TRANSPARENT, if p.dark { p.raised } else { p.muted }, hov));
             w::paint_icon(ui, cr_, icons::CLOSE, 12.0, mix(p.muted_a(50), p.muted_a(100), hov));
             if resp.clicked() {
                 out.close = true;
@@ -235,9 +243,9 @@ fn sidebar(ui: &mut Ui, p: &Palette, st: &mut SettingsState, compact: bool) {
             let hov = w::hover_anim(ui, resp.id.with("h"), resp.hovered() && !active);
             let painter = ui.painter();
             if active {
-                painter.rect_filled(r, cr(8.0), p.primary_wash(1));
+                painter.rect_filled(r, cr(6.0), if p.dark { p.raised } else { p.muted });
             } else if hov > 0.0 {
-                painter.rect_filled(r, cr(8.0), mix(Color32::TRANSPARENT, p.wash(1), hov));
+                painter.rect_filled(r, cr(6.0), mix(Color32::TRANSPARENT, if p.dark { p.surface2 } else { with_alpha(p.muted, 50) }, hov));
             }
             let ic = if active { p.primary } else { mix(p.muted_a(70), p.fg_a(80), hov) };
             painter.text(pos2(r.min.x + 16.0, r.center().y), Align2::CENTER_CENTER, s.icon().to_string(), fonts::icon(14.0), ic);
@@ -256,7 +264,7 @@ fn sidebar(ui: &mut Ui, p: &Palette, st: &mut SettingsState, compact: bool) {
     if h > 36.0 {
         ui.add_space(h - 34.0);
         let (rect, _) = ui.allocate_exact_size(vec2(w_, 34.0), Sense::hover());
-        ui.painter().line_segment([rect.left_top() + vec2(16.0, 0.0), rect.right_top() - vec2(16.0, 0.0)], Stroke::new(1.0, p.divider()));
+        ui.painter().line_segment([rect.left_top(), rect.right_top()], Stroke::new(1.0, if p.dark { p.border_subtle } else { p.border_a(70) }));
         if !compact {
             ui.painter().circle_filled(pos2(rect.min.x + 18.0, rect.center().y), 2.0, p.success_a(60));
             ui.painter().text(pos2(rect.min.x + 28.0, rect.center().y), Align2::LEFT_CENTER, format!("v{}", env!("CARGO_PKG_VERSION")), fonts::regular(11.0), p.muted_a(70));
@@ -352,8 +360,8 @@ pub fn api_key_field(ui: &mut Ui, env: &mut Env, st: &mut SettingsState, name: &
             ui.spacing_mut().item_spacing.x = 8.0;
             let wd = (ui.available_width() - 150.0).max(120.0);
             let (rect, _) = ui.allocate_exact_size(vec2(wd, 32.0), Sense::hover());
-            ui.painter().rect_filled(rect, cr(8.0), p.wash(0));
-            ui.painter().line_segment([pos2(rect.min.x + 1.0, rect.max.y - 0.5), pos2(rect.max.x - 1.0, rect.max.y - 0.5)], Stroke::new(1.0, p.input_border()));
+            ui.painter().rect_filled(rect, cr(6.0), if p.dark { p.surface1 } else { p.muted });
+            ui.painter().rect_stroke(rect, cr(6.0), Stroke::new(1.0, p.input_border()), StrokeKind::Inside);
             ui.painter().text(pos2(rect.min.x + 10.0, rect.center().y), Align2::LEFT_CENTER, m, fonts::regular(13.0), p.muted_a(90));
             if let Some(var) = &env_var {
                 // Set by the environment: Edit/Remove would change only the stored copy, which
@@ -366,11 +374,10 @@ pub fn api_key_field(ui: &mut Ui, env: &mut Env, st: &mut SettingsState, name: &
             if w::button(ui, &p, Btn::new("Edit", Variant::Outline).small()).clicked() {
                 st.key_edit = Some((name.to_string(), String::new()));
             }
-            if w::button(ui, &p, Btn::new("Remove", Variant::DestructiveOutline).small()).clicked()
-                && st.secrets.set(name, "").is_ok() {
-                    saved = true;
-                    env.cmds.push(Cmd::Toast("API key removed".into()));
-                }
+            if w::button(ui, &p, Btn::new("Remove", Variant::DestructiveOutline).small()).clicked() && st.secrets.set(name, "").is_ok() {
+                saved = true;
+                env.cmds.push(Cmd::Toast("API key removed".into()));
+            }
         });
     }
     saved

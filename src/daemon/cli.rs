@@ -20,6 +20,13 @@ pub fn render_pill(args: &[String]) -> i32 {
     super::pill::cli_render(args)
 }
 
+/// `--render-tray-popup <out.png> [--dark] [--recording|--transcribing] [--recent] [--retry]
+/// [--pill-hidden] [--hover <row>] [--focus] [--scale 1.0] [--transparent] [--no-text]`
+pub fn render_tray_popup(args: &[String]) -> i32 {
+    attach_console();
+    super::tray::cli_render_popup(args)
+}
+
 /// `--bench <scenario> ...` — see bench/bench.ps1.
 pub fn bench(args: &[String]) -> i32 {
     attach_console();

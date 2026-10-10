@@ -358,17 +358,17 @@ fn anim_thread(core: Arc<TimerCore>, sink: Box<dyn Fn() + Send>) {
 
 // --- DIB ---------------------------------------------------------------------------------------
 
-struct Dib {
-    dc: HDC,
+pub(crate) struct Dib {
+    pub(crate) dc: HDC,
     bmp: HBITMAP,
     old: HGDIOBJ,
     bits: *mut u8,
-    w: i32,
-    h: i32,
+    pub(crate) w: i32,
+    pub(crate) h: i32,
 }
 
 impl Dib {
-    fn new(w: i32, h: i32) -> Option<Dib> {
+    pub(crate) fn new(w: i32, h: i32) -> Option<Dib> {
         // SAFETY: standard memory-DC + DIB section creation, released in Drop.
         unsafe {
             let dc = CreateCompatibleDC(None);
@@ -400,7 +400,7 @@ impl Dib {
 
     /// Copy the `r` part of a premultiplied RGBA frame into the BGRA bitmap (the whole frame for the
     /// full rect). `r` is clipped to the bitmap.
-    fn upload(&mut self, rgba: &[u8], r: DevRect) {
+    pub(crate) fn upload(&mut self, rgba: &[u8], r: DevRect) {
         let n = (self.w * self.h * 4) as usize;
         if rgba.len() < n {
             return;

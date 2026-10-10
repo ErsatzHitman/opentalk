@@ -20,9 +20,9 @@ the same floating recording pill, and adds a deterministic filler-word cleaner, 
   recording. While it rests there is no timer at all: the circle's glass is refreshed only when something happens (it
   appears, moves or changes state, you hover it, or another window is activated, moved, minimised or restored), so its
   frost can lag a little behind the screen (see "Pill surface material" in [docs/SPEC.md](docs/SPEC.md)).
-- **Liquid-glass control panel.** History, Dictionary and Settings are frosted, refracting glass panels over an
-  ambient colour mesh and the Windows 11 acrylic backdrop (opaque page when acrylic is unavailable, when Windows'
-  Transparency effects are off, or with *Reduce transparency* on). Design notes: [docs/GLASS.md](docs/GLASS.md).
+- **Minimal control panel and tray popup.** History, Dictionary and Settings are a plain flat window (solid surfaces, 1 px
+  borders, light / dark / system theme); the glass is only on the pill. Clicking the tray icon opens a small popup
+  next to the tray with Dictation, History, Dictionary, Settings and a few shortcuts (see "Using it").
 - **Fast.** Mic stream prepared in advance, TLS connection pre-warmed at key press, silence trimmed before upload, streaming
   transport for Deepgram / AssemblyAI / OpenAI Realtime / Gemini Live. Local post-processing is a few milliseconds.
 - **Clean text.** Deterministic filler removal (um, uh, "you know", stutters, loops, hallucinated "Thanks for watching"),
@@ -76,7 +76,7 @@ powershell -File bench\bench.ps1            # CPU / memory / latency benchmark -
 ### Cross-compile and test on Linux
 
 The whole build and most of the test suite run on Linux, cross-compiled to the same GNU Windows target and executed
-under Wine with a virtual X display. This is how the liquid-glass work was merged and audited; it does not replace a
+under Wine with a virtual X display. This is how the work is merged and audited; it does not replace a
 Windows desktop for the checks in [Run on Windows](#run-on-windows).
 
 ```sh
@@ -112,14 +112,17 @@ wine $EXE --render-pill error 400 err.png --dark --backdrop gradient --composite
 # backdrops: white black gradient busy-text (or a PNG path)
 ```
 
-Headless screenshots of every Settings / History / Dictionary page (egui rendered on the CPU, a synthetic wallpaper in
-place of acrylic; icon glyphs show as `?` because Segoe Fluent Icons has no free stand-in):
+Headless screenshots of every Settings / History / Dictionary page (egui rendered on the CPU; icon glyphs show as `?`
+because Segoe Fluent Icons has no free stand-in, and the text uses Liberation Sans in place of Segoe UI), and of the
+tray popup:
 
 ```sh
-OPENTALK_SHOT_DIR=docs/screenshots/glass/offscreen cargo test --target x86_64-pc-windows-gnu --bin opentalk offscreen_shots
+OPENTALK_SHOT_DIR=docs/screenshots/ui cargo test --target x86_64-pc-windows-gnu --bin opentalk offscreen_shots
+wine $EXE --render-tray-popup popup.png [--dark] [--recording|--transcribing] [--recent] [--retry] [--hover History] [--focus]
 ```
 
-What does **not** work under Wine: `WDA_EXCLUDEFROMCAPTURE` (so the pill's glass falls back to its neutral backdrop and
+What does **not** work under Wine: the tray popup's real window (`Shell_NotifyIconGetRect`, `ABM_GETTASKBARPOS`),
+`WDA_EXCLUDEFROMCAPTURE` (so the pill's glass falls back to its neutral backdrop and
 the `desktop_pill_*backdrop*` / `capture_*` desktop tests fail), out-of-context WinEvents from other processes, DWM
 acrylic, real audio devices, and the network from the Windows binaries when the host only has an HTTPS proxy (the app
 does not read `HTTPS_PROXY`), so the `live_*` tests cannot reach OpenRouter there.
@@ -127,7 +130,7 @@ does not read `HTTPS_PROXY`), so the `live_*` tests cannot reach OpenRouter ther
 ## Run on Windows
 
 Everything below needs a real, unlocked Windows 10/11 desktop (not Wine, not a locked session) and has not been run on the
-merged liquid-glass build:
+merged build:
 
 - **Every `desktop_*` test** (`cargo test -- --ignored --test-threads=1 desktop_`; list them with
   `cargo test -- --list --ignored | findstr desktop_`):
@@ -150,18 +153,22 @@ merged liquid-glass build:
     `desktop_pill_lifecycle_and_idle_is_silent`, `desktop_pill_real_app_icon_bubble`,
     `desktop_pill_resting_circle_runs_no_timer_and_refreshes_on_events`,
     `desktop_pill_steady_recording_presents_only_the_dirty_lane`, `desktop_pill_thinking_glow_presents_partial_frames`
-  - sound / tray: `desktop_sound_plays`, `desktop_tray_add_remove`
+  - sound / tray: `desktop_sound_plays`, `desktop_tray_add_remove`, `desktop_tray_popup_opens_and_closes`
   - streaming: `desktop_session_cpu_budget`, `desktop_tls_loopback_roundtrip`
   - Settings hotkey capture: `desktop_capture_ctrl_win`, `desktop_capture_escape_cancels_and_f8_works`
   - end to end (`tests/e2e.rs`): `desktop_cancel_while_the_mic_starts_drops_the_dictation`, `desktop_e2e_notepad`,
     `desktop_e2e_notepad_streaming`
-- `powershell -File bench\bench.ps1`: re-measure every PLAN section 1 budget on the glass build (idle CPU with the
+- `powershell -File bench\bench.ps1`: re-measure every PLAN section 1 budget (idle CPU with the
   resting glass circle on screen, recording CPU with the 4 Hz backdrop capture, daemon working set / private bytes with
-  the capture buffers, Settings working set with the glass pages, startup, latency) and regenerate
+  the capture buffers, Settings working set, startup, latency, and the executable size now that the Settings glass is gone) and regenerate
   [docs/BENCHMARK.md](docs/BENCHMARK.md).
 - `powershell -File tests\e2e.ps1` (`-Stt mock` and `-Stt mock-stream`): the real paste into Notepad.
-- Live Settings window screenshots over real acrylic (`docs/screenshots/glass/live-*.png` predate the page migration):
-  every page in light and dark, and with *Reduce transparency* / Transparency effects off.
+- The tray popup on a real desktop (the `docs/screenshots/tray-popup/` pictures come from `--render-tray-popup`): left
+  click, right click and Enter on the icon, also with the icon in the hidden-icons overflow; the position with the
+  taskbar at the bottom, top, left and right, on a second monitor, and at 125 / 150 / 200 % DPI; Esc, arrow keys, Enter,
+  click outside and Alt+Tab close or drive it; the second click on the icon closes it instead of reopening; the
+  open time and that the closed popup costs nothing (no window, no timer). Settings in light and dark on the real
+  window (Segoe UI, Segoe Fluent Icons).
 - The GDI-text goldens (error cards, tooltips) in `goldens_match`, with Segoe UI installed.
 - The pill's capture exclusion: `desktop_pill_capture_excludes_the_pill`, and a manual check that the pill, bubble,
   tooltip and error card are absent from a screenshot / screen share while the glass still shows the screen behind.
@@ -179,10 +186,16 @@ merged liquid-glass build:
 2. Focus any text field and press **Ctrl + Win** (default). Speak. Press it again to finish; the text is pasted.
    - **Tap to talk** (default): press to start, press to stop.
    - **Push to talk**: hold to record (starts after 150 ms), release to stop; a shorter press does nothing.
-3. **Esc** cancels while recording or transcribing. The pill's `x` button and the tray menu do the same.
-4. Click the pill to toggle recording, right-click it for *Hide for now*. Left-click the tray icon (or launch the exe
-   again) to open the app window with History, Dictionary and Settings.
-5. If a transcription fails (network, quota) the error card offers **Retry** with the audio that was kept in memory.
+3. **Esc** cancels while recording or transcribing. The pill's `x` button does the same.
+4. Click the pill to toggle recording, right-click it for *Hide for now*.
+5. **Click the tray icon** (left or right click, or Enter / Space on it from the keyboard; it works from the hidden-icons
+   overflow too) to open a small popup at the bottom-right, next to the tray. It shows OpenTalk's status (Ready /
+   Recording / Transcribing), a **Start / Stop dictation** button with the hotkey, **History**, **Dictionary**,
+   **Settings**, your last two dictations (click one to copy it), **Show / Hide floating pill**, **Retry last dictation**
+   (only after a failure) and **Quit**. Use the mouse, or the arrow keys, Home / End, Tab, Enter and Esc. It closes when
+   you pick a row, press Esc or click anywhere else; clicking the tray icon again closes it too. Launching the exe a
+   second time opens History.
+6. If a transcription fails (network, quota) the error card offers **Retry** with the audio that was kept in memory.
 
 Command line (the exe is a GUI-subsystem program, so run these from a terminal and capture the output with a pipe):
 
@@ -192,6 +205,7 @@ Command line (the exe is a GUI-subsystem program, so run these from a terminal a
 | `opentalk.exe --settings [history\|dictionary\|settings[:section]]` | Open the control panel |
 | `opentalk.exe --transcribe-file x.wav [--provider id] [--model m] [--llm\|--no-llm]` | Run the full pipeline headless, print JSON `{raw, text, provider, model, stt_ms, cleanup_ms, total_ms}` |
 | `opentalk.exe --render-pill <state> <t_ms> out.png [--dark] [--backdrop white\|black\|gradient\|busy-text [--composite]] [--upscale N]` | Render a pill state to PNG (visual goldens), optionally over a backdrop fixture (`--composite` shows the window over the fixture it sits on) |
+| `opentalk.exe --render-tray-popup out.png [--dark] [--recording\|--transcribing] [--recent] [--retry] [--hover <row>] [--focus]` | Render the tray popup to PNG (screenshots, structural goldens) |
 | `opentalk.exe --bench ...` | Benchmark helpers: `toggle`, `dictate <n> <wav>`, `latency`, `mock-stt`, `info` (see `bench/bench.ps1`) |
 
 Automation hooks: `OPENTALK_HOME` (data directory), `OPENTALK_INJECT_WAV` (play a WAV instead of the microphone),
@@ -202,7 +216,7 @@ the secret store), `OPENTALK_LOG=debug`.
 
 | Section | What you can change |
 |---|---|
-| Preferences | Theme, reduce transparency (opaque window instead of the acrylic glass backdrop), dictation sounds, pause media while dictating, mute system audio while dictating (on by default), automatic pasting, keep text on the clipboard, floating icon (auto-hide, position, app bubble), language, microphone, launch at login |
+| Preferences | Theme, dictation sounds, pause media while dictating, mute system audio while dictating (on by default), automatic pasting, keep text on the clipboard, floating icon (auto-hide, position, app bubble), language, microphone, launch at login |
 | Hotkeys | Dictation hotkey (modifier-only combos allowed), Tap / Push to talk, Start-menu suppression for Win combos |
 | Speech-to-Text | Provider, model, API key (masked), custom endpoint, streaming preference, **Test** button |
 | Cleanup | Filler removal (Off / Standard / Aggressive), fuzzy dictionary, spoken line breaks, AI cleanup provider / model / key / prompt |
@@ -247,7 +261,7 @@ docs/                  PLAN, SPEC, BENCHMARK
 Measured with `bench/bench.ps1` on an i7-14650HX (24 logical cores), release build, local mock STT so the network does not
 enter the numbers. Full report: [docs/BENCHMARK.md](docs/BENCHMARK.md).
 
-**These Windows figures predate the liquid glass** (pill backdrop capture, glass Settings pages). The rows marked
+**These Windows figures predate the liquid glass** (pill backdrop capture) **and the flat Settings / tray popup rework**. The rows marked
 *stale* must be re-measured with `bench.ps1` on Windows (see [Run on Windows](#run-on-windows)); the executable size is
 from the merged tree, cross-built on Linux.
 
@@ -258,7 +272,7 @@ from the merged tree, cross-built on Linux.
 | Daemon memory, idle *stale* | 17.9 MB working set, 4.4 MB private bytes | <= 25 MB | ~110 MB |
 | Daemon memory, recording / 10 dictations (peak) *stale* | 19.1 MB WS (app bubble off), 23.2-23.4 MB WS with the app bubble and no foreground app; **37-40 MB WS with a packaged app such as Windows Terminal in front** (misses, see below) | <= 25 MB | ~110 MB |
 | Settings window *stale* | 12.4 MB working set, separate process, ~0% CPU idle (commits ~267 MB of GL driver pools, documented) | <= 80 MB | - |
-| Executable | 7.51 MB (7,505,920 bytes), one file (merged glass tree, 2026-10-10) | <= 8 MB (8,000,000 bytes) | - |
+| Executable | 7.51 MB (7,505,920 bytes), one file (merged glass tree, 2026-10-10; the flat Settings window removes `ui/glass.rs`, expected smaller) | <= 8 MB (8,000,000 bytes) | - |
 | Start-up | daemon ready in ~21 ms | - | - |
 | Hotkey -> pill / -> first mic packet | 1.6 ms / 20.5 ms (median) | <= 16 / <= 50 ms | - |
 | Local overhead stop -> paste (excluding STT) | ~1 ms before paste; ~18 ms including a real `SendInput` paste (earlier unlocked-desktop run) | <= 40 ms | - |

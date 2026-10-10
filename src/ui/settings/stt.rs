@@ -4,10 +4,10 @@ use crate::core::config::SttProviderId;
 use crate::core::secrets::SecretName;
 use crate::stt::registry::{self, PROVIDERS};
 use crate::ui::fonts;
-use crate::ui::theme::{Palette, mix};
-use crate::ui::widgets::{self as w, Btn, ChipKind, Variant};
+use crate::ui::theme::{Palette, mix, with_alpha};
+use crate::ui::widgets::{self as w, Btn, ChipKind, Variant, cr};
 use crate::ui::{Env, icons};
-use eframe::egui::{self, Align2, Color32, Sense, Ui, pos2, vec2};
+use eframe::egui::{self, Align2, Color32, Sense, Stroke, StrokeKind, Ui, pos2, vec2};
 use std::sync::mpsc::{Receiver, channel};
 use std::time::Instant;
 
@@ -34,10 +34,11 @@ impl SttState {
     /// Pull a finished result from the background thread.
     pub fn poll(&mut self) {
         if let Some(rx) = &self.rx
-            && let Ok(o) = rx.try_recv() {
-                self.outcome = Some(o);
-                self.rx = None;
-            }
+            && let Ok(o) = rx.try_recv()
+        {
+            self.outcome = Some(o);
+            self.rx = None;
+        }
     }
 }
 
@@ -82,12 +83,13 @@ pub fn show(ui: &mut Ui, env: &mut Env, st: &mut SettingsState) -> bool {
     let labels: Vec<(&str, &str)> = PROVIDERS.iter().map(|pi| (pi.name, if pi.id == SttProviderId::Openai { "Recommended" } else { "" })).collect();
     let sel = PROVIDERS.iter().position(|pi| pi.id == provider).unwrap_or(0);
     if let Some(i) = w::pill_tabs(ui, &p, sel, &labels)
-        && PROVIDERS[i].id != provider {
-            env.cfg.stt.provider = PROVIDERS[i].id;
-            st.key_edit = None;
-            st.stt.outcome = None;
-            changed = true;
-        }
+        && PROVIDERS[i].id != provider
+    {
+        env.cfg.stt.provider = PROVIDERS[i].id;
+        st.key_edit = None;
+        st.stt.outcome = None;
+        changed = true;
+    }
     let provider = env.cfg.stt.provider;
     let info = if provider == info.id { info } else { registry::provider(provider) };
 
@@ -149,30 +151,27 @@ pub fn show(ui: &mut Ui, env: &mut Env, st: &mut SettingsState) -> bool {
         group(ui, &p, "Model", "");
         let active = env.cfg.stt_model();
         let mut chosen: Option<&'static str> = None;
-        w::panel(ui, &p, |ui| {
-            for (i, m) in info.models.iter().enumerate() {
-                if i > 0 {
-                    w::divider(ui, &p);
-                }
-                let mut chips: Vec<(&str, ChipKind)> = Vec::new();
-                if i == 0 {
-                    chips.push(("Recommended", ChipKind::Primary));
-                }
-                if m.streaming_only {
-                    chips.push(("Streaming only", ChipKind::Neutral));
-                } else if m.streaming {
-                    chips.push(("Streaming", ChipKind::Neutral));
-                }
-                let is_active = m.id == active;
-                if model_card(ui, &p, m.name, m.description, &chips, is_active, (i == 0, i + 1 == info.models.len())) && !is_active {
-                    chosen = Some(m.id);
-                }
+        ui.spacing_mut().item_spacing = vec2(0.0, 4.0);
+        for (i, m) in info.models.iter().enumerate() {
+            let mut chips: Vec<(&str, ChipKind)> = Vec::new();
+            if i == 0 {
+                chips.push(("Recommended", ChipKind::Primary));
             }
-        });
+            if m.streaming_only {
+                chips.push(("Streaming only", ChipKind::Neutral));
+            } else if m.streaming {
+                chips.push(("Streaming", ChipKind::Neutral));
+            }
+            let is_active = m.id == active;
+            if model_card(ui, &p, m.name, m.description, &chips, is_active) && !is_active {
+                chosen = Some(m.id);
+            }
+        }
         if let Some(id) = chosen {
             env.cfg.stt.models.insert(provider, id.to_string());
             changed = true;
         }
+        ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
     }
 
     // ---- transport
@@ -224,47 +223,64 @@ pub fn show(ui: &mut Ui, env: &mut Env, st: &mut SettingsState) -> bool {
 
 fn result_box(ui: &mut Ui, p: &Palette, ok: bool, badge: &str, body: &str) {
     let col = if ok { p.success } else { p.destructive };
-    w::notice(ui, p, col, |ui| {
-        ui.spacing_mut().item_spacing = vec2(0.0, 4.0);
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 8.0;
-            w::text_semi(ui, if ok { "Transcribed" } else { "Error" }, 12.0, col);
-            w::text(ui, badge, 12.0, p.muted_a(90));
+    egui::Frame::new()
+        .fill(with_alpha(col, if p.dark { 10 } else { 6 }))
+        .stroke(Stroke::new(1.0, with_alpha(col, 30)))
+        .corner_radius(cr(8.0))
+        .inner_margin(egui::Margin::symmetric(14, 10))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing = vec2(0.0, 4.0);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                w::text_semi(ui, if ok { "Transcribed" } else { "Error" }, 12.0, col);
+                w::text(ui, badge, 12.0, p.muted_a(80));
+            });
+            w::text(ui, body, 13.0, p.foreground);
         });
-        w::text(ui, body, 13.0, p.foreground);
-    });
 }
 
-/// One selectable model row of the models panel: a wash on hover, a primary wash when active.
-/// Returns true when clicked.
-fn model_card(ui: &mut Ui, p: &Palette, name: &str, desc: &str, chips: &[(&str, ChipKind)], active: bool, (first, last): (bool, bool)) -> bool {
-    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 48.0), Sense::click());
+/// One selectable model card. Returns true when clicked.
+fn model_card(ui: &mut Ui, p: &Palette, name: &str, desc: &str, chips: &[(&str, ChipKind)], active: bool) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 44.0), Sense::click());
     w::pointer(&resp);
     let hov = w::hover_anim(ui, resp.id.with("h"), resp.hovered());
     let t = ui.ctx().animate_bool_with_time(resp.id.with("a"), active, 0.15);
     let painter = ui.painter();
-    painter.rect_filled(rect, w::edge_rounding(first, last), mix(mix(Color32::TRANSPARENT, p.wash(0), hov), p.primary_wash(0), t));
+    let fill = mix(mix(Color32::TRANSPARENT, p.overlay(3), hov), p.primary_a(if p.dark { 10 } else { 5 }), t);
+    painter.rect_filled(rect, cr(6.0), fill);
+    let base = if p.dark { with_alpha(Color32::WHITE, 8) } else { p.border_a(60) };
+    painter.rect_stroke(rect, cr(6.0), Stroke::new(1.0, mix(mix(base, p.border_hover, hov), p.primary_a(35), t)), StrokeKind::Inside);
     // status dot
-    painter.circle_filled(pos2(rect.min.x + 20.0, rect.center().y), 3.0, mix(p.muted_a(30), p.success, t));
-    painter.text(pos2(rect.min.x + 34.0, rect.center().y), Align2::LEFT_CENTER, name, fonts::semibold(13.0), p.foreground);
+    painter.circle_filled(pos2(rect.min.x + 16.0, rect.center().y), 3.0, mix(p.muted_a(30), p.success, t));
+    painter.text(pos2(rect.min.x + 30.0, rect.center().y), Align2::LEFT_CENTER, name, fonts::semibold(13.0), p.foreground);
     let nw = w::measure(ui, name, fonts::semibold(13.0)).x;
     ui.painter().with_clip_rect(egui::Rect::from_min_max(rect.min, pos2(rect.max.x - 150.0, rect.max.y))).text(
-        pos2(rect.min.x + 34.0 + nw + 10.0, rect.center().y),
+        pos2(rect.min.x + 30.0 + nw + 10.0, rect.center().y),
         Align2::LEFT_CENTER,
         desc,
         fonts::regular(12.0),
-        p.muted_a(85),
+        p.muted_a(70),
     );
     // chips from the right edge
-    let mut x = rect.max.x - 16.0;
+    let mut x = rect.max.x - 12.0;
     let mut all: Vec<(&str, ChipKind)> = chips.to_vec();
     if active {
         all.push(("Active", ChipKind::Primary));
     }
     for (label, kind) in all.iter().rev() {
-        let tw = w::chip_width(ui, label);
+        let font = fonts::semibold(11.0);
+        let tw = w::measure(ui, label, font.clone()).x + 14.0;
         let r = egui::Rect::from_min_size(pos2(x - tw, rect.center().y - 10.0), vec2(tw, 20.0));
-        w::paint_chip(ui, p, r, label, *kind);
+        let (bg, fg) = match kind {
+            ChipKind::Primary => (p.primary_a(10), p.primary),
+            ChipKind::Success => (p.success_a(12), p.success),
+            ChipKind::Warning => (p.warning_a(14), p.warning),
+            ChipKind::Destructive => (p.destructive_a(10), p.destructive),
+            ChipKind::Neutral => (if p.dark { p.surface3 } else { p.muted }, p.muted_fg),
+        };
+        ui.painter().rect_filled(r, cr(4.0), bg);
+        ui.painter().text(r.center(), Align2::CENTER_CENTER, label, font, fg);
         x -= tw + 6.0;
     }
     resp.clicked()

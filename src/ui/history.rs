@@ -7,7 +7,7 @@ use super::timefmt;
 use super::widgets::{self as w, Btn, ChipKind, Variant, cr};
 use super::{Cmd, Env};
 use crate::core::history::{Entry, Status};
-use eframe::egui::{self, Align, Color32, Layout, Margin, Rect, Sense, Shape, Ui, UiBuilder, vec2};
+use eframe::egui::{self, Align, Color32, Layout, Margin, Rect, Sense, Shape, Stroke, StrokeKind, Ui, UiBuilder, vec2};
 use std::collections::HashSet;
 
 // ---------------------------------------------------------------- pure logic
@@ -189,12 +189,9 @@ pub fn show(ui: &mut Ui, env: &mut Env, st: &mut HistoryState) {
                 if st.entries.is_empty() {
                     empty_state(ui, env);
                 } else if groups.is_empty() {
-                    w::panel(ui, &p, |ui| {
-                        w::panel_pad(ui, 16, 36, |ui| {
-                            ui.vertical_centered(|ui| {
-                                w::text(ui, "No dictations match your search.", 13.0, p.muted_a(90));
-                            });
-                        });
+                    ui.add_space(40.0);
+                    ui.vertical_centered(|ui| {
+                        w::text(ui, "No dictations match your search.", 13.0, p.muted_a(80));
                     });
                 } else {
                     for (gi, g) in groups.iter().enumerate() {
@@ -202,14 +199,20 @@ pub fn show(ui: &mut Ui, env: &mut Env, st: &mut HistoryState) {
                             ui.add_space(24.0);
                         }
                         group_header(ui, &p, st, &g.label, gi == 0);
-                        w::panel(ui, &p, |ui| {
-                            for (k, &i) in g.items.iter().enumerate() {
-                                if k > 0 {
-                                    w::divider(ui, &p);
+                        let fill = p.panel_fill();
+                        egui::Frame::new()
+                            .fill(fill)
+                            .stroke(Stroke::new(1.0, p.panel_border()))
+                            .corner_radius(cr(16.0))
+                            .show(ui, |ui| {
+                                ui.set_width(content_w - 2.0);
+                                for (k, &i) in g.items.iter().enumerate() {
+                                    if k > 0 {
+                                        w::divider(ui, &p);
+                                    }
+                                    row(ui, env, st, i, &offset_of, k == 0, k + 1 == g.items.len());
                                 }
-                                row(ui, env, st, i, &offset_of, k == 0, k + 1 == g.items.len());
-                            }
-                        });
+                            });
                     }
                 }
                 ui.add_space(32.0);
@@ -221,13 +224,19 @@ pub fn show(ui: &mut Ui, env: &mut Env, st: &mut HistoryState) {
 }
 
 fn banner(ui: &mut Ui, p: &Palette, msg: &str) {
-    w::notice(ui, p, p.warning, |ui| {
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 8.0;
-            w::text(ui, "\u{2298}", 14.0, p.warning);
-            w::text(ui, msg, 12.0, if p.dark { w::with_alpha_mul(p.warning, 0.95) } else { mix(p.warning, Color32::BLACK, 0.25) });
+    egui::Frame::new()
+        .fill(p.warning_a(if p.dark { 10 } else { 6 }))
+        .stroke(Stroke::new(1.0, p.warning_a(30)))
+        .corner_radius(cr(8.0))
+        .inner_margin(Margin::symmetric(14, 10))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                w::text(ui, "\u{2298}", 14.0, p.warning);
+                w::text(ui, msg, 12.0, if p.dark { w::with_alpha_mul(p.warning, 0.95) } else { mix(p.warning, Color32::BLACK, 0.25) });
+            });
         });
-    });
 }
 
 fn header(ui: &mut Ui, env: &mut Env, st: &mut HistoryState, has_history: bool) {
@@ -305,7 +314,7 @@ fn small_link(ui: &mut Ui, p: &Palette, glyph: char, label: &str, destructive: b
     let (rect, resp) = ui.allocate_exact_size(vec2(tw + 28.0, 22.0), Sense::click());
     w::pointer(&resp);
     let hov = w::hover_anim(ui, resp.id.with("h"), resp.hovered());
-    let (fg, bg) = if destructive { (p.destructive, p.destructive_a(12)) } else { (p.foreground, p.wash(1)) };
+    let (fg, bg) = if destructive { (p.destructive, p.destructive_a(8)) } else { (p.foreground, p.overlay(5)) };
     ui.painter().rect_filled(rect, cr(4.0), mix(Color32::TRANSPARENT, bg, hov));
     let col = mix(p.muted_a(70), fg, hov);
     ui.painter().text(egui::pos2(rect.min.x + 10.0, rect.center().y), egui::Align2::CENTER_CENTER, glyph.to_string(), fonts::icon(10.0), col);
@@ -315,38 +324,44 @@ fn small_link(ui: &mut Ui, p: &Palette, glyph: char, label: &str, destructive: b
 
 fn empty_state(ui: &mut Ui, env: &mut Env) {
     let p = *env.p;
-    w::panel(ui, &p, |ui| {
-        w::panel_pad(ui, 24, 44, |ui| {
-            ui.vertical_centered(|ui| {
-                let (rect, _) = ui.allocate_exact_size(vec2(64.0, 64.0), Sense::hover());
-                ui.painter().circle_filled(rect.center(), 32.0, p.primary_a(if p.dark { 20 } else { 13 }));
-                w::paint_icon(ui, rect, icons::MIC, 26.0, p.primary);
-                ui.add_space(20.0);
-                w::text_semi(ui, "Start your first dictation", 18.0, p.foreground);
-                ui.add_space(8.0);
-                w::text(ui, "Press your hotkey, speak, and the text appears wherever your cursor is.", 13.5, p.muted_a(90));
-                ui.add_space(14.0);
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 6.0;
-                    let parts = super::hotkey_capture::parts(&env.cfg.hotkey);
-                    let est = parts.iter().map(|k| w::measure(ui, k, fonts::semibold(11.0)).x + 24.0).sum::<f32>() + 150.0;
-                    ui.add_space(((ui.available_width() - est) / 2.0).max(0.0));
-                    w::text(ui, "Press", 13.0, p.muted_a(90));
-                    for (i, k) in parts.iter().enumerate() {
-                        if i > 0 {
-                            w::text(ui, "+", 12.0, p.muted_a(70));
-                        }
-                        w::keycap(ui, &p, k);
-                    }
-                    w::text(ui, "to start and stop.", 13.0, p.muted_a(90));
-                });
-                ui.add_space(16.0);
-                if w::button(ui, &p, Btn::new("Open settings", Variant::Outline).icon(icons::SETTINGS).small()).clicked() {
-                    env.cmds.push(Cmd::OpenSettings(super::settings::Section::Hotkeys));
+    ui.add_space(48.0);
+    ui.vertical_centered(|ui| {
+        let (rect, _) = ui.allocate_exact_size(vec2(64.0, 64.0), Sense::hover());
+        ui.painter().circle_filled(rect.center(), 32.0, p.primary_a(if p.dark { 14 } else { 9 }));
+        ui.painter().circle_stroke(rect.center(), 32.0, Stroke::new(1.0, p.primary_a(25)));
+        w::paint_icon(ui, rect, icons::MIC, 26.0, p.primary);
+        ui.add_space(20.0);
+        w::text_semi(ui, "Start your first dictation", 18.0, p.foreground);
+        ui.add_space(8.0);
+        w::text(ui, "Press your hotkey, speak, and the text appears wherever your cursor is.", 13.5, p.muted_a(85));
+        ui.add_space(14.0);
+        ui.horizontal(|ui| {
+            let parts = super::hotkey_capture::parts(&env.cfg.hotkey);
+            let est = parts.iter().map(|k| w::measure(ui, k, fonts::semibold(11.0)).x + 24.0).sum::<f32>() + 150.0;
+            ui.add_space(((ui.available_width() - est) / 2.0).max(0.0));
+            w::text(ui, "Press", 13.0, p.muted_a(85));
+            for (i, k) in parts.iter().enumerate() {
+                if i > 0 {
+                    w::text(ui, "+", 12.0, p.muted_a(60));
                 }
-            });
+                keycap(ui, &p, k);
+            }
+            w::text(ui, "to start and stop.", 13.0, p.muted_a(85));
         });
+        ui.add_space(16.0);
+        if w::button(ui, &p, Btn::new("Open settings", Variant::Outline).icon(icons::SETTINGS).small()).clicked() {
+            env.cmds.push(Cmd::OpenSettings(super::settings::Section::Hotkeys));
+        }
     });
+}
+
+pub fn keycap(ui: &mut Ui, p: &Palette, label: &str) {
+    let font = fonts::semibold(11.5);
+    let tw = w::measure(ui, label, font.clone()).x;
+    let (rect, _) = ui.allocate_exact_size(vec2(tw + 16.0, 24.0), Sense::hover());
+    ui.painter().rect_filled(rect, cr(6.0), if p.dark { p.surface3 } else { p.muted });
+    ui.painter().rect_stroke(rect, cr(6.0), Stroke::new(1.0, p.border_hover), StrokeKind::Inside);
+    ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, label, font, p.foreground);
 }
 
 fn row(ui: &mut Ui, env: &mut Env, st: &mut HistoryState, i: usize, offset_of: &dyn Fn(i64) -> i64, first: bool, last: bool) {
@@ -421,7 +436,7 @@ fn row(ui: &mut Ui, env: &mut Env, st: &mut HistoryState, i: usize, offset_of: &
             w::text(ui, "(empty)", 13.5, p.muted_a(60));
         }
         if st.raw_open.contains(&e.id) {
-            egui::Frame::new().fill(p.wash(1)).corner_radius(cr(8.0)).inner_margin(Margin::symmetric(12, 8)).show(ui, |ui| {
+            egui::Frame::new().fill(if p.dark { p.surface1 } else { p.muted }).corner_radius(cr(8.0)).inner_margin(Margin::symmetric(12, 8)).show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 w::text_semi(ui, "Raw transcript", 11.0, p.muted_a(75));
                 ui.add_space(2.0);
@@ -432,17 +447,16 @@ fn row(ui: &mut Ui, env: &mut Env, st: &mut HistoryState, i: usize, offset_of: &
     let rect = resp.response.rect;
     ui.data_mut(|d| d.insert_temp(id, rect));
     let hot_now = ui.rect_contains_pointer(rect);
-    // Washes only (rule 3): the panel around the rows is the glass.
     let tint = if failed {
-        p.destructive_a(if p.dark { 9 } else { 7 })
-    } else if hot_now {
-        p.wash(1)
+        p.destructive_a(5)
     } else if discarded {
-        p.wash(0)
+        w::with_alpha_mul(p.muted, 0.5)
+    } else if hot_now {
+        if p.dark { Color32::from_white_alpha(5) } else { w::with_alpha_mul(p.muted, 0.4) }
     } else {
         Color32::TRANSPARENT
     };
-    let rounding = w::edge_rounding(first, last);
+    let rounding = egui::CornerRadius { nw: if first { 15 } else { 0 }, ne: if first { 15 } else { 0 }, sw: if last { 15 } else { 0 }, se: if last { 15 } else { 0 } };
     ui.painter().set(bg, Shape::rect_filled(rect, rounding, tint));
     if flash > 0.0 {
         ui.painter().rect_filled(rect, rounding, p.primary_a((flash * 18.0) as u8));
@@ -465,31 +479,30 @@ fn row_menu(ui: &mut Ui, env: &mut Env, st: &mut HistoryState, e: &Entry, idx: u
         .close_behavior(egui::PopupCloseBehavior::CloseOnClick)
         .align(egui::RectAlign::BOTTOM_END)
         .gap(4.0)
-        .frame(egui::Frame::NONE)
+        .frame(w::popup_frame(&p))
         .show(|ui| {
-            w::menu_surface(ui, &p, 210.0, |ui| {
-                ui.spacing_mut().item_spacing = vec2(0.0, 1.0);
-                if can_retry && w::menu_item(ui, &p, if e.status == Status::Discarded { "Recover recording" } else { "Retry transcription" }, false, false, Some(icons::RETRY)).clicked() {
-                    env.cmds.push(Cmd::RetryLast);
-                }
-                if e.status == Status::Ok {
-                    let open = st.raw_open.contains(&e.id);
-                    let lbl = if open { "Hide raw transcript" } else { "View raw transcript" };
-                    if w::menu_item(ui, &p, lbl, false, false, Some(icons::DOC)).clicked() {
-                        if open {
-                            st.raw_open.remove(&e.id);
-                        } else {
-                            st.raw_open.insert(e.id);
-                        }
+            ui.set_min_width(210.0);
+            ui.spacing_mut().item_spacing = vec2(0.0, 1.0);
+            if can_retry && w::menu_item(ui, &p, if e.status == Status::Discarded { "Recover recording" } else { "Retry transcription" }, false, false, Some(icons::RETRY)).clicked() {
+                env.cmds.push(Cmd::RetryLast);
+            }
+            if e.status == Status::Ok {
+                let open = st.raw_open.contains(&e.id);
+                let lbl = if open { "Hide raw transcript" } else { "View raw transcript" };
+                if w::menu_item(ui, &p, lbl, false, false, Some(icons::DOC)).clicked() {
+                    if open {
+                        st.raw_open.remove(&e.id);
+                    } else {
+                        st.raw_open.insert(e.id);
                     }
                 }
-                if !e.text.is_empty() && w::menu_item(ui, &p, "Copy text", false, false, Some(icons::COPY)).clicked() {
-                    env.cmds.push(Cmd::Copy(e.text.clone()));
-                }
-                if w::menu_item(ui, &p, "Delete", false, true, Some(icons::DELETE)).clicked() {
-                    st.confirm_delete = Some(e.id);
-                }
-            });
+            }
+            if !e.text.is_empty() && w::menu_item(ui, &p, "Copy text", false, false, Some(icons::COPY)).clicked() {
+                env.cmds.push(Cmd::Copy(e.text.clone()));
+            }
+            if w::menu_item(ui, &p, "Delete", false, true, Some(icons::DELETE)).clicked() {
+                st.confirm_delete = Some(e.id);
+            }
         });
     let _ = ui;
 }
