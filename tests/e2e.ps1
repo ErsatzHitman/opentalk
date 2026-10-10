@@ -10,6 +10,11 @@
 # - -Llm             also enable AI cleanup through an OpenRouter ":free" text model
 # Opens Notepad, triggers dictation twice (start/stop) and asserts that Notepad receives the cleaned
 # text (fillers removed) and that history holds the entry. Cleans up everything it opened.
+# The whole clipboard (every format, or an "empty" flag) is saved first and put back exactly at the end;
+# the result JSON carries clipboard_restored (true/false) and clipboard_snapshot. A failed restore never
+# fails the run. On a locked desktop clipboard access is denied: the snapshot is then "denied" and
+# clipboard_restored is false (nothing could be read, so nothing is claimed).
+# The OpenRouter key comes from -KeyFile, else OPENTALK_SECRET_OPENROUTER (never printed).
 param(
     [string]$Exe = (Join-Path $PSScriptRoot '..\target\release\opentalk.exe'),
     [ValidateSet('mock', 'mock-stream', 'openrouter')][string]$Stt = 'mock',
@@ -76,8 +81,9 @@ $result.mode = $Mode
 $result.desktop_locked = $locked
 $result.paste_verified = ($Mode -eq 'paste')
 if ($Mode -eq 'clipboard') { $cfg.auto_paste = $false; $cfg.keep_in_clipboard = $true }
-$savedClip = $null
-try { $savedClip = Get-Clipboard -Raw -ErrorAction SilentlyContinue } catch {}
+$clipSnap = Save-Clipboard   # whole clipboard; $null only if the helper cannot run
+$result.clipboard_snapshot = if ($null -eq $clipSnap) { 'unavailable' } elseif ($clipSnap.Denied) { 'denied' } elseif ($clipSnap.Empty) { 'empty' } else { "$($clipSnap.Formats.Count) formats" }
+$result.clipboard_restored = $false
 
 try {
     if ($Stt -eq 'mock') {
@@ -92,14 +98,14 @@ try {
         $cfg.stt = @{ provider = 'deepgram'; prefer_streaming = $true; models = @{ deepgram = 'nova-3' } }
     } else {
         $key = Read-OpenRouterKey $KeyFile
-        if (-not $key) { throw "no OpenRouter key at $KeyFile" }
+        if (-not $key) { throw 'no OpenRouter key (set OPENTALK_SECRET_OPENROUTER or pass -KeyFile)' }
         if (-not $Model.EndsWith(':free')) { throw 'live tests may only use ":free" models' }
         $envv.OPENTALK_SECRET_OPENROUTER = $key
         $cfg.stt = @{ provider = 'openrouter'; models = @{ openrouter = $Model }; timeout_ms = 45000 }
     }
     if ($Llm) {
         $key = Read-OpenRouterKey $KeyFile
-        if (-not $key) { throw "no OpenRouter key at $KeyFile" }
+        if (-not $key) { throw 'no OpenRouter key (set OPENTALK_SECRET_OPENROUTER or pass -KeyFile)' }
         if (-not $LlmModel.EndsWith(':free')) { throw 'live tests may only use ":free" models' }
         $envv.OPENTALK_SECRET_OPENROUTER = $key
         $cfg.ai_cleanup = @{ enabled = $true; provider = 'openrouter'; models = @{ openrouter = $LlmModel }; timeout_ms = 15000 }
@@ -197,7 +203,6 @@ catch {
     $result.error = $_.Exception.Message + ' @ line ' + $_.InvocationInfo.ScriptLineNumber
 }
 finally {
-    if ($null -ne $savedClip) { try { Set-Clipboard -Value $savedClip } catch {} }
     # Leave Notepad empty (it restores unsaved tabs), then close everything we opened.
     if ($hwnd -ne [IntPtr]::Zero -and $result.target -eq 'notepad') {
         # Notepad restores unsaved tabs: leave it empty.
@@ -216,6 +221,11 @@ finally {
     }
     Stop-Daemon $Exe $daemon $envv
     if ($mock) { Stop-Quietly $mock.Proc }
+    # Put the clipboard back last: the daemon may still be restoring it itself while it shuts down.
+    $clip = Restore-Clipboard $clipSnap
+    $result.clipboard_restored = [bool]$clip.restored
+    $result.clipboard_detail = $clip.detail
+    if (-not $clip.restored) { Write-Host "clipboard not restored: $($clip.detail)" }
     Remove-Item -Recurse -Force $home_ -ErrorAction SilentlyContinue
 }
 
