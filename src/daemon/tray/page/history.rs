@@ -1,4 +1,4 @@
-//! History pages (agent H).
+//! History pages.
 //!
 //! * [`model`] (`Route::History`): stats line, search field, "Show discarded", a virtualised list
 //!   of fixed-height rows (`ROW_H_HISTORY`, newest first, the day and time in each row's first

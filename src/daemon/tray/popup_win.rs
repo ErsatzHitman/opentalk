@@ -134,7 +134,6 @@ pub fn is_open() -> bool {
 
 /// Register the functions that start and stop the in-daemon hotkey capture (`hotkey::begin_capture`
 /// / `hotkey::end_capture`). Until then a hotkey field simply shows "Press the keys" and waits.
-#[allow(dead_code)] // called by the host once it is wired (merge step)
 pub fn set_capture_hooks(begin: fn(), end: fn()) {
     *CAPTURE_HOOKS.lock().unwrap_or_else(|e| e.into_inner()) = Some((begin, end));
 }
@@ -158,7 +157,6 @@ pub fn activate(req: Request) {
 
 /// Show `route` now: navigate the open popup there, or open one (no toggle, no echo guard). This is
 /// what `--settings <page>`, a second launch, the first run and the pill's menu use.
-#[allow(dead_code)] // called by the host once it is wired (merge step)
 pub fn open_route(req: Request) {
     if is_open() {
         let route = req.route;
@@ -174,7 +172,6 @@ pub fn open_route(req: Request) {
 }
 
 /// Navigate the open popup to `route` (Home shows the menu).
-#[allow(dead_code)] // called by the host once it is wired (merge step)
 pub fn navigate(route: Route) {
     with(|p| goto(p, route));
 }
@@ -212,7 +209,6 @@ pub fn refresh(content: Content, texts: Vec<String>) {
 
 /// A fresh config from the daemon (after it applied a `SetConfig`): the open page re-reads it, and the
 /// theme follows at once.
-#[allow(dead_code)] // called by the host once it is wired (merge step)
 pub fn set_config(cfg: Config) {
     with(|p| {
         let dark = resolve_dark(cfg.theme);
@@ -230,7 +226,6 @@ pub fn set_config(cfg: Config) {
 
 /// A provider test finished on a worker thread. Safe to call from any thread; dropped when no popup
 /// is open any more.
-#[allow(dead_code)] // called by the host once it is wired (merge step)
 pub fn deliver_test(result: TestResult) {
     let hwnd = POPUP_HWND.load(Ordering::Acquire);
     if hwnd == 0 {
@@ -244,7 +239,6 @@ pub fn deliver_test(result: TestResult) {
 }
 
 /// The hotkey capture's live preview ("Control+Super" so far); call on the UI thread.
-#[allow(dead_code)] // called by the host once it is wired (merge step)
 pub fn capture_update(text: String) {
     with(|p| {
         let mut clip = WinClip;
@@ -255,17 +249,35 @@ pub fn capture_update(text: String) {
     });
 }
 
-/// The hotkey capture finished with this accelerator; call on the UI thread.
-#[allow(dead_code)] // called by the host once it is wired (merge step)
+/// The hotkey capture finished with this accelerator (empty: cancelled); call on the UI thread.
 pub fn capture_done(accel: String) {
     with(|p| {
         let mut clip = WinClip;
+        let was_capturing = std::mem::take(&mut p.capturing);
         if let Some(pg) = p.pager.as_mut() {
-            p.capturing = false;
             let r = pg.capture_done(accel, &p.metrics, &mut clip);
             apply(p, r);
         }
+        // The hook stays in capture mode until told otherwise: end it, unless the page started a
+        // new capture (a rejected combination asks for another one).
+        if was_capturing && !p.capturing {
+            capture_hook(false);
+        }
     });
+}
+
+/// Show `text` in the open page's status strip. `false` when no page is showing (Home has no
+/// strip, or the popup is closed).
+pub fn toast(text: &str) -> bool {
+    with(|p| {
+        let mut clip = WinClip;
+        let Some(pg) = p.pager.as_mut() else { return false };
+        let mut r = PResp::default();
+        pg.run(vec![page::Effect::Toast(text.to_owned())], &p.metrics, &mut clip, &mut r);
+        apply(p, r);
+        true
+    })
+    .unwrap_or(false)
 }
 
 /// Destroy the popup (no-op when closed) and remember when, for the re-click guard. Dirty fields are
@@ -496,9 +508,11 @@ fn make_waker(hwnd: HWND) -> Waker {
     })
 }
 
-/// Create the pager (the working config is read from disk once) and show `route` in it.
+/// Create the pager and show `route` in it. The working config starts from the daemon's applied
+/// config ([`super::latest_config`]); the file is read only when the host never pushed one.
 fn start_pager(p: &mut Popup, route: Route) {
-    let mut pg = Pager::new(Config::load(), p.dark, p.page_h, make_waker(p.hwnd));
+    let cfg = super::latest_config().unwrap_or_else(Config::load);
+    let mut pg = Pager::new(cfg, p.dark, p.page_h, make_waker(p.hwnd));
     let mut clip = WinClip;
     let r = pg.open(route, &p.metrics, &mut clip);
     p.pager = Some(pg);

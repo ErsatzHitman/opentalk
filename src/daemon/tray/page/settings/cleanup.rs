@@ -38,7 +38,7 @@ pub const KEY_A: ItemId = 100;
 pub const KEY_B: ItemId = 110;
 
 /// Longest trigger phrase (the daemon's matcher refuses longer ones too).
-pub const TRIGGER_MAX_CHARS: usize = 80;
+pub const TRIGGER_MAX_CHARS: usize = rewrite::MAX_PHRASE_CHARS;
 
 const OPTIONS: &[ToggleDef] = &[
     ToggleDef {
@@ -77,41 +77,19 @@ pub fn normalize_trigger(s: &str) -> String {
     cleaned.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn is_cjk(c: char) -> bool {
-    matches!(c, '\u{3040}'..='\u{30FF}' | '\u{3400}'..='\u{4DBF}' | '\u{4E00}'..='\u{9FFF}' | '\u{AC00}'..='\u{D7AF}')
-}
-
-/// Why `phrase` cannot be a trigger (`None` = usable, or empty = the rewrite is off). The rule is
-/// the matcher's own: at least two tokens, at least six letters/digits, at most 80 characters, and
-/// `rewrite::Trigger::new` has the last word (filler words cleaned away can shrink it).
-/// `strict = false` skips that last call (page snapshots do not depend on the matcher).
-pub fn trigger_error(phrase: &str, filler: FillerMode, language: &str, strict: bool) -> Option<String> {
+/// Why `phrase` cannot be a trigger (`None` = usable, or empty = the rewrite is off). This is the
+/// matcher's own rule ([`rewrite::Trigger::check`]): two or more words, six or more letters, at
+/// most 80 characters, after the same filler removal the dictation gets.
+pub fn trigger_error(phrase: &str, filler: FillerMode, language: &str) -> Option<String> {
     let p = normalize_trigger(phrase);
     if p.is_empty() {
         return None;
     }
-    if p.chars().count() > TRIGGER_MAX_CHARS {
-        return Some(format!("Use at most {TRIGGER_MAX_CHARS} characters."));
-    }
-    let squashed = p.chars().filter(|c| c.is_alphanumeric()).count();
-    let tokens = p.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).map(|w| if w.chars().any(is_cjk) { w.chars().filter(|c| is_cjk(*c)).count().max(1) } else { 1 }).sum::<usize>();
-    if tokens < 2 {
-        return Some("Use at least two words, so ordinary dictation never triggers it.".into());
-    }
-    if squashed < 6 {
-        return Some("Use a longer phrase (at least six letters).".into());
-    }
-    if strict {
-        let lang = language.to_string();
-        let clean = |s: &str| {
-            let ctx = crate::core::cleanup::CleanupCtx { language: &lang, filler_mode: filler, dictionary: &[], snippets: &[], speech_ms: None, fuzzy_dictionary: false, spoken_line_breaks: false };
-            crate::core::cleanup::process_pre_llm(s, &ctx)
-        };
-        if rewrite::Trigger::new(&p, clean).is_none() {
-            return Some("Contains filler words that are removed before matching. Use other words.".into());
-        }
-    }
-    None
+    let clean = |s: &str| {
+        let ctx = crate::core::cleanup::CleanupCtx { language, filler_mode: filler, dictionary: &[], snippets: &[], speech_ms: None, fuzzy_dictionary: false, spoken_line_breaks: false };
+        crate::core::cleanup::process_pre_llm(s, &ctx)
+    };
+    rewrite::Trigger::check(&p, clean).err().map(|e| e.message().to_string())
 }
 
 pub struct CleanupPage {
@@ -125,8 +103,6 @@ pub struct CleanupPage {
     default_prompt: String,
     busy: bool,
     result: Option<TestResult>,
-    /// Ask `rewrite::Trigger::new` too (off in snapshot tests).
-    strict: bool,
 }
 
 impl CleanupPage {
@@ -135,7 +111,7 @@ impl CleanupPage {
     }
 
     pub fn new(store: Box<dyn SecretStore>, provider: LlmProviderId) -> CleanupPage {
-        let mut p = CleanupPage { store, provider, keys: Vec::new(), draft: None, error: None, default_prompt: String::new(), busy: false, result: None, strict: true };
+        let mut p = CleanupPage { store, provider, keys: Vec::new(), draft: None, error: None, default_prompt: String::new(), busy: false, result: None };
         p.rebuild_keys(provider);
         p
     }
@@ -337,13 +313,13 @@ impl PageModel for CleanupPage {
         let commit = |dst: &mut String, t: &str| *dst = t.trim().to_string();
         match (id, ev) {
             (ID_RW_TRIGGER, Event::Edited(t)) => {
-                self.error = trigger_error(&t, cx.cfg.filler_mode, &cx.cfg.language, self.strict);
+                self.error = trigger_error(&t, cx.cfg.filler_mode, &cx.cfg.language);
                 self.draft = Some(t);
                 Vec::new()
             }
             (ID_RW_TRIGGER, Event::Committed(t)) => {
                 let norm = normalize_trigger(&t);
-                self.error = trigger_error(&norm, cx.cfg.filler_mode, &cx.cfg.language, self.strict);
+                self.error = trigger_error(&norm, cx.cfg.filler_mode, &cx.cfg.language);
                 if self.error.is_some() {
                     self.draft = Some(norm);
                     return Vec::new();
@@ -468,7 +444,6 @@ mod tests {
 
     fn page(provider: LlmProviderId, store: Fake) -> CleanupPage {
         let mut p = CleanupPage::new(Box::new(store), provider);
-        p.strict = false;
         p.default_prompt = "DEFAULT PROMPT".into();
         p
     }
@@ -779,16 +754,25 @@ mod tests {
     #[test]
     fn trigger_validation_rules() {
         use FillerMode::Standard as S;
-        assert_eq!(trigger_error("", S, "auto", false), None);
-        assert!(trigger_error("rewrite", S, "auto", false).unwrap().contains("two words"));
-        assert!(trigger_error("ab cd", S, "auto", false).unwrap().contains("longer"));
-        assert!(trigger_error(&"x".repeat(81), S, "auto", false).unwrap().contains("80"));
-        assert_eq!(trigger_error("rewrite this concisely", S, "auto", false), None);
-        assert_eq!(trigger_error("请用简洁的方式改写", S, "auto", false), None, "each CJK character is a token");
-        assert_eq!(trigger_error("re-write this", S, "auto", false), None);
-        // With the matcher: valid exactly when it accepts the phrase (the stub accepts nothing).
-        let accepted = rewrite::Trigger::new(DEFAULT_REWRITE_TRIGGER, |s| s.to_string()).is_some();
-        assert_eq!(trigger_error(DEFAULT_REWRITE_TRIGGER, S, "auto", true).is_none(), accepted);
+        assert_eq!(trigger_error("", S, "auto"), None, "empty turns the rewrite off");
+        assert!(trigger_error("rewrite", S, "auto").unwrap().contains("two words"));
+        assert!(trigger_error("ab cd", S, "auto").unwrap().contains("six letters"));
+        assert!(trigger_error(&"x".repeat(81), S, "auto").unwrap().contains("80"));
+        assert_eq!(trigger_error("rewrite this concisely", S, "auto"), None);
+        assert_eq!(trigger_error(DEFAULT_REWRITE_TRIGGER, S, "auto"), None, "the default phrase is usable");
+        assert_eq!(trigger_error("请用简洁的方式改写", S, "auto"), None, "CJK characters count as words");
+        assert_eq!(trigger_error("re-write this", S, "auto"), None);
+        // Filler removal runs on the phrase as on the dictation.
+        assert!(trigger_error("um uh", S, "auto").is_some());
+        // Exactly the matcher's verdict.
+        for t in ["rewrite this concisely", "make it short", "um, rewrite", "ab cd", "please shorten this"] {
+            let lang = "auto";
+            let clean = |s: &str| {
+                let ctx = crate::core::cleanup::CleanupCtx { language: lang, filler_mode: S, dictionary: &[], snippets: &[], speech_ms: None, fuzzy_dictionary: false, spoken_line_breaks: false };
+                crate::core::cleanup::process_pre_llm(s, &ctx)
+            };
+            assert_eq!(trigger_error(t, S, lang).is_none(), rewrite::Trigger::new(t, clean).is_some(), "{t}");
+        }
     }
 
     #[test]

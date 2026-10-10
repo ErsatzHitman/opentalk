@@ -483,7 +483,6 @@ impl Outcome {
 // ---------------------------------------------------------------------------------------------
 
 /// How long a capture may stay on without being ended (the popup ends it on close).
-#[allow(dead_code)] // called by the tray popup (renderer track)
 pub const CAPTURE_LIMIT_MS: f64 = 2.0 * 60.0 * 1000.0;
 
 /// Set of virtual keys 0..=255 (fixed size, so the hook never allocates).
@@ -667,7 +666,6 @@ pub fn validate(accel: &str) -> Option<&'static str> {
 }
 
 /// The keys of an accelerator as separate label parts, for key caps ("Control+Super" -> Ctrl, Win).
-#[allow(dead_code)] // called by the tray popup (renderer track)
 pub fn label_parts(accel: &str) -> Vec<String> {
     label(accel).split(" + ").filter(|s| !s.is_empty()).map(str::to_string).collect()
 }
@@ -1406,7 +1404,6 @@ pub fn set_suspended(on: bool) {
 /// Start capturing the next key combination: the keys are recorded and swallowed (the Win key
 /// does not open the Start menu), and the dictation hotkey is inactive meanwhile. The hook posts
 /// `CaptureUpdate` / `CaptureDone` / `CaptureCancel`. Always pair it with [`end_capture`].
-#[allow(dead_code)] // called by the tray popup (renderer track)
 pub fn begin_capture() {
     let cut = lock_matcher().begin_capture(CAPTURE_LIMIT_MS);
     if let Some(ev) = cut {
@@ -1415,7 +1412,6 @@ pub fn begin_capture() {
 }
 
 /// Leave capture mode (idempotent). Normal matching resumes with no press in flight.
-#[allow(dead_code)] // called by the tray popup (renderer track)
 pub fn end_capture() {
     let cut = lock_matcher().end_capture();
     if let Some(ev) = cut {
@@ -1423,7 +1419,6 @@ pub fn end_capture() {
     }
 }
 
-#[allow(dead_code)] // called by the tray popup (renderer track)
 pub fn capture_active() -> bool {
     lock_matcher().capture_active()
 }
@@ -1464,7 +1459,6 @@ pub fn capture_msg(ev: HotkeyEvent) -> Option<CaptureMsg> {
 }
 
 /// Record again after a rejected combination.
-#[allow(dead_code)] // called by the tray popup (renderer track)
 pub fn capture_rearm() {
     lock_matcher().capture_rearm();
 }

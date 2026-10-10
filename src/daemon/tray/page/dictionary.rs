@@ -1,4 +1,4 @@
-//! Dictionary and snippet pages (agent H).
+//! Dictionary and snippet pages.
 //!
 //! * [`model`] (`Route::Dictionary`): an add field (Enter or the button adds; commas and new lines
 //!   split several words), a link to the snippets, the speech-prompt budget banner, an optional

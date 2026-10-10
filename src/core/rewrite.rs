@@ -9,8 +9,6 @@
 //! Why no fuzz: a false positive silently rewrites (destroys) the user's text, a false negative
 //! pastes the literal phrase, which is visible and trivially undone. A fuzzy match would also make
 //! "write this concisely", a legitimate ending, fire the rewrite.
-// Consumers (pipeline, settings page) land in later commits; remove this once everything is wired.
-#![allow(dead_code)]
 
 /// A validated trigger phrase, squashed to lowercase letters/digits without separators.
 #[derive(Clone, Debug, PartialEq, Eq)]

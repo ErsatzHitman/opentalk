@@ -17,7 +17,6 @@ mod popup_draw;
 mod popup_win;
 
 pub use popup_draw::cli_render as cli_render_popup;
-#[allow(unused_imports)] // WM_TRAY_POPUP_ACT is handled by the host (merge step)
 pub use popup_win::{WM_TRAY_POPUP_ACT, WM_TRAY_POPUP_CMD};
 
 use std::ffi::c_void;
@@ -134,7 +133,6 @@ pub fn activate(owner: isize, act: Activation, state: &TrayState) {
 /// `Route::Home` shows the menu. This is the entry for `--settings <page>`, a second launch, the
 /// first-run Speech-to-Text page and the pill's "Open OpenTalk". `keyboard` starts with the first
 /// row focused.
-#[allow(dead_code)] // called by the host once it is wired (merge step)
 pub fn open_route(owner: isize, route: page::Route, keyboard: bool, state: &TrayState) {
     popup_win::open_route(popup_win::Request {
         owner,
@@ -147,35 +145,13 @@ pub fn open_route(owner: isize, route: page::Route, keyboard: bool, state: &Tray
     });
 }
 
-/// Hand the popup the daemon's config after applying a [`page::PopupAction::SetConfig`] (or any
-/// reload): the open page shows it and the theme follows at once. No-op when the popup is closed.
-#[allow(dead_code)] // called by the host once it is wired (merge step)
-pub fn popup_set_config(cfg: &crate::core::config::Config) {
-    popup_win::set_config(cfg.clone());
-}
-
 /// A provider test finished (any thread). Dropped when the popup is closed.
-#[allow(dead_code)] // called by the host once it is wired (merge step)
 pub fn popup_test_done(result: page::TestResult) {
     popup_win::deliver_test(result);
 }
 
-/// Live preview of the in-daemon hotkey capture ("Control+Super" so far), on the UI thread.
-#[allow(dead_code)] // called by the host once it is wired (merge step)
-pub fn popup_capture_update(text: String) {
-    popup_win::capture_update(text);
-}
-
-/// The hotkey capture finished with this accelerator, on the UI thread. An empty string means the
-/// capture was cancelled (Esc alone): the popup just ends it and shows the old value.
-#[allow(dead_code)] // called by the host once it is wired (merge step)
-pub fn popup_capture_done(accel: String) {
-    popup_win::capture_done(accel);
-}
-
 /// Register `hotkey::begin_capture` / `hotkey::end_capture`; the popup calls them when a hotkey
 /// field starts or ends capturing (and on close, so a capture can never outlive the popup).
-#[allow(dead_code)] // called by the host once it is wired (merge step)
 pub fn set_hotkey_capture_hooks(begin: fn(), end: fn()) {
     popup_win::set_capture_hooks(begin, end);
 }
@@ -191,51 +167,45 @@ pub fn refresh_popup(state: &TrayState) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Host bridge (settings agent). The daemon host talks to the popup only through these functions
-// and the page mailbox; the renderer implements them for real (page routes, live config, capture
-// events, test results) and keeps the signatures. Until then Home opens and the rest is inert.
+// Host bridge. The daemon host talks to the popup only through these functions and the page
+// mailbox (drained on [`WM_TRAY_POPUP_ACT`]).
 // ---------------------------------------------------------------------------------------------
-
-/// Posted by the popup to the daemon window after it queued actions in `page::mailbox`: the host
-/// drains the mailbox on receipt.
-pub const WM_TRAY_POPUP_ACT: u32 = crate::core::ipc::WM_OT_INTERNAL_BASE + 0x41;
 
 static LATEST_CONFIG: std::sync::Mutex<Option<crate::core::config::Config>> = std::sync::Mutex::new(None);
 
 /// The daemon's applied config, pushed by the host before the popup opens and after every apply.
-/// A page's `Cx::cfg` working copy starts from it (and is replaced when it changes under an open page).
+/// A page's `Cx::cfg` working copy starts from it, and an open page is handed the new copy at once
+/// (its theme follows, a rejected hotkey snaps back).
 pub fn sync_config(cfg: &crate::core::config::Config) {
     *LATEST_CONFIG.lock().unwrap_or_else(|e| e.into_inner()) = Some(cfg.clone());
+    if popup_is_open() {
+        popup_win::set_config(cfg.clone());
+    }
 }
 
-/// The last config passed to [`sync_config`].
-#[allow(dead_code)] // read by the popup (renderer track)
+/// The last config passed to [`sync_config`] (`None` before the host pushed one).
 pub fn latest_config() -> Option<crate::core::config::Config> {
     LATEST_CONFIG.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
-/// Open the popup at `route` (a no-op navigation when it is open already). Used by `--settings`,
-/// a second launch, first run and the pill/tray rows.
-pub fn open_route(owner: isize, route: crate::core::nav::Route, state: &TrayState) {
-    if !popup_is_open() {
-        activate(owner, Activation { keyboard: false }, state);
-    }
-    let _ = route; // the page renderer navigates to it
-}
-
-/// Hotkey capture progress for the focused hotkey field (from the daemon's keyboard hook).
+/// Hotkey capture progress for the focused hotkey field (from the daemon's keyboard hook), on the
+/// UI thread. A finished or cancelled capture ends the hook's capture mode unless the page starts
+/// a new one (a rejected combination).
 pub fn popup_capture(msg: crate::daemon::hotkey::CaptureMsg) {
-    let _ = msg;
+    use crate::daemon::hotkey::CaptureMsg;
+    match msg {
+        CaptureMsg::Update(text) => popup_win::capture_update(text),
+        CaptureMsg::Done(accel) => popup_win::capture_done(accel),
+        CaptureMsg::Cancelled => popup_win::capture_done(String::new()),
+    }
 }
 
-/// A provider test finished (the host already dropped stale ones).
-pub fn popup_test_done(result: page::TestResult) {
-    let _ = result;
-}
-
-/// Show `text` in the popup's status strip (e.g. "Could not save the key").
+/// Show `text` in the open page's status strip (e.g. "Could not save the key"). Logged only when
+/// no page is showing.
 pub fn popup_toast(text: &str) {
-    let _ = text;
+    if !popup_win::toast(text) {
+        crate::log_info!("tray popup: {text}");
+    }
 }
 
 // ---------------------------------------------------------------------------------------------

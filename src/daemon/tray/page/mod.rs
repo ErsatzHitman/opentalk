@@ -8,16 +8,14 @@
 //! own, or the daemon: everything with a side effect is an `Effect`, executed by the popup, which
 //! turns it into a [`PopupAction`] in the [`mailbox`] for the daemon thread.
 //!
-//! File ownership (so parallel branches do not touch the same lines):
-//! - `mod.rs` (this file): the contract. Changes after Phase 0 are additive and agreed.
-//! - `layout`, `draw`, `edit`, `scroll`, `controls`: renderer agent (A).
-//! - `settings/**`: settings agent (S).
-//! - `history`, `dictionary`: history/dictionary agent (H).
+//! Layout:
+//! - `mod.rs` (this file): the contract between models and renderer.
+//! - `layout`, `draw`, `edit`, `scroll`, `controls`, `session`, `pager`: the renderer.
+//! - `settings/**`: the Settings index, its pages and the list pickers.
+//! - `history`, `dictionary`: History, Dictionary and Snippets.
 //!
 //! Data flow of one interaction: input -> renderer finds the item -> `model.event(id, ev, cx)`
 //! -> `Vec<Effect>` -> renderer re-asks `model.items(cx)` and re-lays-out.
-// Contract module: consumers land in later commits; the renderer agent removes this at the end.
-#![allow(dead_code)]
 
 pub mod controls;
 pub mod dictionary;

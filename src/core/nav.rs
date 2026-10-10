@@ -7,8 +7,6 @@
 //! parameter; x86_64 only, asserted below).
 //!
 //! Pure: no Win32, no I/O.
-// Contract module: consumers land in later commits; remove this once everything is wired.
-#![allow(dead_code)]
 
 const _: () = assert!(usize::BITS >= 64, "Route::encode packs a 48-bit payload into a usize");
 

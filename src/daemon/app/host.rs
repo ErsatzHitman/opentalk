@@ -942,7 +942,7 @@ fn open_route_released(hwnd: HWND, route: Route) -> bool {
         return false;
     }
     if let Some(state) = state {
-        crate::daemon::tray::open_route(hwnd.0 as isize, route, &state);
+        crate::daemon::tray::open_route(hwnd.0 as isize, route, false, &state);
     }
     true
 }
@@ -1040,6 +1040,9 @@ pub fn run(hidden: bool, initial: Option<Route>) -> i32 {
         }
     }
     hotkey::set_start_menu_mask(app.cfg.suppress_start_menu);
+    // A hotkey field in the popup records the next combination through the same hook.
+    crate::daemon::tray::set_hotkey_capture_hooks(hotkey::begin_capture, hotkey::end_capture);
+    crate::daemon::tray::sync_config(&app.cfg);
     app.sync_foreground();
     let mic = app.cfg.mic_device_id.clone();
     let warm_hold = app.cfg.mic_warm_hold_secs;

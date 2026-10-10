@@ -283,7 +283,6 @@ impl Config {
 
     /// The trigger phrase to detect, or `None` when voice rewrite is off (toggle off or empty
     /// phrase). Whether the phrase is usable (two or more words) is `rewrite::Trigger::new`'s call.
-    #[allow(dead_code)] // read by the pipeline and the Cleanup page once they land
     pub fn rewrite_trigger_effective(&self) -> Option<&str> {
         let t = self.rewrite_trigger.trim();
         (self.ai_cleanup.rewrite_enabled && !t.is_empty()).then_some(t)

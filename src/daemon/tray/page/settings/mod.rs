@@ -1,4 +1,4 @@
-//! Settings pages (agent S): the index (`index_model`), one page per [`Section`] (`model`) and the
+//! Settings pages: the index (`index_model`), one page per [`Section`] (`model`) and the
 //! list pickers (`picker_model`). Every setting of the former Settings window lives here as a
 //! pure [`PageModel`]: `items()` reads `Cx::cfg`, `event()` mutates it and answers
 //! `Effect::Saved`; the popup posts the config to the daemon, which applies it in-process
