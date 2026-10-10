@@ -48,6 +48,7 @@ Upload per dictation: 249964.0 bytes (16 kHz mono PCM WAV after silence trim).
 The paste stage here only writes the clipboard (the benchmark runs with `auto_paste = false`); a real paste adds the
 10 ms clipboard settle plus `SendInput`. The desktop was **locked** during this run (LogonUI active), where Windows denies clipboard access, so the clipboard write retries and fails; its time is not representative. Re-run on an unlocked desktop for the real figure.
 
+<!-- keep:begin flac -->
 ## FLAC upload experiment (PLAN 9.5, Phase 8)
 
 **Decision: not adopted; uploads stay 16 kHz mono PCM WAV.** The bar was "saves at least 30 ms on a median connection".
@@ -85,24 +86,30 @@ Reading:
 
 - FLAC clears 30 ms net only on slow uplinks: below roughly 13 Mbps for a 5 s dictation and below roughly 20 Mbps for an 8.5 s one (noisy input; 17 Mbps for 5 s clean). On a 20-50 Mbps uplink, which is a conservative stand-in for a median fixed connection (mobile is lower, broadband usually higher), a typical 5-8.5 s dictation nets 1-42 ms, and only the clean (best-case) 8.5 s clip at 20 Mbps clears 30 ms; every mic-noise case is under the bar.
 - The model ignores TCP slow start and TLS record overhead. With a pre-warmed keep-alive socket (PLAN 9.3) the 130-270 KB body spans several round trips either way, so the real saving at high bandwidth is bounded by the bandwidth term above plus at most about one RTT, and no measurement here supports counting on that.
-- Cost: `flacenc` adds 248,320 bytes to a release binary (526,336 against 278,016 bytes for the same program without it), about 242 KB. That is 3.2% of the 7.51 MB executable and about half of the 0.49 MB left under the 8 MB budget, for no win at the target connection speed.
+- Cost: `flacenc` adds 248,320 bytes to a release binary (526,336 against 278,016 bytes for the same program without it), about 242 KB. That is 3.2% of the 7,877,632-byte (7.51 MiB) executable of that build and more than twice the 122,368 bytes left under the 8,000,000-byte budget (PLAN section 1: MB is decimal), so it would not even have fit, for no win at the target connection speed.
 - Compatibility risk the WAV path does not have: every provider needs a verified FLAC accept path (content type, file name, extension sniffing; Gemini inline data and the Realtime/streaming providers differ), and each would need a WAV fallback on rejection.
 - The encode is also on the stop-to-text path (about 15 ms for 8.5 s) unless it is moved into the recording thread, which spends CPU while the 1.5% recording target is tight on small laptops (see the 4-core projection above).
 
 Revisit only as an opt-in for slow uplinks (for example when a measured upload rate stays below about 10 Mbps), not as the default format. Until then the PLAN section 1 upload row stays "silence-trimmed 16 kHz mono PCM WAV", logged in bytes per request (249,964 bytes in the benchmark above).
+<!-- keep:end flac -->
 
+<!-- keep:begin binary-size -->
 ## Binary size
 
 Release executable, measured by rebuilding the same commit with parts of the cleanup LLM code stubbed out (`bench/out/size.json`):
 
-| Build | Bytes | MB | Delta |
+| Build | Bytes | MiB (2^20 bytes) | Delta |
 |---|---|---|---|
 | Full (all providers, Settings UI, enterprise LLMs) | 7877632 | 7.51 | - |
 | Without Vertex AI (no rsa / RS256 JWT): -204 KB | 7669248 | 7.31 | - |
 | Without any enterprise LLM (Azure, Bedrock, Vertex): -246 KB | 7625216 | 7.27 | - |
 
-Vertex (rsa for the RS256 service-account JWT) costs 208,384 bytes (~204 KB) and Azure + Bedrock another 44,032 bytes (~43 KB): 252 KB in all, about 3% of the executable. Vertex is above the ~150 KB threshold set in the review, so a cargo feature for it is a reasonable follow-up; everything stays within the 8 MB budget either way.
+Vertex (rsa for the RS256 service-account JWT) costs 208,384 bytes (~204 KiB) and Azure + Bedrock another 44,032 bytes (~43 KiB): 252 KiB in all, about 3% of the executable. Vertex is above the ~150 KB threshold set in the review, so a cargo feature for it is a reasonable follow-up; everything stays within the 8 MB budget either way.
 
+Units: the MiB column is 2^20 bytes (so 7,877,632 bytes = 7.51 MiB = 7.88 MB decimal). The budget (PLAN section 1) is 8 MB **decimal**, i.e. 8,000,000 bytes (7.63 MiB); the release executable measured 7,928,832 bytes (7.93 MB, about 71 KB of headroom) on 2026-10-10 after the last merge, and `bench.ps1` checks it against that number.
+<!-- keep:end binary-size -->
+
+<!-- keep:begin unlocked-desktop -->
 ## Unlocked-desktop measurements (earlier build, 2026-10-10 03:44-03:52, before the round-1 fixes)
 
 The run above happened while the workstation was locked. An earlier run (an older build: app-bubble memory and pill CPU were fixed since) of the same benchmark on the unlocked
@@ -122,6 +129,9 @@ Notepad was open, so the script did not touch Notepad), measured:
 
 All e2e runs left the target text exactly equal to the history text, with every filler removed:
 "So I think we should ship the new release on Friday because the client is waiting."
+
+**These numbers predate the app-bubble fix (`d53ba4d`, `7fbcd92`) and still need an unlocked-desktop re-run**: the two working-set rows with the app bubble on (38.4 MB and 39.1 MB) in particular describe the old behaviour, not the current build. They are kept as the only unlocked measurements so far.
+<!-- keep:end unlocked-desktop -->
 
 ## Scenario details
 
@@ -150,6 +160,29 @@ Settings window: opened in 636 ms; private working set n/a. It is a separate pro
 
 Free OpenRouter models are rate limited and sometimes not available to non-agent clients, so this section is a smoke test of the real
 network path, not a latency reference; the table above is measured against a local mock to isolate OpenTalk's own cost.
+
+<!-- keep:begin live-stt-evidence -->
+## Live STT on the free tier (evidence)
+
+Verified 2026-10-10 against OpenRouter with the project key, `:free` models only (PLAN section 10). **Live STT cannot be verified under the free-only policy**: the only free models that list audio input either refuse the request or never receive the audio.
+
+| Model | What OpenRouter answers | Meaning |
+|---|---|---|
+| `thinkingmachines/inkling-small:free` | HTTP 403 "only available on agentic harnesses" | gated for non-agent clients |
+| `thinkingmachines/inkling:free` | HTTP 403 "only available on agentic harnesses" | gated for non-agent clients |
+| `nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free` | 200, but `usage.prompt_tokens` = 28 with or without a 6 s WAV attached | the free endpoint drops the audio before the model |
+
+The Nemotron measurement holds for both content shapes (`input_audio` with base64 WAV, and `audio_url`): the prompt token count does not move when the 6 s recording (`tests/fixtures/tts_clean.wav`) is attached, so the model only ever sees the text prompt. It follows that OpenTalk's request shape is not the cause, and that a 200 reply from this endpoint is not a transcript. This supersedes the earlier "502 / audio_tokens 0" wording, which depended on the endpoint answering at all.
+
+How the tests treat it (`tests/common/live.rs`, shared by `live_transcribe_file_openrouter_free` and `live_openrouter_transcribe`):
+
+- A "No audio detected" error, or a 200 reply without the spoken words, is **UNVERIFIED**: "free endpoint dropped the audio (prompt_tokens=28 with or without the WAV; see PLAN §10)". One attempt per model, no backoff.
+- A 403 gated model is **UNVERIFIED** ("access denied"), also one attempt.
+- Only rate limits (429), capacity errors (5xx) and timeouts are retried with backoff, then reported as **UNVERIFIED**.
+- A bad key or request stays **FAILED**. `OPENTALK_LIVE_REQUIRE=1` turns every **UNVERIFIED** into a failure.
+
+STT correctness therefore rests on the mock contract tests; getting a real transcript needs the owner's decision in PLAN section 12b (decision 0): one paid OpenRouter audio model or another provider key for a single run. That decision is still open.
+<!-- keep:end live-stt-evidence -->
 
 ## Method
 
