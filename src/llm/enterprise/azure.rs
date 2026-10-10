@@ -68,6 +68,38 @@ fn body_for(reasoning: bool, model: &str, version: &str, system: &str, user: &st
     body
 }
 
+/// What a 400 body says about the offending parameter: `error.code`, `error.param`, and the
+/// lowercased message (or the whole body when it is not the Azure/OpenAI error JSON).
+struct ParamError {
+    code: Option<String>,
+    param: Option<String>,
+    text: String,
+}
+
+impl ParamError {
+    fn parse(body: &str) -> Self {
+        let v: Option<Value> = serde_json::from_str(body).ok();
+        let field = |p: &str| v.as_ref().and_then(|v| v.pointer(p)).and_then(Value::as_str).map(str::to_ascii_lowercase).filter(|s| !s.is_empty());
+        let message = field("/error/message");
+        Self { code: field("/error/code"), param: field("/error/param"), text: message.unwrap_or_else(|| body.to_ascii_lowercase()) }
+    }
+
+    /// Does this error blame one of `names`? With a JSON `code`, only `unsupported_parameter` /
+    /// `unsupported_value` count, and `param` (when present) must name the field, so e.g.
+    /// `invalid_value: "max_tokens is too large"` is not a shape problem. Without a code (older
+    /// "Unrecognized request argument supplied: ..." bodies) a substring check decides.
+    fn blames(&self, names: &[&str]) -> bool {
+        match self.code.as_deref() {
+            Some("unsupported_parameter" | "unsupported_value" | "unknown_parameter") => match &self.param {
+                Some(p) => names.iter().any(|n| p == n),
+                None => names.iter().any(|n| self.text.contains(n)),
+            },
+            Some(_) => false,
+            None => names.iter().any(|n| self.text.contains(n)),
+        }
+    }
+}
+
 /// A 400 that says the other body shape is needed: `Some(true)` = switch to the reasoning shape
 /// (the deployment rejected `temperature`/`max_tokens`), `Some(false)` = back to the classic shape
 /// (it rejected `max_completion_tokens`). `None` for any other failure.
@@ -75,12 +107,18 @@ fn shape_switch(status: u16, body: &str, tried_reasoning: bool) -> Option<bool> 
     if status != 400 {
         return None;
     }
-    let b = body.to_ascii_lowercase();
+    let e = ParamError::parse(body);
     if tried_reasoning {
-        b.contains("max_completion_tokens").then_some(false)
+        e.blames(&["max_completion_tokens"]).then_some(false)
     } else {
-        (b.contains("temperature") || b.contains("max_tokens")).then_some(true)
+        e.blames(&["temperature", "max_tokens"]).then_some(true)
     }
+}
+
+/// A 400 on a reasoning-shaped request that rejects `reasoning_effort` (the api-version or model
+/// does not know the field although [`supports_reasoning_effort`] guessed it does).
+fn rejects_reasoning_effort(status: u16, body: &str) -> bool {
+    status == 400 && ParamError::parse(body).blames(&["reasoning_effort"])
 }
 
 /// `reasoning_effort` on gpt-5 needs 2025-04-01 or later (dated), or the undated `v1`/`preview`.
@@ -99,22 +137,35 @@ fn run(endpoint: &str, deployment: &str, model: &str, version: &str, key: &str, 
         uri_encode(version)
     );
     let mut reasoning = !accepts_temperature(model);
+    let mut drop_effort = false;
     let mut retried = false;
     loop {
-        let body = body_for(reasoning, model, version, system, user);
+        let mut body = body_for(reasoning, model, version, system, user);
+        if drop_effort {
+            if let Some(o) = body.as_object_mut() {
+                o.remove("reasoning_effort");
+            }
+        }
         let resp = http::post_json(&url, &[("api-key", key)], &body, deadline.remaining()?).map_err(net_err)?;
         if resp.ok() {
             let v = resp.json().map_err(|e| LlmError::InvalidOutput(format!("bad JSON: {e}")))?;
             return extract(&v);
         }
-        // One retry with the other shape, inside the same deadline (`remaining()` above bounds it).
-        match shape_switch(resp.status, &resp.body, reasoning) {
-            Some(next) if !retried => {
+        // At most one retry (two requests in all), inside the same deadline (`remaining()` above
+        // bounds it): the other body shape, or the same reasoning body without `reasoning_effort`.
+        if !retried {
+            if let Some(next) = shape_switch(resp.status, &resp.body, reasoning) {
                 retried = true;
                 reasoning = next;
+                continue;
             }
-            _ => return Err(http_error(resp.status, &resp.body)),
+            if reasoning && body.get("reasoning_effort").is_some() && rejects_reasoning_effort(resp.status, &resp.body) {
+                retried = true;
+                drop_effort = true;
+                continue;
+            }
         }
+        return Err(http_error(resp.status, &resp.body));
     }
 }
 
@@ -244,6 +295,63 @@ mod tests {
         // "o-series"-looking name on a deployment that is really a classic model.
         assert_eq!(run(&mock.base, "o3-proxy", "o3-proxy", "2024-10-21", "K", "s", "u", &Deadline::new(5000)).unwrap(), "Hello, world.");
         assert_eq!(mock.reqs.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn rejected_reasoning_effort_is_dropped_once() {
+        let mock = serve(|r| {
+            let b: Value = serde_json::from_str(&r.body).unwrap();
+            if b.get("reasoning_effort").is_some() {
+                (400, r#"{"error":{"message":"Unrecognized request argument supplied: reasoning_effort"}}"#.into())
+            } else {
+                (200, OK.into())
+            }
+        });
+        // New enough api-version that the effort is sent on the first try.
+        let out = run(&mock.base, "gpt-5-mini", "gpt-5-mini", "2025-04-01-preview", "K", "s", "u", &Deadline::new(5000)).unwrap();
+        assert_eq!(out, "Hello, world.");
+        let reqs = mock.reqs.lock().unwrap();
+        assert!(reqs.len() <= 2, "{} requests", reqs.len());
+        assert_eq!(reqs.len(), 2);
+        let first: Value = serde_json::from_str(&reqs[0].body).unwrap();
+        let second: Value = serde_json::from_str(&reqs[1].body).unwrap();
+        assert_eq!(first["reasoning_effort"], json!("minimal"));
+        assert!(second.get("reasoning_effort").is_none());
+        assert_eq!(second["max_completion_tokens"], json!(4096));
+        assert!(second.get("temperature").is_none() && second.get("max_tokens").is_none());
+    }
+
+    #[test]
+    fn persistent_reasoning_effort_400_stops_after_two_requests() {
+        let mock = serve(|_| (400, r#"{"error":{"code":"unsupported_parameter","param":"reasoning_effort","message":"nope"}}"#.into()));
+        let e = run(&mock.base, "gpt-5-mini", "gpt-5-mini", "2025-04-01-preview", "K", "s", "u", &Deadline::new(5000)).unwrap_err();
+        assert!(matches!(e, LlmError::Http { status: 400, .. }));
+        assert_eq!(mock.reqs.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn json_error_code_decides_the_shape_switch() {
+        // Not a shape problem: the value is too large. One request, mapped error.
+        let mock = serve(|_| (400, r#"{"error":{"code":"invalid_value","message":"max_tokens is too large","param":"max_tokens"}}"#.into()));
+        let e = run(&mock.base, "cleanup", "cleanup", "2024-10-21", "K", "s", "u", &Deadline::new(5000)).unwrap_err();
+        assert_eq!(e, LlmError::Http { status: 400, detail: "max_tokens is too large".into() });
+        assert_eq!(mock.reqs.lock().unwrap().len(), 1);
+        // Pure decision table.
+        let up = |param: &str| format!(r#"{{"error":{{"code":"unsupported_value","param":"{param}","message":"x"}}}}"#);
+        assert_eq!(shape_switch(400, &up("temperature"), false), Some(true));
+        assert_eq!(shape_switch(400, &up("max_completion_tokens"), true), Some(false));
+        assert_eq!(shape_switch(400, &up("top_p"), false), None, "param names some other field");
+        assert_eq!(shape_switch(400, &up("temperature"), true), None, "wrong direction");
+        assert_eq!(shape_switch(400, UNSUPPORTED_TEMP, false), Some(true));
+        // No JSON code: substring fallback.
+        assert_eq!(shape_switch(400, "Unrecognized request argument supplied: temperature", false), Some(true));
+        assert_eq!(shape_switch(400, r#"{"error":{"message":"max_tokens is too large"}}"#, false), Some(true));
+        assert_eq!(shape_switch(429, UNSUPPORTED_TEMP, false), None);
+        // OpenAI-style "unknown_parameter" (an argument the api-version does not know).
+        let unknown = r#"{"error":{"code":"unknown_parameter","param":"reasoning_effort","message":"Unknown parameter: 'reasoning_effort'."}}"#;
+        assert!(rejects_reasoning_effort(400, unknown));
+        assert!(!rejects_reasoning_effort(400, &up("temperature")));
+        assert!(!rejects_reasoning_effort(500, unknown));
     }
 
     #[test]
