@@ -68,6 +68,9 @@ pub enum PasteOutcome {
     Pasted,
     /// Text left on the clipboard; reason is user-facing.
     CopiedOnly { reason: String },
+    /// The dictation was cancelled (Esc) before the paste keystroke was sent: nothing was pasted
+    /// and the user's clipboard is being put back.
+    Cancelled,
 }
 
 /// `dwExtraInfo` stamped on the keystrokes we inject ("OTPS"), so our own hook can recognise them.
@@ -85,6 +88,12 @@ const MODIFIER_WAIT: Duration = Duration::from_millis(1500);
 const RESTORE_DELAY: Duration = Duration::from_millis(500);
 /// Clipboard snapshots above this size are not taken (the paste proceeds without restoring).
 const SNAPSHOT_CAP: usize = 64 << 20;
+/// The prefetch taken at recording start keeps data only up to this size: it sits in memory for
+/// the whole recording and transcription, against the daemon's RAM budget (PLAN §1). A larger
+/// clipboard keeps only its sequence number, and the paste path reads it itself (still bounded by
+/// [`SNAPSHOT_CAP`]); that read is cheap because the prefetch pass already made a delay-rendering
+/// owner render every format.
+const PREFETCH_CAP: usize = 8 << 20;
 
 const TERMINAL_CLASSES: &[&str] = &[
     "ConsoleWindowClass",
@@ -432,22 +441,58 @@ impl Drop for Owner {
     }
 }
 
+/// How long [`Clipboard::open_with`] keeps trying while another app holds the clipboard.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OpenPatience {
+    /// 10 tries, 10 ms apart (90 ms of waiting): the paste path.
+    Fast,
+    /// 10 tries with exponential backoff, 10 ms doubling to 160 ms (950 ms of waiting): the
+    /// restore, which is off the critical path and must not lose the user's data.
+    Patient,
+}
+
+impl OpenPatience {
+    const ATTEMPTS: u32 = 10;
+
+    /// Pause after failed attempt number `attempt` (0-based); `None` once the attempts are used up.
+    fn delay_after(self, attempt: u32) -> Option<Duration> {
+        if attempt + 1 >= Self::ATTEMPTS {
+            return None;
+        }
+        let ms = match self {
+            OpenPatience::Fast => 10,
+            OpenPatience::Patient => (10u64 << attempt.min(4)).min(160),
+        };
+        Some(Duration::from_millis(ms))
+    }
+}
+
 /// An open clipboard (closed on drop).
 struct Clipboard;
 
 impl Clipboard {
-    /// OpenClipboard fails while another app holds it: up to 10 tries x 10 ms.
+    /// OpenClipboard fails while another app holds it: retried on the [`OpenPatience::Fast`]
+    /// schedule (10 tries x 10 ms), which keeps the paste path quick.
+    ///
+    /// Trade-off: the prefetch keeps the clipboard open while a delay-rendering owner (an Excel
+    /// range) renders every format, which can take seconds. Whatever opens the clipboard meanwhile
+    /// fails once its schedule runs out. A paste never does (it waits for the prefetch first); a
+    /// restore retries for about a second ([`OpenPatience::Patient`]) and is lost, with a warning,
+    /// if the owner is slower than that, leaving the dictation text on the clipboard.
     fn open(owner: &Owner) -> Option<Clipboard> {
-        for attempt in 0..10 {
+        Self::open_with(owner, OpenPatience::Fast)
+    }
+
+    fn open_with(owner: &Owner, patience: OpenPatience) -> Option<Clipboard> {
+        let mut attempt = 0;
+        loop {
             // SAFETY: owner window is valid for the lifetime of the guard's use.
             if unsafe { OpenClipboard(Some(owner.0)) }.is_ok() {
                 return Some(Clipboard);
             }
-            if attempt < 9 {
-                thread::sleep(Duration::from_millis(10));
-            }
+            thread::sleep(patience.delay_after(attempt)?);
+            attempt += 1;
         }
-        None
     }
 
     /// Place `bytes` on the (already emptied) clipboard under `fmt`.
@@ -494,28 +539,46 @@ pub(crate) struct Snapshot {
     formats: Vec<(u32, Vec<u8>)>,
 }
 
+#[cfg(test)]
 impl Snapshot {
     pub(crate) fn format_count(&self) -> usize {
         self.formats.len()
     }
 }
 
-/// Read every restorable format. `None` when the clipboard can't be opened or holds too much data.
-pub(crate) fn snapshot_clipboard() -> Option<Snapshot> {
-    read_clipboard_snapshot()?.0
+/// What one pass over the clipboard found.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ClipRead {
+    Data(Snapshot),
+    /// More than the caller's keep cap but within [`SNAPSHOT_CAP`]: nothing was copied.
+    Unkept,
+    /// More than [`SNAPSHOT_CAP`]: never snapshotted (the paste proceeds without restoring).
+    TooBig,
 }
 
-/// One pass over the clipboard. Outer `None`: it could not be opened. Inner `None`: it holds more
-/// than [`SNAPSHOT_CAP`]. The `u32` is `GetClipboardSequenceNumber` read while the clipboard was
-/// still open, so nobody can have changed it between the read and the number (rendering a
-/// delay-rendered format does not count as a change).
-fn read_clipboard_snapshot() -> Option<(Option<Snapshot>, u32)> {
+/// Read every restorable format. `None` when the clipboard can't be opened or holds too much data.
+#[cfg(test)]
+pub(crate) fn snapshot_clipboard() -> Option<Snapshot> {
+    match read_clipboard_snapshot(SNAPSHOT_CAP)?.0 {
+        ClipRead::Data(s) => Some(s),
+        _ => None,
+    }
+}
+
+/// One pass over the clipboard. `None`: it could not be opened. Data is copied while the total
+/// stays within `keep_cap` (at most [`SNAPSHOT_CAP`]); past it the copies are dropped and the
+/// pass only measures, so a large clipboard costs no memory but still renders its formats. The
+/// `u32` is `GetClipboardSequenceNumber` read while the clipboard was still open, so nobody can
+/// have changed it between the read and the number (rendering a delay-rendered format does not
+/// count as a change).
+fn read_clipboard_snapshot(keep_cap: usize) -> Option<(ClipRead, u32)> {
     let owner = Owner::new()?;
     let cb = Clipboard::open(&owner)?;
     let mut formats: Vec<(u32, Vec<u8>)> = Vec::new();
     let mut total = 0usize;
     let mut has_unicode = false;
     let mut too_big = false;
+    let mut unkept = false;
     let mut fmt = 0u32;
     // SAFETY: the clipboard stays open for the whole loop; handles returned by GetClipboardData
     // are owned by the clipboard and only read here (locked, copied, unlocked).
@@ -556,6 +619,13 @@ fn read_clipboard_snapshot() -> Option<(Option<Snapshot>, u32)> {
                 too_big = true;
                 break;
             }
+            if total > keep_cap {
+                if !unkept {
+                    unkept = true;
+                    formats = Vec::new(); // free what was copied so far
+                }
+                continue;
+            }
             let p = GlobalLock(hg);
             if p.is_null() {
                 continue;
@@ -566,13 +636,22 @@ fn read_clipboard_snapshot() -> Option<(Option<Snapshot>, u32)> {
         GetClipboardSequenceNumber()
     };
     drop(cb);
-    Some((if too_big { None } else { Some(Snapshot { formats }) }, seq))
+    let read = if too_big {
+        ClipRead::TooBig
+    } else if unkept {
+        ClipRead::Unkept
+    } else {
+        ClipRead::Data(Snapshot { formats })
+    };
+    Some((read, seq))
 }
 
-/// Put a snapshot back (an empty snapshot clears the clipboard, as it was empty before).
+/// Put a snapshot back (an empty snapshot clears the clipboard, as it was empty before). Opening
+/// the clipboard is retried for about a second ([`OpenPatience::Patient`]): this runs off the
+/// critical path and a lost restore leaves the dictation text where the user's data was.
 pub(crate) fn restore_clipboard(snap: &Snapshot) -> bool {
     let Some(owner) = Owner::new() else { return false };
-    let Some(cb) = Clipboard::open(&owner) else { return false };
+    let Some(cb) = Clipboard::open_with(&owner, OpenPatience::Patient) else { return false };
     if !cb.empty() {
         return false;
     }
@@ -645,6 +724,7 @@ fn add_exclusion_markers(cb: &Clipboard, already: &[u32]) {
 }
 
 /// Read CF_UNICODETEXT (None if absent).
+#[cfg(test)]
 pub(crate) fn read_clipboard_text() -> Option<String> {
     let owner = Owner::new()?;
     let _cb = Clipboard::open(&owner)?;
@@ -749,19 +829,39 @@ fn modifiers_held() -> bool {
     MODIFIER_VKS.iter().any(|vk| unsafe { GetAsyncKeyState(vk.0 as i32) } < 0)
 }
 
-/// Wait until no modifier is physically held. False if still held after `MODIFIER_WAIT`.
-fn wait_modifiers_released() -> bool {
-    if !modifiers_held() {
-        return true;
+/// Poll interval of the modifier wait (the only polling in the paste path).
+const MODIFIER_POLL: Duration = Duration::from_millis(5);
+
+#[derive(Debug, PartialEq, Eq)]
+enum ModifierWait {
+    Released,
+    /// Still held after the wait.
+    TimedOut,
+    /// The dictation was cancelled while waiting.
+    Cancelled,
+}
+
+/// Wait until `held()` turns false, polling every `poll` for at most `wait`. `cancelled()` is
+/// checked before the first probe and after every sleep, so a cancel ends the wait within one
+/// poll interval.
+fn wait_modifiers(held: &dyn Fn() -> bool, cancelled: &dyn Fn() -> bool, wait: Duration, poll: Duration) -> ModifierWait {
+    if cancelled() {
+        return ModifierWait::Cancelled;
     }
-    let deadline = Instant::now() + MODIFIER_WAIT;
+    if !held() {
+        return ModifierWait::Released;
+    }
+    let deadline = Instant::now() + wait;
     while Instant::now() < deadline {
-        thread::sleep(Duration::from_millis(5));
-        if !modifiers_held() {
-            return true;
+        thread::sleep(poll);
+        if cancelled() {
+            return ModifierWait::Cancelled;
+        }
+        if !held() {
+            return ModifierWait::Released;
         }
     }
-    false
+    ModifierWait::TimedOut
 }
 
 fn key(vk: VIRTUAL_KEY, up: bool) -> INPUT {
@@ -829,93 +929,180 @@ fn copied_only(reason: &str) -> PasteOutcome {
     PasteOutcome::CopiedOnly { reason: reason.to_owned() }
 }
 
-/// Core of [`paste_text`]; also returns the clipboard-restore thread so tests can join it.
+/// Everything [`paste_with`] does to the outside world, so tests can stub the keyboard, the
+/// clipboard and the focus (see the `FakeEnv` in the tests).
+trait PasteEnv: Send + Sync {
+    fn capture_foreground(&self) -> Option<Target>;
+    fn write_text(&self, text: &str) -> bool;
+    fn sequence(&self) -> u32;
+    /// A Ctrl/Alt/Shift/Win key is physically down.
+    fn modifiers_held(&self) -> bool;
+    fn ensure_foreground(&self, target: &Target) -> bool;
+    /// Inject the paste chord (the key injector).
+    fn send_paste(&self, terminal: bool) -> Result<(), SendError>;
+    fn acquire_pending(&self) -> Option<(u64, Arc<Snapshot>)>;
+    fn take_pending(&self, gen_id: u64) -> bool;
+    fn restore(&self, snap: &Snapshot) -> bool;
+    fn discard_snapshot(&self);
+}
+
+struct SystemPaste;
+
+impl PasteEnv for SystemPaste {
+    fn capture_foreground(&self) -> Option<Target> {
+        capture_foreground()
+    }
+    fn write_text(&self, text: &str) -> bool {
+        write_text(text)
+    }
+    fn sequence(&self) -> u32 {
+        // SAFETY: trivially safe query.
+        unsafe { GetClipboardSequenceNumber() }
+    }
+    fn modifiers_held(&self) -> bool {
+        modifiers_held()
+    }
+    fn ensure_foreground(&self, target: &Target) -> bool {
+        ensure_foreground(target)
+    }
+    fn send_paste(&self, terminal: bool) -> Result<(), SendError> {
+        send_chord(&paste_chord(terminal))
+    }
+    fn acquire_pending(&self) -> Option<(u64, Arc<Snapshot>)> {
+        acquire_pending()
+    }
+    fn take_pending(&self, gen_id: u64) -> bool {
+        take_pending(gen_id)
+    }
+    fn restore(&self, snap: &Snapshot) -> bool {
+        restore_clipboard(snap)
+    }
+    fn discard_snapshot(&self) {
+        discard_clipboard_snapshot();
+    }
+}
+
+/// Put the user's clipboard back after `delay`, on its own thread, unless a newer paste took the
+/// snapshot over or somebody touched the clipboard since our write (`seq`). `None` when no thread
+/// could be started: the snapshot is abandoned and the dictation text stays on the clipboard.
+fn spawn_restore(env: Arc<dyn PasteEnv>, gen_id: u64, snap: Arc<Snapshot>, seq: u32, delay: Duration) -> Option<JoinHandle<()>> {
+    let worker = env.clone();
+    let spawned = thread::Builder::new().name("clipboard-restore".into()).spawn(move || {
+        if !delay.is_zero() {
+            thread::sleep(delay);
+        }
+        // A newer paste took over this snapshot (or abandoned it): nothing to do here.
+        if !worker.take_pending(gen_id) {
+            return;
+        }
+        // Only if nobody (user, other app) has touched the clipboard since our write.
+        if worker.sequence() == seq && !worker.restore(&snap) {
+            crate::log_warn!("paste: could not restore the previous clipboard contents");
+        }
+    });
+    match spawned {
+        Ok(h) => Some(h),
+        Err(_) => {
+            env.take_pending(gen_id);
+            crate::log_warn!("paste: could not start the clipboard restore thread");
+            None
+        }
+    }
+}
+
+/// Core of [`paste_text_cancellable`]; also returns the clipboard-restore thread so tests can
+/// join it.
 pub(crate) fn paste_inner(
     text: &str,
     target: Option<&Target>,
     opts: PasteOptions,
+    cancelled: &dyn Fn() -> bool,
+) -> (PasteOutcome, Option<JoinHandle<()>>) {
+    paste_with(Arc::new(SystemPaste), text, target, opts, cancelled)
+}
+
+fn paste_with(
+    env: Arc<dyn PasteEnv>,
+    text: &str,
+    target: Option<&Target>,
+    opts: PasteOptions,
+    cancelled: &dyn Fn() -> bool,
 ) -> (PasteOutcome, Option<JoinHandle<()>>) {
     let text = if opts.smart_spacing { apply_smart_spacing(text) } else { text.to_owned() };
     if text.is_empty() {
         return (PasteOutcome::Pasted, None);
     }
+    // Nothing has been touched yet: a cancel that already happened costs nothing to honour.
+    if cancelled() {
+        return (PasteOutcome::Cancelled, None);
+    }
     let owned;
     let target = match target {
         Some(t) => Some(t),
         None => {
-            owned = capture_foreground();
+            owned = env.capture_foreground();
             owned.as_ref()
         }
     };
 
     // UIPI would silently drop our keystrokes: leave the text for a manual paste.
     if target.is_some_and(|t| t.elevated) {
-        discard_clipboard_snapshot();
-        let reason = if write_text(&text) { ELEVATED_REASON } else { CLIPBOARD_BUSY_REASON };
+        env.discard_snapshot();
+        let reason = if env.write_text(&text) { ELEVATED_REASON } else { CLIPBOARD_BUSY_REASON };
         return (copied_only(reason), None);
     }
 
     let pending = if opts.restore_clipboard {
-        acquire_pending()
+        env.acquire_pending()
     } else {
-        discard_clipboard_snapshot();
+        env.discard_snapshot();
         None
     };
-    // Any outcome other than a completed paste leaves our text on the clipboard on purpose, so
-    // the user's previous contents are not put back over it.
+    // Any outcome other than a completed paste or a cancel leaves our text on the clipboard on
+    // purpose, so the user's previous contents are not put back over it.
     let fail = |reason: &str| {
         if let Some((gen_id, _)) = &pending {
-            abandon_pending(*gen_id);
+            env.take_pending(*gen_id);
         }
         (copied_only(reason), None)
     };
-    if !write_text(&text) {
+    if !env.write_text(&text) {
         return fail(CLIPBOARD_BUSY_REASON);
     }
-    // SAFETY: trivially safe query.
-    let seq = unsafe { GetClipboardSequenceNumber() };
+    let seq = env.sequence();
+    // A cancel after the clipboard write: nothing will be pasted, so put the user's clipboard back
+    // through the normal restore path, without the post-paste delay (no target is reading it).
+    // With no snapshot (restore off, or the clipboard too large) the text stays on the clipboard.
+    let cancel = || {
+        let restore = pending.clone().and_then(|(gen_id, snap)| spawn_restore(env.clone(), gen_id, snap, seq, Duration::ZERO));
+        (PasteOutcome::Cancelled, restore)
+    };
 
-    if !wait_modifiers_released() {
-        return fail(HELD_REASON);
+    match wait_modifiers(&|| env.modifiers_held(), cancelled, MODIFIER_WAIT, MODIFIER_POLL) {
+        ModifierWait::Released => {}
+        ModifierWait::TimedOut => return fail(HELD_REASON),
+        ModifierWait::Cancelled => return cancel(),
     }
     if let Some(t) = target {
-        if !ensure_foreground(t) {
+        if !env.ensure_foreground(t) {
             return fail(NO_FOCUS_REASON);
         }
     }
     // Give the clipboard-owner change a moment to settle before the target reads it.
     thread::sleep(Duration::from_millis(10));
+    // Last chance to honour Esc: after this the keystroke is out and cannot be recalled.
+    if cancelled() {
+        return cancel();
+    }
 
     let terminal = target.is_some_and(|t| t.is_terminal);
-    match send_chord(&paste_chord(terminal)) {
+    match env.send_paste(terminal) {
         Ok(()) => {}
         Err(SendError::Denied) => return fail(ELEVATED_REASON),
         Err(SendError::Failed) => return fail(SEND_FAILED_REASON),
     }
 
-    let restore = pending.and_then(|(gen_id, snap)| {
-        let spawned = thread::Builder::new().name("clipboard-restore".into()).spawn(move || {
-            thread::sleep(RESTORE_DELAY);
-            // A newer paste took over this snapshot (or abandoned it): nothing to do here.
-            if !take_pending(gen_id) {
-                return;
-            }
-            // Only if nobody (user, other app) has touched the clipboard since our write.
-            // SAFETY: trivially safe query.
-            if unsafe { GetClipboardSequenceNumber() } == seq && !restore_clipboard(&snap) {
-                crate::log_warn!("paste: could not restore the previous clipboard contents");
-            }
-        });
-        match spawned {
-            Ok(h) => Some(h),
-            Err(_) => {
-                // No thread for the delayed restore: leave the dictation text on the clipboard.
-                abandon_pending(gen_id);
-                crate::log_warn!("paste: could not start the clipboard restore thread");
-                None
-            }
-        }
-    });
+    let restore = pending.and_then(|(gen_id, snap)| spawn_restore(env.clone(), gen_id, snap, seq, RESTORE_DELAY));
     (PasteOutcome::Pasted, restore)
 }
 
@@ -949,7 +1136,11 @@ fn acquire_pending_with(
         None => match prefetch.take_fresh(src, PREFETCH_WAIT) {
             Prefetched::Usable(s) => s,
             Prefetched::TooBig => return None,
-            Prefetched::Miss => Arc::new(src.snapshot()?.0?),
+            // Read at paste time: bounded by SNAPSHOT_CAP, not the smaller prefetch cap.
+            Prefetched::Miss => match src.snapshot(SNAPSHOT_CAP)?.0 {
+                ClipRead::Data(s) => Arc::new(s),
+                ClipRead::Unkept | ClipRead::TooBig => return None,
+            },
         },
     };
     *slot = Some((gen_id, snap.clone()));
@@ -968,7 +1159,7 @@ const PREFETCH_WAIT: Duration = Duration::from_secs(5);
 trait ClipSource: Send + Sync {
     fn sequence(&self) -> u32;
     /// See [`read_clipboard_snapshot`].
-    fn snapshot(&self) -> Option<(Option<Snapshot>, u32)>;
+    fn snapshot(&self, keep_cap: usize) -> Option<(ClipRead, u32)>;
 }
 
 struct SystemClip;
@@ -978,8 +1169,8 @@ impl ClipSource for SystemClip {
         // SAFETY: trivially safe query.
         unsafe { GetClipboardSequenceNumber() }
     }
-    fn snapshot(&self) -> Option<(Option<Snapshot>, u32)> {
-        read_clipboard_snapshot()
+    fn snapshot(&self, keep_cap: usize) -> Option<(ClipRead, u32)> {
+        read_clipboard_snapshot(keep_cap)
     }
 }
 
@@ -987,8 +1178,17 @@ enum PrefetchState {
     Empty,
     /// A worker with this epoch is reading the clipboard.
     Running(u64),
-    /// `snap` is `None` when the clipboard held more than [`SNAPSHOT_CAP`].
-    Ready { seq: u32, snap: Option<Arc<Snapshot>> },
+    Ready { seq: u32, snap: PrefetchData },
+}
+
+/// What a finished prefetch holds.
+enum PrefetchData {
+    Snapshot(Arc<Snapshot>),
+    /// More than [`PREFETCH_CAP`]: the data was dropped and only the sequence number is kept, so
+    /// the paste path reads the clipboard itself.
+    Unkept,
+    /// More than [`SNAPSHOT_CAP`]: never restorable.
+    TooBig,
 }
 
 enum Prefetched {
@@ -1037,13 +1237,20 @@ impl Prefetch {
         Some(epoch)
     }
 
-    fn finish(&self, epoch: u64, result: Option<(Option<Snapshot>, u32)>) {
+    fn finish(&self, epoch: u64, result: Option<(ClipRead, u32)>) {
         let mut g = self.lock();
         if !matches!(g.state, PrefetchState::Running(e) if e == epoch) {
             return; // cleared meanwhile: drop the data
         }
         g.state = match result {
-            Some((snap, seq)) => PrefetchState::Ready { seq, snap: snap.map(Arc::new) },
+            Some((read, seq)) => PrefetchState::Ready {
+                seq,
+                snap: match read {
+                    ClipRead::Data(s) => PrefetchData::Snapshot(Arc::new(s)),
+                    ClipRead::Unkept => PrefetchData::Unkept,
+                    ClipRead::TooBig => PrefetchData::TooBig,
+                },
+            },
             None => PrefetchState::Empty,
         };
         self.done.notify_all();
@@ -1073,8 +1280,9 @@ impl Prefetch {
         }
         match std::mem::replace(&mut g.state, PrefetchState::Empty) {
             PrefetchState::Ready { seq, snap } if seq == src.sequence() => match snap {
-                Some(s) => Prefetched::Usable(s),
-                None => Prefetched::TooBig,
+                PrefetchData::Snapshot(s) => Prefetched::Usable(s),
+                PrefetchData::TooBig => Prefetched::TooBig,
+                PrefetchData::Unkept => Prefetched::Miss,
             },
             _ => Prefetched::Miss,
         }
@@ -1086,7 +1294,7 @@ fn prepare_with(prefetch: &'static Prefetch, src: Arc<dyn ClipSource>) -> Option
     let epoch = prefetch.begin(&*src)?;
     let spawned = thread::Builder::new().name("clipboard-prefetch".into()).spawn(move || {
         // A panic must still end the `Running` state, or the paste would wait out PREFETCH_WAIT.
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| src.snapshot())).ok().flatten();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| src.snapshot(PREFETCH_CAP))).ok().flatten();
         prefetch.finish(epoch, result);
     });
     match spawned {
@@ -1137,13 +1345,23 @@ fn take_pending(gen_id: u64) -> bool {
     }
 }
 
+#[cfg(test)]
 fn abandon_pending(gen_id: u64) {
     take_pending(gen_id);
 }
 
-/// Paste `text` into `target` (or the current foreground window).
+/// Paste `text` into `target` (or the current foreground window). Not cancellable.
+#[allow(dead_code)] // public entry point for callers without a cancel flag; the dictation worker uses the cancellable one
 pub fn paste_text(text: &str, target: Option<&Target>, opts: PasteOptions) -> PasteOutcome {
-    paste_inner(text, target, opts).0
+    paste_text_cancellable(text, target, opts, &|| false)
+}
+
+/// Like [`paste_text`], but `cancelled` is polled while waiting for held modifier keys and once
+/// more right before the paste keystroke: when it turns true the keystroke is not sent, the
+/// user's clipboard is put back and [`PasteOutcome::Cancelled`] is returned. A paste whose
+/// keystroke is already out cannot be recalled.
+pub fn paste_text_cancellable(text: &str, target: Option<&Target>, opts: PasteOptions, cancelled: &dyn Fn() -> bool) -> PasteOutcome {
+    paste_inner(text, target, opts, cancelled).0
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1357,11 +1575,13 @@ mod tests {
         reads: std::sync::atomic::AtomicUsize,
         delay: Duration,
         too_big: bool,
+        /// Pretend clipboard size, compared with the cap the caller passes.
+        size: usize,
     }
 
     impl FakeClip {
         fn new(seq: u32) -> Arc<FakeClip> {
-            Arc::new(FakeClip { seq: seq.into(), reads: 0.into(), delay: Duration::ZERO, too_big: false })
+            Arc::new(FakeClip { seq: seq.into(), reads: 0.into(), delay: Duration::ZERO, too_big: false, size: 1 })
         }
         fn reads(&self) -> usize {
             self.reads.load(Ordering::SeqCst)
@@ -1375,11 +1595,17 @@ mod tests {
         fn sequence(&self) -> u32 {
             self.seq.load(Ordering::SeqCst)
         }
-        fn snapshot(&self) -> Option<(Option<Snapshot>, u32)> {
+        fn snapshot(&self, keep_cap: usize) -> Option<(ClipRead, u32)> {
             thread::sleep(self.delay);
             self.reads.fetch_add(1, Ordering::SeqCst);
-            let snap = Snapshot { formats: vec![(CF_UNICODETEXT, vec![1, 2, 3])] };
-            Some((if self.too_big { None } else { Some(snap) }, self.sequence()))
+            let read = if self.too_big {
+                ClipRead::TooBig
+            } else if self.size > keep_cap {
+                ClipRead::Unkept
+            } else {
+                ClipRead::Data(Snapshot { formats: vec![(CF_UNICODETEXT, vec![1, 2, 3])] })
+            };
+            Some((read, self.sequence()))
         }
     }
 
@@ -1461,6 +1687,7 @@ mod tests {
             reads: 0.into(),
             delay: Duration::from_millis(150),
             too_big: false,
+            size: 1,
         });
         let worker = prepare_with(pre, clip.clone()).expect("started");
         assert!(acquire_pending_with(&pending, pre, &*clip).is_some());
@@ -1471,7 +1698,7 @@ mod tests {
     #[test]
     fn oversized_clipboard_is_remembered_and_not_read_again() {
         let (pre, pending) = (leaked_prefetch(), pending_slot());
-        let clip = Arc::new(FakeClip { seq: 3.into(), reads: 0.into(), delay: Duration::ZERO, too_big: true });
+        let clip = Arc::new(FakeClip { seq: 3.into(), reads: 0.into(), delay: Duration::ZERO, too_big: true, size: 1 });
         prepare_with(pre, clip.clone()).unwrap().join().unwrap();
         assert!(acquire_pending_with(&pending, pre, &*clip).is_none());
         assert_eq!(clip.reads(), 1);
@@ -1484,8 +1711,220 @@ mod tests {
         let clip = FakeClip::new(1);
         let epoch = pre.begin(&*clip).unwrap();
         pre.clear();
-        pre.finish(epoch, clip.snapshot());
+        pre.finish(epoch, clip.snapshot(PREFETCH_CAP));
         assert!(matches!(pre.lock().state, PrefetchState::Empty));
+    }
+
+    #[test]
+    fn over_prefetch_cap_keeps_no_data_and_the_paste_reads_once() {
+        let (pre, pending) = (leaked_prefetch(), pending_slot());
+        let clip = Arc::new(FakeClip {
+            seq: 4.into(),
+            reads: 0.into(),
+            delay: Duration::ZERO,
+            too_big: false,
+            size: PREFETCH_CAP + 1,
+        });
+        prepare_with(pre, clip.clone()).expect("started").join().unwrap();
+        assert_eq!(clip.reads(), 1);
+        // The prefetch holds the sequence number and a marker, no clipboard data.
+        assert!(matches!(pre.lock().state, PrefetchState::Ready { seq: 4, snap: PrefetchData::Unkept }));
+        // A current prefetch is not repeated.
+        assert!(prepare_with(pre, clip.clone()).is_none());
+        // The paste path reads the clipboard itself, once, under the larger snapshot cap.
+        let (_, snap) = acquire_pending_with(&pending, pre, &*clip).expect("read at paste time");
+        assert_eq!(clip.reads(), 2);
+        assert_eq!(snap.format_count(), 1);
+        assert!(matches!(pre.lock().state, PrefetchState::Empty), "the marker is consumed");
+    }
+
+    #[test]
+    fn over_snapshot_cap_at_paste_time_pastes_without_restore() {
+        let (pre, pending) = (leaked_prefetch(), pending_slot());
+        let clip = Arc::new(FakeClip {
+            seq: 4.into(),
+            reads: 0.into(),
+            delay: Duration::ZERO,
+            too_big: false,
+            size: SNAPSHOT_CAP + 1,
+        });
+        prepare_with(pre, clip.clone()).unwrap().join().unwrap();
+        assert!(acquire_pending_with(&pending, pre, &*clip).is_none());
+        assert!(pending.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn open_schedule_is_bounded() {
+        for (patience, total_ms) in [(OpenPatience::Fast, 90u128), (OpenPatience::Patient, 950)] {
+            let mut attempts = 1;
+            let mut total = Duration::ZERO;
+            let mut last = Duration::ZERO;
+            while let Some(d) = patience.delay_after(attempts - 1) {
+                assert!(d >= last, "{patience:?}: backoff never shrinks");
+                last = d;
+                total += d;
+                attempts += 1;
+            }
+            assert_eq!(attempts, OpenPatience::ATTEMPTS, "{patience:?}");
+            assert_eq!(total.as_millis(), total_ms, "{patience:?}");
+        }
+        // The restore waits roughly a second; the paste path stays under 100 ms.
+        let patient: Duration = (0..OpenPatience::ATTEMPTS).filter_map(|a| OpenPatience::Patient.delay_after(a)).sum();
+        assert!((Duration::from_millis(900)..=Duration::from_millis(1100)).contains(&patient), "{patient:?}");
+        assert_eq!(OpenPatience::Patient.delay_after(OpenPatience::ATTEMPTS - 1), None);
+        assert_eq!(OpenPatience::Fast.delay_after(0), Some(Duration::from_millis(10)));
+    }
+
+    #[test]
+    fn modifier_wait_outcomes() {
+        let poll = Duration::from_millis(2);
+        let never = || false;
+        let always = || true;
+        assert_eq!(wait_modifiers(&never, &never, Duration::from_millis(50), poll), ModifierWait::Released);
+        assert_eq!(wait_modifiers(&always, &never, Duration::from_millis(30), poll), ModifierWait::TimedOut);
+        assert_eq!(wait_modifiers(&never, &always, Duration::from_millis(50), poll), ModifierWait::Cancelled);
+        // Released after a few probes.
+        let n = std::sync::atomic::AtomicUsize::new(0);
+        let held = || n.fetch_add(1, Ordering::SeqCst) < 3;
+        assert_eq!(wait_modifiers(&held, &never, Duration::from_secs(1), poll), ModifierWait::Released);
+    }
+
+    /// Stubs every outside effect of a paste and records what was asked of it.
+    #[derive(Default)]
+    struct FakeEnv {
+        /// A modifier key is held for as long as the test lasts.
+        held: bool,
+        /// Raise `cancel` on the n-th modifier probe (0 = never).
+        cancel_on_probe: usize,
+        /// Raise `cancel` while returning focus to the target.
+        cancel_in_foreground: bool,
+        /// A snapshot of the user's clipboard is pending.
+        pending: bool,
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+        cancelled_at: Mutex<Option<Instant>>,
+        probes: std::sync::atomic::AtomicUsize,
+        writes: std::sync::atomic::AtomicUsize,
+        sends: std::sync::atomic::AtomicUsize,
+        restores: std::sync::atomic::AtomicUsize,
+        takes: std::sync::atomic::AtomicUsize,
+        acquires: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FakeEnv {
+        fn raise_cancel(&self) {
+            *self.cancelled_at.lock().unwrap() = Some(Instant::now());
+            self.cancel.store(true, Ordering::SeqCst);
+        }
+        fn count(c: &std::sync::atomic::AtomicUsize) -> usize {
+            c.load(Ordering::SeqCst)
+        }
+    }
+
+    impl PasteEnv for FakeEnv {
+        fn capture_foreground(&self) -> Option<Target> {
+            None
+        }
+        fn write_text(&self, _text: &str) -> bool {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            true
+        }
+        fn sequence(&self) -> u32 {
+            7
+        }
+        fn modifiers_held(&self) -> bool {
+            let n = self.probes.fetch_add(1, Ordering::SeqCst) + 1;
+            if self.cancel_on_probe != 0 && n == self.cancel_on_probe {
+                self.raise_cancel();
+            }
+            self.held
+        }
+        fn ensure_foreground(&self, _target: &Target) -> bool {
+            if self.cancel_in_foreground {
+                self.raise_cancel();
+            }
+            true
+        }
+        fn send_paste(&self, _terminal: bool) -> Result<(), SendError> {
+            self.sends.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        fn acquire_pending(&self) -> Option<(u64, Arc<Snapshot>)> {
+            self.acquires.fetch_add(1, Ordering::SeqCst);
+            self.pending.then(|| (42, Arc::new(Snapshot::default())))
+        }
+        fn take_pending(&self, _gen_id: u64) -> bool {
+            self.takes.fetch_add(1, Ordering::SeqCst);
+            true
+        }
+        fn restore(&self, _snap: &Snapshot) -> bool {
+            self.restores.fetch_add(1, Ordering::SeqCst);
+            true
+        }
+        fn discard_snapshot(&self) {}
+    }
+
+    fn run_paste(env: &Arc<FakeEnv>, restore_clipboard: bool) -> (PasteOutcome, Option<JoinHandle<()>>, Instant) {
+        let target = Target::default();
+        let opts = PasteOptions { restore_clipboard, smart_spacing: false };
+        let cancel = env.cancel.clone();
+        let (out, restore) = paste_with(env.clone(), "hello", Some(&target), opts, &|| cancel.load(Ordering::SeqCst));
+        (out, restore, Instant::now())
+    }
+
+    #[test]
+    fn cancel_mid_modifier_wait_returns_within_a_poll_without_injecting() {
+        let env = Arc::new(FakeEnv { held: true, cancel_on_probe: 3, pending: true, ..Default::default() });
+        let (out, restore, returned) = run_paste(&env, true);
+        assert_eq!(out, PasteOutcome::Cancelled);
+        assert_eq!(FakeEnv::count(&env.sends), 0, "the injector must not be called");
+        assert_eq!(FakeEnv::count(&env.probes), 3, "no probe after the cancel");
+        let lag = returned.duration_since(env.cancelled_at.lock().unwrap().expect("cancel was raised"));
+        // One 5 ms poll after the cancel (probe count above); the bound only has to beat the 1.5 s wait.
+        assert!(lag < MODIFIER_WAIT / 3, "returned {lag:?} after the cancel");
+        // The text was already on the clipboard: the user's data comes back through the restore path.
+        assert_eq!(FakeEnv::count(&env.writes), 1);
+        restore.expect("restore thread").join().unwrap();
+        assert_eq!((FakeEnv::count(&env.takes), FakeEnv::count(&env.restores)), (1, 1));
+    }
+
+    #[test]
+    fn cancel_right_before_the_keystroke_does_not_inject() {
+        let env = Arc::new(FakeEnv { cancel_in_foreground: true, pending: true, ..Default::default() });
+        let (out, restore, _) = run_paste(&env, true);
+        assert_eq!(out, PasteOutcome::Cancelled);
+        assert_eq!(FakeEnv::count(&env.sends), 0);
+        restore.expect("restore thread").join().unwrap();
+        assert_eq!(FakeEnv::count(&env.restores), 1);
+    }
+
+    #[test]
+    fn cancel_before_the_clipboard_is_touched_does_nothing() {
+        let env = Arc::new(FakeEnv { pending: true, ..Default::default() });
+        env.cancel.store(true, Ordering::SeqCst);
+        let (out, restore, _) = run_paste(&env, true);
+        assert_eq!(out, PasteOutcome::Cancelled);
+        assert!(restore.is_none());
+        assert_eq!((FakeEnv::count(&env.writes), FakeEnv::count(&env.acquires), FakeEnv::count(&env.sends)), (0, 0, 0));
+    }
+
+    #[test]
+    fn cancel_without_a_snapshot_has_nothing_to_restore() {
+        let env = Arc::new(FakeEnv { cancel_in_foreground: true, ..Default::default() });
+        let (out, restore, _) = run_paste(&env, false);
+        assert_eq!(out, PasteOutcome::Cancelled);
+        assert!(restore.is_none());
+        assert_eq!(FakeEnv::count(&env.restores), 0);
+    }
+
+    #[test]
+    fn uncancelled_paste_injects_once_and_restores_later() {
+        let env = Arc::new(FakeEnv { pending: true, ..Default::default() });
+        let (out, restore, _) = run_paste(&env, true);
+        assert_eq!(out, PasteOutcome::Pasted);
+        assert_eq!(FakeEnv::count(&env.sends), 1);
+        assert_eq!(FakeEnv::count(&env.restores), 0, "restore waits for RESTORE_DELAY");
+        restore.expect("restore thread").join().unwrap();
+        assert_eq!(FakeEnv::count(&env.restores), 1);
     }
 
     #[test]
@@ -1595,6 +2034,39 @@ mod tests {
         assert!(names.iter().any(|n| n == "ExcludeClipboardContentFromMonitorProcessing"), "{names:?}");
         assert!(names.iter().any(|n| n == "CanIncludeInClipboardHistory"), "{names:?}");
         assert!(names.iter().any(|n| n == "CanUploadToCloudClipboard"), "{names:?}");
+        assert!(restore_clipboard(&before));
+    }
+
+    /// Another process (here: a thread with its own owner window) keeps the clipboard open, as a
+    /// delay-rendering owner does during the prefetch. The paste path's fast schedule gives up; the
+    /// restore's patient one waits it out and puts the user's data back.
+    #[test]
+    #[ignore]
+    fn desktop_restore_outlasts_a_busy_clipboard() {
+        if !require_input_desktop("desktop_restore_outlasts_a_busy_clipboard") {
+            return;
+        }
+        let _g = DESKTOP.lock().unwrap_or_else(|e| e.into_inner());
+        let before = snapshot_clipboard().expect("snapshot");
+        let known = Snapshot { formats: vec![(CF_UNICODETEXT, utf16_bytes("busy clipboard restore"))] };
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let holder = thread::spawn(move || {
+            let owner = Owner::new().expect("owner window");
+            let cb = Clipboard::open(&owner).expect("holder opens the clipboard");
+            held_tx.send(()).unwrap();
+            thread::sleep(Duration::from_millis(400));
+            drop(cb);
+        });
+        held_rx.recv().unwrap();
+        let t = Instant::now();
+        {
+            let owner = Owner::new().expect("owner window");
+            assert!(Clipboard::open_with(&owner, OpenPatience::Fast).is_none(), "the fast schedule (90 ms) gives up");
+        }
+        assert!(restore_clipboard(&known), "the patient schedule outlasts a 400 ms hold");
+        assert!(t.elapsed() >= Duration::from_millis(300), "waited for the holder: {:?}", t.elapsed());
+        holder.join().unwrap();
+        assert_eq!(read_clipboard_text().as_deref(), Some("busy clipboard restore"));
         assert!(restore_clipboard(&before));
     }
 
@@ -1918,6 +2390,7 @@ mod tests {
             text,
             Some(&target),
             PasteOptions { restore_clipboard: true, smart_spacing: false },
+            &|| false,
         );
         assert_eq!(out, PasteOutcome::Pasted);
         if let Some(h) = restore {
