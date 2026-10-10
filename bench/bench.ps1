@@ -1,6 +1,13 @@
-# OpenTalk benchmark (docs/PLAN.md section 11). Writes docs\BENCHMARK.md and bench\out\results.json.
+# OpenTalk benchmark (docs/PLAN.md section 11). Writes docs\BENCHMARK.md (or -OutFile) and bench\out\results.json.
 #
-#   powershell -File bench\bench.ps1 [-Exe path] [-Quick] [-SkipLive] [-SkipMic]
+#   powershell -File bench\bench.ps1 [-Exe path] [-Quick] [-SkipLive] [-SkipMic] [-OutFile path] [-CheckSizeOnly]
+#
+# -OutFile       report path (default docs\BENCHMARK.md). Blocks between `<!-- keep:begin NAME -->` and
+#                `<!-- keep:end NAME -->` lines in the existing file are re-emitted byte for byte (see
+#                Write-ReportKeepingBlocks in common.ps1); everything else is regenerated.
+# -CheckSizeOnly only check the release exe against the 8,000,000 byte budget (for CI): exit 1 when over.
+#                A normal run also exits 1 after writing the report when the exe is over budget.
+# The OpenRouter key comes from -KeyFile / OPENTALK_OPENROUTER_KEY_FILE, else OPENTALK_SECRET_OPENROUTER.
 #
 # Scenarios (each runs a fresh daemon in an isolated OPENTALK_HOME):
 #   startup      process start -> daemon window, 5 runs
@@ -25,12 +32,31 @@ param(
     [switch]$Quick,
     [switch]$SkipLive,
     [switch]$SkipMic,
-    [switch]$SkipE2E
+    [switch]$SkipE2E,
+    [string]$OutFile = (Join-Path $PSScriptRoot '..\docs\BENCHMARK.md'),
+    [switch]$CheckSizeOnly
 )
 . (Join-Path $PSScriptRoot 'common.ps1')
 if (-not $KeyFile) { $KeyFile = $script:KeyFileDefault }
 if ($Quick) { $IdleSec = 10; $Dictations = 3; $RecordSec = 8; $SettingsSec = 8; $LiveDictations = 1 }
 $Exe = (Resolve-Path $Exe).Path
+
+# Release executable budget (PLAN section 1): decimal bytes, so the MB figures (bytes / 10^6) match what the budget says.
+$SizeBudgetBytes = 8000000
+function Format-Bytes([long]$n) { return $n.ToString('N0', [Globalization.CultureInfo]::InvariantCulture) }
+function Format-ExeMB([long]$n) { return [math]::Round($n / 1e6, 2).ToString('0.00', [Globalization.CultureInfo]::InvariantCulture) }
+# Prints the size verdict; returns $true when within budget.
+function Test-ExeSize([string]$exePath) {
+    $n = (Get-Item $exePath).Length
+    if ($n -le $SizeBudgetBytes) {
+        Write-Host ("exe size {0} bytes ({1} MB (10^6 bytes)) is within the {2} byte budget" -f (Format-Bytes $n), (Format-ExeMB $n), (Format-Bytes $SizeBudgetBytes))
+        return $true
+    }
+    Write-Host ("FAIL: exe size {0} bytes ({1} MB (10^6 bytes)) exceeds the {2} byte budget by {3} bytes" -f (Format-Bytes $n), (Format-ExeMB $n), (Format-Bytes $SizeBudgetBytes), (Format-Bytes ($n - $SizeBudgetBytes))) -ForegroundColor Red
+    return $false
+}
+if ($CheckSizeOnly) { if (Test-ExeSize $Exe) { exit 0 } else { exit 1 } }
+
 $wav = (Resolve-Path (Join-Path $PSScriptRoot '..\tests\fixtures\tts_fillers.wav')).Path
 $wavMs = Get-WavMs $wav
 $outDir = Join-Path $PSScriptRoot 'out'
@@ -71,14 +97,51 @@ function Measure-Until($proc, $until) {
     }
 }
 
-# Private working set (what Task Manager shows as "Memory"), via the Process V2 counters.
-function Get-PrivateWsMB([int]$procId) {
+# Private working set (what Task Manager shows as "Memory"): PROCESS_MEMORY_COUNTERS_EX2.PrivateWorkingSetSize via
+# K32GetProcessMemoryInfo (the 'Process V2' perf counter throws invalid-sample errors on some machines). Falls back
+# to the WMI perf class (WorkingSetPrivate). Returns MB, or $null when neither works.
+function Get-PrivateWsBytes([int]$procId) {
+    if (-not ('OtMem' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System; using System.Runtime.InteropServices;
+public static class OtMem {
+    [StructLayout(LayoutKind.Sequential)]
+    struct PMC_EX2 {
+        public uint cb; public uint PageFaultCount;
+        public UIntPtr PeakWorkingSetSize, WorkingSetSize, QuotaPeakPagedPoolUsage, QuotaPagedPoolUsage,
+            QuotaPeakNonPagedPoolUsage, QuotaNonPagedPoolUsage, PagefileUsage, PeakPagefileUsage, PrivateUsage;
+        public UIntPtr PrivateWorkingSetSize;
+        public ulong SharedCommitUsage;
+    }
+    [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr OpenProcess(uint access, bool inherit, uint pid);
+    [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+    [DllImport("kernel32.dll", EntryPoint = "K32GetProcessMemoryInfo", SetLastError = true)]
+    static extern bool GetProcessMemoryInfo(IntPtr h, out PMC_EX2 c, uint cb);
+    // -1 when the process cannot be opened or the OS does not know the EX2 layout.
+    public static long PrivateWorkingSet(uint pid) {
+        IntPtr h = OpenProcess(0x1000 | 0x0010, false, pid);   // PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ
+        if (h == IntPtr.Zero) return -1;
+        try {
+            PMC_EX2 c;
+            if (!GetProcessMemoryInfo(h, out c, (uint)Marshal.SizeOf(typeof(PMC_EX2)))) return -1;
+            return (long)c.PrivateWorkingSetSize.ToUInt64();
+        } finally { CloseHandle(h); }
+    }
+}
+'@
+    }
+    try { $b = [OtMem]::PrivateWorkingSet([uint32]$procId); if ($b -gt 0) { return [long]$b } } catch {}
     try {
-        $c = Get-Counter -Counter '\Process V2(*)\Working Set - Private' -ErrorAction Stop
-        $s = $c.CounterSamples | Where-Object { $_.InstanceName -like "*:$procId" } | Select-Object -First 1
-        if ($s) { return [math]::Round($s.CookedValue / 1MB, 1) }
+        $o = Get-CimInstance -ClassName Win32_PerfFormattedData_PerfProc_Process -Filter "IDProcess=$procId" -ErrorAction Stop | Select-Object -First 1
+        if ($o -and $o.WorkingSetPrivate) { return [long]$o.WorkingSetPrivate }
     } catch {}
     return $null
+}
+
+function Get-PrivateWsMB([int]$procId) {
+    $b = Get-PrivateWsBytes $procId
+    if ($null -eq $b) { return $null }
+    return [math]::Round($b / 1MB, 1)
 }
 
 function New-Env([string]$home_, [hashtable]$extra = @{}) {
@@ -121,11 +184,11 @@ $os = (Get-CimInstance Win32_OperatingSystem)
 $exeInfo = Get-Item $Exe
 $R['env'] = [ordered]@{
     cpu = $cpuName; logical_cores = [Environment]::ProcessorCount; os = "$($os.Caption) $($os.Version)"
-    exe_bytes = $exeInfo.Length; exe_mb = [math]::Round($exeInfo.Length / 1MB, 2); exe_built = $exeInfo.LastWriteTime.ToString('s')
+    exe_bytes = $exeInfo.Length; exe_mb = [math]::Round($exeInfo.Length / 1e6, 2); size_budget_bytes = $SizeBudgetBytes; exe_built = $exeInfo.LastWriteTime.ToString('s')
     wav_ms = $wavMs; date = (Get-Date).ToString('s')
     desktop_locked = [bool](Get-Process -Name LogonUI -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -eq (Get-Process -Id $PID).SessionId })
 }
-Write-Host ("exe {0:N2} MB, {1} cores, {2}" -f $R.env.exe_mb, $R.env.logical_cores, $cpuName)
+Write-Host ("exe {0} bytes ({1} MB (10^6 bytes)), {2} cores, {3}" -f (Format-Bytes $R.env.exe_bytes), (Format-ExeMB $R.env.exe_bytes), $R.env.logical_cores, $cpuName)
 
 # ---- startup ----------------------------------------------------------------------------
 Section 'startup (5 runs)'
@@ -230,8 +293,8 @@ if (-not $SkipMic) {
     Section "recording $RecordSec s (real microphone, cancelled, no upload)"
     $h = New-TempHome 'ot-bench-mic'
     $e = New-Env $h @{ OPENTALK_STT_BASE_URL = $mock.Url; OPENTALK_SECRET_OPENAI = 'bench-dummy-key-123456' }
-    # App bubble off here: its icon lookup loads the shell's image stack (see the notes), and this
-    # run isolates the cost of capture + pill.
+    # App bubble off here: this run isolates the cost of capture + pill (the bubble's icon lookup is
+    # measured by the injected run above).
     Write-Config $h @{ audio_cues = $false; auto_paste = $false; show_app_bubble = $false; start_minimized = $true; stt = @{ provider = 'openai' } }
     $daemon = Start-Daemon $Exe $e
     try {
@@ -272,7 +335,7 @@ if (-not $SkipE2E) {
             $raw = & powershell -NoProfile -ExecutionPolicy Bypass -File $script -Exe $Exe -Stt $mode -Target form -Mode paste 2>&1 | Out-String
             $json = $null
             if ($raw -match '(?s)(\{.*\})') { try { $json = $Matches[1] | ConvertFrom-Json } catch {} }
-            $row = [ordered]@{ stt = $mode; pass = [bool]($json -and $json.pass); error = if ($json -and $json.PSObject.Properties['error']) { $json.error } elseif ($json) { $null } else { 'no JSON from tests\e2e.ps1' } }
+            $row = [ordered]@{ stt = $mode; pass = [bool]($json -and $json.pass); clipboard_restored = $(if ($json -and $json.PSObject.Properties['clipboard_restored']) { $json.clipboard_restored } else { $null }); error = if ($json -and $json.PSObject.Properties['error']) { $json.error } elseif ($json) { $null } else { 'no JSON from tests\e2e.ps1' } }
             if ($json -and $json.PSObject.Properties['latency_line'] -and $json.latency_line) { $row.latency = ConvertFrom-LatencyLine $json.latency_line }
             $R['e2e'] += [pscustomobject]$row
             Write-Host ("e2e {0}: pass={1} {2}" -f $mode, $row.pass, $(if ($row.latency) { "paste {0} ms, total {1} ms" -f $row.latency.paste, $row.latency.total } else { $row.error }))
@@ -282,15 +345,23 @@ if (-not $SkipE2E) {
 
 # ---- live OpenRouter (free models only) ---------------------------------------------------
 # Rotates over the free audio-input models (free tiers rate-limit, gate or drop audio); each round
-# uses the next model whose last attempt did not fail.
+# uses the next model whose last attempt did not fail. The key comes from -KeyFile /
+# OPENTALK_OPENROUTER_KEY_FILE, else OPENTALK_SECRET_OPENROUTER; it only ever travels in the
+# daemon's environment and is never printed or written.
 $R['live'] = $null
+$R['live_status'] = if ($SkipLive) { 'not run (-SkipLive)' } else { 'not run' }
 if (-not $SkipLive) {
     $models = @($LiveModels -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_.EndsWith(':free') })
-    Section "live OpenRouter ($($models -join ', ')), $LiveDictations dictations"
     $key = Read-OpenRouterKey $KeyFile
-    if (-not $key -or $models.Count -eq 0) {
-        Write-Host 'skipped (no key, or no :free model)' -ForegroundColor Yellow
+    Section "live OpenRouter ($($models -join ', ')), $LiveDictations dictations"
+    if (-not $key) {
+        $R['live_status'] = 'skipped: no key'
+        Write-Host 'skipped: no key (set OPENTALK_SECRET_OPENROUTER, or pass -KeyFile)' -ForegroundColor Yellow
+    } elseif ($models.Count -eq 0) {
+        $R['live_status'] = 'skipped: no :free audio model'
+        Write-Host 'skipped: no :free audio model in -LiveModels' -ForegroundColor Yellow
     } else {
+        $R['live_status'] = 'ran'
         $live = [ordered]@{ models = $models; rounds = 0; ok = 0; verified = 0; per_model = [ordered]@{} }
         $round = 0
         foreach ($m in $models) {
@@ -301,16 +372,17 @@ if (-not $SkipLive) {
             $daemon = Start-Daemon $Exe $e
             try {
                 $n = 1
-                $null = Invoke-Ot $Exe @('--bench', 'dictate', $n, $wav, '150') $e 900
+                $dr = Invoke-Ot $Exe @('--bench', 'dictate', $n, $wav, '150') $e 900
                 $round += $n
                 $hist = Read-History $h
+                $dictateStatus = @($dr.Out -split "`n" | Where-Object { $_.Trim().StartsWith('{') } | ForEach-Object { try { ($_ | ConvertFrom-Json).status } catch {} })
                 $ok = @($hist | Where-Object { $_.status -eq 'ok' })
                 # A dictation only counts as verified when the transcript has the words in the fixture (tts_fillers.wav).
                 $verified = @($ok | Where-Object { $_.text -match '(?i)friday|release' })
                 $live.rounds += $hist.Count; $live.ok += $ok.Count; $live.verified += $verified.Count
                 $live.per_model[$m] = [ordered]@{
                     ok = $ok.Count; verified = $verified.Count; total = $hist.Count
-                    errors = @($hist | Where-Object { $_.status -ne 'ok' } | ForEach-Object { if ($_.error) { $_.error } else { "status $($_.status)" } } | Select-Object -Unique)
+                    errors = @(@($hist | Where-Object { $_.status -ne 'ok' } | ForEach-Object { if ($_.error) { $_.error } else { "status $($_.status)" } }) + $(if ($hist.Count -eq 0) { "no history entry within 150 s (dictation $($dictateStatus -join '/'); the free tier answered slowly or kept rate limiting)" }) | Select-Object -Unique)
                     texts = @($ok | ForEach-Object { $_.text })
                 }
                 if ($ok.Count) { $live.latency = (Invoke-Ot $Exe @('--bench', 'latency') $e 30).Out | ConvertFrom-Json }
@@ -325,6 +397,7 @@ if (-not $SkipLive) {
         $R['live'] = $live
     }
 }
+$key = $null
 
 $R | ConvertTo-Json -Depth 8 | Set-Content -Encoding UTF8 (Join-Path $outDir 'results.json')
 
@@ -332,13 +405,33 @@ $R | ConvertTo-Json -Depth 8 | Set-Content -Encoding UTF8 (Join-Path $outDir 're
 function Fmt($v, [string]$unit = '') { if ($null -eq $v) { 'n/a' } else { "$v$unit" } }
 function Verdict([bool]$ok) { if ($ok) { 'meets' } else { 'misses' } }
 $lat = $R.latency
+$sizeOk = ($R.env.exe_bytes -le $SizeBudgetBytes)
+$exeSizeText = "$(Format-ExeMB $R.env.exe_bytes) MB (10^6 bytes), $(Format-Bytes $R.env.exe_bytes) bytes"
+# Live section text (the status says why it did not run; an all-UNVERIFIED run says so and points to the evidence section).
+$liveMd = switch -Wildcard ($R.live_status) {
+    'ran' {
+        $t = "$($R.live.verified) of $($R.live.rounds) live dictations VERIFIED (transcript contains the spoken words); $($R.live.ok) returned any text."
+        if ($R.live.verified -eq 0) {
+            $t += " **UNVERIFIED:** no free model produced a transcript of the audio, so this run says nothing about live STT correctness. The free NVIDIA endpoint drops the audio (``prompt_tokens=28`` with or without the WAV) and the inkling models answer 403; see the section 'Live STT on the free tier (evidence)'."
+        }
+        $t + "`n`n| Model | OK | Errors reported (redacted by OpenTalk) |`n|---|---|---|`n" + (($R.live.per_model.Keys | ForEach-Object { $pm = $R.live.per_model[$_]; "| ``$_`` | $($pm.ok) / $($pm.total) | $((@($pm.errors) | ForEach-Object { $_ -replace '\|', '/' }) -join '; ') |" }) -join "`n")
+    }
+    'skipped: no key' { '**Skipped: no key.** Set `OPENTALK_SECRET_OPENROUTER` (or pass `-KeyFile`) to run it.' }
+    'skipped: no :free audio model' { '**Skipped: no :free audio model** in `-LiveModels`.' }
+    default { "Not run ($($R.live_status))." }
+}
+$clipNote = if ($R.env.desktop_locked) {
+    '- Clipboard and paste timings in this run are not representative: the workstation was locked (LogonUI active), where Windows refuses clipboard access, so `copy_to_clipboard` exhausts its retries (~95 ms) and real-paste e2e runs are skipped. Re-run on an unlocked desktop.'
+} else {
+    '- Clipboard and paste timings are only meaningful on an unlocked desktop (Windows refuses clipboard access while the workstation is locked); this run found the desktop unlocked.'
+}
 $rec = if ($R.recording_mic) { $R.recording_mic } else { $R.recording_injected }
 $recLabel = if ($R.recording_mic) { 'real microphone' } else { 'injected WAV' }
 $md = @"
 # OpenTalk benchmark
 
 Generated by ``bench/bench.ps1`` on $($R.env.date) - $($R.env.cpu), $($R.env.logical_cores) logical cores, $($R.env.os).
-Release build ($($R.env.exe_built)), single executable $($R.env.exe_mb) MB. Reference: **Spokenly ~3% CPU, ~110 MB RAM** (PLAN section 1).
+Release build ($($R.env.exe_built)), single executable $exeSizeText (budget $(Format-Bytes $SizeBudgetBytes) bytes). Reference: **Spokenly ~3% CPU, ~110 MB RAM** (PLAN section 1).
 
 CPU % is process CPU time / (wall time x $($R.env.logical_cores) logical cores), i.e. what Task Manager's CPU column shows;
 the one-core figure (100% = one fully busy core) is given in brackets.
@@ -362,7 +455,7 @@ $(if ($R.recording_mic) { "| Daemon working set while recording, real mic, app b
 | Settings window working set (mean / peak) | $(if ($R.settings) { "$($R.settings.WsMeanMB) / $($R.settings.WsPeakMB) MB" } else { 'n/a' }) | <= 80 MB, only while open | n/a | $(if ($R.settings) { Verdict ($R.settings.WsPeakMB -le 80) } else { '-' }) |
 | Settings window CPU while idle | $(if ($R.settings) { "$($R.settings.CpuPctAll)%" } else { 'n/a' }) | ~0 | n/a | - |
 | Settings window private bytes (commit, only while open; mean / peak / private WS) | $(if ($R.settings) { "$($R.settings.PrivMeanMB) / $($R.settings.PrivPeakMB) / $(Fmt $R.settings.private_ws_mb ' MB')" } else { 'n/a' }) | <= 80 MB as working set | n/a | $(if ($R.settings) { 'documented deviation: GL driver commit, see the Settings private bytes note' } else { '-' }) |
-| Executable size | $($R.env.exe_mb) MB | <= 8 MB | n/a | $(Verdict ($R.env.exe_mb -le 8)) |
+| Executable size | $exeSizeText | <= $(Format-Bytes $SizeBudgetBytes) bytes | n/a | $(Verdict $sizeOk) |
 | Startup (process start -> daemon window, median of 5) | $($R.startup.process_to_window_ms_median) ms (daemon reports ready at $(Fmt $R.startup.daemon_ready_log_ms_median ' ms')) | - | - | - |
 | Daemon threads / handles (idle) | $($R.idle.Threads) / $($R.idle.Handles) | - | - | - |
 | Microphone in use while idle (prepared stream) | $(if ($R.mic_idle.known) { if ($R.mic_idle.in_use) { 'yes' } else { 'no' } } else { 'not recorded by Windows yet' }) | no (mic indicator off) | - | $(if ($R.mic_idle.known) { Verdict (-not $R.mic_idle.in_use) } else { '-' }) |
@@ -403,9 +496,9 @@ $(if (Test-Path (Join-Path $outDir 'size.json')) { $sz = Get-Content -Raw (Join-
 
 Release executable, measured by rebuilding the same commit with parts of the cleanup LLM code stubbed out (``bench/out/size.json``):
 
-| Build | Bytes | MB | Delta |
+| Build | Bytes | MB (10^6 bytes) | Delta |
 |---|---|---|---|
-" + (($sz.builds | ForEach-Object { "| $($_.name) | $($_.bytes) | $([math]::Round($_.bytes / 1MB, 2)) | $(if ($_.delta) { '+' + [math]::Round($_.delta / 1KB) + ' KB' } else { '-' }) |" }) -join "`n") + "
+" + (($sz.builds | ForEach-Object { "| $($_.name) | $($_.bytes) | $(Format-ExeMB $_.bytes) | $(if ($_.delta) { '+' + [math]::Round($_.delta / 1000) + ' kB (10^3 bytes)' } else { '-' }) |" }) -join "`n") + "
 
 $($sz.note)
 " })
@@ -427,7 +520,7 @@ $(if ($R.settings) { "Settings window: opened in $($R.settings_open_ms) ms; priv
 
 ## Live check (OpenRouter, ``:free`` models only)
 
-$(if ($R.live) { "$($R.live.verified) of $($R.live.rounds) live dictations VERIFIED (transcript contains the spoken words); $($R.live.ok) returned any text. $(if ($R.live.verified -eq 0) { '**UNVERIFIED:** no free model produced a transcript of the audio, so this run says nothing about live STT correctness.' })`n`n| Model | OK | Errors reported (redacted by OpenTalk) |`n|---|---|---|`n" + (($R.live.per_model.Keys | ForEach-Object { $pm = $R.live.per_model[$_]; "| ``$_`` | $($pm.ok) / $($pm.total) | $((@($pm.errors) | ForEach-Object { $_ -replace '\|', '/' }) -join '; ') |" }) -join "`n") } else { 'Not run.' })
+$liveMd
 
 Free OpenRouter models are rate limited and sometimes not available to non-agent clients, so this section is a smoke test of the real
 network path, not a latency reference; the table above is measured against a local mock to isolate OpenTalk's own cost.
@@ -463,13 +556,16 @@ network path, not a latency reference; the table above is measured against a loc
   frame while the input is silent. The thinking glow keeps its 60 fps but also caches the chrome. WASAPI capture and the
   VAD/level meter stay well under 1% of one core. The row "Main thread while recording" is the figure the pill is judged by
   (<= 6% of one core is <= 1.5% on a 4-core laptop).
-- **Working set and the app bubble**: the active-app icon of a classic Win32 executable comes from
-  ``PrivateExtractIconsW`` (user32 only), then ``SHGetFileInfoW`` in its own COM apartment. ``IShellItemImageFactory``,
-  which loads ~35 shell DLLs (XAML, StateRepository, thumbcache, ...) into the daemon for the rest of its life (~+17 MB
-  working set of shared image pages, ~2-4 MB private), is used only for packaged (UWP / MSIX) apps or when both lighter
-  paths return nothing.
-- Clipboard and paste timings are only meaningful on an unlocked desktop: Windows refuses clipboard access while the
-  workstation is locked, so ``copy_to_clipboard`` exhausts its retries (~95 ms) and real-paste e2e runs are skipped.
+- **Working set and the app bubble**: the active-app icon of a classic Win32 executable comes from ``PrivateExtractIconsW``
+  (user32 only), then ``SHGetFileInfoW`` (in its own COM apartment). ``IShellItemImageFactory`` is the last resort, used
+  only for packaged (UWP / MSIX) apps or when both lighter paths return nothing, because it loads ~35 shell DLLs (XAML,
+  StateRepository, thumbcache, ...) into the daemon for the rest of its life (~+17 MB working set of shared image pages,
+  ~2-4 MB private). Since commits d53ba4d and 7fbcd92 those shell DLLs stay out of the daemon for Win32 apps. The
+  bubble-on working set on an unlocked desktop with a real foreground app has not been re-measured since the change and is
+  still to be done: the "app bubble on" rows of this report use whichever window was in front of the benchmark, and the
+  earlier unlocked-desktop section predates it.
+$clipNote
 "@
-$md | Set-Content -Encoding UTF8 (Join-Path $PSScriptRoot '..\docs\BENCHMARK.md')
-Write-Host "`nwrote docs\BENCHMARK.md and bench\out\results.json"
+$kept = @(Write-ReportKeepingBlocks $OutFile $md)
+Write-Host ("`nwrote {0} and bench\out\results.json{1}" -f $OutFile, $(if ($kept.Count) { " (kept hand-written blocks: $($kept -join ', '))" } else { '' }))
+if (-not (Test-ExeSize $Exe)) { exit 1 }
