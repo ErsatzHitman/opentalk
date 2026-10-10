@@ -639,11 +639,13 @@ impl<K: KeyState> Matcher<K> {
                 self.active = false;
                 out.push(HotkeyEvent::Up);
             }
-            // Self-heal a missed main-key key-up (not valid for the key in this very event).
+            // Self-heal a missed main-key key-up (not valid for the key in this very event). A
+            // swallowed key never reaches the OS key state, so `is_down` would always say "up";
+            // then only another real key going down proves the main key-up was missed.
             if self.active
                 && let Some(t) = self.spec.vk
                 && vk != t
-                && !self.keys.is_down(t)
+                && if self.main_swallowed { down && bit == 0 } else { !self.keys.is_down(t) }
             {
                 self.active = false;
                 out.push(HotkeyEvent::Up);
@@ -701,9 +703,9 @@ impl<K: KeyState> Matcher<K> {
             if self.active && self.combo_has_win() && self.mods & WIN_MASK != 0 {
                 self.win_used = true;
             }
-            // Swallowing the main key hides it from the OS, so a held Win/Alt would look like a
-            // lone tap on release (Start menu / menu bar).
-            if out.swallow {
+            // Swallowing the main key hides it from the OS, so a held Win/Alt (even one pressed
+            // while the swallowed key is held) would look like a lone tap on release.
+            if out.swallow || self.main_swallowed {
                 if self.mods & WIN_MASK != 0 {
                     self.win_used = true;
                 }
@@ -961,10 +963,13 @@ mod tests {
     use HotkeyEvent::{Down as D, Escape as E, Up as U};
 
     impl H {
-        /// Physical press: the OS key state updates after the hook has seen the event.
+        /// Physical press: the OS key state updates after the hook has seen the event, and never
+        /// for a key the hook swallowed (the OS does not see it at all).
         fn press(&mut self, vk: u32) -> (Vec<HotkeyEvent>, bool) {
             let r = self.m.on_key(vk, true, false);
-            self.down.borrow_mut().insert(vk);
+            if !r.1 {
+                self.down.borrow_mut().insert(vk);
+            }
             r
         }
         fn release(&mut self, vk: u32) -> (Vec<HotkeyEvent>, bool) {
@@ -980,7 +985,7 @@ mod tests {
         }
         fn step_full(&mut self, vk: u32, down: bool) -> Outcome {
             let o = self.m.step(vk, down, false);
-            if down {
+            if down && !o.swallow {
                 self.down.borrow_mut().insert(vk);
             } else {
                 self.down.borrow_mut().remove(&vk);
@@ -1290,6 +1295,38 @@ mod tests {
     }
 
     #[test]
+    fn held_swallowed_main_key_survives_other_key_events() {
+        // The OS key state never sees a swallowed key, so it must not read as "released".
+        let mut h = harness("F8");
+        assert_eq!(h.press(0x77), (vec![D], true));
+        assert!(!h.down.borrow().contains(&0x77));
+        assert_eq!(h.press(VK_LSHIFT), (vec![], false));
+        assert_eq!(h.release(VK_LSHIFT), (vec![], false));
+        assert_eq!(h.press(0x77), (vec![], true));
+        assert_eq!(h.release(0x77), (vec![U], true));
+        let mut h = harness("Control+Shift+Space");
+        h.press(VK_LCONTROL);
+        h.press(VK_LSHIFT);
+        assert_eq!(h.press(VK_SPACE), (vec![D], true));
+        assert_eq!(h.press(VK_LMENU), (vec![], false));
+        // Alt tapped while the (invisible) Space is held still needs the menu-bar mask.
+        let o = h.step_full(VK_LMENU, false);
+        assert!(o.mask && !o.swallow && o.events().next().is_none());
+        assert_eq!(h.release(VK_SPACE), (vec![U], true));
+    }
+
+    #[test]
+    fn missed_swallowed_key_up_heals_on_next_real_key() {
+        let mut h = harness("F8");
+        assert_eq!(h.press(0x77), (vec![D], true));
+        // F8 key-up lost (secure desktop); the next typed key ends the press and passes.
+        assert_eq!(h.press(b'A' as u32), (vec![U], false));
+        assert_eq!(h.release(b'A' as u32), (vec![], false));
+        assert_eq!(h.press(0x77), (vec![D], true));
+        assert_eq!(h.release(0x77), (vec![U], true));
+    }
+
+    #[test]
     fn single_key_main_key_swallowed() {
         let mut h = harness("F8");
         assert_eq!(h.press(0x77), (vec![D], true));
@@ -1529,10 +1566,12 @@ mod tests {
         assert_eq!(h.press_ev(0x77), vec![D]);
         // Win+L while F8 is held; F8, Win and L are released on the secure desktop (unseen).
         h.press_ev(VK_LWIN);
-        h.press_ev(b'L' as u32);
+        // F8 was swallowed, so the OS state cannot say whether it is held: the next real key
+        // (L) ends the press.
+        assert_eq!(h.press_ev(b'L' as u32), vec![U]);
         h.down.borrow_mut().clear();
-        // The first event after unlock is the next F8 press: it ends the stale press and starts anew.
-        assert_eq!(h.press_ev(0x77), vec![U, D]);
+        // The next F8 press after unlock starts a fresh press.
+        assert_eq!(h.press_ev(0x77), vec![D]);
         assert!(h.press_ev(0x77).is_empty(), "auto-repeat");
         assert_eq!(h.release_ev(0x77), vec![U]);
     }
