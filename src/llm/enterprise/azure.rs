@@ -90,7 +90,7 @@ impl ParamError {
     /// "Unrecognized request argument supplied: ..." bodies) a substring check decides.
     fn blames(&self, names: &[&str]) -> bool {
         match self.code.as_deref() {
-            Some("unsupported_parameter" | "unsupported_value") => match &self.param {
+            Some("unsupported_parameter" | "unsupported_value" | "unknown_parameter") => match &self.param {
                 Some(p) => names.iter().any(|n| p == n),
                 None => names.iter().any(|n| self.text.contains(n)),
             },
@@ -347,6 +347,11 @@ mod tests {
         assert_eq!(shape_switch(400, "Unrecognized request argument supplied: temperature", false), Some(true));
         assert_eq!(shape_switch(400, r#"{"error":{"message":"max_tokens is too large"}}"#, false), Some(true));
         assert_eq!(shape_switch(429, UNSUPPORTED_TEMP, false), None);
+        // OpenAI-style "unknown_parameter" (an argument the api-version does not know).
+        let unknown = r#"{"error":{"code":"unknown_parameter","param":"reasoning_effort","message":"Unknown parameter: 'reasoning_effort'."}}"#;
+        assert!(rejects_reasoning_effort(400, unknown));
+        assert!(!rejects_reasoning_effort(400, &up("temperature")));
+        assert!(!rejects_reasoning_effort(500, unknown));
     }
 
     #[test]
