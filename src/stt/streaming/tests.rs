@@ -457,11 +457,15 @@ fn connection_dropped_mid_session_keeps_text_or_errors() {
     let mock = serve(Options::default(), |c| {
         let _ = c.recv(Duration::from_secs(2));
         c.send(&dg_results("kept text", true, false));
+        // Read what is still in flight first: dropping a socket with unread data sends an RST, and
+        // Windows then discards the text the client has not read yet (a flaky 10053 under load).
+        while c.recv(Duration::from_millis(100)).is_some() {}
         // script returns: the socket is dropped without a close frame
     });
     let mut s = deepgram::Deepgram.start(&opts("nova-3"), &creds(&mock)).unwrap();
     s.push(&pcm(800, 100));
-    std::thread::sleep(Duration::from_millis(300));
+    // several drain periods, so the text is read before the next push meets the closed socket
+    std::thread::sleep(Duration::from_millis(700));
     s.push(&pcm(800, 100));
     assert_eq!(s.finish().unwrap().text, "kept text");
 
