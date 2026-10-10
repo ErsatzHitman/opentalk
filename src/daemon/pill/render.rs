@@ -9,6 +9,7 @@
 
 use super::anim::*;
 use super::card;
+use super::glass::{self, Ctx, Params, Surface};
 use super::glow::{self, GLOW_RADIUS, GlowFrame, Sprites};
 use super::model::*;
 use super::PillMode;
@@ -85,37 +86,37 @@ fn draw_glow(cv: &mut Canvas, st: &RenderState, g: &Geometry, t: f64) {
 }
 
 /// 2-5. App bubble, pill shadow, fused cancel skin, pill body and hover gradient; then the logo and
-/// the divider.
+/// the divider. The bubble, the pill and the skin are liquid glass over the frosted backdrop.
 fn draw_under(cv: &mut Canvas, st: &RenderState, g: &Geometry, t: f64) {
-    let scale = st.scale;
     let pal = st.pal;
     let app = st.appearance_at(t);
     let fused = st.fused.value(t).clamp(0.0, 1.0);
     let chrome_alpha = 1.0 - fused;
+    let backdrop = st.backdrop_or_neutral();
+    let ctx = Ctx { backdrop: &backdrop, dark: pal.dark };
 
     // 2. app bubble
     if g.bubble_t > 0.003 {
         if let Some(a) = st.app() {
-            draw_bubble(cv, st, g, &app, a);
+            draw_bubble(cv, st, &ctx, g, &app, a);
         }
     }
 
     // 3. pill shadow (fades with the chrome once the liquid skin owns the surface)
     let p = g.pill;
-    if app.shadow.alpha > 0.001 && chrome_alpha > 0.002 {
-        cv.shadow_sdf(p, app.shadow.dy, app.shadow.blur, app.shadow.spread, Rgba::new(0.0, 0.0, 0.0, 1.0), app.shadow.alpha * chrome_alpha, |x, y| {
-            sd_capsule(x, y, p.cx(), p.cy(), p.w(), p.h())
-        });
-    }
+    let r = p.h().min(p.w()) * 0.5;
+    let pill_sdf = move |x: f32, y: f32| sd_capsule(x, y, p.cx(), p.cy(), p.w(), p.h());
+    let pill = Surface { field: p, radius: Some(r), sdf: &pill_sdf };
+    glass::paint_shadow(cv, &pill, app.shadow, chrome_alpha);
 
     // 4. fused cancel skin
     if g.cancel_t > 0.0 || fused > 0.002 {
-        draw_skin(cv, st, g, &app);
+        draw_skin(cv, &ctx, g, &app, fused);
     }
 
     // 5. pill body
     if chrome_alpha > 0.002 {
-        draw_chrome(cv, p, &app, chrome_alpha, scale);
+        glass::paint(cv, &ctx, &pill, &Params { alpha: chrome_alpha, shadow: app.shadow, shadow_alpha: 0.0, lift: app.lift, edge: app.edge, frost: None });
     }
     let grad = st.grad.value(t);
     if grad > 0.002 {
@@ -160,28 +161,6 @@ fn tooltip_for(st: &RenderState) -> Option<String> {
         return st.app().map(|a| a.name.clone());
     }
     st.tooltip_text()
-}
-
-/// Capsule fill + 1 px inside border.
-fn draw_chrome(cv: &mut Canvas, r: Rect, app: &Appearance, alpha: f32, scale: f32) {
-    let (cx, cy, w, h) = (r.cx(), r.cy(), r.w(), r.h());
-    let (bg, bd) = (app.bg, app.border);
-    cv.shade_sdf(
-        r.inflate(1.0),
-        |x, y| sd_capsule(x, y, cx, cy, w, h),
-        |x, y, c| {
-            let ci = cov(sd_capsule(x, y, cx, cy, w - 2.0, h - 2.0) * scale);
-            let ba = (c - ci).max(0.0) * bd.a;
-            let pa = c * bg.a;
-            let inv = 1.0 - ba;
-            [
-                (bd.r * ba + bg.r * pa * inv) * alpha,
-                (bd.g * ba + bg.g * pa * inv) * alpha,
-                (bd.b * ba + bg.b * pa * inv) * alpha,
-                (ba + pa * inv) * alpha,
-            ]
-        },
-    );
 }
 
 /// `bg-gradient-to-br from-foreground/10 to-transparent` clipped to the padding box.
@@ -326,17 +305,15 @@ fn draw_x_glyph(cv: &mut Canvas, cx: f32, cy: f32, color: Rgba, alpha: f32) {
     });
 }
 
-fn draw_bubble(cv: &mut Canvas, st: &RenderState, g: &Geometry, app: &Appearance, a: &AppBubble) {
+fn draw_bubble(cv: &mut Canvas, st: &RenderState, ctx: &Ctx, g: &Geometry, app: &Appearance, a: &AppBubble) {
     let (bx, by, br) = g.bubble;
     let alpha = g.bubble_t;
     let d = br * 2.0;
     let r = Rect::new(bx - br, by - br, bx + br, by + br);
-    if app.shadow.alpha > 0.001 {
-        cv.shadow_sdf(r, app.shadow.dy, app.shadow.blur, app.shadow.spread, Rgba::new(0.0, 0.0, 0.0, 1.0), app.shadow.alpha * alpha, |x, y| {
-            sd_capsule(x, y, bx, by, d, d)
-        });
-    }
-    draw_chrome(cv, r, app, alpha, st.scale);
+    // a glass circle: same recipe as the pill, circle radius
+    let sdf = move |x: f32, y: f32| sd_capsule(x, y, bx, by, d, d);
+    let surf = Surface { field: r, radius: Some(br), sdf: &sdf };
+    glass::paint(cv, ctx, &surf, &Params { alpha, shadow: app.shadow, shadow_alpha: alpha, lift: app.lift, edge: app.edge, frost: None });
     // icon, snapped to whole device pixels
     let s = st.scale;
     let ic = &a.icon;
@@ -381,36 +358,27 @@ pub fn fusion_field(g: &Geometry, k: f32, x: f32, y: f32) -> f32 {
     smin(d_pill, d_circle, k)
 }
 
-fn draw_skin(cv: &mut Canvas, st: &RenderState, g: &Geometry, app: &Appearance) {
+/// The fused pill + cancel bud as one glass surface. `fused` (0..1) weights its shadow, which takes
+/// over from the pill's own as the bud emerges.
+fn draw_skin(cv: &mut Canvas, ctx: &Ctx, g: &Geometry, app: &Appearance, fused: f32) {
     let k = emergence_blend(g.cancel_t);
     let p = g.pill;
-    let (ccx, _, cr) = g.cancel;
-    let bb = Rect::new(p.l.min(ccx - cr) - k - 2.0, p.t.min(g.cancel.1 - cr) - k - 2.0, p.r.max(ccx + cr) + k + 2.0, p.b.max(g.cancel.1 + cr) + k + 2.0);
-    let s = cv.scale;
+    let (ccx, ccy, cr) = g.cancel;
+    let field = Rect::new(p.l.min(ccx - cr), p.t.min(ccy - cr), p.r.max(ccx + cr), p.b.max(ccy + cr));
+    let e = 0.25 / cv.scale;
     let f = |x: f32, y: f32| fusion_field(g, k, x, y);
-    if st.pal.dark {
-        cv.shadow_sdf(bb, 1.0, 3.0, 0.0, Rgba::new(0.0, 0.0, 0.0, 1.0), 0.2, f);
-    }
-    let (bg, bd) = (app.bg, app.border);
-    let e = 0.25 / s;
-    cv.shade_sdf(bb, f, |x, y, _c| {
-        // distance normalised by the field gradient (smin is not a true distance)
+    // distance normalised by the field gradient (smin is not a true distance), near the edge only
+    let sdf = move |x: f32, y: f32| {
         let d = f(x, y);
-        if d.abs() > 2.0 {
-            let c = if d < 0.0 { 1.0 } else { 0.0 };
-            return [bg.r * bg.a * c, bg.g * bg.a * c, bg.b * bg.a * c, bg.a * c];
+        if d.abs() > 4.0 {
+            return d;
         }
         let gx = (f(x + e, y) - f(x - e, y)) / (2.0 * e);
         let gy = (f(x, y + e) - f(x, y - e)) / (2.0 * e);
-        let gl = gx.hypot(gy).max(0.25);
-        let dn = d / gl;
-        let fill = cov(dn * s);
-        let stroke = cov((dn.abs() - 0.5) * s) ;
-        let ba = stroke * bd.a;
-        let pa = fill * bg.a;
-        let inv = 1.0 - ba;
-        [bd.r * ba + bg.r * pa * inv, bd.g * ba + bg.g * pa * inv, bd.b * ba + bg.b * pa * inv, ba + pa * inv]
-    });
+        d / gx.hypot(gy).max(0.25)
+    };
+    let surf = Surface { field, radius: None, sdf: &sdf };
+    glass::paint(cv, ctx, &surf, &Params { alpha: 1.0, shadow: app.shadow, shadow_alpha: fused, lift: app.lift, edge: app.edge, frost: None });
 }
 
 // --- tooltip -----------------------------------------------------------------------------
@@ -434,16 +402,12 @@ fn draw_tooltip(cv: &mut Canvas, st: &RenderState, txt: &str, anchor: Rect, alig
     // shadow-lg
     cv.shadow_rect(r, h * 0.5, (0.0, 10.0), 15.0, -3.0, Rgba::new(0.0, 0.0, 0.0, 0.1), 1.0);
     cv.shadow_rect(r, h * 0.5, (0.0, 4.0), 6.0, -4.0, Rgba::new(0.0, 0.0, 0.0, 0.1), 1.0);
-    // body + border
+    // body + border: the menu tier of the glass (frosted backdrop under a wash, no refraction)
     let outer = |x: f32, y: f32| sd_capsule(x, y, r.cx(), r.cy(), r.w(), r.h());
-    cv.fill_sdf(r.inflate(1.0), pal.popover, 1.0, outer);
-    let bd = pal.border;
-    cv.shade_sdf(r.inflate(1.0), outer, |x, y, c| {
-        let inner = cov(sd_capsule(x, y, r.cx(), r.cy(), r.w() - 2.0, r.h() - 2.0) * s);
-        let k = (c - inner).max(0.0) * bd.a;
-        [bd.r * k, bd.g * k, bd.b * k, k]
-    });
-    // arrow (4x2 triangle on the bottom edge)
+    let backdrop = st.backdrop_or_neutral();
+    let ctx = Ctx { backdrop: &backdrop, dark: pal.dark };
+    glass::paint_menu(cv, &ctx, r, 1.0, &outer);
+    // arrow (4x2 triangle on the bottom edge), in the colour of the body behind it
     let ax = match align {
         Align::Right => r.r - 1.0 - 12.0 - 4.0,
         Align::Left => r.l + 1.0 + 12.0,
@@ -453,9 +417,9 @@ fn draw_tooltip(cv: &mut Canvas, st: &RenderState, txt: &str, anchor: Rect, alig
     cv.shade_sdf(
         Rect::new(ax - 1.0, ay, ax + 5.0, ay + 3.0),
         |x, y| arrow_sd(x, y, ax, ay),
-        |_x, _y, c| {
-            let p = pal.popover;
-            [p.r * c, p.g * c, p.b * c, c]
+        |x, y, c| {
+            let p = glass::menu_color(&ctx, x * s, y * s);
+            [p[0] * c, p[1] * c, p[2] * c, c]
         },
     );
     if let Some(m) = text::mask(txt, font) {
@@ -476,7 +440,8 @@ fn arrow_sd(px: f32, py: f32, ax: f32, ay: f32) -> f32 {
 fn render_error(st: &RenderState, e: &card::ErrorCard, t: f64, pm: &mut Pixmap) {
     let scale = st.scale;
     let layout = e.layout(scale);
-    let Some(base) = card::base_layer(e, scale, &st.pal) else { return };
+    let backdrop = st.backdrop_or_neutral();
+    let Some(base) = card::base_layer(e, scale, &st.pal, &backdrop) else { return };
     let (op, ty, sc) = e.presence(t);
     if op <= 0.001 {
         return;
@@ -598,8 +563,10 @@ fn signature(st: &RenderState, t: f64, g: &Geometry, size: (u32, u32), kind: Kin
         h.f(v);
     }
     let a = st.appearance_at(t);
-    h.c(a.bg);
-    h.c(a.border);
+    h.f(a.lift);
+    h.f(a.edge);
+    // the frosted picture under the glass (and where it sits in the window)
+    h.write_u64(st.backdrop.as_ref().map_or(0, |b| b.id));
     for v in [a.shadow.dy, a.shadow.blur, a.shadow.spread, a.shadow.alpha] {
         h.f(v);
     }
@@ -839,6 +806,27 @@ mod tests {
         assert!(AppBubble::new("x", &[], 0, 1.0).is_none());
     }
 
+    /// The glass body is exactly the approved capsule: opaque inside it, nothing but the soft shadow
+    /// (alpha <= `shadow_max`) outside it. Skips the logo/bars (they do not change alpha inside).
+    fn assert_footprint(pm: &Pixmap, cx: f32, cy: f32, w: f32, h: f32, shadow_max: u8) {
+        let mut body = 0usize;
+        for y in 0..pm.height() {
+            for x in 0..pm.width() {
+                let d = sd_capsule(x as f32 + 0.5, y as f32 + 0.5, cx, cy, w, h);
+                let a = alpha_at(pm, x, y);
+                if d <= -1.0 {
+                    assert_eq!(a, 255, "inside the capsule at ({x},{y})");
+                    body += 1;
+                } else if d >= 1.0 {
+                    assert!(a <= shadow_max, "outside the capsule at ({x},{y}): alpha {a}");
+                }
+            }
+        }
+        // area of the capsule shrunk by 1 px: (w - h) * (h - 2) + pi * ((h - 2) / 2)^2
+        let want = (w - h) * (h - 2.0) + std::f32::consts::PI * ((h - 2.0) * 0.5).powi(2);
+        assert!((body as f32 - want).abs() < want * 0.03, "body area {body}, want {want}");
+    }
+
     #[test]
     fn idle_circle_is_40x40_at_bottom_right() {
         let s = RenderState::new(Palette::LIGHT, 1.0, PanelPosition::BottomRight);
@@ -846,12 +834,11 @@ mod tests {
         assert_eq!((pm.width(), pm.height()), (208, 120));
         // circle spans x 156..196, y 68..108
         assert_eq!(alpha_at(&pm, 176, 88), 255);
-        assert_eq!(alpha_at(&pm, 150, 88), 0);
-        assert_eq!(alpha_at(&pm, 176, 60), 0);
         assert!(alpha_at(&pm, 157, 88) > 128);
-        // idle background is surface-1 #fafafa away from the logo
+        assert_footprint(&pm, 176.0, 88.0, 40.0, 40.0, 24);
+        // the glass is light in light mode, away from the logo: frost over the neutral backdrop
         let px = pm.pixel(165, 80).unwrap();
-        assert_eq!((px.red(), px.green(), px.blue()), (0xfa, 0xfa, 0xfa));
+        assert!(px.red() > 0xc8 && px.green() > 0xc8 && px.blue() > 0xc8, "{px:?}");
     }
 
     #[test]
@@ -860,9 +847,8 @@ mod tests {
         let pm = render(&s, 1500.0);
         // capsule x 98..196, y 72..108
         assert!(alpha_at(&pm, 99, 90) > 128);
-        assert_eq!(alpha_at(&pm, 96, 90), 0);
-        assert_eq!(alpha_at(&pm, 150, 70), 0);
         assert_eq!(alpha_at(&pm, 150, 90), 255);
+        assert_footprint(&pm, 147.0, 90.0, 98.0, 36.0, 24);
     }
     fn ink(pm: &Pixmap, x: u32, y: u32) -> bool {
         pm.pixel(x, y).unwrap().red() < 128
@@ -945,8 +931,11 @@ mod tests {
     fn dark_theme_uses_dark_tokens() {
         let s = RenderState::new(Palette::DARK, 1.0, PanelPosition::BottomRight);
         let pm = render(&s, 0.0);
+        // dark frost over the neutral backdrop: well below the light theme's glass, away from the logo
         let px = pm.pixel(165, 80).unwrap();
-        assert_eq!((px.red(), px.green(), px.blue()), (0x20, 0x22, 0x25));
+        let light = render(&RenderState::new(Palette::LIGHT, 1.0, PanelPosition::BottomRight), 0.0).pixel(165, 80).unwrap();
+        assert!(px.red() < 0x50 && px.green() < 0x50 && px.blue() < 0x50, "{px:?}");
+        assert!(light.red() > px.red() + 0x60);
     }
 
     #[test]
@@ -1149,6 +1138,146 @@ mod tests {
         let mut pm2 = new_pm(&quiet);
         assert_eq!(cache.render(&quiet, tq, &mut pm2), FrameOutcome::Dirty(full_rect(&pm2)));
         assert_eq!(pm2.data(), render(&quiet, tq).data());
+    }
+
+
+    #[test]
+    fn a_new_backdrop_rebuilds_the_cached_base_and_a_same_one_keeps_it() {
+        use crate::daemon::pill::glass::{Backdrop, DEFAULT_PAGE, Frosted};
+        let flat = |rgb: [u8; 3], ox: i32| Arc::new(Backdrop::new(Arc::new(Frosted::flat(rgb)), ox, 0, DEFAULT_PAGE));
+        let mut s = rec_state(false);
+        let mut t = 0.0;
+        run(&mut s, &mut t, 1500.0, &speech);
+        let mut pm = new_pm(&s);
+        let mut cache = FrameCache::new();
+        cache.render(&s, t, &mut pm);
+        let incremental = |cache: &mut FrameCache, s: &mut RenderState, t: &mut f64, pm: &mut Pixmap| {
+            for _ in 0..4 {
+                *t += FRAME;
+                s.tick(*t, speech(*t));
+                if cache.render(s, *t, pm) != FrameOutcome::Dirty(full_rect(pm)) {
+                    return true;
+                }
+            }
+            false
+        };
+        assert!(incremental(&mut cache, &mut s, &mut t, &mut pm), "the lane updates incrementally");
+        // a new picture under the glass: full repaint, identical to the reference renderer
+        assert!(s.set_backdrop(Some(flat([30, 60, 200], 0))));
+        s.tick(t, speech(t));
+        assert_eq!(cache.render(&s, t, &mut pm), FrameOutcome::Dirty(full_rect(&pm)));
+        assert_eq!(pm.data(), render(&s, t).data());
+        assert!(incremental(&mut cache, &mut s, &mut t, &mut pm), "steady again after the rebuild");
+        // the same picture installed again (a recapture with an unchanged hash) changes nothing
+        let id = s.backdrop.as_ref().map(|b| b.id);
+        assert!(!s.set_backdrop(Some(flat([30, 60, 200], 0))), "equal id: unchanged");
+        assert_eq!(s.backdrop.as_ref().map(|b| b.id), id);
+        assert!(incremental(&mut cache, &mut s, &mut t, &mut pm));
+        // only the glass pixels follow the picture: the bar lane keeps its ink
+        let (before, after) = (render(&s, t), {
+            s.set_backdrop(Some(flat([240, 240, 40], 0)));
+            render(&s, t)
+        });
+        assert!(max_diff(&before, &after) > 20, "the glass shows the new backdrop");
+        // the picture's placement is part of the signature (a dragged window)
+        s.set_backdrop(Some(flat([240, 240, 40], 7)));
+        assert_eq!(cache.render(&s, t, &mut pm), FrameOutcome::Dirty(full_rect(&pm)));
+    }
+
+    /// Frame costs of the glass: a steady recording frame (the waveform lane only), a base rebuild
+    /// when the backdrop picture changed (at most every 250 ms while recording), and a full repaint. Prints the
+    /// numbers (`-- --nocapture glass_frame_cost`); the assertions are structural (which path ran)
+    /// plus a very loose time ceiling, so a slow or busy machine cannot make it flaky.
+    #[test]
+    fn glass_frame_cost_is_measured_and_the_steady_frame_stays_incremental() {
+        use crate::daemon::pill::glass::{Backdrop, Cells, DEFAULT_PAGE, FROST_SIGMA, cell_for};
+        let median = |mut v: Vec<f64>| {
+            v.sort_by(|a, b| a.total_cmp(b));
+            v[v.len() / 2]
+        };
+        for scale in [1.0f32, 2.0] {
+            // two different busy pictures, as the capture would deliver them (window + 96 px margin)
+            let (w, h) = (((208.0 + 192.0) * scale) as usize, ((120.0 + 192.0) * scale) as usize);
+            let pic = |seed: usize| {
+                let raw: Vec<u8> = (0..w * h).flat_map(|i| { let (x, y) = (i % w + seed * 7, i / w); let v = if (x / 9 + y / 11) % 2 == 0 { 30 } else { 225 }; [v, v ^ (x as u8), v ^ (y as u8), 255] }).collect();
+                let f = Cells::from_bgra(&raw, w, h, cell_for(scale)).unwrap().frost(FROST_SIGMA, scale);
+                let o = (-96.0 * scale) as i32;
+                Arc::new(Backdrop::new(Arc::new(f), o, o, DEFAULT_PAGE))
+            };
+            let (a, b) = (pic(0), pic(1));
+            let mut s = RenderState::new(Palette::LIGHT, scale, PanelPosition::BottomRight);
+            s.set_mode(PillMode::Recording, 0.0);
+            s.set_backdrop(Some(a.clone()));
+            let mut t = 0.0;
+            run(&mut s, &mut t, 1500.0, &speech);
+            let mut pm = new_pm(&s);
+            let mut cache = FrameCache::new();
+            cache.render(&s, t, &mut pm);
+            // steady frames: 60 fps ticks, the glass stays in the cached base
+            let (mut steady, mut lane_only) = (Vec::new(), 0);
+            for _ in 0..90 {
+                t += FRAME;
+                s.tick(t, speech(t));
+                let t0 = std::time::Instant::now();
+                let out = cache.render(&s, t, &mut pm);
+                steady.push(t0.elapsed().as_secs_f64() * 1000.0);
+                if out != FrameOutcome::Dirty(full_rect(&pm)) {
+                    lane_only += 1;
+                }
+            }
+            assert!(lane_only >= 80, "{scale}x: only {lane_only} of 90 steady frames were incremental");
+            // a new backdrop picture rebuilds the base layer (the capture cadence while recording is 250 ms)
+            let mut rebuild = Vec::new();
+            for i in 0..12 {
+                s.set_backdrop(Some(if i % 2 == 0 { b.clone() } else { a.clone() }));
+                let t0 = std::time::Instant::now();
+                assert_eq!(cache.render(&s, t, &mut pm), FrameOutcome::Dirty(full_rect(&pm)));
+                rebuild.push(t0.elapsed().as_secs_f64() * 1000.0);
+            }
+            let mut full = Vec::new();
+            for _ in 0..12 {
+                let t0 = std::time::Instant::now();
+                render_into(&s, t, &mut pm);
+                full.push(t0.elapsed().as_secs_f64() * 1000.0);
+            }
+            let (st, rb, fu) = (median(steady), median(rebuild), median(full));
+            // the error card's base layer (glass + text), rebuilt when the picture under it changes
+            let card = card::ErrorCard::new("Transcription failed", "The speech provider rejected your API key. Check it in Settings.", true, 0.0);
+            let mut card_ms = Vec::new();
+            for i in 0..6 {
+                let bd = if i % 2 == 0 { &a } else { &b };
+                let t0 = std::time::Instant::now();
+                assert!(card::draw_base(&card, scale, &Palette::LIGHT, bd).is_some());
+                card_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
+            }
+            let cd = median(card_ms);
+            println!("glass frames {scale}x: steady recording frame {st:.3} ms, base rebuild {rb:.3} ms, full repaint {fu:.3} ms, error card base {cd:.3} ms");
+            assert!(st < 50.0 && rb < 250.0 && cd < 500.0, "{scale}x: steady {st:.1} ms, rebuild {rb:.1} ms, card {cd:.1} ms");
+        }
+    }
+
+    #[test]
+    fn glass_follows_the_backdrop_in_every_surface() {
+        use crate::daemon::pill::glass::{Backdrop, DEFAULT_PAGE, Frosted};
+        // pill, bubble and the fused cancel bud all take their colour from what is behind them
+        let mut s = rec_state(false);
+        s.set_app(Some(AppBubble::new("App", &[0u8; 8 * 8 * 4], 8, 1.0).unwrap()), 0.0);
+        let mut t = 0.0;
+        run(&mut s, &mut t, 1500.0, &speech);
+        s.set_pointer(Pointer { group: true, pill: false, bubble: false, cancel: false }, t);
+        let until = t + 800.0;
+        run(&mut s, &mut t, until, &speech);
+        let g = s.geometry(t);
+        let probe = |s: &mut RenderState, rgb: [u8; 3]| {
+            s.set_backdrop(Some(Arc::new(Backdrop::new(Arc::new(Frosted::flat(rgb)), 0, 0, DEFAULT_PAGE))));
+            render(s, t)
+        };
+        let dark = probe(&mut s, [0, 0, 0]);
+        let bright = probe(&mut s, [255, 255, 255]);
+        let lum = |pm: &Pixmap, x: f32, y: f32| pm.pixel(x as u32, y as u32).unwrap().red() as i32;
+        for (name, x, y) in [("pill", g.pill.l + 4.0, g.pill.cy()), ("bubble", g.bubble.0 - g.bubble.2 + 3.0, g.bubble.1), ("cancel bud", g.cancel.0, g.cancel.1 + g.cancel.2 - 4.0)] {
+            assert!(lum(&bright, x, y) > lum(&dark, x, y) + 30, "{name}: {} vs {}", lum(&bright, x, y), lum(&dark, x, y));
+        }
     }
 
     #[test]

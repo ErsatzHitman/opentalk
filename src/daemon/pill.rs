@@ -23,7 +23,9 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 
 mod anim;
+mod capture;
 mod card;
+mod glass;
 mod glow;
 mod model;
 mod preview;

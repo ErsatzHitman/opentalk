@@ -3,6 +3,7 @@
 //! click-vs-drag, the right-click menu, per-monitor DPI and the on-demand 60 fps animation timer.
 
 use super::anim::{QuietRun, SLOW_TICK_MS, TICK_MS, level_band};
+use super::capture::{GlassHost, Refresh, WM_APP_GLASS};
 use super::card::CardHover;
 use super::model::{Hit, Pointer, RenderState, TickOutcome};
 use super::raster::DevRect;
@@ -36,7 +37,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     HTCLIENT, HTTRANSPARENT, HWND_TOPMOST, IDC_ARROW, IDC_HAND, IDC_NO, IDC_SIZEALL, LoadCursorW, MF_GRAYED, MF_STRING, MA_NOACTIVATE, PostMessageW,
     RegisterClassExW, SPI_SETWORKAREA, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SetCursor, SetForegroundWindow,
     SetWindowLongPtrW, SetWindowPos, ShowWindow, TPM_BOTTOMALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, ULW_ALPHA, UPDATELAYEREDWINDOWINFO,
-    UpdateLayeredWindow, UpdateLayeredWindowIndirect,
+    UpdateLayeredWindow, UpdateLayeredWindowIndirect, KillTimer, SetTimer, WM_TIMER,
     WM_APP, WM_DESTROY, WM_DISPLAYCHANGE, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_NCHITTEST, WM_NULL,
     WM_RBUTTONUP, WM_SETCURSOR, WM_SETTINGCHANGE, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
@@ -48,8 +49,37 @@ const WM_CAPTURECHANGED: u32 = 0x0215;
 const WM_DPICHANGED: u32 = 0x02E0;
 const CLASS_NAME: PCWSTR = w!("OpenTalkPill");
 const DRAG_THRESHOLD_PX: f32 = 5.0;
+/// Timer id of the backdrop refresh (a USER timer on the pill window; it exists only while the window is shown).
+const GLASS_TIMER_ID: usize = 0x6c67;
+/// Backdrop refresh period while the pointer is on the pill or it is being dragged: 8 Hz (a
+/// dragged window must keep its picture under it).
+const GLASS_FAST_MS: u32 = 125;
+/// Backdrop refresh period while recording, thinking or animating: 4 Hz. The glass
+/// frosts ~10 px of the screen, so it changes slowly; every capture costs ~1 ms of CPU at 2x (PLAN
+/// section 1 caps recording at 1.5 %), and a capture of an unchanged screen repaints nothing.
+const GLASS_ACTIVE_MS: u32 = 250;
+/// Backdrop refresh period for the resting circle (it is shown all day, so this is the only thing the
+/// daemon does while idle: one ~1 ms capture every 4 s, ~0.03 % of a core). Hover, a state change, a
+/// size / scale / dock change and showing the window capture at once.
+const GLASS_IDLE_MS: u32 = 4000;
+/// Two captures are never closer than this, whatever asks for one.
+const GLASS_MIN_GAP_MS: f64 = 100.0;
 
 // --- pure helpers (unit-tested) ------------------------------------------------------------
+
+/// Period of the backdrop timer: 0 (no timer) unless the window is shown and can capture; the fast
+/// rate for hover and drag, the active rate while something is going on, the resting rate otherwise.
+fn glass_period_ms(shown_and_capturing: bool, fast: bool, busy: bool) -> u32 {
+    if !shown_and_capturing {
+        0
+    } else if fast {
+        GLASS_FAST_MS
+    } else if busy {
+        GLASS_ACTIVE_MS
+    } else {
+        GLASS_IDLE_MS
+    }
+}
 
 /// Device scale for an effective DPI (96 = 1.0).
 pub fn scale_from_dpi(dpi: u32) -> f32 {
@@ -436,6 +466,14 @@ pub(super) struct Inner {
     pub partial: u64,
     /// Consecutive recording frames that changed nothing; a long run slows the animation timer.
     quiet: QuietRun,
+    /// Screen capture under the window (the glass backdrop); see `capture.rs`.
+    glass: GlassHost,
+    /// Full rect of the monitor the window is on (device px).
+    mon: (i32, i32, i32, i32),
+    /// Period of the running backdrop timer, 0 while it is off.
+    glass_ms: u32,
+    /// Window origin the installed backdrop was placed for.
+    bd_origin: (i32, i32),
 }
 
 /// What the window procedure asks the outer layer to do after the borrow is released.
@@ -457,6 +495,18 @@ fn monitor_info(hmon: HMONITOR) -> Option<(i32, i32, i32, i32)> {
     // SAFETY: valid out-pointer with cbSize set.
     if unsafe { GetMonitorInfoW(hmon, &mut mi) }.as_bool() {
         let r = mi.rcWork;
+        Some((r.left, r.top, r.right, r.bottom))
+    } else {
+        None
+    }
+}
+
+/// Full monitor rect (`rcMonitor`), device px.
+fn monitor_rect(hmon: HMONITOR) -> Option<(i32, i32, i32, i32)> {
+    let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+    // SAFETY: valid out-pointer with cbSize set.
+    if unsafe { GetMonitorInfoW(hmon, &mut mi) }.as_bool() {
+        let r = mi.rcMonitor;
         Some((r.left, r.top, r.right, r.bottom))
     } else {
         None
@@ -514,6 +564,9 @@ impl Inner {
         if let Some(w) = monitor_info(hmon) {
             self.work = w;
         }
+        if let Some(m) = monitor_rect(hmon) {
+            self.mon = m;
+        }
         let s = monitor_scale(hmon);
         self.st.set_scale(s);
     }
@@ -521,6 +574,9 @@ impl Inner {
     /// Re-layout (window size may have changed) and push a frame.
     fn relayout(&mut self) {
         self.ensure_buffers();
+        // size, scale or dock changed: what is under the window is a different rect, capture at once
+        self.glass.dirty = true;
+        self.glass.last_ms = f64::NEG_INFINITY;
         // the window may have moved or been re-docked: push a full frame so the position is applied
         self.cache.reset();
         self.pos = match (self.custom_pos, self.st.error().is_some()) {
@@ -530,7 +586,167 @@ impl Inner {
         self.present();
     }
 
+    /// Draw (or hide) the window, then keep the backdrop timer in step with what is shown.
     fn present(&mut self) {
+        self.present_frame();
+        self.glass_retune();
+    }
+
+    // --- glass backdrop -----------------------------------------------------------------
+
+    /// The window's screen rect (device px).
+    fn win_rect(&self) -> (i32, i32, i32, i32) {
+        let (w, h) = self.client_size();
+        (self.pos.0, self.pos.1, self.pos.0 + w, self.pos.1 + h)
+    }
+
+    /// Follow the monitor the window is on (it can be dragged onto another one, which changes the area
+    /// that may be captured and the field's page size).
+    fn sync_monitor_rect(&mut self) {
+        let (l, t, r, b) = self.win_rect();
+        let p = POINT { x: (l + r) / 2, y: (t + b) / 2 };
+        // SAFETY: plain query.
+        let hmon = unsafe { MonitorFromPoint(p, MONITOR_DEFAULTTONEAREST) };
+        if let Some(m) = monitor_rect(hmon).filter(|m| *m != self.mon) {
+            self.mon = m;
+            self.glass.dirty = true;
+        }
+    }
+
+    /// The monitor in logical px: the refraction field's `pageW` / `pageH`.
+    fn page(&self) -> (f32, f32) {
+        let s = self.st.scale;
+        (((self.mon.2 - self.mon.0) as f32 / s).max(1.0), ((self.mon.3 - self.mon.1) as f32 / s).max(1.0))
+    }
+
+    /// Ask the worker for the screen under the window (no-op while one request is in flight; the
+    /// result arrives as `WM_APP_GLASS`).
+    fn request_backdrop(&mut self, now: f64) -> bool {
+        self.sync_monitor_rect();
+        let (win, page) = (self.win_rect(), self.page());
+        // a fast refresh keeps the capture buffer; the resting circle (4 s) gives it back after each copy
+        let keep = self.glass_ms != 0 && self.glass_ms < GLASS_IDLE_MS;
+        self.glass.request(win, self.mon, self.st.scale, page, now, keep)
+    }
+
+    /// Install the kept picture for the window's current origin; returns whether the glass changed.
+    fn place_backdrop(&mut self) -> bool {
+        self.bd_origin = self.pos;
+        let b = self.glass.backdrop((self.pos.0, self.pos.1), self.page());
+        self.st.set_backdrop(b)
+    }
+
+    /// `WM_APP_GLASS`: the worker finished. Install the picture and repaint only when it changed,
+    /// then chain the next capture if something asked for one meanwhile.
+    fn glass_done(&mut self) {
+        let Some(result) = self.glass.take() else { return };
+        if !self.visible {
+            // hid while the capture ran: the next show places the kept picture and asks again
+            return;
+        }
+        let changed = match result {
+            Refresh::Unavailable => self.st.set_backdrop(None),
+            Refresh::Unchanged => self.bd_origin != self.pos && self.place_backdrop(),
+            Refresh::Changed => self.place_backdrop(),
+        };
+        if !self.glass.covers(self.win_rect(), self.mon, self.st.scale) {
+            self.glass.dirty = true;
+        }
+        let now = self.now();
+        if self.glass.dirty && now - self.glass.last_ms >= GLASS_MIN_GAP_MS {
+            self.request_backdrop(now);
+        }
+        if changed {
+            self.present();
+        }
+    }
+
+    /// Before a frame: place the kept picture when the window is about to appear and ask for a fresh
+    /// one; when the window outgrew the picture or something marked it dirty (rate-limited), ask
+    /// again; just re-place the kept picture when the window only moved.
+    fn glass_before_frame(&mut self, was_visible: bool, now: f64) {
+        if !self.glass.available() {
+            return;
+        }
+        let due = now - self.glass.last_ms >= GLASS_MIN_GAP_MS;
+        if !was_visible || self.bd_origin != self.pos {
+            self.sync_monitor_rect();
+        }
+        if !was_visible {
+            if self.glass.covers(self.win_rect(), self.mon, self.st.scale) {
+                self.place_backdrop();
+            } else {
+                self.st.set_backdrop(None);
+            }
+            self.request_backdrop(now);
+        } else if !self.glass.covers(self.win_rect(), self.mon, self.st.scale) || (self.glass.dirty && due) {
+            if !self.glass.scale_matches(self.st.scale) {
+                // another DPI: the picture's cells are the wrong size, paint the neutral glass until the new one lands
+                self.st.set_backdrop(None);
+            } else if self.bd_origin != self.pos {
+                self.place_backdrop();
+            }
+            self.request_backdrop(now);
+        } else if self.bd_origin != self.pos {
+            self.place_backdrop();
+        }
+    }
+
+    /// How often the backdrop is refreshed in the current state (ms); 0 while the window is hidden or
+    /// cannot capture.
+    fn glass_period(&self, now: f64) -> u32 {
+        let fast = self.st.pointer().group || self.down.as_ref().is_some_and(|d| d.dragging);
+        // the error card sits still for 3-5 s: the capture taken as it appears is enough (rebuilding its
+        // glass costs up to ~30 ms at 2x), so it refreshes at the resting rate unless something else is going on
+        let busy = !matches!(self.st.mode(), PillMode::Idle | PillMode::Hidden) || self.st.is_animating(now);
+        glass_period_ms(self.visible && self.glass.available(), fast, busy)
+    }
+
+    /// Run the backdrop timer only while the window is shown, at the rate the state calls for.
+    fn glass_retune(&mut self) {
+        let want = self.glass_period(self.now());
+        if want == self.glass_ms {
+            return;
+        }
+        // SAFETY: a timer on our own window; replaced by id, killed when the window hides.
+        unsafe {
+            if want == 0 {
+                let _ = KillTimer(Some(self.hwnd), GLASS_TIMER_ID);
+            } else {
+                SetTimer(Some(self.hwnd), GLASS_TIMER_ID, want, None);
+            }
+        }
+        self.glass_ms = want;
+    }
+
+    /// The window hid: stop capturing and give the buffers back.
+    fn glass_stop(&mut self) {
+        if self.glass_ms != 0 {
+            // SAFETY: killing our own timer.
+            unsafe {
+                let _ = KillTimer(Some(self.hwnd), GLASS_TIMER_ID);
+            }
+            self.glass_ms = 0;
+        }
+        self.glass.release();
+        self.st.set_backdrop(None);
+    }
+
+    /// `WM_TIMER`: ask for a new capture when the rate limit allows; the answer repaints.
+    fn glass_tick(&mut self) {
+        // a result whose `WM_APP_GLASS` post was dropped (full message queue) is picked up here, so a
+        // lost message can never leave a request in flight forever
+        if self.glass.in_flight {
+            self.glass_done();
+        }
+        let now = self.now();
+        if self.visible && self.glass.available() && now - self.glass.last_ms >= GLASS_MIN_GAP_MS {
+            self.request_backdrop(now);
+        }
+        self.glass_retune();
+    }
+
+    fn present_frame(&mut self) {
         let t = self.now();
         let visible = self.st.wants_visible(t, self.opts.auto_hide) || self.st.is_animating(t);
         if !visible {
@@ -541,6 +757,7 @@ impl Inner {
                     let _ = ShowWindow(self.hwnd, SW_HIDE);
                 }
                 self.visible = false;
+                self.glass_stop();
             }
             self.cache.reset();
             self.quiet.reset();
@@ -550,6 +767,7 @@ impl Inner {
         if !self.visible {
             self.cache.reset();
         }
+        self.glass_before_frame(self.visible, t);
         let outcome = self.cache.render(&self.st, t, &mut self.pm);
         self.frames += 1;
         let FrameOutcome::Dirty(dirty) = outcome else {
@@ -637,6 +855,7 @@ impl Inner {
 
     /// State changed from outside the message loop: draw once and (re)arm the timer.
     pub fn refresh(&mut self) {
+        self.glass.dirty = true;
         self.relayout_if_resized();
         self.present();
         self.sync_timer();
@@ -652,6 +871,10 @@ impl Inner {
 
     fn set_pos(&mut self, p: (i32, i32)) {
         self.pos = p;
+        // the screen under the window changed: the timer (now at the active rate while dragging)
+        // recaptures; between captures the kept picture stays where it was on the screen
+        self.glass.dirty = true;
+        self.glass_retune();
         // SAFETY: valid window handle.
         unsafe {
             let _ = SetWindowPos(self.hwnd, None, p.0, p.1, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
@@ -850,6 +1073,14 @@ impl Inner {
                 }
                 out.result = Some(LRESULT(0));
             }
+            WM_APP_GLASS => {
+                self.glass_done();
+                out.result = Some(LRESULT(0));
+            }
+            WM_TIMER if wp.0 == GLASS_TIMER_ID => {
+                self.glass_tick();
+                out.result = Some(LRESULT(0));
+            }
             WM_SETTINGCHANGE => {
                 if self.opts.theme == Theme::Auto {
                     let dark = resolve_dark(Theme::Auto);
@@ -1021,6 +1252,10 @@ impl Window {
                 skipped: 0,
                 partial: 0,
                 quiet: QuietRun::default(),
+                glass: GlassHost::new(hwnd),
+                mon: monitor_rect(hmon).unwrap_or((0, 0, 1920, 1080)),
+                glass_ms: 0,
+                bd_origin: (0, 0),
             };
             let rc = Rc::new(RefCell::new(inner));
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, Rc::into_raw(rc.clone()) as isize);
@@ -1117,6 +1352,21 @@ impl Drop for Window {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backdrop_timer_runs_only_while_shown_and_at_the_rate_the_state_needs() {
+        // hidden or unable to capture: no timer at all (idle CPU stays flat)
+        assert_eq!(glass_period_ms(false, true, true), 0);
+        assert_eq!(glass_period_ms(false, false, false), 0);
+        // resting circle (and a still error card): the slowest rate; recording / thinking: 4 Hz; hover / drag: 8 Hz
+        assert_eq!(glass_period_ms(true, false, false), GLASS_IDLE_MS);
+        assert_eq!(glass_period_ms(true, false, true), GLASS_ACTIVE_MS);
+        assert_eq!(glass_period_ms(true, true, false), GLASS_FAST_MS);
+        assert_eq!(glass_period_ms(true, true, true), GLASS_FAST_MS);
+        // the rates are ordered and keep the rate limit meaningful
+        const { assert!(GLASS_FAST_MS < GLASS_ACTIVE_MS && GLASS_ACTIVE_MS < GLASS_IDLE_MS) };
+        const { assert!(GLASS_FAST_MS as f64 >= GLASS_MIN_GAP_MS) };
+    }
 
     #[test]
     fn dpi_scale_mapping() {

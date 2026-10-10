@@ -246,3 +246,254 @@ fn desktop_pill_real_app_icon_bubble() {
     assert!(w.with(|i| i.st.pointer().bubble));
     send(hwnd, WM_MOUSELEAVE, 0, LPARAM(0));
 }
+
+// --- glass backdrop (desktop) ------------------------------------------------------------------
+
+use crate::daemon::pill::capture::{Capturer, GlassHost, exclude_from_capture, is_excluded};
+use windows::Win32::UI::WindowsAndMessaging::{SetWindowDisplayAffinity, WDA_NONE};
+
+/// `true` when the desktop lets us copy the screen (a locked session or the secure desktop does not).
+fn can_capture() -> bool {
+    Capturer::new().is_some_and(|mut c| c.grab(0, 0, 8, 8).is_some())
+}
+
+/// Mean absolute channel difference and the share of pixels that differ by more than `tol`.
+fn diff(a: &[u8], b: &[u8], tol: u8) -> (f64, f64) {
+    let n = a.len() / 4;
+    let (mut sum, mut bad) = (0u64, 0usize);
+    for (x, y) in a.chunks_exact(4).zip(b.chunks_exact(4)) {
+        let d = (0..3).map(|c| x[c].abs_diff(y[c])).max().unwrap_or(0);
+        sum += (0..3).map(|c| x[c].abs_diff(y[c]) as u64).sum::<u64>();
+        bad += (d > tol) as usize;
+    }
+    (sum as f64 / (n * 3) as f64, bad as f64 / n as f64)
+}
+
+/// Pump messages until the worker's answer has been installed (the window handles `WM_APP_GLASS`).
+fn wait_glass(w: &Window) {
+    let t0 = Instant::now();
+    while w.with(|i| i.glass.in_flight) {
+        pump(5);
+        assert!(t0.elapsed().as_secs() < 10, "the capture never finished");
+    }
+}
+
+fn hidden_opts() -> PillOptions {
+    PillOptions { auto_hide: true, show_app_bubble: false, ..opts() }
+}
+
+fn win_screen_rect(w: &Window) -> (i32, i32, i32, i32) {
+    w.with(|i| i.win_rect())
+}
+
+#[test]
+#[ignore]
+fn desktop_pill_capture_excludes_the_pill() {
+    if !can_capture() {
+        println!("SKIPPED: the desktop cannot be captured (locked session?)");
+        return;
+    }
+    // auto-hide: the idle pill is not on screen until a dictation starts
+    let w = Window::create(Arc::new(AtomicU32::new(0)), hidden_opts(), Box::new(|_| {})).expect("create pill window");
+    let hwnd = HWND(w.hwnd() as *mut core::ffi::c_void);
+    assert!(is_excluded(hwnd), "the pill window is excluded from capture");
+    // SAFETY: valid handle.
+    assert!(!unsafe { IsWindowVisible(hwnd) }.as_bool(), "hidden before the dictation");
+    let (l, t, r, b) = win_screen_rect(&w);
+    let (cw, ch) = (r - l, b - t);
+    let mut cap = Capturer::new().expect("capturer");
+    pump(150);
+    let before = cap.grab(l, t, cw, ch).expect("grab before").to_vec();
+    w.with(|i| i.set_mode(PillMode::Recording));
+    pump(1200); // entrance done, capsule fully drawn
+    // SAFETY: valid handle.
+    assert!(unsafe { IsWindowVisible(hwnd) }.as_bool(), "shown while recording");
+    let after = cap.grab(l, t, cw, ch).expect("grab after").to_vec();
+
+    // control: without the exclusion the capsule is in the capture
+    // SAFETY: valid handle.
+    unsafe {
+        SetWindowDisplayAffinity(hwnd, WDA_NONE).expect("clear the affinity");
+    }
+    pump(400);
+    let included = cap.grab(l, t, cw, ch).expect("grab included").to_vec();
+    assert!(exclude_from_capture(hwnd) && is_excluded(hwnd), "affinity restored");
+    w.with(|i| i.set_mode(PillMode::Idle));
+
+    let (cmean, cbad) = diff(&before, &included, 24);
+    println!("control (not excluded): mean abs diff {cmean:.3}, {:.2} % of pixels differ", cbad * 100.0);
+    if cbad < 0.05 {
+        // a locked session grabs fine but composes no windows: neither comparison can mean anything
+        println!("SKIPPED: the control capture does not contain the pill (the desktop is not composed; locked session?)");
+        return;
+    }
+    let (mean, bad) = diff(&before, &after, 24);
+    println!("excluded: mean abs diff {mean:.3}, {:.2} % of pixels differ", bad * 100.0);
+    assert!(bad < 0.02 && mean < 3.0, "the capture after show equals the capture before (mean {mean:.3}, {:.2} % differ)", bad * 100.0);
+}
+
+#[test]
+#[ignore]
+fn desktop_pill_backdrop_is_captured_only_while_shown_and_hash_gated() {
+    if !can_capture() {
+        println!("SKIPPED: the desktop cannot be captured (locked session?)");
+        return;
+    }
+    let w = Window::create(Arc::new(AtomicU32::new(0)), hidden_opts(), Box::new(|_| {})).expect("create pill window");
+    // hidden: no capture, no timer, no picture kept
+    pump(700);
+    let (grabs, ms, has) = w.with(|i| (i.glass.grabs, i.glass_ms, i.st.backdrop.is_some()));
+    assert_eq!((grabs, ms, has), (0, 0, false), "nothing is captured while hidden");
+
+    // show: captured at once, the timer runs at the active rate while recording
+    w.with(|i| i.set_mode(PillMode::Recording));
+    wait_glass(&w);
+    assert!(w.with(|i| i.glass.grabs) >= 1, "captured on show");
+    assert!(w.with(|i| i.st.backdrop.is_some()), "a backdrop is installed");
+    pump(300);
+    assert_eq!(w.with(|i| i.glass_ms), 250, "4 Hz while recording");
+    let g0 = w.with(|i| (i.glass.grabs, i.glass.unchanged));
+    pump(1500);
+    let g1 = w.with(|i| (i.glass.grabs, i.glass.unchanged));
+    let (grabs, unchanged) = (g1.0 - g0.0, g1.1 - g0.1);
+    println!("recording: {grabs} captures in 1.5 s, {unchanged} unchanged");
+    assert!((3..=8).contains(&grabs), "at most ~4 Hz, got {grabs} captures in 1.5 s");
+    assert!(unchanged * 2 >= grabs, "a static screen finds the hash unchanged ({unchanged}/{grabs})");
+
+    // back to the resting circle: auto-hide hides it again, so the timer is off and the buffers are released
+    w.with(|i| i.set_mode(PillMode::Idle));
+    pump(1000);
+    let (ms, has) = w.with(|i| (i.glass_ms, i.st.backdrop.is_some()));
+    assert_eq!((ms, has), (0, false), "hidden again: timer killed, picture dropped");
+    let g2 = w.with(|i| i.glass.grabs);
+    pump(700);
+    assert_eq!(w.with(|i| i.glass.grabs), g2, "no captures while hidden");
+}
+
+#[test]
+#[ignore]
+fn desktop_pill_resting_circle_refreshes_slowly() {
+    if !can_capture() {
+        println!("SKIPPED: the desktop cannot be captured (locked session?)");
+        return;
+    }
+    let (w, _events) = make(); // auto-hide off: the resting circle stays on screen
+    pump(300);
+    assert_eq!(w.with(|i| i.glass_ms), 4000, "the resting circle refreshes every 4 s");
+    let g0 = w.with(|i| i.glass.grabs);
+    pump(4400);
+    let grabs = w.with(|i| i.glass.grabs) - g0;
+    println!("resting circle: {grabs} captures in 4.4 s");
+    assert!((1..=2).contains(&grabs), "one every 4 s, got {grabs}");
+}
+
+#[test]
+#[ignore]
+fn desktop_pill_falls_back_to_neutral_glass_when_capture_is_unavailable() {
+    let (w, _events) = make();
+    // the host cannot capture (what a refused WDA_EXCLUDEFROMCAPTURE leaves): no picture, never garbage
+    w.with(|i| {
+        i.glass = GlassHost::unavailable();
+        i.glass_stop();
+        i.set_mode(PillMode::Recording);
+    });
+    pump(900);
+    let (has, ms, grabs) = w.with(|i| (i.st.backdrop.is_some(), i.glass_ms, i.glass.grabs));
+    assert_eq!((has, ms, grabs), (false, 0, 0), "no capture, no timer");
+    // the frame on screen is the neutral frosted glass, what the pure renderer draws
+    let same = w.with(|i| {
+        let now = i.now();
+        let want = crate::daemon::pill::render::render(&i.st, now);
+        let (a, b) = (i.pm.data(), want.data());
+        a.chunks_exact(4).zip(b.chunks_exact(4)).all(|(x, y)| (0..4).all(|c| x[c].abs_diff(y[c]) <= 3))
+    });
+    assert!(same, "the window shows the neutral glass");
+    let mut host = GlassHost::unavailable();
+    assert!(!host.request((0, 0, 100, 100), (0, 0, 1920, 1080), 1.0, (1920.0, 1080.0), 0.0, true));
+    assert!(host.take().is_none());
+}
+
+#[test]
+#[ignore]
+fn desktop_pill_backdrop_follows_the_window_when_dragged() {
+    if !can_capture() {
+        println!("SKIPPED: the desktop cannot be captured (locked session?)");
+        return;
+    }
+    let (w, _events) = make();
+    let hwnd = HWND(w.hwnd() as *mut core::ffi::c_void);
+    pump(300);
+    let (scale, g) = w.with(|i| (i.st.scale, i.st.geometry(i.now())));
+    let (px, py) = ((g.pill.cx() * scale) as i32, (g.pill.cy() * scale) as i32);
+    let start = rect(hwnd);
+    let grabs0 = w.with(|i| i.glass.grabs);
+    send(hwnd, WM_LBUTTONDOWN, 1, lparam(px, py));
+    let target = (start.left + px - 80, start.top + py - 40);
+    for _ in 0..2 {
+        let now = rect(hwnd);
+        send(hwnd, MOVE, 1, lparam(target.0 - now.left, target.1 - now.top));
+    }
+    // dragging: the timer runs at the fast rate and recaptures the new place within a tick or two
+    assert_eq!(w.with(|i| i.glass_ms), 125);
+    pump(350);
+    assert!(w.with(|i| i.glass.grabs) > grabs0, "recaptured after the move");
+    assert!(w.with(|i| i.bd_origin == i.pos), "the picture is placed for the new window origin");
+    let now = rect(hwnd);
+    send(hwnd, WM_LBUTTONUP, 0, lparam(target.0 - now.left, target.1 - now.top));
+    send(hwnd, WM_MOUSELEAVE, 0, LPARAM(0)); // the cursor is elsewhere: no hover keeps the rate up
+    pump(700);
+    assert_eq!(w.with(|i| i.glass_ms), 4000, "back to the resting rate after the drag");
+}
+
+
+#[test]
+#[ignore]
+fn desktop_pill_capture_cost() {
+    use crate::daemon::pill::glass::{Cells, FROST_SIGMA, capture_region, cell_for, margin_logical};
+    if !can_capture() {
+        println!("SKIPPED: the desktop cannot be captured (locked session?)");
+        return;
+    }
+    let (w, _events) = make();
+    pump(200);
+    let (win, mon, scale, page) = w.with(|i| (i.win_rect(), i.mon, i.st.scale, i.page()));
+    let region = capture_region(win, (margin_logical(page) * scale).ceil() as i32, mon).expect("region");
+    let (rw, rh) = (region.2 - region.0, region.3 - region.1);
+    let mut cap = Capturer::new().expect("capturer");
+    let n = 200;
+    let time = |f: &mut dyn FnMut()| {
+        f(); // warm
+        let t0 = Instant::now();
+        for _ in 0..n {
+            f();
+        }
+        t0.elapsed().as_secs_f64() * 1000.0 / n as f64
+    };
+    let grab = time(&mut || {
+        let _ = cap.grab(region.0, region.1, rw, rh).expect("grab").len();
+    });
+    let raw = cap.grab(region.0, region.1, rw, rh).expect("grab").to_vec();
+    let cell = cell_for(scale);
+    let cells_ms = time(&mut || {
+        let _ = Cells::from_bgra(&raw, rw as usize, rh as usize, cell).expect("cells");
+    });
+    let cells = Cells::from_bgra(&raw, rw as usize, rh as usize, cell).expect("cells");
+    let frost_ms = time(&mut || {
+        let _ = cells.frost(FROST_SIGMA, scale);
+    });
+    println!(
+        "capture {rw}x{rh} px ({:.0} KB): BitBlt {grab:.3} ms, cell average + hash {cells_ms:.3} ms (an unchanged screen stops here), frost {frost_ms:.3} ms",
+        (rw * rh * 4) as f64 / 1024.0
+    );
+    // one full round trip through the window's host: request, worker thread, message, install
+    let t0 = Instant::now();
+    let (sent, ui_ms) = w.with(|i| {
+        let (win, page) = (i.win_rect(), i.page());
+        let t = Instant::now();
+        let sent = i.glass.request(win, mon, scale, page, 1e12, true);
+        (sent, t.elapsed().as_secs_f64() * 1000.0)
+    });
+    assert!(sent, "a request is accepted");
+    wait_glass(&w);
+    println!("host round trip: {:.3} ms; the UI thread spent {ui_ms:.3} ms of it (the request only)", t0.elapsed().as_secs_f64() * 1000.0);
+}
