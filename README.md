@@ -49,7 +49,7 @@ Desktop and live tests are `#[ignore]`d and named `desktop_*` / `live_*`:
 ```powershell
 cargo test -- --ignored desktop_            # needs an interactive desktop
 cargo test -- --ignored live_               # OpenRouter ":free" models only; set OPENTALK_SECRET_OPENROUTER
-powershell -File tests\e2e.ps1              # daemon + injected WAV + paste into Notepad
+powershell -File tests\e2e.ps1              # daemon + injected WAV + real paste (Notepad, or a scratch text box if Notepad is open)
 powershell -File bench\bench.ps1            # CPU / memory / latency benchmark -> docs\BENCHMARK.md
 ```
 
@@ -128,14 +128,14 @@ enter the numbers. Full report: [docs/BENCHMARK.md](docs/BENCHMARK.md).
 | | OpenTalk | Target | Spokenly |
 |---|---|---|---|
 | Idle CPU (60 s) | 0.0% | ~0% | ~3% |
-| Recording CPU (30 s, real mic) | 0.41% of all cores (9.9% of one core; ~2.5% projected on 4 cores) | <= 1.5% | ~3% |
-| Daemon memory, idle | 17.9 MB working set, 4.6 MB private bytes, ~3 MB private working set | <= 25 MB | ~110 MB |
-| Daemon memory, recording | 19.5 MB WS (app bubble off) / 23-39 MB WS with the app bubble (shared shell DLLs; private WS ~5.5 MB) | <= 25 MB | ~110 MB |
-| Settings window | 13 MB working set, separate process, 0% CPU idle | <= 80 MB | - |
-| Executable | 7.51 MB, one file | <= 8 MB | - |
-| Start-up | daemon ready in ~20 ms | - | - |
-| Hotkey -> pill / -> first mic packet | 1.4 ms / 19.9 ms (median) | <= 16 / <= 50 ms | - |
-| Local overhead stop -> paste (excluding STT) | ~1 ms before paste, ~18 ms including a real `SendInput` paste | <= 40 ms | - |
+| Recording CPU (30 s, real mic) | 0.03% of all cores (0.78% of one core; ~0.2% projected on 4 cores) | <= 1.5% | ~3% |
+| Daemon memory, idle | 17.9 MB working set, 4.4 MB private bytes | <= 25 MB | ~110 MB |
+| Daemon memory, recording / 10 dictations (peak) | 19.1 MB WS (app bubble off), 23.2-23.4 MB WS with the app bubble | <= 25 MB | ~110 MB |
+| Settings window | 12.4 MB working set, separate process, ~0% CPU idle (commits ~267 MB of GL driver pools, documented) | <= 80 MB | - |
+| Executable | 7.55 MB, one file | <= 8 MB | - |
+| Start-up | daemon ready in ~21 ms | - | - |
+| Hotkey -> pill / -> first mic packet | 1.6 ms / 20.5 ms (median) | <= 16 / <= 50 ms | - |
+| Local overhead stop -> paste (excluding STT) | ~1 ms before paste; ~18 ms including a real `SendInput` paste (earlier unlocked-desktop run) | <= 40 ms | - |
 
 Live checks use OpenRouter `:free` models only: AI cleanup works through `nvidia/nemotron-3.5-lightning:free` (~1 s); no free
 audio model returned a transcript during these runs (gated to "agentic harnesses", or upstream capacity errors).

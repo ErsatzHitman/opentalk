@@ -463,11 +463,11 @@ network path, not a latency reference; the table above is measured against a loc
   frame while the input is silent. The thinking glow keeps its 60 fps but also caches the chrome. WASAPI capture and the
   VAD/level meter stay well under 1% of one core. The row "Main thread while recording" is the figure the pill is judged by
   (<= 6% of one core is <= 1.5% on a 4-core laptop).
-- **Working set and the app bubble**: the active-app icon is fetched with ``IShellItemImageFactory``, which loads ~35 shell
-  DLLs (XAML, StateRepository, thumbcache, ...) into the daemon on the first dictation. They are shared image pages, so the
-  working set grows by ~17 MB while the private working set (Task Manager's "Memory") grows by ~2-4 MB. With the bubble off
-  the daemon stays at ~19 MB WS / ~3.6 MB private WS while recording. A lighter icon path for plain Win32 executables
-  (``SHGetFileInfoW``/``PrivateExtractIconsW``) is an open follow-up for the app-icon module.
+- **Working set and the app bubble**: the active-app icon of a classic Win32 executable comes from
+  ``PrivateExtractIconsW`` (user32 only), then ``SHGetFileInfoW`` in its own COM apartment. ``IShellItemImageFactory``,
+  which loads ~35 shell DLLs (XAML, StateRepository, thumbcache, ...) into the daemon for the rest of its life (~+17 MB
+  working set of shared image pages, ~2-4 MB private), is used only for packaged (UWP / MSIX) apps or when both lighter
+  paths return nothing.
 - Clipboard and paste timings are only meaningful on an unlocked desktop: Windows refuses clipboard access while the
   workstation is locked, so ``copy_to_clipboard`` exhausts its retries (~95 ms) and real-paste e2e runs are skipped.
 "@
