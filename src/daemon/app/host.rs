@@ -34,7 +34,7 @@ use crate::core::timing::now_ms;
 use crate::core::{autostart, history, secrets};
 use crate::daemon::hotkey::{self, HotkeyEvent};
 use crate::daemon::pill::{Pill, PillEvent, PillMode, PillOptions};
-use crate::daemon::tray::{Tray, TrayCmd, TrayState};
+use crate::daemon::tray::{Tray, TrayCmd, TrayState, WM_TRAY_POPUP_CMD, command_from_popup};
 use crate::daemon::{media, sound};
 use crate::{log_err, log_info, log_warn};
 
@@ -364,7 +364,7 @@ impl App {
                 let hide = !self.icon_hidden;
                 self.set_icon_hidden(hide);
             }
-            TrayCmd::OpenSettings => self.settings.open(settings::PAGE_HISTORY),
+            TrayCmd::OpenSettings => self.settings.open(settings::PAGE_SETTINGS),
             TrayCmd::OpenHistory => self.settings.open(settings::PAGE_HISTORY),
             TrayCmd::OpenDictionary => self.settings.open(settings::PAGE_DICTIONARY),
             TrayCmd::RetryLast => self.retry_last(),
@@ -539,8 +539,13 @@ impl App {
     pub(super) fn tray_state(&self) -> TrayState {
         TrayState {
             listening: self.machine.is_recording(),
+            transcribing: self.machine.phase == Phase::Thinking,
             floating_icon_visible: !self.icon_hidden,
             can_retry: self.last_failed.is_some(),
+            hotkey: hotkey::label(&self.cfg.hotkey),
+            dark: crate::daemon::pill::kit::resolve_dark(self.cfg.theme),
+            // Only the tail of the history file is read; nothing when history is off.
+            recent: if self.cfg.history_enabled { history::recent_ok(2).into_iter().map(|e| e.text).collect() } else { Vec::new() },
         }
     }
 }
@@ -637,7 +642,12 @@ fn dispatch(hwnd: HWND, msg: u32, wparam: usize, lparam: isize, t0: f64) -> Opti
                 t.readd();
             }
         })),
-        WM_TRAY_EVT => Some(on_tray_message(hwnd, LPARAM(lparam), t0)),
+        WM_TRAY_EVT => Some(on_tray_message(hwnd, lparam)),
+        WM_TRAY_POPUP_CMD => Some(with_app(|a| {
+            if let Some(cmd) = command_from_popup(wparam) {
+                a.on_tray_cmd(cmd, t0);
+            }
+        })),
         m if (ipc::WM_APP + 1..=ipc::WM_OT_STOP).contains(&m) => Some(with_app(|a| a.on_ipc(m, wparam, t0))),
         m if m != 0 && m == TASKBAR_CREATED.load(Ordering::Relaxed) => Some(with_app(|a| {
             if let Some(t) = a.tray.as_mut() {
@@ -703,25 +713,22 @@ fn register_session_notifications(hwnd: HWND) {
     }
 }
 
-/// Tray callback. The popup menu runs a modal loop, so the tray is taken out of the app for it.
+/// Tray callback: an activation toggles the popup. The popup is its own window on this thread (no
+/// modal loop), and the row the user picks comes back as [`WM_TRAY_POPUP_CMD`].
 /// `false` when the app was busy: the caller defers the message instead of dropping the click.
-fn on_tray_message(hwnd: HWND, lparam: LPARAM, t0: f64) -> bool {
-    let mut taken = None;
-    let mut state = TrayState::default();
+fn on_tray_message(hwnd: HWND, lparam: isize) -> bool {
+    let mut open = None;
     if !with_app(|a| {
-        taken = a.tray.take();
-        state = a.tray_state();
+        if let Some(act) = a.tray.as_ref().and_then(|t| t.activation(lparam)) {
+            open = Some((act, a.tray_state()));
+        }
     }) {
         return false;
     }
-    let Some(mut tray) = taken else { return true };
-    let cmd = tray.handle(hwnd.0 as isize, lparam.0, state);
-    with_app(|a| {
-        a.tray = Some(tray);
-        if let Some(cmd) = cmd {
-            a.on_tray_cmd(cmd, t0);
-        }
-    });
+    if let Some((act, state)) = open {
+        // The app is released: the popup only reads the state it was handed.
+        crate::daemon::tray::activate(hwnd.0 as isize, act, &state);
+    }
     true
 }
 

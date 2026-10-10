@@ -118,3 +118,14 @@ impl Pill {
 pub fn cli_render(args: &[String]) -> i32 {
     preview::cli_render(args)
 }
+
+/// The software-render helpers the tray popup (`daemon::tray`) shares with the pill, so it does not
+/// duplicate the rasteriser, the GDI text path or the layered-window bitmap.
+pub(crate) mod kit {
+    pub(crate) use super::card::draw_retry_icon;
+    pub(crate) use super::raster::{Canvas, DevRect, Rect, sd_round_box, sd_segment};
+    pub(crate) use super::render::draw_logo;
+    pub(crate) use super::text::{Font, content_height, draw as draw_text, mask as text_mask, measure as text_measure};
+    pub(crate) use super::theme::{Palette, Rgba, resolve_dark};
+    pub(crate) use super::window::{Dib, scale_from_dpi};
+}

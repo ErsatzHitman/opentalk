@@ -326,7 +326,7 @@ pub fn draw_base(card: &ErrorCard, scale: f32, pal: &Palette, backdrop: &Backdro
 }
 
 /// Nucleo `Redo2Outline18` arrow at `rect`, stroke 1.5 in 18-units.
-fn draw_retry_icon(cv: &mut Canvas, rect: Rect, scale: f32, color: Rgba) {
+pub fn draw_retry_icon(cv: &mut Canvas, rect: Rect, scale: f32, color: Rgba) {
     let (w, h) = (cv.w as u32, cv.h as u32);
     let Some(mut pm) = tiny_skia::PixmapMut::from_bytes(&mut *cv.data, w, h) else { return };
     let k = rect.w() / 18.0;

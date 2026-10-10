@@ -16,7 +16,6 @@ use crate::{log_info, log_warn};
 /// Pages understood by `ui::run` (`--settings <page>`).
 pub const PAGE_HISTORY: &str = "history";
 pub const PAGE_DICTIONARY: &str = "dictionary";
-#[cfg(test)]
 pub const PAGE_SETTINGS: &str = "settings";
 pub const PAGE_STT: &str = "settings:stt";
 

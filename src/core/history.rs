@@ -278,6 +278,37 @@ fn stats_of(entries: &[Entry]) -> (usize, u64, u64) {
     (count, words, if n == 0 { 0 } else { sum / n })
 }
 
+/// How much of the end of the file [`recent_ok`] reads: a handful of entries, not the whole history.
+const RECENT_TAIL_BYTES: u64 = 64 * 1024;
+
+/// The newest `n` successful, non-empty entries (the tray popup's "Recent" rows), newest first. Reads
+/// only the tail of the file, so it stays cheap however long the history is.
+pub fn recent_ok(n: usize) -> Vec<Entry> {
+    recent_ok_in(&paths::history_file(), n)
+}
+
+fn recent_ok_in(path: &Path, n: usize) -> Vec<Entry> {
+    use std::io::{Read, Seek, SeekFrom};
+    let _g = lock();
+    let Ok(mut f) = std::fs::File::open(path) else { return Vec::new() };
+    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    let start = len.saturating_sub(RECENT_TAIL_BYTES);
+    if f.seek(SeekFrom::Start(start)).is_err() {
+        return Vec::new();
+    }
+    let mut buf = Vec::new();
+    if f.take(RECENT_TAIL_BYTES).read_to_end(&mut buf).is_err() {
+        return Vec::new();
+    }
+    // A cut start lands mid-line: drop the partial first line.
+    let body = if start > 0 { buf.iter().position(|&b| b == b'\n').map_or(&buf[..0], |i| &buf[i + 1..]) } else { &buf[..] };
+    let mut v: Vec<Entry> = body.split(|&b| b == b'\n').filter_map(parse_line).filter(|e| e.status == Status::Ok && !e.text.trim().is_empty()).collect();
+    v.reverse();
+    v.sort_by(|a, b| b.ts.cmp(&a.ts).then(b.id.cmp(&a.id)));
+    v.truncate(n);
+    v
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -299,6 +330,34 @@ mod tests {
 
     fn entry(id: i64, ts: i64, text: &str) -> Entry {
         Entry { id, ts, text: text.into(), raw: format!("raw {text}"), provider: "groq".into(), ..Default::default() }
+    }
+
+    #[test]
+    fn recent_ok_reads_the_tail_and_skips_failures() {
+        let p = temp_file("recent");
+        assert!(recent_ok_in(&p, 2).is_empty(), "missing file");
+        append_to(&p, &entry(1, 100, "first")).unwrap();
+        append_to(&p, &entry(2, 200, "second")).unwrap();
+        append_to(&p, &Entry { status: Status::Failed, ..entry(3, 300, "") }).unwrap();
+        append_to(&p, &entry(4, 400, "   ")).unwrap();
+        append_to(&p, &entry(5, 500, "third")).unwrap();
+        let texts = |n| recent_ok_in(&p, n).into_iter().map(|e| e.text).collect::<Vec<_>>();
+        assert_eq!(texts(2), ["third", "second"]);
+        assert_eq!(texts(10), ["third", "second", "first"]);
+        assert_eq!(texts(0), Vec::<String>::new());
+    }
+
+    #[test]
+    fn recent_ok_on_a_long_file_reads_only_the_tail_and_drops_the_cut_line() {
+        let p = temp_file("recent-long");
+        for i in 0..3000i64 {
+            append_to(&p, &entry(i + 1, 1000 + i, &format!("dictation number {i} with some padding text to make the line longer"))).unwrap();
+        }
+        assert!(std::fs::metadata(&p).unwrap().len() > RECENT_TAIL_BYTES * 2);
+        let got = recent_ok_in(&p, 2);
+        assert_eq!(got.len(), 2);
+        assert!(got[0].text.starts_with("dictation number 2999 "), "{}", got[0].text);
+        assert!(got[1].text.starts_with("dictation number 2998 "));
     }
 
     #[test]

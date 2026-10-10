@@ -89,9 +89,9 @@ src/daemon/glow.rs     signal-glow (conic ring, halo, comet), pre-blurred sprite
 src/daemon/pill/glass.rs, capture.rs   liquid-glass surface material of the pill (frosted, refracted screen capture; SPEC "Pill surface material")
 src/daemon/appicon.rs  foreground exe → icon (UWP aware), cache
 src/daemon/paste.rs    clipboard snapshot/restore, SendInput, terminal detection
-src/daemon/tray.rs     Shell_NotifyIcon + menu
+src/daemon/tray.rs     Shell_NotifyIcon; tray/popup*.rs: the flat tray popup (model + placement, software rendering, window)
 src/daemon/sound.rs    synthesized cues → in-memory WAV → PlaySound
-src/ui/…               egui app: shell, theme tokens, widgets, history, dictionary, settings; liquid-glass panels in src/ui/glass.rs (docs/GLASS.md)
+src/ui/…               egui app: shell, theme tokens, widgets, history, dictionary, settings; flat solid surfaces, no glass (the pill keeps its glass, SPEC "Pill surface material")
 `--bench mock-stt`      in-repo mock STT server (Rust, replaces the planned tools/mock_stt.py); per-provider wire-format mocks are in-process test servers
 bench/bench.ps1        CPU/RAM/latency benchmark harness
 ```
@@ -269,9 +269,14 @@ OpenWhispr already has History (its Home page) and a Dictionary page with Snippe
   - Smart trailing space (OpenWhispr `smartSpacing`).
   - Detect an elevated target (UIPI) and show a "Text copied — target app is running as admin" error card instead of failing silently (new).
 - **Tray.**
-  - Static icon.
-  - Menu: Start/Stop listening, Show/Hide floating icon, Open OpenTalk, History, Dictionary, Retry last, Quit.
-  - Left click opens Settings.
+  - Static icon (`NOTIFYICON_VERSION_4`, so Enter / Space on the icon arrive as `NIN_KEYSELECT` / `NIN_SELECT`, also from the hidden overflow).
+  - Any activation (left click, right click, keyboard) toggles a small flat popup instead of a classic menu: no egui, no GPU, no timers.
+    The window is created when the icon is activated and destroyed when it closes (layered, topmost, tool window, activated so it takes
+    the arrow / Enter / Esc keys; it closes when it loses activation). It is rendered with the pill's software rasteriser and GDI text.
+    It sits at the bottom-right next to the tray: anchored on `Shell_NotifyIconGetRect` when the icon is visible, else in the corner
+    of the work area of the taskbar's edge (any of the four; auto-hidden bars via `ABM_GETTASKBARPOS`), per monitor and per-monitor DPI.
+  - Rows: status header (Ready / Recording / Transcribing), Start / Stop dictation with the hotkey, History, Dictionary, Settings,
+    the last two dictations (click to copy), Show / Hide floating pill, Retry last dictation (only after a failure), Quit.
 - **Autostart.** HKCU `Run` value `OpenTalk` = `"<exe>" --hidden`. The state reads `StartupApproved\Run` too, mirroring OpenWhispr's `executableWillLaunchAtLogin` lesson.
 - **Sounds.** OpenWhispr cues synthesised once:
   - Start: C5→E5. Stop: D5→A4.

@@ -1,29 +1,37 @@
-//! System tray icon (Shell_NotifyIconW) + popup menu. TASK win-output implements.
-//! Left click -> TrayCmd::OpenSettings; right click -> menu.
-//! Menu: Start/Stop listening, Show/Hide floating icon, Open OpenTalk, History, Dictionary,
-//! Retry last, separator, Quit OpenTalk. Tooltip "OpenTalk - Voice Dictation".
+//! System tray icon (Shell_NotifyIconW) and the popup it opens.
+//!
+//! Activating the icon (left click, right click, keyboard Enter / Space, also from the hidden
+//! overflow area) opens a small flat popup near the tray instead of a classic menu: see [`popup`]
+//! (model, layout, placement), `popup_draw` (software rendering) and `popup_win` (the window). The
+//! icon asks for `NOTIFYICON_VERSION_4` so it receives `NIN_SELECT` / `NIN_KEYSELECT`; on a shell
+//! that refuses, the plain `WM_LBUTTONUP` / `WM_RBUTTONUP` messages are used instead.
 //!
 //! The icon (OpenWhispr logo: ring + three bars) is drawn at runtime at the system small-icon size,
 //! white on a dark taskbar and black on a light one, so no resource file is needed. The window proc
-//! of the owner must forward `callback_msg` to [`Tray::handle`] and the registered `TaskbarCreated`
-//! message (see [`taskbar_created_message`]) to [`Tray::readd`].
+//! of the owner must forward `callback_msg` to [`Tray::activation`] and the registered `TaskbarCreated`
+//! message (see [`taskbar_created_message`]) to [`Tray::readd`], and [`WM_TRAY_POPUP_CMD`] to
+//! [`command_from_popup`].
+mod popup;
+mod popup_draw;
+mod popup_win;
+
+pub use popup_draw::cli_render as cli_render_popup;
+pub use popup_win::WM_TRAY_POPUP_CMD;
+
 use std::ffi::c_void;
 
 use tiny_skia::{LineCap, Paint, PathBuilder, Pixmap, Stroke, Transform};
-use windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
-use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+use windows::Win32::Foundation::HWND;
 use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
 use windows::Win32::UI::Shell::{
-    NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
+    NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NIM_SETVERSION, NOTIFYICONDATAW,
     Shell_NotifyIconW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreateIcon, CreatePopupMenu, DestroyIcon, DestroyMenu, GetCursorPos,
-    GetSystemMetrics, HICON, HMENU, MF_CHECKED, MF_GRAYED, MF_SEPARATOR, MF_STRING, PostMessageW,
-    RegisterWindowMessageW, SM_CXSMICON, SetForegroundWindow, SetMenuDefaultItem, TPM_RETURNCMD,
-    TPM_RIGHTBUTTON, TrackPopupMenu, WM_CONTEXTMENU, WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP,
+    CreateIcon, DestroyIcon, GetSystemMetrics, HICON, RegisterWindowMessageW, SM_CXSMICON,
+    WM_CONTEXTMENU, WM_LBUTTONUP, WM_RBUTTONUP,
 };
-use windows::core::{PCSTR, PCWSTR, w};
+use windows::core::w;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TrayCmd {
@@ -42,46 +50,88 @@ pub struct Tray {
     icon: HICON,
     /// Whether Explorer currently shows our icon.
     added: bool,
+    /// The shell accepted `NOTIFYICON_VERSION_4` (`NIN_SELECT` / `NIN_KEYSELECT` / `WM_CONTEXTMENU`).
+    v4: bool,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+/// What the popup needs to know about the daemon when the icon is activated.
+#[derive(Clone, Debug, Default)]
 pub struct TrayState {
     pub listening: bool,
+    pub transcribing: bool,
     pub floating_icon_visible: bool,
     pub can_retry: bool,
+    /// The dictation hotkey as the pill shows it, e.g. "Ctrl + Win".
+    pub hotkey: String,
+    /// The app theme resolved to dark / light.
+    pub dark: bool,
+    /// Full text of the newest dictations (empty when history is off).
+    pub recent: Vec<String>,
+}
+
+impl TrayState {
+    fn content(&self) -> popup::Content {
+        use popup::Phase;
+        popup::Content {
+            phase: if self.transcribing {
+                Phase::Transcribing
+            } else if self.listening {
+                Phase::Recording
+            } else {
+                Phase::Ready
+            },
+            floating_pill_visible: self.floating_icon_visible,
+            can_retry: self.can_retry,
+            hotkey: self.hotkey.clone(),
+            recent: self.recent.iter().map(|t| popup::preview_line(t)).filter(|t| !t.is_empty()).take(popup::MAX_RECENT).collect(),
+        }
+    }
+}
+
+/// A tray event that opens (or closes) the popup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Activation {
+    /// Triggered from the keyboard: the popup starts with its first row focused.
+    pub keyboard: bool,
 }
 
 const TOOLTIP: &str = "OpenTalk - Voice Dictation";
 const ICON_ID: u32 = 1;
+const NOTIFYICON_VERSION_4: u32 = 4;
+/// `NIN_SELECT` (`WM_USER`) and `NIN_KEYSELECT` (`NIN_SELECT | NINF_KEY`).
+const NIN_SELECT: u32 = 0x400;
+const NIN_KEYSELECT: u32 = 0x401;
 
-// ---------------------------------------------------------------------------------------------
-// Menu model (pure, testable)
-// ---------------------------------------------------------------------------------------------
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct MenuEntry {
-    pub cmd: Option<TrayCmd>,
-    pub label: &'static str,
-    pub checked: bool,
-    pub disabled: bool,
-    /// Rendered bold: what a double-click would do.
-    pub default: bool,
-}
-
-impl MenuEntry {
-    const SEPARATOR: MenuEntry =
-        MenuEntry { cmd: None, label: "", checked: false, disabled: false, default: false };
-
-    fn item(cmd: TrayCmd, label: &'static str) -> MenuEntry {
-        MenuEntry { cmd: Some(cmd), label, checked: false, disabled: false, default: false }
-    }
-
-    fn is_separator(&self) -> bool {
-        self.cmd.is_none()
+/// What a notification message means: any activation of the icon, once. Version 4 reports a click as
+/// `WM_LBUTTONUP` followed by `NIN_SELECT` (and a right click as `WM_RBUTTONUP` then
+/// `WM_CONTEXTMENU`), so only the second of each pair counts; the legacy protocol has just the first.
+pub(crate) fn classify(v4: bool, event: u32) -> Option<Activation> {
+    match (v4, event) {
+        (true, NIN_SELECT | WM_CONTEXTMENU) => Some(Activation { keyboard: false }),
+        (true, NIN_KEYSELECT) => Some(Activation { keyboard: true }),
+        (false, WM_LBUTTONUP | WM_RBUTTONUP) => Some(Activation { keyboard: false }),
+        _ => None,
     }
 }
 
-/// Menu command ids are the 1-based position of the command in this table.
+/// Toggle the popup for an activation: open it near the tray, or close it if it is open. `owner` is
+/// the daemon window the chosen row is posted back to.
+pub fn activate(owner: isize, act: Activation, state: &TrayState) {
+    popup_win::activate(popup_win::Request {
+        owner,
+        content: state.content(),
+        texts: state.recent.clone(),
+        icon_id: ICON_ID,
+        keyboard: act.keyboard,
+        dark: state.dark,
+    });
+}
+
+// ---------------------------------------------------------------------------------------------
+// Commands
+// ---------------------------------------------------------------------------------------------
+
+/// Command ids carried by [`WM_TRAY_POPUP_CMD`] are the 1-based position of the command in this table.
 const CMDS: [TrayCmd; 7] = [
     TrayCmd::ToggleListening,
     TrayCmd::ToggleFloatingIcon,
@@ -100,27 +150,9 @@ fn cmd_from_id(id: u32) -> Option<TrayCmd> {
     (id as usize).checked_sub(1).and_then(|i| CMDS.get(i).copied())
 }
 
-pub(crate) fn menu_model(state: TrayState) -> Vec<MenuEntry> {
-    let mut open = MenuEntry::item(TrayCmd::OpenSettings, "Open OpenTalk");
-    open.default = true;
-    let mut floating = MenuEntry::item(TrayCmd::ToggleFloatingIcon, "Show floating icon");
-    floating.checked = state.floating_icon_visible;
-    let mut retry = MenuEntry::item(TrayCmd::RetryLast, "Retry last");
-    retry.disabled = !state.can_retry;
-    vec![
-        MenuEntry::item(
-            TrayCmd::ToggleListening,
-            if state.listening { "Stop listening" } else { "Start listening" },
-        ),
-        floating,
-        MenuEntry::SEPARATOR,
-        open,
-        MenuEntry::item(TrayCmd::OpenHistory, "History"),
-        MenuEntry::item(TrayCmd::OpenDictionary, "Dictionary"),
-        retry,
-        MenuEntry::SEPARATOR,
-        MenuEntry::item(TrayCmd::Quit, "Quit OpenTalk"),
-    ]
+/// The command a [`WM_TRAY_POPUP_CMD`] message carries (`wparam`).
+pub fn command_from_popup(wparam: usize) -> Option<TrayCmd> {
+    cmd_from_id(wparam as u32)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -219,27 +251,6 @@ pub fn taskbar_created_message() -> u32 {
     unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) }
 }
 
-/// Opt the process's popup menus into dark mode when Windows is dark (uxtheme ordinals 135 and
-/// 136; harmless no-ops when unavailable).
-fn allow_dark_menus() {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
-        // SAFETY: ordinal 135 is `SetPreferredAppMode(int)` (1903+) / `AllowDarkModeForApp(BOOL)`
-        // (1809); both take one int-sized argument. 136 is `FlushMenuThemes()`.
-        unsafe {
-            let Ok(lib) = LoadLibraryW(w!("uxtheme.dll")) else { return };
-            if let Some(f) = GetProcAddress(lib, PCSTR(135 as *const u8)) {
-                let f: unsafe extern "system" fn(i32) -> i32 = std::mem::transmute(f);
-                f(1); // APPMODE_ALLOWDARK
-            }
-            if let Some(f) = GetProcAddress(lib, PCSTR(136 as *const u8)) {
-                let f: unsafe extern "system" fn() = std::mem::transmute(f);
-                f();
-            }
-        }
-    });
-}
-
 fn notify_data(hwnd: isize, msg: u32, icon: HICON) -> NOTIFYICONDATAW {
     let mut nid = NOTIFYICONDATAW {
         cbSize: size_of::<NOTIFYICONDATAW>() as u32,
@@ -256,13 +267,20 @@ fn notify_data(hwnd: isize, msg: u32, icon: HICON) -> NOTIFYICONDATAW {
     nid
 }
 
+/// Ask the shell for the version 4 callback protocol; `false` when it refuses.
+fn set_version_4(hwnd: isize, msg: u32, icon: HICON) -> bool {
+    let mut nid = notify_data(hwnd, msg, icon);
+    nid.Anonymous.uVersion = NOTIFYICON_VERSION_4;
+    // SAFETY: nid is fully initialised.
+    unsafe { Shell_NotifyIconW(NIM_SETVERSION, &nid) }.as_bool()
+}
+
 impl Tray {
     /// Add the icon. Shell notifications arrive at `hwnd` as message `callback_msg`.
     ///
     /// A failed `NIM_ADD` (Explorer not running yet, e.g. at login) is not an error: the icon is
     /// added when `TaskbarCreated` reaches [`Tray::readd`].
     pub fn create(hwnd: isize, callback_msg: u32) -> Result<Tray, String> {
-        allow_dark_menus();
         let icon = make_icon()?;
         let nid = notify_data(hwnd, callback_msg, icon);
         // SAFETY: nid is fully initialised.
@@ -270,16 +288,14 @@ impl Tray {
         if !added {
             crate::log_warn!("tray: NIM_ADD failed; waiting for TaskbarCreated");
         }
-        Ok(Tray { hwnd, callback_msg, icon, added })
+        let v4 = added && set_version_4(hwnd, callback_msg, icon);
+        Ok(Tray { hwnd, callback_msg, icon, added, v4 })
     }
 
-    /// Handle a `callback_msg` (lparam from the window proc). Shows the menu on right click.
-    pub fn handle(&mut self, hwnd: isize, lparam: isize, state: TrayState) -> Option<TrayCmd> {
-        match (lparam as usize & 0xFFFF) as u32 {
-            WM_LBUTTONUP => Some(TrayCmd::OpenSettings),
-            WM_RBUTTONUP | WM_CONTEXTMENU => show_menu(hwnd, state),
-            _ => None,
-        }
+    /// Interpret a `callback_msg` (its `lparam` from the window proc): `Some` when the icon was
+    /// activated and the popup should toggle.
+    pub fn activation(&self, lparam: isize) -> Option<Activation> {
+        classify(self.v4, (lparam as usize & 0xFFFF) as u32)
     }
 
     /// Re-add after Explorer restarts (TaskbarCreated). Also refreshes the glyph colour, so it can
@@ -301,12 +317,14 @@ impl Tray {
                 Shell_NotifyIconW(NIM_ADD, &nid).as_bool() || Shell_NotifyIconW(NIM_MODIFY, &nid).as_bool()
             };
         }
+        self.v4 = self.added && set_version_4(self.hwnd, self.callback_msg, self.icon);
         if !self.added {
             crate::log_warn!("tray: could not (re-)add icon");
         }
     }
 
     pub fn remove(&mut self) {
+        popup_win::close();
         if self.added {
             let nid = notify_data(self.hwnd, self.callback_msg, self.icon);
             // SAFETY: nid identifies our icon (hWnd + uID).
@@ -331,89 +349,55 @@ impl Drop for Tray {
     }
 }
 
-/// Pop the context menu at the cursor and return the chosen command.
-fn show_menu(hwnd: isize, state: TrayState) -> Option<TrayCmd> {
-    let owner = HWND(hwnd as *mut c_void);
-    // SAFETY: the menu is created, shown and destroyed within this function; the owner window is
-    // the caller's live message window.
-    unsafe {
-        let menu: HMENU = CreatePopupMenu().ok()?;
-        let mut default_id = 0usize;
-        for e in menu_model(state) {
-            if e.is_separator() {
-                let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-                continue;
-            }
-            let id = e.cmd.map_or(0, cmd_id);
-            let mut flags = MF_STRING;
-            if e.checked {
-                flags |= MF_CHECKED;
-            }
-            if e.disabled {
-                flags |= MF_GRAYED;
-            }
-            if e.default {
-                default_id = id;
-            }
-            let label: Vec<u16> = e.label.encode_utf16().chain(std::iter::once(0)).collect();
-            let _ = AppendMenuW(menu, flags, id, PCWSTR(label.as_ptr()));
-        }
-        if default_id != 0 {
-            let _ = SetMenuDefaultItem(menu, default_id as u32, 0);
-        }
-
-        let mut pt = POINT::default();
-        let _ = GetCursorPos(&mut pt);
-        // Required so the menu closes when the user clicks elsewhere.
-        let _ = SetForegroundWindow(owner);
-        let chosen = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, Some(0), owner, None);
-        // Documented workaround so the next click on the tray icon is not swallowed.
-        let _ = PostMessageW(Some(owner), WM_NULL, WPARAM(0), LPARAM(0));
-        let _ = DestroyMenu(menu);
-        cmd_from_id(chosen.0 as u32)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn menu_labels_follow_state() {
-        let idle = menu_model(TrayState::default());
-        assert_eq!(idle[0].label, "Start listening");
-        assert!(!idle[1].checked);
-        let retry = idle.iter().find(|e| e.cmd == Some(TrayCmd::RetryLast)).unwrap();
-        assert!(retry.disabled);
-
-        let busy = menu_model(TrayState { listening: true, floating_icon_visible: true, can_retry: true });
-        assert_eq!(busy[0].label, "Stop listening");
-        assert!(busy[1].checked);
-        let retry = busy.iter().find(|e| e.cmd == Some(TrayCmd::RetryLast)).unwrap();
-        assert!(!retry.disabled);
+    fn every_activation_opens_the_popup_once() {
+        // Version 4: the second message of each pair, plus the keyboard.
+        assert_eq!(classify(true, NIN_SELECT), Some(Activation { keyboard: false }));
+        assert_eq!(classify(true, WM_CONTEXTMENU), Some(Activation { keyboard: false }));
+        assert_eq!(classify(true, NIN_KEYSELECT), Some(Activation { keyboard: true }));
+        assert_eq!(classify(true, WM_LBUTTONUP), None, "v4 sends NIN_SELECT right after");
+        assert_eq!(classify(true, WM_RBUTTONUP), None, "v4 sends WM_CONTEXTMENU right after");
+        // Legacy: the mouse-up messages.
+        assert_eq!(classify(false, WM_LBUTTONUP), Some(Activation { keyboard: false }));
+        assert_eq!(classify(false, WM_RBUTTONUP), Some(Activation { keyboard: false }));
+        assert_eq!(classify(false, NIN_SELECT), None);
+        // Mouse moves, balloon events and the like never open it.
+        for ev in [0x0200u32 /* WM_MOUSEMOVE */, 0x0201 /* WM_LBUTTONDOWN */, 0x402 /* NIN_BALLOONSHOW */, 0x405, 0] {
+            assert_eq!(classify(true, ev), None);
+            assert_eq!(classify(false, ev), None);
+        }
     }
 
     #[test]
-    fn menu_order_and_default() {
-        let m = menu_model(TrayState::default());
-        let cmds: Vec<_> = m.iter().filter_map(|e| e.cmd).collect();
-        assert_eq!(
-            cmds,
-            vec![
-                TrayCmd::ToggleListening,
-                TrayCmd::ToggleFloatingIcon,
-                TrayCmd::OpenSettings,
-                TrayCmd::OpenHistory,
-                TrayCmd::OpenDictionary,
-                TrayCmd::RetryLast,
-                TrayCmd::Quit,
-            ]
-        );
-        assert_eq!(m.last().unwrap().label, "Quit OpenTalk");
-        assert!(m[m.len() - 2].is_separator());
-        let defaults: Vec<_> = m.iter().filter(|e| e.default).collect();
-        assert_eq!(defaults.len(), 1);
-        assert_eq!(defaults[0].cmd, Some(TrayCmd::OpenSettings));
+    fn popup_content_follows_the_daemon_state() {
+        use popup::Phase;
+        let idle = TrayState { floating_icon_visible: true, hotkey: "Ctrl + Win".into(), ..TrayState::default() };
+        let c = idle.content();
+        assert_eq!((c.phase, c.floating_pill_visible, c.can_retry), (Phase::Ready, true, false));
+        assert_eq!(c.hotkey, "Ctrl + Win");
+        assert!(c.recent.is_empty());
+        let rec = TrayState { listening: true, can_retry: true, ..idle.clone() };
+        assert_eq!(rec.content().phase, Phase::Recording);
+        assert!(rec.content().can_retry);
+        // Transcribing wins over a still-set listening flag.
+        let busy = TrayState { listening: true, transcribing: true, ..idle.clone() };
+        assert_eq!(busy.content().phase, Phase::Transcribing);
+        // Recent entries are collapsed to one line, blanks dropped, at most two kept.
+        let many = TrayState { recent: vec!["  one\n two ".into(), "   ".into(), "three".into(), "four".into()], ..idle };
+        assert_eq!(many.content().recent, ["one two", "three"]);
+    }
+
+    #[test]
+    fn popup_commands_reach_the_daemon_window_by_id() {
+        for c in CMDS {
+            assert_eq!(command_from_popup(cmd_id(c)), Some(c));
+        }
+        assert_eq!(command_from_popup(0), None);
+        assert_eq!(WM_TRAY_POPUP_CMD, crate::core::ipc::WM_OT_INTERNAL_BASE + 0x40);
     }
 
     #[test]
@@ -494,7 +478,7 @@ mod tests {
             windows::Win32::UI::WindowsAndMessaging::CreateWindowExW(
                 windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(0),
                 w!("STATIC"),
-                PCWSTR::null(),
+                windows::core::PCWSTR::null(),
                 windows::Win32::UI::WindowsAndMessaging::WS_POPUP,
                 0,
                 0,
@@ -511,15 +495,37 @@ mod tests {
         assert!(t.added, "NIM_ADD succeeded");
         t.readd();
         assert!(t.added);
-        assert_eq!(
-            t.handle(hwnd.0 as isize, WM_LBUTTONUP as isize, TrayState::default()),
-            Some(TrayCmd::OpenSettings)
-        );
+        assert!(t.activation(NIN_SELECT as isize).is_some() || t.activation(WM_LBUTTONUP as isize).is_some());
         t.remove();
         assert!(!t.added);
         // SAFETY: window created above on this thread.
         unsafe {
             let _ = windows::Win32::UI::WindowsAndMessaging::DestroyWindow(hwnd);
+        }
+    }
+
+    /// Opens the real popup on the desktop, drives it with the keyboard model, and closes it.
+    #[test]
+    #[ignore]
+    fn desktop_tray_popup_opens_and_closes() {
+        use windows::Win32::UI::WindowsAndMessaging::{CreateWindowExW, DestroyWindow, HWND_MESSAGE, WINDOW_EX_STYLE, WS_POPUP};
+        // SAFETY: a message-only STATIC window on this thread, destroyed below.
+        let owner = unsafe { CreateWindowExW(WINDOW_EX_STYLE(0), w!("STATIC"), windows::core::PCWSTR::null(), WS_POPUP, 0, 0, 0, 0, Some(HWND_MESSAGE), None, None, None) }.expect("window");
+        let state = TrayState { floating_icon_visible: true, hotkey: "Ctrl + Win".into(), recent: vec!["Hello from the tray test".into()], ..TrayState::default() };
+        let act = Activation { keyboard: true };
+        activate(owner.0 as isize, act, &state);
+        assert!(popup_win::is_open(), "the popup opened");
+        // Another activation straight away is the echo of the opening click and is ignored.
+        activate(owner.0 as isize, act, &state);
+        assert!(popup_win::is_open());
+        popup_win::close();
+        assert!(!popup_win::is_open());
+        // The click that deactivated it must not reopen it.
+        activate(owner.0 as isize, act, &state);
+        assert!(!popup_win::is_open(), "re-click guard");
+        // SAFETY: window created above on this thread.
+        unsafe {
+            let _ = DestroyWindow(owner);
         }
     }
 }
