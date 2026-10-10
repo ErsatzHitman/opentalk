@@ -50,6 +50,12 @@ pub fn agent() -> &'static ureq::Agent {
     }
 }
 
+/// Agent for one request: plain `http://` URLs (local/self-hosted endpoints) never need TLS,
+/// so only `https://` requests fail when schannel is unavailable.
+fn agent_for(url: &str) -> Result<&'static ureq::Agent, HttpError> {
+    if url.get(..7).is_some_and(|p| p.eq_ignore_ascii_case("http://")) { Ok(agent()) } else { try_agent() }
+}
+
 #[derive(Debug, Clone)]
 pub struct HttpResponse {
     pub status: u16,
@@ -117,7 +123,7 @@ fn convert(res: Result<ureq::Response, ureq::Error>) -> Result<HttpResponse, Htt
 
 /// POST raw bytes.
 pub fn post(url: &str, headers: &[(&str, &str)], content_type: &str, body: &[u8], timeout: Duration) -> Result<HttpResponse, HttpError> {
-    let mut req = try_agent()?.post(url).timeout(timeout).set("Content-Type", content_type);
+    let mut req = agent_for(url)?.post(url).timeout(timeout).set("Content-Type", content_type);
     for (k, v) in headers {
         req = req.set(k, v);
     }
@@ -130,7 +136,7 @@ pub fn post_json(url: &str, headers: &[(&str, &str)], body: &serde_json::Value, 
 }
 
 pub fn get(url: &str, headers: &[(&str, &str)], timeout: Duration) -> Result<HttpResponse, HttpError> {
-    let mut req = try_agent()?.get(url).timeout(timeout);
+    let mut req = agent_for(url)?.get(url).timeout(timeout);
     for (k, v) in headers {
         req = req.set(k, v);
     }
@@ -138,7 +144,7 @@ pub fn get(url: &str, headers: &[(&str, &str)], timeout: Duration) -> Result<Htt
 }
 
 pub fn delete(url: &str, headers: &[(&str, &str)], timeout: Duration) -> Result<HttpResponse, HttpError> {
-    let mut req = try_agent()?.delete(url).timeout(timeout);
+    let mut req = agent_for(url)?.delete(url).timeout(timeout);
     for (k, v) in headers {
         req = req.set(k, v);
     }
