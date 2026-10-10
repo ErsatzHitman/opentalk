@@ -25,7 +25,7 @@ Companion spec with exact pixel and colour values: `docs/SPEC.md`.
 | Recording CPU | ≤1.5% (60 fps pill plus capture) | Same, during a scripted 30 s recording |
 | Daemon RAM | ≤25 MB working set, ≤15 MB private | `Get-Process` WS/PrivateMemorySize, idle and recording |
 | Settings window RAM | ≤80 MB, and only while open | Separate process that exits on close |
-| Disk | Single exe ≤8 MB, where MB is decimal: **8,000,000 bytes** (7.63 MiB). The current release exe is 7,901,184 bytes (7.90 MB), about 99 KB of headroom. No installer runtime | `bench.ps1` checks the file size against 8,000,000 bytes; history and config are KB-scale |
+| Disk | Single exe ≤8 MB, where MB is decimal: **8,000,000 bytes** (7.63 MiB). The release exe measured 7,928,832 bytes (7.93 MB) on 2026-10-10, about 71 KB of headroom (it moves with every commit; `bench.ps1` has the current figure). No installer runtime | `bench.ps1` checks the file size against 8,000,000 bytes; history and config are KB-scale |
 | Hotkey to pill visible | ≤16 ms | Timestamped debug log (QPC) |
 | Hotkey to mic capturing | ≤50 ms | Log: hook event → first WASAPI packet |
 | Stop to text pasted | Network RTT + ≤40 ms local overhead | Log: stop → request sent → response → paste done |
