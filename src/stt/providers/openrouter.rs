@@ -309,24 +309,67 @@ mod tests {
         ids
     }
 
+    /// What a live run proved. Only `Verified` is a verification; the rest is reported as such.
+    #[derive(Debug, PartialEq)]
+    enum Live {
+        /// A free model returned a transcript containing the spoken words.
+        Verified(String),
+        /// No free model produced a transcript (limits, gated models, audio dropped upstream).
+        Unverified(String),
+        /// A fault on our side or a bad key (auth, bad request, unknown model).
+        Failed(String),
+    }
+
+    /// `Unverified` passes unless `require` (`OPENTALK_LIVE_REQUIRE=1`); `Failed` never passes.
+    fn live_result(outcome: &Live, require: bool) -> Result<(), String> {
+        match outcome {
+            Live::Verified(_) => Ok(()),
+            Live::Unverified(_) if !require => Ok(()),
+            Live::Unverified(why) => Err(format!("OPENTALK_LIVE_REQUIRE=1 and STT was not verified: {why}")),
+            Live::Failed(why) => Err(format!("live STT failed: {why}")),
+        }
+    }
+
+    fn report_live(outcome: Live) {
+        match &outcome {
+            Live::Verified(t) => eprintln!("live_openrouter_transcribe: VERIFIED live transcript: {t:?}"),
+            Live::Unverified(why) => eprintln!("live_openrouter_transcribe: UNVERIFIED - no free model produced a transcript of the audio: {why}"),
+            Live::Failed(why) => eprintln!("live_openrouter_transcribe: FAILED - {why}"),
+        }
+        let require = std::env::var("OPENTALK_LIVE_REQUIRE").is_ok_and(|v| v == "1");
+        if let Err(e) = live_result(&outcome, require) {
+            panic!("live_openrouter_transcribe: {e}");
+        }
+    }
+
+    #[test]
+    fn live_verdicts_distinguish_verified_unverified_and_failed() {
+        let (v, u, f) = (Live::Verified("t".into()), Live::Unverified("x".into()), Live::Failed("y".into()));
+        assert!(live_result(&v, false).is_ok() && live_result(&v, true).is_ok());
+        assert!(live_result(&u, false).is_ok());
+        assert!(live_result(&u, true).unwrap_err().contains("not verified"));
+        assert!(live_result(&f, false).is_err() && live_result(&f, true).is_err());
+    }
+
     /// Live: transcribes tests/fixtures/tts_clean.wav through a free OpenRouter audio model.
     /// Needs OPENTALK_SECRET_OPENROUTER (only `:free` models are ever requested).
     ///
-    /// Passes with a matching transcript. Upstream limits are reported, not failed: 429/5xx
-    /// (retried with backoff), 403 "only available on agentic harnesses" (the inkling models),
-    /// and providers that accept `input_audio` but drop the audio (the NVIDIA Nemotron free
-    /// endpoint answers "no audio provided"). Anything else (bad key, bad request) fails.
+    /// Prints `VERIFIED` (a transcript with the spoken words), `UNVERIFIED` or `FAILED`.
+    /// Upstream limits are `UNVERIFIED`: 429/5xx/timeouts (retried with backoff), 403 "only
+    /// available on agentic harnesses" (the inkling models), and providers that accept
+    /// `input_audio` but drop the audio (the NVIDIA Nemotron free endpoint answers "no audio
+    /// provided", audio_tokens 0). `UNVERIFIED` passes unless `OPENTALK_LIVE_REQUIRE=1`, which
+    /// turns it into a failure. Anything else (bad key, bad request) is `FAILED`.
     #[test]
     #[ignore]
     fn live_openrouter_transcribe() {
         let Ok(key) = std::env::var("OPENTALK_SECRET_OPENROUTER") else {
-            eprintln!("OPENTALK_SECRET_OPENROUTER not set; skipping");
-            return;
+            return report_live(Live::Unverified("OPENTALK_SECRET_OPENROUTER not set".into()));
         };
         let wav = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/tts_clean.wav")).expect("fixture");
         let audio = Audio::from_wav(&wav).expect("fixture is PCM16 WAV");
         let creds = Credentials { api_key: Some(key), base_url: None, extra: vec![] };
-        let mut upstream_blocked = Vec::new();
+        let mut notes = Vec::new();
         let models = free_audio_models();
         eprintln!("candidate free audio models: {models:?}");
         for model in models.iter().take(6) {
@@ -344,27 +387,26 @@ mod tests {
                         eprintln!("LIVE model={model} attempt={} latency={ms} ms transcript={:?}", attempt + 1, t.text);
                         let lower = t.text.to_lowercase();
                         if lower.contains("report") || lower.contains("priya") {
-                            return;
+                            return report_live(Live::Verified(t.text));
                         }
-                        upstream_blocked.push(format!("{model}: reply without the speech ({:?})", t.text));
+                        notes.push(format!("{model}: reply without the speech ({:?})", t.text));
                         break;
                     }
-                    Err(e) if matches!(e.code, SttErrorCode::RateLimited | SttErrorCode::Unavailable | SttErrorCode::Timeout) => {
+                    Err(e) if matches!(e.code, SttErrorCode::RateLimited | SttErrorCode::Unavailable | SttErrorCode::Timeout | SttErrorCode::NoSpeech) => {
                         eprintln!("LIVE model={model} attempt={} upstream {:?}: {}", attempt + 1, e.code, e.detail);
                         if attempt == 2 {
-                            upstream_blocked.push(format!("{model}: {:?}", e.code));
+                            notes.push(format!("{model}: {:?}", e.code));
                         }
                     }
                     Err(e) if e.code == SttErrorCode::AccessDenied => {
                         eprintln!("LIVE model={model} blocked upstream: {}", e.detail);
-                        upstream_blocked.push(format!("{model}: access denied"));
+                        notes.push(format!("{model}: access denied"));
                         break;
                     }
-                    Err(e) => panic!("LIVE model={model} failed: {:?} {} ({})", e.code, e.message, e.detail),
+                    Err(e) => return report_live(Live::Failed(format!("model={model}: {:?} {} ({})", e.code, e.message, e.detail))),
                 }
             }
         }
-        assert!(!upstream_blocked.is_empty(), "no candidate models were tried");
-        eprintln!("no free model produced the transcript; upstream limits, not a code failure: {upstream_blocked:?}");
+        report_live(Live::Unverified(if notes.is_empty() { "no candidate models were tried".into() } else { notes.join("; ") }));
     }
 }

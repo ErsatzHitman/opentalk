@@ -298,7 +298,7 @@ OpenWhispr already has History (its Home page) and a Dictionary page with Snippe
 |---|---|
 | Unit | `cargo test`: cleanup pipeline (all ported OpenWhispr fixtures plus new ones), snippets, dictionary prompt caps, echo filter, hotkey parser and matcher, provider request builders (golden multipart bodies), response parsers, error classifier, config migration. |
 | Provider contracts | `tools/mock_stt.py` replays each provider's documented request and response shape (OpenAI SSE, xAI, Mistral, Gemini JSON, Deepgram REST and WS, AssemblyAI WS, Corti flow). Every provider's request is asserted byte-for-byte against OpenWhispr's format. No real keys are needed. |
-| Live STT | OpenRouter audio-input free models (`thinkingmachines/inkling-small:free`, `inkling:free`) through the OpenRouter provider, fed Windows-TTS WAVs. Expect free-tier rate limits (429 seen on Gemma); the harness retries and backs off. |
+| Live STT | **Best effort, reported honestly; not an exit gate.** OpenRouter lists exactly three `:free` models with audio input (re-checked 2026-10-10): `thinkingmachines/inkling-small:free` and `inkling:free` (403 "only available on agentic harnesses") and `nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free`. The last mostly answers 502 ResourceExhausted; when it answers, `usage.prompt_tokens_details.audio_tokens` is 0 and the model says it needs the audio file, so the free NVIDIA endpoint discards the audio (our `input_audio`/wav request shape is correct). No free model currently yields a transcript, so live STT is **UNVERIFIED** and STT correctness rests on the mock contract tests. The `live_*` tests print `VERIFIED` (a transcript with the spoken words), `UNVERIFIED` (limits, gated model, audio dropped) or `FAILED` (bad key or request, always a failure). `OPENTALK_LIVE_REQUIRE=1` turns `UNVERIFIED` into a failure, for runs that have a model able to verify. Retries and backoff on 429/5xx. |
 | Live cleanup LLM | OpenRouter `:free` text models (`nvidia/nemotron-3.5-lightning:free`, `google/gemma-4-31b-it:free`, `liquid/lfm-2.5-2.6b:free`). Check output validation and the 4 s timeout fallback. |
 | End-to-end | `opentalk.exe --transcribe-file x.wav` runs the full pipeline headless. A scripted dictation sends `SendInput` of the hotkey, plays TTS into the mic (or uses `--inject-wav` to bypass the mic), and pastes into Notepad. Assert the Notepad text. |
 | Visual | Golden PNGs per pill state and time sample, plus a screenshot of the real layered window. Compare against OpenWhispr reference captures. |
@@ -329,7 +329,7 @@ OpenWhispr already has History (its Home page) and a Dictionary page with Snippe
 | # | Phase | Deliverable | Exit check |
 |---|---|---|---|
 | 1 | Core skeleton | Daemon loop, config/secrets/history, tray, single instance, logging, `--transcribe-file` | Builds; tray works; config round-trips; DPAPI works |
-| 2 | STT batch providers | OpenAI, Groq, xAI, Mistral, Gemini, Deepgram REST, Custom/Azure, OpenRouter; error classifier | Mock contract tests pass; live OpenRouter free transcription passes |
+| 2 | STT batch providers | OpenAI, Groq, xAI, Mistral, Gemini, Deepgram REST, Custom/Azure, OpenRouter; error classifier | Mock contract tests pass; live OpenRouter transcription is reported VERIFIED/UNVERIFIED (see decision below), never a gate |
 | 3 | Capture, hotkey, paste | WASAPI capture plus VAD trim, LL hook (Tap/Hold/Esc/Start mask), paste plus clipboard restore, sounds | Scripted dictation lands in Notepad; latency logged |
 | 4 | Pill and app bubble | Exact pill states and animations, glow, tooltip, error card, cancel, drag, menu, app-icon bubble | Golden images match SPEC; recording CPU ≤1.5% |
 | 5 | Cleanup | Deterministic pipeline, LLM cleanup (OpenAI, Anthropic, Gemini, Groq, OpenRouter, Custom), validation, snippets, dictionary fixes | Fixture suite green; OpenRouter free-model cleanup works with fallback |
@@ -342,11 +342,13 @@ OpenWhispr already has History (its Home page) and a Dictionary page with Snippe
 ## 12a. Risks
 
 - **egui fidelity.** Tailwind subtleties (blur, gradients, shadows) need custom painting. The plan is to paint shadows and gradients by hand where they matter (cards, buttons) and accept minor differences elsewhere.
-- **No real keys for most providers.** Correctness rests on the contract tests against OpenWhispr's exact wire formats. Live verification is limited to OpenRouter.
+- **No real keys for most providers.** Correctness rests on the contract tests against OpenWhispr's exact wire formats. Live verification is limited to OpenRouter, and its free tier currently cannot verify STT at all (see §12b decision 0).
 - **OpenRouter free tier is rate-limited** (Gemma returned 429). Live tests retry with backoff and rotate across free models.
 - **Start-menu mask key** can interact with other hook tools such as AutoHotkey. It is behind a setting, default on.
 
 ## 12b. Open decisions (for the user)
+
+0. **Live STT verification (provisional default, owner may override).** No free OpenRouter model delivers audio to its model, so a live STT transcript is unobtainable at zero cost. Options were: (a) allow one paid OpenRouter audio model or another provider key for a single live run, or (b) accept mock-only STT verification. **Recorded default: (b), pending the owner's confirmation (nothing paid is spent without it).** §10 and the Phase 2 exit check are amended accordingly: Phase 2 passes on the mock contract tests; the live tests stay in the suite and report `UNVERIFIED` rather than green. The strict policy (OpenRouter, `:free` only) is unchanged. If the owner later supplies a paid key and approves one run, that run is made with `OPENTALK_LIVE_REQUIRE=1` and a model override, the `:free` assertion in the live tests is relaxed for that run only, and this entry is updated to record the verified model and date.
 
 1. **Tinfoil.** OpenWhispr uses an attested enclave client. Choose one: (a) plain HTTPS without attestation, (b) skip Tinfoil, or (c) port attestation later. Recommendation: (b), unless you use it.
 2. **Corti and enterprise clouds** (Bedrock SigV4, Vertex). Keep in Phase 6/8, or drop for a personal build?
