@@ -33,6 +33,14 @@ the same floating recording pill, and adds a deterministic filler-word cleaner, 
 - **Careful paste.** Full clipboard snapshot and restore, excluded from Windows clipboard history, waits for held modifier keys,
   Ctrl+Shift+V for terminals, tells you when the target app runs as administrator.
 
+## Download
+
+Get `opentalk.exe` from [Releases](https://github.com/ErsatzHitman/opentalk/releases): **latest** is rebuilt from `main` on
+every push, tagged versions (`v*`) are fixed releases. It is one portable file with no installer: put it anywhere and run it.
+The exe is not code-signed, so Windows SmartScreen may warn on the first run (**More info > Run anyway**); compare it with
+`opentalk.exe.sha256` if you want to check the download. Built by `.github/workflows/release.yml` (cross-compiled on Linux,
+see below). Windows 10/11 x64.
+
 ## Build
 
 Requirements: Windows 10/11 x64, Rust stable with the **GNU** target, and mingw-w64 (for `dlltool` and `windres`).

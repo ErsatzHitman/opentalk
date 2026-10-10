@@ -1,0 +1,67 @@
+# Builds opentalk.exe (cross-compiled on Linux with mingw-w64, the same path as README
+# "Cross-compile and test on Linux") and publishes it as a GitHub Release asset.
+#   - every push to main updates the rolling "latest" pre-release
+#   - a pushed tag v* (e.g. v0.1.0) creates a normal release for that tag
+#   - "Run workflow" on the Actions tab does the same as a push to main
+name: release
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install mingw-w64 and the Windows target
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mingw-w64
+          rustup target add x86_64-pc-windows-gnu
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: x86_64-pc-windows-gnu
+
+      - name: Build release exe
+        run: cargo build --release --locked --target x86_64-pc-windows-gnu
+
+      - name: Check size budget and hash
+        run: |
+          exe=target/x86_64-pc-windows-gnu/release/opentalk.exe
+          size=$(stat -c %s "$exe")
+          echo "opentalk.exe: $size bytes (budget 8,000,000)"
+          test "$size" -le 8000000
+          mkdir dist
+          cp "$exe" dist/opentalk.exe
+          (cd dist && sha256sum opentalk.exe > opentalk.exe.sha256)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: opentalk-exe
+          path: dist/*
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            gh release create "$GITHUB_REF_NAME" dist/opentalk.exe dist/opentalk.exe.sha256 \
+              --title "OpenTalk $GITHUB_REF_NAME" --generate-notes
+          else
+            gh release delete latest --yes --cleanup-tag || true
+            gh release create latest dist/opentalk.exe dist/opentalk.exe.sha256 \
+              --prerelease --target "$GITHUB_SHA" --title "Latest build (main)" \
+              --notes "Built from ${GITHUB_SHA::7} on main. Unsigned: Windows SmartScreen may warn on first run (More info > Run anyway)."
+          fi
