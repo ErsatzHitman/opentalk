@@ -80,6 +80,56 @@ error card); one capture per screen event (window activated / move-size end / mi
 state, size, DPI or position change; 4 Hz while recording, preparing, thinking or animating; 8 Hz while hovered or dragged.
 <!-- keep:end glass-merge -->
 
+<!-- keep:begin round-2026-10-10b -->
+## Tray popup, live app bubble, mute, detached cancel, paced animation (merged 2026-10-10)
+
+What changed since the liquid-glass merge above: the Settings / History / Dictionary window is flat again (no glass,
+mesh or acrylic; `src/ui/glass.rs` removed), the tray menu became a flat popup (`src/daemon/tray/`), the app bubble is
+resolved when an app comes to the front and follows the foreground app while dictating (`src/daemon/foreground.rs`,
+one out-of-context WinEvent hook and one idle-blocked worker while the bubble is on), the default playback device is
+muted while recording (`src/daemon/muteaudio.rs`, one worker started on first use), the cancel X is a detached glass
+circle beside the pill, and the pill's animation frames use a table-driven glass field and shadow, are paced on the
+compositor (`DwmFlush`) and keep the backdrop frozen while the pill resizes. Built, tested and audited on the Linux
+host (Wine 9.0 on Xvfb, 4 cores); **no Windows figure was re-measured**.
+
+**Stale until `bench.ps1` runs on Windows** (in addition to the rows listed above):
+
+| Row | Why it is stale |
+|---|---|
+| Idle CPU, daemon threads / handles | the foreground tracker (hook + worker) is installed while the app bubble is on, even at rest; event-driven, no timer, expected ~0 but not measured |
+| Daemon working set / private bytes, idle and during dictations | icon LRU (16 entries, <= 1 MB), tracker and mute worker threads; the pre-resolve avoids the shell-factory path, which may also lower the 37-40 MB "packaged app in front" peak; not measured |
+| Recording CPU | vsync-paced ticks (one `DwmFlush` wait per animated frame instead of the 60 Hz timer), cheaper expand / shrink frames; not measured |
+| Settings window working set / idle CPU | flat pages again; expected back near the pre-glass 12-13 MB, not measured |
+| Executable size in the Summary | superseded below |
+
+**Measured here** (Linux host; not Windows numbers):
+
+| What | Result |
+|---|---|
+| Release executable (`cargo build --release --target x86_64-pc-windows-gnu`) | **7,578,624 bytes** (7.58 MB decimal), budget 8,000,000 bytes: **meets**, 421,376 bytes of headroom (+72,704 bytes over the 7,505,920-byte glass merge) |
+| Unit tests (`cargo test --target x86_64-pc-windows-gnu`, Wine) | 913 passed, 0 failed, 54 ignored |
+| Headless end-to-end tests (`tests/e2e.rs`, Wine) | 12 passed, 0 failed, 4 ignored |
+
+Pill frame costs, **Wine on Xvfb wall time, optimised test build, `--test-threads=1`, not Windows**
+(`cargo test --release --target x86_64-pc-windows-gnu -- --nocapture --test-threads=1 transition_frame_cost cancel_emerge glass_frame_cost glass_paint_cost`):
+
+| Item | 1x | 2x |
+|---|---|---|
+| Steady 60 fps recording frame (waveform lane only) | 0.015 ms | 0.049 ms |
+| Base-layer rebuild / full repaint | 0.47 / 0.47 ms | 1.94 / 1.84 ms |
+| Expand frame (median) | 0.55 ms | 2.21 ms |
+| Shrink frame incl. the glow fade-in (median / worst) | 0.61 / 1.08 ms | 2.25 / 4.07 ms |
+| Cancel button emerge / retract frame (median / worst; pill, bubble, button and tooltip repainted) | 1.36 ms / one 34 ms first-hover outlier | 4.83 / 6.14 ms |
+| Error card base layer | 4.47 ms | 18.27 ms |
+| Glass paint of a 442x108 card (shadow / no shadow) | - | 21.0 / 14.3 ms |
+| `--render-pill bench` full repaint p50 (recording / thinking / cancel / tooltip) | 0.46 / 0.48 / 0.64 / 0.54 ms | 1.80 / 1.89 / 2.49 / 2.19 ms |
+
+No expand, shrink, emerge or retract frame bakes a displacement map or allocates (`steady_and_transition_frames_do_not_allocate`,
+`cancel_emerge_frames_use_the_table_field_and_bake_nothing`); the shrink's glow blits go through tiny-skia (about 150 small
+allocations over its 250 ms, not on the steady path). Under Wine `DwmFlush` does not block, so pacing falls back to the
+timer there; `desktop_pill_expand_and_shrink_frames_arrive_on_time` checks the real pacing on Windows.
+<!-- keep:end round-2026-10-10b -->
+
 <!-- keep:begin unverified -->
 ## Not yet verified (audit 2026-10-10)
 

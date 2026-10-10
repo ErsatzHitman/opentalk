@@ -144,13 +144,15 @@ merged build:
   - audio: `desktop_record_1s`, `desktop_list_devices_from_sta_and_mta_threads`
   - hotkey: `desktop_hook_smoke`, `desktop_hook_stop_then_start_is_reliable`, `desktop_injected_paste_keys_are_filtered`,
     `desktop_main_key_not_typed_into_focused_app`, `desktop_start_menu_mask`, `desktop_start_menu_opens_without_mask`
-  - media: `desktop_media_roundtrip_is_fast`, `desktop_media_roundtrip_restores_playback`
+  - media / mute: `desktop_media_roundtrip_is_fast`, `desktop_media_roundtrip_restores_playback`,
+    `desktop_mute_roundtrip_restores_the_device`
   - paste: `desktop_capture_foreground`, `desktop_clipboard_history_flags`, `desktop_clipboard_snapshot_roundtrip`,
     `desktop_paste_elevated_target_copies_only`, `desktop_paste_notepad`, `desktop_paste_restores_focus`,
     `desktop_prefetch_keeps_delay_rendered_clipboard_off_the_paste_path`, `desktop_restore_outlasts_a_busy_clipboard`
   - pill: `desktop_pill_backdrop_follows_the_window_when_dragged`,
     `desktop_pill_backdrop_is_captured_only_while_shown_and_hash_gated`, `desktop_pill_cancel_button_and_error_card`,
     `desktop_pill_capture_cost`, `desktop_pill_capture_excludes_the_pill`, `desktop_pill_click_drag_hover_hittest`,
+    `desktop_pill_expand_and_shrink_frames_arrive_on_time`,
     `desktop_pill_falls_back_to_neutral_glass_when_capture_is_unavailable`, `desktop_pill_frame_cost`,
     `desktop_pill_lifecycle_and_idle_is_silent`, `desktop_pill_real_app_icon_bubble`,
     `desktop_pill_resting_circle_runs_no_timer_and_refreshes_on_events`,
@@ -196,8 +198,10 @@ merged build:
    Recording / Transcribing), a **Start / Stop dictation** button with the hotkey, **History**, **Dictionary**,
    **Settings**, your last two dictations (click one to copy it), **Show / Hide floating pill**, **Retry last dictation**
    (only after a failure) and **Quit**. Use the mouse, or the arrow keys, Home / End, Tab, Enter and Esc. It closes when
-   you pick a row, press Esc or click anywhere else; clicking the tray icon again closes it too. Launching the exe a
-   second time opens History.
+   you pick a row, press Esc or click anywhere else; clicking the tray icon again closes it too. While it is open it follows
+   the dictation (a hotkey press or a finished transcription updates the Start / Stop row in place). **Start dictation**
+   here is the same as the hotkey: same sounds, mute, app bubble and paste target (the app you were in before you clicked
+   the tray). Launching the exe a second time opens History.
 6. If a transcription fails (network, quota) the error card offers **Retry** with the audio that was kept in memory.
 
 Command line (the exe is a GUI-subsystem program, so run these from a terminal and capture the output with a pipe):
@@ -264,7 +268,8 @@ docs/                  PLAN, SPEC, BENCHMARK
 Measured with `bench/bench.ps1` on an i7-14650HX (24 logical cores), release build, local mock STT so the network does not
 enter the numbers. Full report: [docs/BENCHMARK.md](docs/BENCHMARK.md).
 
-**These Windows figures predate the liquid glass** (pill backdrop capture) **and the flat Settings / tray popup rework**. The rows marked
+**These Windows figures predate the liquid glass** (pill backdrop capture), **the flat Settings / tray popup rework, the live
+app bubble (foreground tracker), mute-while-dictating, the detached cancel button and the vsync-paced animation**. The rows marked
 *stale* must be re-measured with `bench.ps1` on Windows (see [Run on Windows](#run-on-windows)); the executable size is
 from the merged tree, cross-built on Linux.
 
@@ -275,7 +280,7 @@ from the merged tree, cross-built on Linux.
 | Daemon memory, idle *stale* | 17.9 MB working set, 4.4 MB private bytes | <= 25 MB | ~110 MB |
 | Daemon memory, recording / 10 dictations (peak) *stale* | 19.1 MB WS (app bubble off), 23.2-23.4 MB WS with the app bubble and no foreground app; **37-40 MB WS with a packaged app such as Windows Terminal in front** (misses, see below) | <= 25 MB | ~110 MB |
 | Settings window *stale* | 12.4 MB working set, separate process, ~0% CPU idle (commits ~267 MB of GL driver pools, documented) | <= 80 MB | - |
-| Executable | 7.51 MB (7,505,920 bytes), one file (merged glass tree, 2026-10-10; the flat Settings window removes `ui/glass.rs`, expected smaller) | <= 8 MB (8,000,000 bytes) | - |
+| Executable | 7.58 MB (7,578,624 bytes), one file (cross-built on Linux, 2026-10-10, after the tray popup / app bubble / mute / cancel / animation round; was 7,505,920 bytes) | <= 8 MB (8,000,000 bytes) | - |
 | Start-up | daemon ready in ~21 ms | - | - |
 | Hotkey -> pill / -> first mic packet | 1.6 ms / 20.5 ms (median) | <= 16 / <= 50 ms | - |
 | Local overhead stop -> paste (excluding STT) | ~1 ms before paste; ~18 ms including a real `SendInput` paste (earlier unlocked-desktop run) | <= 40 ms | - |
