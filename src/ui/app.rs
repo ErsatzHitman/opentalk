@@ -232,6 +232,10 @@ impl eframe::App for App {
         self.was_focused = focused;
         if let Some(launch) = take_page_request() {
             crate::log_info!("settings: switching to {launch:?}");
+            // A capture pauses the daemon's hotkeys; it must not outlive the section it belongs to.
+            if self.settings.hotkeys.capturing() && launch.settings != Some(Section::Hotkeys) {
+                self.settings.hotkeys.cancel(&mut self.cmds);
+            }
             if apply_launch(&mut self.page, &mut self.settings_open, &mut self.settings.section, launch) {
                 let mut cmds = std::mem::take(&mut self.cmds);
                 self.settings.on_close(&mut cmds);
