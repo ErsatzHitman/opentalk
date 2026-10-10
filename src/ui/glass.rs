@@ -628,6 +628,43 @@ fn fill_fan(o: &Outline, origin: Pos2, f: impl Fn(Vec2) -> Px) -> Mesh {
     m
 }
 
+/// Like [`fill_fan`], but with the interior sampled too: the outline is repeated at 1/rings ...
+/// rings/rings of its size around the centre, so a colour that varies across a large surface (the
+/// ambient glows behind a modal) is followed instead of being interpolated between the centre and
+/// the rim. `rings` follows the size, about one every 64 points.
+fn fill_rings(o: &Outline, origin: Pos2, f: impl Fn(Vec2) -> Px) -> Mesh {
+    let n = o.len();
+    let rings = ((o.w.max(o.h) / 128.0).ceil() as usize).clamp(1, 10);
+    let centre = vec2(o.w / 2.0, o.h / 2.0);
+    let mut m = Mesh::default();
+    push_vertex(&mut m, origin + centre, f(centre));
+    for r in 1..=rings {
+        let s = r as f32 / rings as f32;
+        for k in 0..n {
+            let p = o.point(k, -0.5);
+            let q = centre + (p - centre) * s;
+            push_vertex(&mut m, origin + q, f(q));
+        }
+    }
+    // Feather ring outside the rim, as in `fill_fan`.
+    for k in 0..n {
+        let p = o.point(k, 0.5);
+        push_vertex(&mut m, origin + p, scale(f(o.point(k, -0.5)), 0.0));
+    }
+    let ring = |r: usize, k: usize| (1 + (r - 1) * n + k % n) as u32;
+    let feather = |k: usize| (1 + rings * n + k % n) as u32;
+    for k in 0..n {
+        m.indices.extend_from_slice(&[0, ring(1, k), ring(1, k + 1)]);
+        for r in 1..rings {
+            let (a, b, c, d) = (ring(r, k), ring(r, k + 1), ring(r + 1, k), ring(r + 1, k + 1));
+            m.indices.extend_from_slice(&[a, b, c, b, d, c]);
+        }
+        let (a, b, c, d) = (ring(rings, k), ring(rings, k + 1), feather(k), feather(k + 1));
+        m.indices.extend_from_slice(&[a, b, c, b, d, c]);
+    }
+    m
+}
+
 /// CSS `linear-gradient(<angle>deg, top, bottom)` parameter at `p` inside a `w x h` box.
 fn gradient_t(angle_deg: f32, p: Vec2, w: f32, h: f32) -> f32 {
     let a = angle_deg.to_radians();
@@ -803,7 +840,7 @@ pub fn menu_shapes(g: &Gl, rect: Rect, radius: f32) -> Vec<Shape> {
     }
     let wash = t.menu_surface.px(0.55);
     // Window position of the rect is needed for the stand-in; the fan works in local space.
-    shapes.push(Shape::mesh(fill_fan(&o, origin, |p| over(wash, solid_backdrop_px(origin + p, t, g.window)))));
+    shapes.push(Shape::mesh(fill_rings(&o, origin, |p| over(wash, solid_backdrop_px(origin + p, t, g.window)))));
     shapes.push(border_shape(rect, radius, t.border.color()));
     shapes.push(Shape::mesh(rim_mesh(&o, origin, t, true, false, false, 1.0)));
     shapes
@@ -821,7 +858,7 @@ pub fn modal_shapes(g: &Gl, rect: Rect, radius: f32) -> Vec<Shape> {
     let mut shapes = Vec::with_capacity(7);
     shapes.extend(shadow_shape(&o, origin, &t.shadow));
     // The page behind the modal, dimmed by the scrim and blurred away.
-    shapes.push(Shape::mesh(fill_fan(&o, origin, |p| over(scrim, solid_backdrop_px(origin + p, t, g.window)))));
+    shapes.push(Shape::mesh(fill_rings(&o, origin, |p| over(scrim, solid_backdrop_px(origin + p, t, g.window)))));
     shapes.push(band_shape(&o, origin, rect.size(), g));
     shapes.push(Shape::mesh(fill_fan(&o, origin, |p| over(frost, tint_px(t, 0.0, p.y / h)))));
     shapes.push(border_shape(rect, radius, t.border.color()));
@@ -863,6 +900,24 @@ pub fn colored_shapes(g: &Gl, rect: Rect, radius: f32, base: Color32, hover: f32
     rim.vertices.extend(more.vertices);
     rim.indices.extend(more.indices.iter().map(|i| base_ix + i));
     shapes.push(Shape::mesh(rim));
+    shapes
+}
+
+/// A panel whose tint is overridden with `base` at `strength` (0..=1), for notices: the glass tint,
+/// refraction band, shadow and rim stay, the brand colour is added under the border and the border
+/// itself picks it up (recipes.md "colored glass", used at low strength so text stays on glass).
+pub fn tinted_shapes(g: &Gl, rect: Rect, radius: f32, base: Color32, strength: f32) -> Vec<Shape> {
+    let t = g.t();
+    let o = outline(rect.width(), rect.height(), radius);
+    let origin = rect.min;
+    let h = rect.height().max(1.0);
+    let tone = Rgba::new(base.r(), base.g(), base.b(), strength);
+    let mut shapes = Vec::with_capacity(7);
+    shapes.extend(shadow_shape(&o, origin, &t.shadow));
+    shapes.push(band_shape(&o, origin, rect.size(), g));
+    shapes.push(Shape::mesh(fill_fan(&o, origin, |p| over(tone.px(1.0), tint_px(t, 0.0, p.y / h)))));
+    shapes.push(border_shape(rect, radius, Rgba::new(base.r(), base.g(), base.b(), (strength * 3.0).min(0.5)).color()));
+    shapes.push(Shape::mesh(rim_mesh(&o, origin, t, true, true, true, 1.0)));
     shapes
 }
 
@@ -1074,6 +1129,27 @@ mod tests {
         assert_eq!(DARK.mesh_cyan, Rgba::new(6, 182, 212, 0.18));
         assert_eq!(DARK.mesh_corner_top, Rgba::new(99, 102, 241, 0.14));
         assert_eq!(DARK.mesh_corner_bottom, Rgba::new(79, 70, 229, 0.3));
+    }
+
+    /// The stand-in behind a modal follows a colour that varies across it, not just centre -> rim.
+    #[test]
+    fn ring_fill_samples_the_interior_of_a_large_surface() {
+        let o = Outline::new(900.0, 800.0, 20.0);
+        let f = |p: Vec2| [p.x / 900.0, 0.0, 0.0, 1.0];
+        let m = fill_rings(&o, Pos2::ZERO, f);
+        let fan = fill_fan(&o, Pos2::ZERO, f);
+        assert!(m.vertices.len() > 4 * fan.vertices.len() / 2, "{} vs {}", m.vertices.len(), fan.vertices.len());
+        // Every visible vertex carries the colour of its own position (to 8-bit rounding).
+        let visible: Vec<_> = m.vertices.iter().filter(|v| v.color.a() > 0).collect();
+        assert!(visible.len() > fan.vertices.len() / 2 + 1);
+        for v in &visible {
+            let want = v.pos.x / 900.0 * 255.0;
+            assert!((v.color.r() as f32 - want).abs() <= 1.5, "{:?} {:?}", v.pos, v.color);
+        }
+        // Interior vertices exist well away from both the centre and the rim.
+        assert!(visible.iter().any(|v| (v.pos.x - 450.0).abs() > 100.0 && (v.pos.x - 450.0).abs() < 340.0 && (v.pos.y - 400.0).abs() < 100.0));
+        // The indices stay inside the vertex list.
+        assert!(m.indices.iter().all(|&i| (i as usize) < m.vertices.len()));
     }
 
     #[test]

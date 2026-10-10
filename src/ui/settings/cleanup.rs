@@ -5,10 +5,9 @@ use crate::core::config::{FillerMode, LlmProviderId};
 use crate::core::secrets::SecretName;
 use crate::llm::registry::{self, PROVIDERS};
 use crate::ui::fonts;
-use crate::ui::theme::with_alpha;
-use crate::ui::widgets::{self as w, Btn, Variant, cr};
+use crate::ui::widgets::{self as w, Btn, Variant};
 use crate::ui::{Env, icons};
-use eframe::egui::{self, Stroke, Ui, vec2};
+use eframe::egui::{self, Ui, vec2};
 use std::sync::mpsc::{Receiver, channel};
 use std::time::Instant;
 
@@ -297,20 +296,14 @@ fn prompt_studio(ui: &mut Ui, env: &mut Env, st: &mut SettingsState) -> bool {
 
 fn result(ui: &mut Ui, p: &crate::ui::theme::Palette, ok: bool, badge: &str, body: &str) {
     let col = if ok { p.success } else { p.destructive };
-    egui::Frame::new()
-        .fill(with_alpha(col, if p.dark { 10 } else { 6 }))
-        .stroke(Stroke::new(1.0, with_alpha(col, 30)))
-        .corner_radius(cr(8.0))
-        .inner_margin(egui::Margin::symmetric(14, 10))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.spacing_mut().item_spacing = vec2(0.0, 4.0);
-            ui.horizontal(|ui| {
-                w::text_semi(ui, if ok { "Result" } else { "Error" }, 12.0, col);
-                w::text(ui, badge, 12.0, p.muted_a(80));
-            });
-            ui.label(egui::RichText::new(body).font(fonts::regular(13.0)).color(p.foreground));
+    w::notice(ui, p, col, |ui| {
+        ui.spacing_mut().item_spacing = vec2(0.0, 4.0);
+        ui.horizontal(|ui| {
+            w::text_semi(ui, if ok { "Result" } else { "Error" }, 12.0, col);
+            w::text(ui, badge, 12.0, p.muted_a(90));
         });
+        ui.label(egui::RichText::new(body).font(fonts::regular(13.0)).color(p.foreground));
+    });
 }
 
 /// Deterministic pass, then the configured LLM (what the daemon does), timed.

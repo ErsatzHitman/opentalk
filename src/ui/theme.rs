@@ -3,9 +3,8 @@
 //!
 //! Colours are plain sRGB; "alpha" variants (`fg_a`, `primary_a`, ...) mimic Tailwind's `/NN`
 //! opacity modifiers, which the original CSS leans on heavily. Surfaces are NOT palette colours any
-//! more: panels, chips, menus and modals are painted by `glass.rs`; the helpers that used to return
-//! a surface fill (`panel_fill`, `input_fill`, ...) now return glass washes so a page that still
-//! paints its own frame stays translucent instead of going opaque.
+//! more: panels, chips, menus and modals are painted by `glass.rs`; what a child of glass paints is
+//! a wash (`wash`, `primary_wash`), a hairline (`divider`, `input_border`) or text.
 use eframe::egui::{self, Color32};
 
 #[derive(Clone, Copy, Debug)]
@@ -104,18 +103,11 @@ impl Palette {
     pub fn destructive_a(&self, pct: u8) -> Color32 {
         with_alpha(self.destructive, pct)
     }
-    pub fn border_a(&self, pct: u8) -> Color32 {
-        with_alpha(self.border, pct)
-    }
     pub fn success_a(&self, pct: u8) -> Color32 {
         with_alpha(self.success, pct)
     }
     pub fn warning_a(&self, pct: u8) -> Color32 {
         with_alpha(self.warning, pct)
-    }
-    /// White overlay in dark mode / black in light, for `hover:bg-black/5 dark:hover:bg-white/5`.
-    pub fn overlay(&self, pct: u8) -> Color32 {
-        if self.dark { with_alpha(Color32::WHITE, pct) } else { with_alpha(Color32::BLACK, pct) }
     }
 
     /// The glass token set for this theme.
@@ -130,14 +122,6 @@ impl Palette {
     pub fn primary_wash(&self, level: u8) -> Color32 {
         with_alpha(self.primary, [8, 14, 20][level.min(2) as usize] + if self.dark { 4 } else { 0 })
     }
-    /// A list panel's fill, for pages that still frame their own panel: a wash, not a surface.
-    pub fn panel_fill(&self) -> Color32 {
-        self.glass().tint_top.color()
-    }
-    /// Panel border: `--glass-border`.
-    pub fn panel_border(&self) -> Color32 {
-        self.glass().border.color()
-    }
     /// Row dividers: the glass border at 60 %, so they read as spacing rather than as a border.
     pub fn divider(&self) -> Color32 {
         self.glass().border.scaled(0.6)
@@ -145,10 +129,6 @@ impl Palette {
     /// Border of inputs: a hairline (rule 3, inputs inside glass have no box).
     pub fn input_border(&self) -> Color32 {
         super::glass::hairline_color(self.dark)
-    }
-    /// Input background: none; the hover / focus wash is painted by the widget.
-    pub fn input_fill(&self) -> Color32 {
-        Color32::TRANSPARENT
     }
 }
 
@@ -277,13 +257,12 @@ mod tests {
     }
 
     #[test]
-    fn surface_helpers_are_translucent_washes() {
+    fn washes_are_translucent_and_ordered() {
         for p in [Palette::LIGHT, Palette::DARK] {
-            assert!(p.panel_fill().a() < 40, "a page that frames its own panel must not go opaque");
-            assert_eq!(p.input_fill(), Color32::TRANSPARENT);
-            assert!(p.divider().a() < p.panel_border().a() + 1);
+            assert!(p.wash(2).a() < 40, "a wash must never go opaque");
+            assert!(p.divider().a() < p.glass().border.color().a() + 1);
             assert!(p.wash(0).a() < p.wash(2).a());
-            assert!(p.input_border().a() > p.panel_border().a());
+            assert!(p.input_border().a() > p.glass().border.color().a());
         }
     }
 

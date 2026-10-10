@@ -342,7 +342,7 @@ pub fn pill_tabs(ui: &mut Ui, p: &Palette, selected: usize, labels: &[(&str, &st
             glass::chip(painter, &g, r, h / 2.0, hov);
         }
         if t > 0.0 {
-            painter.rect_filled(r, cr(h / 2.0), with_alpha_mul(p.primary_wash(1), t));
+            painter.rect_filled(r, cr(h / 2.0), with_alpha_mul(p.primary_wash(2), t));
         }
         let col = mix(mix(p.muted_fg, p.foreground, hov), p.foreground, t);
         let tx = r.min.x + 10.0;
@@ -362,13 +362,17 @@ pub fn pill_tabs(ui: &mut Ui, p: &Palette, selected: usize, labels: &[(&str, &st
 
 // ---------------------------------------------------------------- inputs
 
-/// The input chrome of rule 3: no box. A hairline along the bottom, a soft wash on hover and, when
-/// focused, the hairline in the brand colour plus a low-alpha primary focus ring. `round` is the
-/// search-field variant, a wash pill.
-fn input_chrome(ui: &Ui, p: &Palette, rect: Rect, focus_t: f32, hover_t: f32, round: bool) {
+/// The input chrome. Inside glass (rule 3) there is no box: a hairline along the bottom, a soft wash
+/// on hover and, when focused, the hairline in the brand colour plus a low-alpha primary focus ring.
+/// On the bare page an input has nothing to sit on, so it is a chip-tier glass box (tint, border, top
+/// rim) with the same focus ring. `round` is the search-field variant, a pill.
+pub fn input_chrome(ui: &Ui, p: &Palette, rect: Rect, focus_t: f32, hover_t: f32, round: bool) {
     let painter = ui.painter();
     let radius = if round { rect.height() / 2.0 } else { 8.0 };
-    if round {
+    let inside = in_glass(ui.ctx());
+    if !inside {
+        glass::chip(painter, &gl(ui, p), rect, radius, hover_t.max(focus_t));
+    } else if round {
         painter.rect_filled(rect, cr(radius), wash_to(p, 0, 1, hover_t));
     } else if hover_t > 0.0 {
         painter.rect_filled(rect, cr(radius), with_alpha_mul(p.wash(0), hover_t));
@@ -377,7 +381,7 @@ fn input_chrome(ui: &Ui, p: &Palette, rect: Rect, focus_t: f32, hover_t: f32, ro
         painter.rect_filled(rect, cr(radius), with_alpha_mul(p.primary_a(6), focus_t));
         painter.rect_stroke(rect.expand(1.0), cr(radius + 1.0), Stroke::new(2.0, p.primary_a(if p.dark { 38 } else { 32 }).gamma_multiply(focus_t)), StrokeKind::Outside);
     }
-    if !round {
+    if inside && !round {
         let y = rect.max.y - 0.5;
         let line = mix(mix(p.input_border(), p.fg_a(if p.dark { 40 } else { 45 }), hover_t), p.primary, focus_t);
         painter.line_segment([pos2(rect.min.x + 1.0, y), pos2(rect.max.x - 1.0, y)], Stroke::new(1.0, line));
@@ -537,19 +541,6 @@ pub fn menu_surface<R>(ui: &mut Ui, p: &Palette, width: f32, add: impl FnOnce(&m
     out.inner
 }
 
-/// An egui frame approximating the menu tier, for popups whose content is not wrapped in
-/// [`menu_surface`] yet: the same surface and border, opaque enough to read over anything. Prefer
-/// `.frame(Frame::NONE)` + `menu_surface`, which also gets the shadow and the rim.
-pub fn popup_frame(p: &Palette) -> egui::Frame {
-    let t = p.glass();
-    egui::Frame::new()
-        .fill(t.menu_surface.scaled(0.96))
-        .stroke(Stroke::new(1.0, t.border.color()))
-        .corner_radius(cr(glass::RADIUS))
-        .inner_margin(Margin::same(4))
-        .shadow(egui::Shadow { offset: [0, 6], blur: 20, spread: 0, color: Color32::from_black_alpha(if p.dark { 120 } else { 40 }) })
-}
-
 /// A dropdown-menu row: optional leading icon, check mark when selected, destructive tint. Hover is
 /// a wash with no border (rule 3).
 pub fn menu_item(ui: &mut Ui, p: &Palette, label: &str, selected: bool, destructive: bool, icon: Option<char>) -> Response {
@@ -604,6 +595,37 @@ pub fn divider(ui: &mut Ui, p: &Palette) {
     let w = ui.available_width();
     let (r, _) = ui.allocate_exact_size(vec2(w, 1.0), Sense::hover());
     ui.painter().rect_filled(Rect::from_min_max(pos2(r.min.x + 16.0, r.min.y), pos2(r.max.x - 16.0, r.max.y)), 0.0, p.divider());
+}
+
+/// Corner rounding for a row wash that touches a panel's rim: the panel's radius (less its border)
+/// on the outer corners of the first and last row, square in between.
+pub fn edge_rounding(first: bool, last: bool) -> CornerRadius {
+    let r = (glass::RADIUS - 1.0) as u8;
+    CornerRadius { nw: if first { r } else { 0 }, ne: if first { r } else { 0 }, sw: if last { r } else { 0 }, se: if last { r } else { 0 } }
+}
+
+/// A status notice (warning banner, test result): a glass panel carrying `tone` as coloured glass
+/// (rule 2: the tint is overridden, rim and refraction stay). Inside another glass surface it is only
+/// a tone wash, never a second panel.
+pub fn notice<R>(ui: &mut Ui, p: &Palette, tone: Color32, add: impl FnOnce(&mut Ui) -> R) -> R {
+    let g = gl(ui, p);
+    let slot = reserve(ui);
+    let nested = in_glass(ui.ctx());
+    let prev = set_in_glass(ui.ctx(), true);
+    let out = egui::Frame::new().inner_margin(Margin::symmetric(14, 10)).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        add(ui)
+    });
+    set_in_glass(ui.ctx(), prev);
+    let rect = out.response.rect;
+    let strength = if p.dark { 0.13 } else { 0.10 };
+    if nested {
+        let r = cr(10.0);
+        ui.painter().set(slot, Shape::Vec(vec![Shape::rect_filled(rect, r, p.wash(0)), Shape::rect_filled(rect, r, with_alpha_mul(tone, strength * 1.2))]));
+    } else {
+        ui.painter().set(slot, Shape::Vec(glass::tinted_shapes(&g, rect, glass::RADIUS, tone, strength)));
+    }
+    out.inner
 }
 
 /// Label + description on the left and a control of width `ctrl_w` on the right.
@@ -682,6 +704,12 @@ pub fn chip(ui: &mut Ui, p: &Palette, label: &str, kind: ChipKind) -> Response {
     let font = fonts::semibold(11.0);
     let tw = measure(ui, label, font.clone()).x;
     let (rect, resp) = ui.allocate_exact_size(vec2(tw + 14.0, 20.0), Sense::hover());
+    paint_chip(ui, p, rect, label, kind);
+    resp
+}
+
+/// [`chip`] drawn into a rect of the caller's layout (model cards line their tags up themselves).
+pub fn paint_chip(ui: &Ui, p: &Palette, rect: Rect, label: &str, kind: ChipKind) {
     let (bg, fg) = match kind {
         ChipKind::Neutral => (p.wash(1), p.muted_fg),
         ChipKind::Primary => (p.primary_a(if p.dark { 18 } else { 13 }), p.primary),
@@ -690,11 +718,36 @@ pub fn chip(ui: &mut Ui, p: &Palette, label: &str, kind: ChipKind) -> Response {
         ChipKind::Destructive => (p.destructive_a(if p.dark { 18 } else { 12 }), p.destructive),
     };
     if !in_glass(ui.ctx()) {
-        glass::chip(ui.painter(), &gl(ui, p), rect, 10.0, 0.0);
+        glass::chip(ui.painter(), &gl(ui, p), rect, rect.height() / 2.0, 0.0);
     }
-    ui.painter().rect_filled(rect, cr(10.0), bg);
-    ui.painter().text(rect.center(), Align2::CENTER_CENTER, label, font, fg);
-    resp
+    ui.painter().rect_filled(rect, cr(rect.height() / 2.0), bg);
+    ui.painter().text(rect.center(), Align2::CENTER_CENTER, label, fonts::semibold(11.0), fg);
+}
+
+/// Width of a chip with `label`.
+pub fn chip_width(ui: &Ui, label: &str) -> f32 {
+    measure(ui, label, fonts::semibold(11.0)).x + 14.0
+}
+
+/// A keyboard key cap (`Ctrl`, `Esc`). A chip on the page; inside glass a wash with a hairline under
+/// it, so it reads as a key without becoming a second surface.
+pub fn keycap(ui: &mut Ui, p: &Palette, label: &str) {
+    let font = fonts::semibold(11.5);
+    let tw = measure(ui, label, font.clone()).x;
+    let (rect, _) = ui.allocate_exact_size(vec2(tw + 16.0, 24.0), Sense::hover());
+    paint_keycap(ui, p, rect, label, font);
+}
+
+/// [`keycap`] into a rect of the caller's layout.
+pub fn paint_keycap(ui: &Ui, p: &Palette, rect: Rect, label: &str, font: FontId) {
+    if in_glass(ui.ctx()) {
+        ui.painter().rect_filled(rect, cr(6.0), p.wash(2));
+        let y = rect.max.y - 0.5;
+        ui.painter().line_segment([pos2(rect.min.x + 3.0, y), pos2(rect.max.x - 3.0, y)], Stroke::new(1.0, p.input_border()));
+    } else {
+        glass::chip(ui.painter(), &gl(ui, p), rect, 6.0, 0.0);
+    }
+    ui.painter().text(rect.center(), Align2::CENTER_CENTER, label, font, p.foreground);
 }
 
 /// Coloured circle with an initial: stand-in for the target application's icon.
