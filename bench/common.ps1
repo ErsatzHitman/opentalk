@@ -349,7 +349,7 @@ function Read-KeepBlocks([string]$text) {
 function Merge-KeepBlocks([string]$generated, [string]$oldText) {
     $eol = if ($oldText -and $oldText.Contains("`r`n")) { "`r`n" } elseif ($oldText -and $oldText.Contains("`n")) { "`n" } else { "`r`n" }
     $gen = $generated -replace "`r?`n", $eol
-    $blocks = if ($oldText) { @(Read-KeepBlocks $oldText) } else { @() }
+    $blocks = @(if ($oldText) { Read-KeepBlocks $oldText })
     if ($blocks.Count -eq 0) { return $gen }
     # Split the generated text into [preamble, section...] at its '## ' headings.
     $sections = New-Object Collections.Generic.List[object]
@@ -406,7 +406,7 @@ function Write-ReportKeepingBlocks([string]$path, [string]$generated) {
     }
     $merged = Merge-KeepBlocks $generated $oldText
     # Invariant: every old block is present, unchanged.
-    $old = if ($oldText) { @(Read-KeepBlocks $oldText) } else { @() }
+    $old = @(if ($oldText) { Read-KeepBlocks $oldText })
     $new = @(Read-KeepBlocks $merged)
     foreach ($b in $old) {
         $n = @($new | Where-Object { $_.Name -eq $b.Name })
@@ -544,7 +544,7 @@ public static class OtClip {
     static OtClipSnapshot SaveCore() {
         OtClipSnapshot s = new OtClipSnapshot();
         IDataObject d = null;
-        for (int i = 0; i < 2 && d == null; i++) {
+        for (int i = 0; i < 5 && d == null; i++) {
             try { d = Clipboard.GetDataObject(); }
             catch (Exception e) { s.Error = e.GetType().Name + ": " + e.Message; Thread.Sleep(50); }
         }
