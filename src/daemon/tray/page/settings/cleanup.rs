@@ -182,6 +182,20 @@ impl CleanupPage {
         }
     }
 
+    /// What is missing before the provider can answer, in words for the warning banner (`None`
+    /// when [`Self::ai_ready`]).
+    fn setup_gap(&self, cfg: &Config) -> Option<&'static str> {
+        if self.ai_ready(cfg) {
+            return None;
+        }
+        let keys = self.provider == LlmProviderId::Custom || self.keys.iter().all(KeyField::has_key);
+        Some(if keys {
+            "The AI provider below is not fully set up (a model or an address is missing). Finish it, or the rewrite pastes your plain text."
+        } else {
+            "No API key is saved for the AI provider below. Add one, or the rewrite pastes your plain text."
+        })
+    }
+
     fn provider_items(&self, cfg: &Config, info: &LlmProviderInfo) -> Vec<Item> {
         let a = &cfg.ai_cleanup;
         let mut v = vec![group("AI provider")];
@@ -236,11 +250,14 @@ impl PageModel for CleanupPage {
         let cfg = &*cx.cfg;
         let a = &cfg.ai_cleanup;
         let toggle = |id| OPTIONS.iter().find(|d| d.id == id).expect("known toggle").item(cfg);
-        let rewrite_on = a.rewrite_enabled;
+        // The toggle shows the phrase field; the provider and the test matter only while the rewrite
+        // can actually fire (toggle on and a phrase set).
+        let rewrite_toggle = a.rewrite_enabled;
+        let rewrite_live = Self::rewrite_on(cfg);
         let mut v = vec![group("AI rewrite")];
         v.push(note("Say a trigger phrase at the end of a dictation. The text before it is rewritten concisely by your AI provider and pasted instead."));
         v.push(toggle(ID_RW_TOGGLE));
-        if rewrite_on {
+        if rewrite_toggle {
             v.push(Item::Field {
                 id: ID_RW_TRIGGER,
                 label: "Trigger phrase".into(),
@@ -252,11 +269,8 @@ impl PageModel for CleanupPage {
             });
             v.push(button(ID_RW_RESET, "Reset to default", BtnStyle::Link, cfg.rewrite_trigger != DEFAULT_REWRITE_TRIGGER || self.draft.is_some()));
             v.push(note("Pick words you would not say otherwise; leave it empty to turn the rewrite off. Avoid digits and filler words such as \"um\"."));
-            if Self::rewrite_on(cfg) && !self.ai_ready(cfg) {
-                v.push(Item::Banner {
-                    tone: crate::daemon::tray::page::Tone::Warn,
-                    text: "No AI model is set up yet. Add an API key and a model under AI provider below, or the rewrite pastes your plain text.".into(),
-                });
+            if rewrite_live && let Some(gap) = self.setup_gap(cfg) {
+                v.push(Item::Banner { tone: crate::daemon::tray::page::Tone::Warn, text: gap.into() });
             }
         }
 
@@ -271,7 +285,7 @@ impl PageModel for CleanupPage {
         v.push(note("An optional language model polishes punctuation and grammar after the on-device pass."));
         v.push(toggle(ID_AI_ENABLE));
 
-        if a.enabled || rewrite_on {
+        if a.enabled || rewrite_live {
             let info = registry::provider(self.provider);
             v.extend(self.provider_items(cfg, info));
         }
@@ -290,7 +304,7 @@ impl PageModel for CleanupPage {
             });
             v.push(button(ID_PROMPT_RESET, "Reset to default", BtnStyle::Link, custom));
         }
-        if a.enabled || rewrite_on {
+        if a.enabled || rewrite_live {
             v.push(group("Test"));
             v.push(note("Runs a built-in rough sentence through the model above."));
             v.push(button(ID_TEST, if self.busy { "Running..." } else { "Run on sample" }, BtnStyle::Primary, self.ai_ready(cfg) && !self.busy));
@@ -593,6 +607,39 @@ mod tests {
         cfg.ai_cleanup.rewrite_enabled = false;
         let p = page(LlmProviderId::Openrouter, Fake::default());
         assert!(!banner(&p, &mut cfg), "rewrite toggled off");
+    }
+
+    #[test]
+    fn the_banner_names_what_is_missing() {
+        let text = |p: &CleanupPage, cfg: &mut Config| {
+            let cx = Cx::new(cfg, false, 0);
+            p.items(&cx).iter().find_map(|i| match i {
+                Item::Banner { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+        };
+        let mut cfg = Config::default();
+        let p = page(LlmProviderId::Openrouter, Fake::default());
+        assert!(text(&p, &mut cfg).is_some_and(|t| t.contains("No API key")), "the key is what is missing, not the model");
+        cfg.ai_cleanup.models.insert(LlmProviderId::Openrouter, "  ".into());
+        let p = page(LlmProviderId::Openrouter, Fake::with("openrouter", "sk-...abcd"));
+        assert!(text(&p, &mut cfg).is_some_and(|t| t.contains("not fully set up")), "a key but no model");
+    }
+
+    #[test]
+    fn the_provider_group_follows_a_rewrite_that_can_fire() {
+        let groups = |p: &CleanupPage, cfg: &mut Config| {
+            let cx = Cx::new(cfg, false, 0);
+            p.items(&cx).iter().filter_map(|i| if let Item::Group(g) = i { Some(g.clone()) } else { None }).collect::<Vec<_>>()
+        };
+        let p = page(LlmProviderId::Openrouter, Fake::default());
+        let mut cfg = Config::default();
+        assert!(groups(&p, &mut cfg).contains(&"AI provider".to_string()), "the rewrite reuses the provider even with AI cleanup off");
+        cfg.rewrite_trigger.clear();
+        let g = groups(&p, &mut cfg);
+        assert!(!g.contains(&"AI provider".to_string()) && !g.contains(&"Test".to_string()), "no phrase, no rewrite, no provider needed: {g:?}");
+        cfg.ai_cleanup.enabled = true;
+        assert!(groups(&p, &mut cfg).contains(&"AI provider".to_string()), "AI cleanup needs it");
     }
 
     #[test]

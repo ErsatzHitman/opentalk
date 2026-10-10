@@ -48,12 +48,18 @@ impl PageModel for PrivacyPage {
 
     fn items(&self, cx: &Cx) -> Vec<Item> {
         let cfg = &*cx.cfg;
-        vec![
+        let kept = &RETENTION[retention_index(cfg.history_retention_days)];
+        let mut v = vec![
             group("History"),
             note("Your dictations are stored only on this PC."),
             TOGGLES[0].item(cfg),
-            choice(ID_RETENTION, "Keep transcripts for", RETENTION[retention_index(cfg.history_retention_days)].0),
-            note("Older entries are deleted automatically."),
+            choice(ID_RETENTION, "Keep transcripts for", kept.0),
+        ];
+        // Only when something is actually deleted: "Keep forever" deletes nothing.
+        if kept.1 != 0 {
+            v.push(note("Older entries are deleted automatically."));
+        }
+        v.extend([
             group("Recordings"),
             note("Audio is never kept on disk."),
             TOGGLES[1].item(cfg),
@@ -62,7 +68,8 @@ impl PageModel for PrivacyPage {
             note(&format!("Everything lives in {}", crate::core::paths::app_dir().display())),
             button(ID_OPEN_DATA, "Open data folder", BtnStyle::Outline, true),
             button(ID_CLEAR, "Clear history...", BtnStyle::Destructive, true),
-        ]
+        ]);
+        v
     }
 
     fn event(&mut self, id: ItemId, ev: Event, cx: &mut Cx) -> Vec<Effect> {
@@ -124,6 +131,18 @@ mod tests {
         let mut cx = Cx::new(&mut cfg, false, 0);
         assert!(p.items(&cx).iter().any(|i| matches!(i, Item::Choice { id: ID_RETENTION, value, .. } if value == "90 days")));
         assert_eq!(p.event(ID_RETENTION, Event::Activated, &mut cx), vec![Effect::Navigate(Route::Picker(PickerId::Retention))]);
+    }
+
+    #[test]
+    fn the_auto_delete_note_appears_only_when_something_is_deleted() {
+        let has_note = |days: u32| {
+            let mut cfg = Config { history_retention_days: days, ..Config::default() };
+            let cx = Cx::new(&mut cfg, false, 0);
+            PrivacyPage.items(&cx).iter().any(|i| matches!(i, Item::Note(n) if n.contains("deleted automatically")))
+        };
+        assert!(!has_note(0), "Keep forever deletes nothing");
+        assert!(has_note(30));
+        assert!(has_note(45), "an unlisted value rounds up to a real period");
     }
 
     #[test]

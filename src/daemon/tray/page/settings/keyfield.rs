@@ -151,6 +151,15 @@ impl KeyField {
         v
     }
 
+    /// The noun for toasts: "API key" for the plain case, else the page's own ("Client ID").
+    fn title_noun(&self) -> String {
+        if self.noun == "key" {
+            return "API key".into();
+        }
+        let mut c = self.noun.chars();
+        c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default()
+    }
+
     /// Handle an event on one of this field's items.
     pub fn event(&mut self, base: ItemId, id: ItemId, ev: Event) -> KeyOutcome {
         let mut out = KeyOutcome::default();
@@ -165,7 +174,7 @@ impl KeyField {
                 self.stored = Some(crate::core::secrets::mask(&value));
                 self.editing = false;
                 self.buf.clear();
-                out.effects = vec![Effect::Do(PopupAction::SetSecret { name: self.name.into(), value: Some(value) }), Effect::Toast("API key saved".into())];
+                out.effects = vec![Effect::Do(PopupAction::SetSecret { name: self.name.into(), value: Some(value) }), Effect::Toast(format!("{} saved", self.title_noun()))];
                 out.changed = true;
             }
             (OFF_CANCEL, Event::Pressed) => {
@@ -198,7 +207,7 @@ impl KeyField {
         self.editing = false;
         self.buf.clear();
         KeyOutcome {
-            effects: vec![Effect::Do(PopupAction::SetSecret { name: self.name.into(), value: None }), Effect::Toast("API key removed".into())],
+            effects: vec![Effect::Do(PopupAction::SetSecret { name: self.name.into(), value: None }), Effect::Toast(format!("{} removed", self.title_noun()))],
             changed: true,
         }
     }
@@ -337,5 +346,19 @@ pub mod tests {
     fn owns_covers_exactly_the_span() {
         assert!(KeyField::owns(100, 100) && KeyField::owns(100, 107));
         assert!(!KeyField::owns(100, 99) && !KeyField::owns(100, 108));
+    }
+
+    #[test]
+    fn toasts_name_the_secret() {
+        let toast = |f: &mut KeyField| {
+            f.event(100, 100, Event::Edited("abcdefghijkl".into()));
+            match f.event(100, 101, Event::Pressed).effects.pop() {
+                Some(Effect::Toast(t)) => t,
+                other => panic!("{other:?}"),
+            }
+        };
+        assert_eq!(toast(&mut KeyField::new(&Fake::default(), "openai", "API key", "")), "API key saved");
+        assert_eq!(toast(&mut KeyField::new(&Fake::default(), "corti_client_id", "Client ID", "").with_noun("client ID")), "Client ID saved");
+        assert_eq!(KeyField::new(&Fake::default(), "x", "Client secret", "").with_noun("client secret").remove().effects.pop(), Some(Effect::Toast("Client secret removed".into())));
     }
 }

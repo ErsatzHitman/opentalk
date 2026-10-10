@@ -575,6 +575,7 @@ impl App {
                 Ok(()) => log_info!("hotkey changed to {}", self.cfg.hotkey),
                 Err(e) => {
                     log_warn!("hotkey '{}' rejected ({e}); keeping '{}'", self.cfg.hotkey, old.hotkey);
+                    crate::daemon::tray::popup_toast(&format!("That hotkey cannot be used; keeping {}", hotkey::label(&old.hotkey)));
                     self.cfg.hotkey = old.hotkey.clone();
                 }
             }

@@ -4,7 +4,6 @@
   note: Your dictations are stored only on this PC.
   [x] #1 Save history -- Keep a list of your dictations in History. Turn off to save nothing.
   choice #2 Keep transcripts for > Keep forever
-  note: Older entries are deleted automatically.
 
 ## Recordings
   note: Audio is never kept on disk.

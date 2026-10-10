@@ -6,7 +6,7 @@
   field #2 Trigger phrase [text] = "rewrite this concisely" (hint "rewrite this concisely", max 80)
   button #3 Reset to default <Link> (disabled)
   note: Pick words you would not say otherwise; leave it empty to turn the rewrite off. Avoid digits and filler words such as "um".
-  banner[warn]: No AI model is set up yet. Add an API key and a model under AI provider below, or the rewrite pastes your plain text.
+  banner[warn]: No API key is saved for the AI provider below. Add one, or the rewrite pastes your plain text.
 
 ## On-device cleanup
   note: Always on and instant: runs on your device before anything is pasted.
