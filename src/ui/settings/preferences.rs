@@ -63,6 +63,8 @@ pub fn show(ui: &mut Ui, env: &mut Env, st: &mut SettingsState) -> bool {
         w::divider(ui, &p);
         changed |= toggle_row(ui, &p, "Pause media while dictating", "Pause music and video when you start, resume afterwards.", &mut cfg.pause_media);
         w::divider(ui, &p);
+        changed |= toggle_row(ui, &p, "Mute system audio while dictating", "Silence your speakers while you record so nothing leaks into the microphone.", &mut cfg.mute_system_audio);
+        w::divider(ui, &p);
         changed |= toggle_row(ui, &p, "Automatic pasting", "Paste the text into the app you were using. When off, it is only copied.", &mut cfg.auto_paste);
         w::divider(ui, &p);
         changed |= toggle_row(ui, &p, "Keep transcription in clipboard", "Leave the text on the clipboard instead of restoring what you had copied.", &mut cfg.keep_in_clipboard);

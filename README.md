@@ -202,7 +202,7 @@ the secret store), `OPENTALK_LOG=debug`.
 
 | Section | What you can change |
 |---|---|
-| Preferences | Theme, reduce transparency (opaque window instead of the acrylic glass backdrop), dictation sounds, pause media while dictating, automatic pasting, keep text on the clipboard, floating icon (auto-hide, position, app bubble), language, microphone, launch at login |
+| Preferences | Theme, reduce transparency (opaque window instead of the acrylic glass backdrop), dictation sounds, pause media while dictating, mute system audio while dictating (on by default), automatic pasting, keep text on the clipboard, floating icon (auto-hide, position, app bubble), language, microphone, launch at login |
 | Hotkeys | Dictation hotkey (modifier-only combos allowed), Tap / Push to talk, Start-menu suppression for Win combos |
 | Speech-to-Text | Provider, model, API key (masked), custom endpoint, streaming preference, **Test** button |
 | Cleanup | Filler removal (Off / Standard / Aggressive), fuzzy dictionary, spoken line breaks, AI cleanup provider / model / key / prompt |
@@ -221,6 +221,9 @@ theme, cleanup, microphone) without a restart.
   dropped by the next dictation that succeeds or fails, when you turn *keep failed audio* off in Privacy & Data, or
   when you quit.
 - API keys are encrypted with Windows DPAPI (current user) in `secrets.json`; they are never logged.
+- *Mute system audio while dictating* mutes the default playback device while you record and restores it the moment the
+  recording ends (stop, cancel, error or quit). It never touches a device that was already muted, and while muted
+  it keeps a tiny `muted-device.txt` (the device id) in `%APPDATA%\OpenTalk` so a crash cannot leave you muted.
 - History (text, app name, provider, timing) is a local `history.jsonl` you can clear or auto-prune.
 - With AI cleanup on, the *transcribed text* (not audio) is sent to the LLM provider you chose.
 - Dictation text goes through the clipboard for pasting; it is excluded from Win+V clipboard history and the previous

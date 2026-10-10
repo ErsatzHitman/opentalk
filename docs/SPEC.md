@@ -58,6 +58,7 @@ Implements the `liquid-glass` skill for a layered window (no DWM backdrop is ava
 - Deterministic filler removal (OpenWhispr only had LLM). Optional LLM cleanup w/ OpenWhispr prompt, 4s timeout, validation.
 - Ctrl+Win Start-menu suppression (mask key 0xE8), injected-event filtering, Esc cancel.
 - Clipboard: full format snapshot/restore, excluded from clipboard history.
+- Mute system audio (Preferences > Dictation, `mute_system_audio`, default on, also for old config files): the default playback endpoint is muted via `IAudioEndpointVolume` once the start cue has played (immediately with sounds off) and restored before the stop cue, on stop, cancel, error, the 5 min cap and quit. Only a device that was not muted is muted, and only that device (by id) is restored; a device the user unmuted meanwhile is left alone. With "Pause media" on the order is pause, then mute; on the way out unmute, then resume. A marker file `muted-device.txt` (device id) in the data directory survives a crash and is undone at the next daemon start.
 
 ## Settings UI (egui, separate process `--settings`)
 - Shell: sidebar 192px (Home/History, Dictionary, Settings), top bar 48px, content card radius 12.

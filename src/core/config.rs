@@ -154,6 +154,8 @@ pub struct Config {
     pub reduce_transparency: bool,
     pub audio_cues: bool,
     pub pause_media: bool,
+    /// Mute the default playback device while recording (restored afterwards).
+    pub mute_system_audio: bool,
     pub auto_paste: bool,
     pub keep_in_clipboard: bool,
     pub smart_spacing: bool,
@@ -200,6 +202,7 @@ impl Default for Config {
             reduce_transparency: false,
             audio_cues: true,
             pause_media: false,
+            mute_system_audio: true,
             auto_paste: true,
             keep_in_clipboard: false,
             smart_spacing: true,
@@ -324,6 +327,18 @@ mod tests {
         m.reduce_transparency = true;
         let back: Config = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
         assert!(back.reduce_transparency);
+    }
+    #[test]
+    fn mute_system_audio_defaults_on_for_old_files() {
+        // A config written before "mute system audio" existed gets it on; an explicit off sticks.
+        let old: Config = serde_json::from_str(r#"{"version":1,"pause_media":true,"audio_cues":false}"#).unwrap();
+        assert!(old.mute_system_audio);
+        assert!(old.pause_media && !old.audio_cues, "other fields untouched");
+        assert!(Config::default().mute_system_audio);
+        let off: Config = serde_json::from_str(r#"{"mute_system_audio":false}"#).unwrap();
+        assert!(!off.mute_system_audio);
+        let back: Config = serde_json::from_str(&serde_json::to_string(&off).unwrap()).unwrap();
+        assert!(!back.mute_system_audio);
     }
     #[test]
     fn roundtrip() {

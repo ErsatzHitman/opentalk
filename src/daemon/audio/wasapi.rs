@@ -147,7 +147,7 @@ fn create_enumerator() -> Result<IMMDeviceEnumerator, String> {
 /// The process-wide enumerator (created and cached on an MTA thread). An STA caller (a GUI
 /// thread) gets a private, uncached one so the shared object never belongs to an apartment
 /// that may go away.
-fn enumerator() -> Result<IMMDeviceEnumerator, String> {
+pub(crate) fn enumerator() -> Result<IMMDeviceEnumerator, String> {
     ensure_com();
     if !in_mta() {
         return create_enumerator();
@@ -178,7 +178,7 @@ fn take_pwstr(p: PWSTR) -> String {
     }
 }
 
-fn device_id(d: &IMMDevice) -> String {
+pub(crate) fn device_id(d: &IMMDevice) -> String {
     // SAFETY: GetId returns a CoTaskMem string we free in take_pwstr.
     unsafe { d.GetId() }.map(take_pwstr).unwrap_or_default()
 }

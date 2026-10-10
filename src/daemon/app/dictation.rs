@@ -10,7 +10,7 @@
 //! so a note for a dictation that was cancelled or stopped meanwhile is cleaned up, not applied.
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::host::{App, TIMER_CAP, WM_NOTE, post};
 use super::latency::{self, Sample};
@@ -23,7 +23,7 @@ use crate::daemon::appicon::{self, AppIcon};
 use crate::daemon::audio::{self, Recorder, vad};
 use crate::daemon::paste::{self, PasteOptions, PasteOutcome, Target};
 use crate::daemon::pill::PillMode;
-use crate::daemon::{media, sound};
+use crate::daemon::{media, muteaudio, sound};
 use crate::stt::{self, Audio, StreamingSession, SttError, SttErrorCode};
 use crate::{log_debug, log_info, log_warn};
 
@@ -56,6 +56,8 @@ pub struct RecSession {
     t_hotkey: f64,
     hotkey_pill: f64,
     media_paused: bool,
+    /// "Mute system audio" was requested for this recording and not yet released.
+    mute_audio: bool,
     /// The safety cap stopped this recording.
     pub capped: bool,
 }
@@ -287,6 +289,9 @@ impl App {
 
         // Bring the stream up off the UI thread, then pause media (both can block).
         let (hwnd, level, device, pause) = (self.hwnd, self.level.clone(), cfg.mic_device_id.clone(), cfg.pause_media);
+        // The mute waits for the start cue (played when the note below is handled), then follows
+        // the media pause: pause media, then mute.
+        let (mute, cue) = (cfg.mute_system_audio, if cfg.audio_cues { sound::start_cue_duration() } else { Duration::ZERO });
         let prefetch = restores_clipboard(&cfg);
         let warm = cfg.mic_warm_hold_secs;
         let spawned = std::thread::Builder::new().name("rec-start".into()).spawn(move || {
@@ -307,9 +312,13 @@ impl App {
                 },
             );
             let started = result.is_ok();
+            let cue_started = Instant::now();
             notify(hwnd, Note::RecStarted { seq, result });
             if started && pause && media::pause_if_playing() {
                 notify(hwnd, Note::MediaPaused { seq });
+            }
+            if started && mute {
+                muteaudio::begin(seq, cue_started, cue);
             }
         });
         if let Err(e) = spawned {
@@ -360,6 +369,7 @@ impl App {
             t_hotkey: t0,
             hotkey_pill,
             media_paused: false,
+            mute_audio: cfg.mute_system_audio,
             capped: false,
         });
     }
@@ -402,6 +412,7 @@ impl App {
             Err(e) => {
                 log_warn!("cannot start the microphone: {e}");
                 paste::discard_clipboard_snapshot();
+                self.release_mute();
                 let rec = self.rec.take();
                 if let Some(s) = take_session(rec.and_then(|r| r.feed)) {
                     s.cancel();
@@ -451,6 +462,8 @@ impl App {
             return;
         };
         self.kill_timer(TIMER_CAP);
+        // Speakers back first: the stop cue below must be heard, and media resumes after this.
+        self.release_mute();
         self.pill.set_mode(PillMode::Thinking);
         if starting {
             // Still starting: stop right after it comes up.
@@ -463,6 +476,19 @@ impl App {
             sound::play_stop();
         }
         self.finish_stop();
+    }
+
+    /// Give the speakers back if "Mute system audio" took them for this recording. Idempotent;
+    /// the wait is short because the unmute is normally a few ms.
+    pub(super) fn release_mute(&mut self) {
+        self.release_mute_within(muteaudio::END_WAIT);
+    }
+
+    fn release_mute_within(&mut self, wait: Duration) {
+        if let Some(rec) = self.rec.as_mut().filter(|r| r.mute_audio) {
+            rec.mute_audio = false;
+            muteaudio::end(rec.seq, wait);
+        }
     }
 
     /// Hand the live recorder to a worker that stops it and transcribes.
@@ -590,6 +616,7 @@ impl App {
     pub(super) fn cancel_recording(&mut self) {
         self.kill_timer(TIMER_CAP);
         paste::discard_clipboard_snapshot();
+        self.release_mute(); // before media resumes
         if let Some(rec) = self.rec.take() {
             if let Some(session) = take_session(rec.feed) {
                 session.cancel();
@@ -625,6 +652,8 @@ impl App {
     /// Shutdown: drop whatever is in flight.
     pub(super) fn cancel_everything(&mut self) {
         self.kill_timer(super::host::TIMER_ARM);
+        // Quitting: nothing runs after this, so wait longer for the unmute to land.
+        self.release_mute_within(muteaudio::QUIT_WAIT);
         self.cancel_recording();
         self.cancel_job();
     }
