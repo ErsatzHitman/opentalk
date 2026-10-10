@@ -2011,6 +2011,9 @@ mod tests {
         #[test]
         #[ignore = "desktop: installs a real WH_KEYBOARD_LL hook and injects keys"]
         fn desktop_hook_smoke() {
+            if !crate::daemon::paste::require_input_desktop("desktop_hook_smoke") {
+                return;
+            }
             let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
             let hwnd = make_window();
             set_allow_injected(true);
@@ -2060,6 +2063,9 @@ mod tests {
         #[test]
         #[ignore = "desktop: installs and removes a real WH_KEYBOARD_LL hook repeatedly"]
         fn desktop_hook_stop_then_start_is_reliable() {
+            if !crate::daemon::paste::require_input_desktop("desktop_hook_stop_then_start_is_reliable") {
+                return;
+            }
             let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
             let hwnd = make_window();
             set_allow_injected(true);
@@ -2173,6 +2179,9 @@ mod tests {
         #[test]
         #[ignore = "desktop: installs a real WH_KEYBOARD_LL hook, takes the foreground and injects keys"]
         fn desktop_main_key_not_typed_into_focused_app() {
+            if !crate::daemon::paste::require_input_desktop("desktop_main_key_not_typed_into_focused_app") {
+                return;
+            }
             let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
             let hwnd = make_window();
             let Some(edit) = make_focused_edit() else {
@@ -2250,6 +2259,9 @@ mod tests {
         #[test]
         #[ignore = "desktop: injects a RightWin tap and checks the Start menu stayed closed"]
         fn desktop_start_menu_mask() {
+            if !crate::daemon::paste::require_input_desktop("desktop_start_menu_mask") {
+                return;
+            }
             let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
             assert!(!start_menu_opens(true), "Start menu opened despite the mask");
         }
@@ -2257,6 +2269,9 @@ mod tests {
         #[test]
         #[ignore = "desktop: negative control, opens the Start menu briefly"]
         fn desktop_start_menu_opens_without_mask() {
+            if !crate::daemon::paste::require_input_desktop("desktop_start_menu_opens_without_mask") {
+                return;
+            }
             let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
             assert!(start_menu_opens(false), "control: a bare Win tap should open Start");
         }

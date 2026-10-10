@@ -1148,6 +1148,70 @@ pub fn paste_text(text: &str, target: Option<&Target>, opts: PasteOptions) -> Pa
 
 // ---------------------------------------------------------------------------------------------
 
+
+/// True when the interactive session is locked. On Windows 10/11 the lock screen (LockApp) runs on
+/// the normal desktop, so `OpenInputDesktop` still succeeds there while every key and click goes
+/// to the lock screen; the session's lock flag is what tells the two apart.
+#[cfg(test)]
+pub(crate) fn session_locked() -> bool {
+    use windows::Win32::System::RemoteDesktop::{
+        WTS_CURRENT_SERVER_HANDLE, WTS_CURRENT_SESSION, WTSFreeMemory, WTSINFOEXW, WTSQuerySessionInformationW,
+        WTSSessionInfoEx,
+    };
+    let mut buf = PWSTR::null();
+    let mut len = 0u32;
+    // SAFETY: the buffer is allocated by WTS, read once (unaligned, size-checked) and freed here.
+    unsafe {
+        if WTSQuerySessionInformationW(Some(WTS_CURRENT_SERVER_HANDLE), WTS_CURRENT_SESSION, WTSSessionInfoEx, &mut buf, &mut len)
+            .is_err()
+        {
+            return false;
+        }
+        let mut locked = false;
+        if !buf.is_null() && len as usize >= std::mem::size_of::<WTSINFOEXW>() {
+            let info = std::ptr::read_unaligned(buf.0 as *const WTSINFOEXW);
+            // WTS_SESSIONSTATE_LOCK == 0 (WTS_SESSIONSTATE_UNLOCK == 1).
+            locked = info.Level == 1 && info.Data.WTSInfoExLevel1.SessionFlags == 0;
+        }
+        WTSFreeMemory(buf.0 as *mut c_void);
+        locked
+    }
+}
+
+/// True when this process can drive the interactive desktop: the session is not locked and
+/// `OpenInputDesktop` succeeds (it fails on the secure desktop: LogonUI, UAC, Ctrl+Alt+Del). Nothing
+/// injected by `SendInput` or seen by a low-level hook reaches an app otherwise.
+#[cfg(test)]
+pub(crate) fn input_desktop_available() -> bool {
+    use windows::Win32::System::StationsAndDesktops::{
+        CloseDesktop, DESKTOP_CONTROL_FLAGS, DESKTOP_SWITCHDESKTOP, OpenInputDesktop,
+    };
+    if session_locked() {
+        return false;
+    }
+    // SAFETY: opens and immediately closes a desktop handle; no pointers are involved.
+    unsafe {
+        match OpenInputDesktop(DESKTOP_CONTROL_FLAGS(0), false, DESKTOP_SWITCHDESKTOP) {
+            Ok(desk) => {
+                let _ = CloseDesktop(desk);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+}
+
+/// Gate for input-dependent desktop tests: returns `false` (after saying why) when they cannot run,
+/// so the test returns early instead of failing or waiting on events that never arrive.
+#[cfg(test)]
+pub(crate) fn require_input_desktop(test: &str) -> bool {
+    let ok = input_desktop_available();
+    if !ok {
+        eprintln!("SKIPPED {test}: no usable input desktop (workstation locked, or OpenInputDesktop failed)");
+    }
+    ok
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1473,6 +1537,9 @@ mod tests {
     #[test]
     #[ignore]
     fn desktop_clipboard_snapshot_roundtrip() {
+        if !require_input_desktop("desktop_clipboard_snapshot_roundtrip") {
+            return;
+        }
         let _g = DESKTOP.lock().unwrap_or_else(|e| e.into_inner());
         let before = snapshot_clipboard().expect("snapshot");
         // Put known multi-format content on the clipboard.
@@ -1502,6 +1569,9 @@ mod tests {
     #[test]
     #[ignore]
     fn desktop_clipboard_history_flags() {
+        if !require_input_desktop("desktop_clipboard_history_flags") {
+            return;
+        }
         let _g = DESKTOP.lock().unwrap_or_else(|e| e.into_inner());
         let before = snapshot_clipboard().expect("snapshot");
         assert!(copy_to_clipboard("flags"));
@@ -1531,6 +1601,9 @@ mod tests {
     #[test]
     #[ignore]
     fn desktop_paste_elevated_target_copies_only() {
+        if !require_input_desktop("desktop_paste_elevated_target_copies_only") {
+            return;
+        }
         let _g = DESKTOP.lock().unwrap_or_else(|e| e.into_inner());
         let before = snapshot_clipboard().expect("snapshot");
         let target = Target { hwnd: 1, pid: 1, elevated: true, ..Default::default() };
@@ -1617,6 +1690,9 @@ mod tests {
     #[test]
     #[ignore]
     fn desktop_prefetch_keeps_delay_rendered_clipboard_off_the_paste_path() {
+        if !require_input_desktop("desktop_prefetch_keeps_delay_rendered_clipboard_off_the_paste_path") {
+            return;
+        }
         let _g = DESKTOP.lock().unwrap_or_else(|e| e.into_inner());
         let before = snapshot_clipboard().expect("snapshot");
         let (th, owner) = delay_rendered_owner();
@@ -1660,6 +1736,9 @@ mod tests {
     #[test]
     #[ignore]
     fn desktop_capture_foreground() {
+        if !require_input_desktop("desktop_capture_foreground") {
+            return;
+        }
         let t = capture_foreground().expect("a foreground window");
         assert!(t.hwnd != 0 && t.pid != 0);
         assert!(!t.class_name.is_empty());
@@ -1680,14 +1759,53 @@ mod tests {
         paste_into_notepad(true);
     }
 
+    /// Undoes what a Notepad test opened even when an assertion panics halfway: kills the Notepad
+    /// it spawned, destroys the focus thief and puts the user's clipboard back.
+    struct NotepadCleanup {
+        /// Process to kill; 0 when the window lives in a Notepad that was already running.
+        pid: u32,
+        /// The window to close in that case.
+        hwnd: isize,
+        thief: Option<HWND>,
+        clip: Snapshot,
+    }
+
+    impl Drop for NotepadCleanup {
+        fn drop(&mut self) {
+            if self.pid != 0 {
+                let _ = std::process::Command::new("taskkill").args(["/F", "/T", "/PID", &self.pid.to_string()]).output();
+            } else if self.hwnd != 0 {
+                // SAFETY: plain message post to a window that may already be gone.
+                unsafe {
+                    let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                        Some(to_hwnd(self.hwnd)),
+                        windows::Win32::UI::WindowsAndMessaging::WM_CLOSE,
+                        windows::Win32::Foundation::WPARAM(0),
+                        LPARAM(0),
+                    );
+                }
+            }
+            if let Some(h) = self.thief.take() {
+                // SAFETY: a window created by this test on this thread (or already gone).
+                unsafe {
+                    let _ = DestroyWindow(h);
+                }
+            }
+            let _ = restore_clipboard(&self.clip);
+        }
+    }
+
     fn paste_into_notepad(steal_focus: bool) {
         use std::collections::HashSet;
         use std::process::Command;
         use windows::Win32::UI::WindowsAndMessaging::{
             EnumWindows, GetWindowTextLengthW, IsWindowVisible, PostMessageW, SendMessageW,
-            WM_CLOSE, WM_GETTEXT, WM_GETTEXTLENGTH,
+            WM_CLOSE, WM_GETTEXT, WM_GETTEXTLENGTH, WM_SETTEXT,
         };
 
+        if !require_input_desktop(if steal_focus { "desktop_paste_restores_focus" } else { "desktop_paste_notepad" }) {
+            return;
+        }
         let _g = DESKTOP.lock().unwrap_or_else(|e| e.into_inner());
 
         unsafe extern "system" fn collect(hwnd: HWND, lp: LPARAM) -> BOOL {
@@ -1734,7 +1852,9 @@ mod tests {
         }
 
         let user_clip = snapshot_clipboard().expect("snapshot");
+        let mut cleanup = NotepadCleanup { pid: 0, hwnd: 0, thief: None, clip: user_clip };
         let known: HashSet<isize> = notepads().into_iter().collect();
+        let known_pids: HashSet<u32> = known.iter().map(|&h| pid_of(to_hwnd(h))).collect();
         let _child = Command::new("notepad.exe").spawn().expect("spawn notepad");
         let mut np = 0isize;
         for _ in 0..100 {
@@ -1745,6 +1865,10 @@ mod tests {
             }
         }
         assert!(np != 0, "notepad window did not appear");
+        // A Notepad that was already running may host the new window: never kill that process.
+        let np_pid = pid_of(to_hwnd(np));
+        cleanup.pid = if known_pids.contains(&np_pid) { 0 } else { np_pid };
+        cleanup.hwnd = np;
         thread::sleep(Duration::from_millis(800)); // let the editor finish loading
 
         // Make notepad the foreground window the way a user would have, then capture it.
@@ -1756,7 +1880,7 @@ mod tests {
         assert!(!target.is_terminal);
         assert!(!target.elevated);
 
-        let thief = if steal_focus {
+        if steal_focus {
             use windows::Win32::UI::WindowsAndMessaging::WS_VISIBLE;
             // SAFETY: a visible popup created and destroyed on this thread.
             let h = unsafe {
@@ -1776,13 +1900,11 @@ mod tests {
                 )
             }
             .expect("thief window");
+            cleanup.thief = Some(h);
             let t = Target { hwnd: h.0 as isize, ..Default::default() };
             assert!(ensure_foreground(&t), "thief could not take focus");
             assert!(!foreground_matches(&target));
-            Some(h)
-        } else {
-            None
-        };
+        }
 
         let text = if steal_focus {
             "OpenTalk focus check\r\nsecond line"
@@ -1810,23 +1932,19 @@ mod tests {
         }
         let got = if edit != 0 { window_text(to_hwnd(edit)) } else { String::new() };
         let _ = unsafe { GetWindowTextLengthW(hwnd) };
-        // Close without saving: WM_CLOSE, then kill the process if a prompt keeps it alive.
-        let pid = pid_of(hwnd);
+        // Leave no text behind (Notepad restores unsaved tabs), then close; `cleanup` kills it if a prompt stays.
+        if edit != 0 {
+            // SAFETY: WM_SETTEXT with a static empty, NUL-terminated wide string.
+            unsafe {
+                SendMessageW(to_hwnd(edit), WM_SETTEXT, None, Some(LPARAM(w!("").as_ptr() as isize)));
+            }
+        }
         // SAFETY: plain message post.
         unsafe {
             let _ = PostMessageW(Some(hwnd), WM_CLOSE, windows::Win32::Foundation::WPARAM(0), LPARAM(0));
         }
         thread::sleep(Duration::from_millis(700));
-        if notepads().contains(&np) {
-            let _ = Command::new("taskkill").args(["/F", "/PID", &pid.to_string()]).output();
-        }
-        assert!(restore_clipboard(&user_clip));
-        if let Some(h) = thief {
-            // SAFETY: created above on this thread.
-            unsafe {
-                let _ = DestroyWindow(h);
-            }
-        }
+        drop(cleanup);
         assert!(edit != 0, "edit control not found");
         let norm = |s: &str| s.replace("\r\n", "\n").replace('\r', "\n");
         assert!(norm(&got).contains(&norm(text)), "notepad text was {got:?}");
