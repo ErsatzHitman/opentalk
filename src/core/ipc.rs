@@ -4,7 +4,9 @@
 use std::sync::OnceLock;
 use windows::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HWND, LPARAM, WPARAM};
 use windows::Win32::System::Threading::CreateMutexW;
-use windows::Win32::UI::WindowsAndMessaging::{FindWindowExW, FindWindowW, HWND_MESSAGE, PostMessageW, RegisterWindowMessageW};
+use windows::Win32::UI::WindowsAndMessaging::{
+    FindWindowExW, FindWindowW, HWND_MESSAGE, PostMessageW, RegisterWindowMessageW, SMTO_ABORTIFHUNG, SendMessageTimeoutW,
+};
 use windows::core::{HSTRING, PCWSTR};
 
 use crate::ui::{Launch, Page, Section};
@@ -21,11 +23,19 @@ pub const WM_OT_TOGGLE: u32 = WM_APP + 4; // toggle dictation (bench/automation)
 pub const WM_OT_CANCEL: u32 = WM_APP + 5;
 pub const WM_OT_RETRY_LAST: u32 = WM_APP + 6;
 pub const WM_OT_QUIT: u32 = WM_APP + 7;
+/// Start dictating; does nothing unless the daemon is idle (idempotent, unlike [`WM_OT_TOGGLE`]).
+pub const WM_OT_START: u32 = WM_APP + 8;
+/// Stop the running recording; does nothing unless one is running (idempotent).
+pub const WM_OT_STOP: u32 = WM_APP + 9;
+/// Synchronous query (`SendMessage`, not posted): the reply is [`DaemonPhase::code`], 0 if the daemon was busy.
+pub const WM_OT_QUERY_PHASE: u32 = WM_APP + 10;
+/// Last id of the `WM_OT_*` range (the daemon lets lower-integrity senders use all of them).
+pub const WM_OT_LAST: u32 = WM_OT_QUERY_PHASE;
 /// First id the daemon may use for its own internal messages.
 pub const WM_OT_INTERNAL_BASE: u32 = WM_APP + 0x100;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum IpcMsg { Reload, SuspendHotkeys(bool), OpenSettings, Toggle, Cancel, RetryLast, Quit }
+pub enum IpcMsg { Reload, SuspendHotkeys(bool), OpenSettings, Toggle, Cancel, RetryLast, Quit, Start, Stop }
 
 impl IpcMsg {
     pub fn encode(self) -> (u32, usize) {
@@ -37,8 +47,60 @@ impl IpcMsg {
             IpcMsg::Cancel => (WM_OT_CANCEL, 0),
             IpcMsg::RetryLast => (WM_OT_RETRY_LAST, 0),
             IpcMsg::Quit => (WM_OT_QUIT, 0),
+            IpcMsg::Start => (WM_OT_START, 0),
+            IpcMsg::Stop => (WM_OT_STOP, 0),
         }
     }
+}
+
+/// What the daemon is doing, as answered to [`WM_OT_QUERY_PHASE`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DaemonPhase { Idle, Arming, Recording, Thinking }
+
+impl DaemonPhase {
+    /// Reply code; never 0 (0 means "no answer").
+    pub fn code(self) -> usize {
+        match self {
+            DaemonPhase::Idle => 1,
+            DaemonPhase::Arming => 2,
+            DaemonPhase::Recording => 3,
+            DaemonPhase::Thinking => 4,
+        }
+    }
+
+    pub fn from_code(code: usize) -> Option<DaemonPhase> {
+        Some(match code {
+            1 => DaemonPhase::Idle,
+            2 => DaemonPhase::Arming,
+            3 => DaemonPhase::Recording,
+            4 => DaemonPhase::Thinking,
+            _ => return None,
+        })
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            DaemonPhase::Idle => "idle",
+            DaemonPhase::Arming => "arming",
+            DaemonPhase::Recording => "recording",
+            DaemonPhase::Thinking => "thinking",
+        }
+    }
+}
+
+/// Ask the running daemon what it is doing. `None`: no daemon, no answer within 2 s, or it was
+/// momentarily busy (retry). Bench/automation only; the daemon never calls this.
+pub fn query_daemon_phase() -> Option<DaemonPhase> {
+    query_phase_of(DAEMON_WINDOW_CLASS)
+}
+
+fn query_phase_of(class: &str) -> Option<DaemonPhase> {
+    let hwnd = find_window(class)?;
+    let mut reply = 0usize;
+    // SAFETY: SendMessageTimeoutW to a window handle; a stale handle or a hung receiver just
+    // makes it fail, and `reply` outlives the call.
+    let ok = unsafe { SendMessageTimeoutW(hwnd, WM_OT_QUERY_PHASE, WPARAM(0), LPARAM(0), SMTO_ABORTIFHUNG, 2000, Some(&mut reply)) };
+    if ok.0 == 0 { None } else { DaemonPhase::from_code(reply) }
 }
 
 /// Name of the registered window message that asks a running Settings window to show a page.
@@ -194,7 +256,21 @@ mod tests {
         assert_eq!(IpcMsg::Cancel.encode().0, WM_APP + 5);
         assert_eq!(IpcMsg::RetryLast.encode().0, WM_APP + 6);
         assert_eq!(IpcMsg::Quit.encode().0, WM_APP + 7);
-        assert!(WM_OT_QUIT < WM_OT_INTERNAL_BASE);
+        assert_eq!(IpcMsg::Start.encode(), (WM_OT_START, 0));
+        assert_eq!(IpcMsg::Stop.encode(), (WM_OT_STOP, 0));
+        assert_eq!((WM_OT_START, WM_OT_STOP, WM_OT_QUERY_PHASE), (WM_APP + 8, WM_APP + 9, WM_APP + 10));
+        assert!(WM_OT_LAST < WM_OT_INTERNAL_BASE);
+    }
+
+    #[test]
+    fn phase_codes_round_trip_and_zero_is_no_answer() {
+        for p in [DaemonPhase::Idle, DaemonPhase::Arming, DaemonPhase::Recording, DaemonPhase::Thinking] {
+            assert_ne!(p.code(), 0);
+            assert_eq!(DaemonPhase::from_code(p.code()), Some(p));
+        }
+        assert_eq!(DaemonPhase::from_code(0), None);
+        assert_eq!(DaemonPhase::from_code(5), None);
+        assert_eq!(query_phase_of("OpenTalkTestNoSuchClass"), None);
     }
 
     #[test]

@@ -315,31 +315,83 @@ mod live_tests {
     use super::*;
     use crate::core::config::{Config, SttProviderId};
 
+    /// Verdict logic shared with `tests/e2e.rs` (one definition: `tests/common/live.rs`).
+    #[allow(dead_code)]
+    mod live {
+        include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/common/live.rs"));
+    }
+    use live::{Live, report_live, try_model};
+
+    /// Free OpenRouter audio-input models (PLAN section 10); the live policy allows `:free` only.
+    const FREE_MODELS: [&str; 3] =
+        ["thinkingmachines/inkling-small:free", "thinkingmachines/inkling:free", "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"];
+
+    /// Words of the sample ("...send the quarterly report to Priya by end of day"); a reply
+    /// without any of them is not a transcript of it (e.g. "I need the audio file.").
+    const SPOKEN: [&str; 2] = ["report", "priya"];
+
+    /// Runs the Test button's pipeline (`run_sample`) on `model` and judges the reply.
+    fn judge(cfg: &Config, model: &str, backoff_s: &[u64], sleep: impl FnMut(std::time::Duration)) -> Live {
+        let mut cfg = cfg.clone();
+        cfg.stt.models.insert(SttProviderId::Openrouter, model.to_string());
+        try_model(
+            model,
+            &SPOKEN,
+            backoff_s,
+            || match run_sample(&cfg) {
+                TestOutcome::Ok { text, latency_ms } => {
+                    eprintln!("{model}: {latency_ms} ms: {text:?}");
+                    Ok(text)
+                }
+                TestOutcome::Err(e) => {
+                    eprintln!("{model}: {e}");
+                    Err(e)
+                }
+            },
+            sleep,
+        )
+    }
+
+    /// A 200 reply that does not contain the spoken words must never count as VERIFIED.
+    #[test]
+    fn reply_without_the_spoken_words_is_not_verified() {
+        let mut calls = 0;
+        let v = try_model(
+            FREE_MODELS[2],
+            &SPOKEN,
+            &[0, 3],
+            || {
+                calls += 1;
+                Ok("I need the audio file.".to_string())
+            },
+            |_| {},
+        );
+        assert_eq!(calls, 1);
+        assert_eq!(v, live::dropped_audio(FREE_MODELS[2]));
+        assert!(FREE_MODELS.iter().all(|m| m.ends_with(":free")));
+    }
+
     /// The Test button's pipeline against the real OpenRouter free tier. Needs
-    /// `OPENTALK_SECRET_OPENROUTER`; upstream rate limits (429) are reported, not failures.
+    /// `OPENTALK_SECRET_OPENROUTER`. Prints `VERIFIED` / `UNVERIFIED - <reason>` / `FAILED`;
+    /// upstream limits are UNVERIFIED (fails under `OPENTALK_LIVE_REQUIRE=1`), a bad key or
+    /// request fails.
     #[test]
     #[ignore = "network: OpenRouter free model"]
     fn live_stt_test_button_openrouter() {
+        const TEST: &str = "live_stt_test_button_openrouter";
+        if std::env::var("OPENTALK_SECRET_OPENROUTER").is_err() {
+            return report_live(TEST, Live::Unverified("OPENTALK_SECRET_OPENROUTER not set".into()));
+        }
         let mut cfg = Config::default();
         cfg.stt.provider = SttProviderId::Openrouter;
-        for model in ["thinkingmachines/inkling-small:free", "google/gemini-3.5-flash-lite"] {
-            if !model.ends_with(":free") {
-                continue; // live policy: free models only
-            }
-            cfg.stt.models.insert(SttProviderId::Openrouter, model.to_string());
-            match run_sample(&cfg) {
-                TestOutcome::Ok { text, latency_ms } => {
-                    eprintln!("{model}: {latency_ms} ms: {text}");
-                    assert!(!text.trim().is_empty());
-                    return;
-                }
-                TestOutcome::Err(e) if e.contains("not available in this build") => {
-                    eprintln!("skipped: STT backend is not merged on this branch yet ({e})");
-                    return;
-                }
-                TestOutcome::Err(e) => eprintln!("{model}: {e}"),
+        let mut notes = Vec::new();
+        for model in FREE_MODELS {
+            assert!(model.ends_with(":free"), "live tests may only use :free models");
+            match judge(&cfg, model, &[0, 3, 8], std::thread::sleep) {
+                Live::Unverified(why) => notes.push(why),
+                done => return report_live(TEST, done),
             }
         }
-        eprintln!("all free models failed or were rate limited (not counted as a failure)");
+        report_live(TEST, Live::Unverified(notes.join("; ")));
     }
 }

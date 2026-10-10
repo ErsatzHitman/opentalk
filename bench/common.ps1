@@ -13,8 +13,14 @@ function New-TempHome([string]$prefix = 'opentalk') {
     return $dir
 }
 
-# Write config.json (UTF-8 without BOM) from a hashtable.
+# Dictation hotkey of every bench / e2e daemon: a combination nobody presses, so a user's own
+# Ctrl+Win (the default hotkey) can never reach a bench daemon and flip its recording state.
+$script:BenchHotkey = 'Control+Alt+Shift+F24'
+
+# Write config.json (UTF-8 without BOM) from a hashtable. A config without a `hotkey` gets $script:BenchHotkey.
 function Write-Config([string]$home_, [hashtable]$cfg) {
+    $cfg = $cfg.Clone()
+    if (-not $cfg.ContainsKey('hotkey')) { $cfg['hotkey'] = $script:BenchHotkey }
     $json = $cfg | ConvertTo-Json -Depth 8
     [IO.File]::WriteAllText((Join-Path $home_ 'config.json'), $json, (New-Object Text.UTF8Encoding $false))
 }
@@ -81,6 +87,73 @@ function Stop-Daemon([string]$exe, $proc, [hashtable]$environment) {
 
 function Stop-Quietly($proc) {
     if ($null -ne $proc) { try { if (-not $proc.HasExited) { $proc.Kill() } } catch {} }
+}
+
+# ---- dictation rounds (`opentalk --bench dictate`) -----------------------------------------
+
+function Get-Prop($o, [string]$name) {
+    if ($null -ne $o -and $o.PSObject.Properties[$name]) { return $o.$name }
+    return $null
+}
+
+function Get-Median([double[]]$values) {
+    $v = @($values | Sort-Object)
+    if ($v.Count -eq 0) { return $null }
+    $m = [int][math]::Floor($v.Count / 2)
+    if ($v.Count % 2) { return $v[$m] }
+    return ($v[$m - 1] + $v[$m]) / 2
+}
+
+# The JSON lines `--bench dictate` prints (one per attempt) as objects.
+function ConvertFrom-DictateOutput([string]$out) {
+    $rows = @($out -split "`n" | Where-Object { $_.Trim().StartsWith('{') } |
+        ForEach-Object { try { $_ | ConvertFrom-Json } catch {} } | Where-Object { $_ -and $_.PSObject.Properties['round'] })
+    return ,$rows
+}
+
+# Per-round summary of --bench dictate output: the last attempt of each round (an earlier 'disturbed'
+# attempt was redone), the median upload size, and the rounds worth keeping the daemon log for: not ok
+# (failed, timeout, not-idle, still disturbed), or an upload under $fraction of the median.
+function Get-DictateSummary($rows, [double]$fraction = 0.5) {
+    $rows = @($rows)
+    $last = @{}
+    foreach ($r in $rows) { $last[[int]$r.round] = $r }
+    $rounds = @($last.Keys | Sort-Object | ForEach-Object { $last[$_] })
+    $median = Get-Median @($rounds | Where-Object { $_.status -eq 'ok' -and (Get-Prop $_ 'upload_bytes') -gt 0 } | ForEach-Object { [double]$_.upload_bytes })
+    $out = @()
+    $flagged = @()
+    foreach ($r in $rounds) {
+        $bytes = Get-Prop $r 'upload_bytes'
+        $why = @()
+        if ($r.status -ne 'ok') { $why += $r.status }
+        elseif ($null -ne $median -and $null -ne $bytes -and $bytes -gt 0 -and $bytes -lt $fraction * $median) { $why += 'upload under 50% of the median' }
+        $attempts = @($rows | Where-Object { [int]$_.round -eq [int]$r.round }).Count
+        $row = [ordered]@{
+            round = [int]$r.round; status = $r.status; attempts = $attempts
+            recorded_ms = Get-Prop $r 'recorded_ms'; audio_ms = Get-Prop $r 'audio_ms'; upload_bytes = $bytes
+            stop_to_history_ms = Get-Prop $r 'stop_to_history_ms'; flagged = ($why.Count -gt 0)
+        }
+        if ($why.Count) { $row.flag = $why -join '; '; $flagged += [int]$r.round }
+        $out += [pscustomobject]$row
+    }
+    return [pscustomobject]@{
+        rounds = $out
+        ok = @($rounds | Where-Object { $_.status -eq 'ok' }).Count
+        total = $rounds.Count
+        disturbed_attempts = @($rows | Where-Object { $_.status -eq 'disturbed' }).Count
+        upload_median = $median
+        flagged = $flagged
+    }
+}
+
+# Copy a daemon's log out of its (soon deleted) home into $outDir; returns the file name, or $null.
+function Save-DaemonLog([string]$home_, [string]$outDir, [string]$label) {
+    $f = Join-Path $home_ 'logs\daemon.log'
+    if (-not (Test-Path $f)) { return $null }
+    New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+    $name = 'daemon-{0}-{1}.log' -f $label, (Get-Date -Format 'yyyyMMdd-HHmmss')
+    Copy-Item -LiteralPath $f -Destination (Join-Path $outDir $name) -Force
+    return $name
 }
 
 # Parse history.jsonl (oldest first).
