@@ -324,17 +324,19 @@ impl App {
             return;
         }
         if cfg.show_app_bubble {
-            if let Some(t) = target.clone() {
+            // Bench hook: `OPENTALK_BENCH_APP_EXE=<exe>` looks up that app's icon whatever is in front, or
+            // when nothing is (bench/bench.ps1 uses it where no packaged app can be brought to the
+            // foreground, e.g. a locked desktop that has no foreground window at all).
+            let bench_exe = std::env::var("OPENTALK_BENCH_APP_EXE").ok().filter(|p| !p.is_empty());
+            let icon_target = match (bench_exe, target.clone()) {
+                (Some(p), t) => Some(Target { exe_path: p, pid: 0, ..t.unwrap_or_default() }),
+                (None, t) => t,
+            };
+            if let Some(t) = icon_target {
                 let hwnd = self.hwnd;
                 let _ = std::thread::Builder::new().name("app-icon".into()).spawn(move || {
                     // Off the message loop: packaged apps read their manifest and PNGs from disk.
                     let started = now_ms();
-                    // Bench hook: `OPENTALK_BENCH_APP_EXE=<exe>` looks up that app's icon whatever is in
-                    // front (bench\bench.ps1 uses it where no packaged app can be brought to the foreground).
-                    let t = match std::env::var("OPENTALK_BENCH_APP_EXE") {
-                        Ok(p) if !p.is_empty() => Target { exe_path: p, pid: 0, ..t },
-                        _ => t,
-                    };
                     let exe = t.exe_path.rsplit(['\\', '/']).next().unwrap_or("").to_ascii_lowercase();
                     match appicon::load(&t, APP_ICON_PX) {
                         Some(icon) => {
