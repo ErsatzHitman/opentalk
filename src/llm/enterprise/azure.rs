@@ -85,17 +85,20 @@ impl ParamError {
     }
 
     /// Does this error blame one of `names`? With a JSON `code`, only `unsupported_parameter` /
-    /// `unsupported_value` count, and `param` (when present) must name the field, so e.g.
-    /// `invalid_value: "max_tokens is too large"` is not a shape problem. Without a code (older
-    /// "Unrecognized request argument supplied: ..." bodies) a substring check decides.
+    /// `unsupported_value` / `unknown_parameter` count, and `param` (when present) must name the
+    /// field, so e.g. `invalid_value: "max_tokens is too large"` is not a shape problem. A generic
+    /// code (Azure's `BadRequest`) counts only when the message says the argument is unknown.
+    /// Without a code (older "Unrecognized request argument supplied: ..." bodies) a substring
+    /// check decides.
     fn blames(&self, names: &[&str]) -> bool {
+        let named = || names.iter().any(|n| self.text.contains(n));
         match self.code.as_deref() {
             Some("unsupported_parameter" | "unsupported_value" | "unknown_parameter") => match &self.param {
                 Some(p) => names.iter().any(|n| p == n),
-                None => names.iter().any(|n| self.text.contains(n)),
+                None => named(),
             },
-            Some(_) => false,
-            None => names.iter().any(|n| self.text.contains(n)),
+            Some(_) => self.text.contains("unrecognized request argument") && named(),
+            None => named(),
         }
     }
 }
@@ -352,6 +355,10 @@ mod tests {
         assert!(rejects_reasoning_effort(400, unknown));
         assert!(!rejects_reasoning_effort(400, &up("temperature")));
         assert!(!rejects_reasoning_effort(500, unknown));
+        // Azure's generic code: only an "unrecognized argument" message counts.
+        let bad = r#"{"error":{"code":"BadRequest","message":"Unrecognized request argument supplied: reasoning_effort"}}"#;
+        assert!(rejects_reasoning_effort(400, bad));
+        assert!(!rejects_reasoning_effort(400, r#"{"error":{"code":"BadRequest","message":"reasoning_effort must be low"}}"#));
     }
 
     #[test]
