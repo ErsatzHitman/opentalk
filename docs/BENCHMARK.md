@@ -106,7 +106,7 @@ Release executable, measured by rebuilding the same commit with parts of the cle
 
 Vertex (rsa for the RS256 service-account JWT) costs 208,384 bytes (~204 KiB) and Azure + Bedrock another 44,032 bytes (~43 KiB): 252 KiB in all, about 3% of the executable. Vertex is above the ~150 KB threshold set in the review, so a cargo feature for it is a reasonable follow-up; everything stays within the 8 MB budget either way.
 
-Units: the MiB column is 2^20 bytes (so 7,877,632 bytes = 7.51 MiB = 7.88 MB decimal). The budget (PLAN section 1) is 8 MB **decimal**, i.e. 8,000,000 bytes (7.63 MiB); the release executable measured 7,928,832 bytes (7.93 MB, about 71 KB of headroom) on 2026-10-10 after the last merge, and `bench.ps1` checks it against that number.
+Units: the MiB column is 2^20 bytes (so 7,877,632 bytes = 7.51 MiB = 7.88 MB decimal). The budget (PLAN section 1) is 8 MB **decimal**, i.e. 8,000,000 bytes (7.63 MiB); the release executable measured 7,959,552 bytes (7.96 MB, about 40 KB of headroom) on 2026-10-10 after the w3-live-stt-evidence-docs merge, and `bench.ps1` checks it against that number.
 <!-- keep:end binary-size -->
 
 <!-- keep:begin unlocked-desktop -->

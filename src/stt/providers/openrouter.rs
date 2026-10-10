@@ -316,6 +316,28 @@ mod tests {
     }
     use live::{Live, report_live, try_model};
 
+    /// The live classifier reads user-facing sentences; pin it to the real ones so a reworded
+    /// message cannot turn a rate limit into a `Failed` live run (or a bad key into a retry).
+    #[test]
+    fn live_classifier_matches_the_real_error_messages() {
+        use SttErrorCode as C;
+        use live::{Attempt, classify_message};
+        let cases = [
+            (C::RateLimited, Attempt::Retry),
+            (C::Unavailable, Attempt::Retry),
+            (C::Timeout, Attempt::Retry),
+            (C::NoSpeech, Attempt::DroppedAudio),
+            (C::AccessDenied, Attempt::AccessDenied),
+            (C::AuthFailed, Attempt::Failed),
+            (C::ModelNotFound, Attempt::Failed),
+            (C::BadRequest, Attempt::Failed),
+        ];
+        for (code, want) in cases {
+            let msg = errors::message_for(code, "OpenRouter", Some("m:free"), false);
+            assert_eq!(classify_message(&msg), want, "{code:?}: {msg}");
+        }
+    }
+
     /// Live: transcribes tests/fixtures/tts_clean.wav through a free OpenRouter audio model.
     /// Needs OPENTALK_SECRET_OPENROUTER (only `:free` models are ever requested).
     ///
