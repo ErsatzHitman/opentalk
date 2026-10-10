@@ -172,8 +172,15 @@ fn desktop_pill_cancel_button_and_error_card() {
     send(hwnd, MOVE, 0, lparam(px, py));
     pump(600);
     let g = w.with(|i| i.st.geometry(i.now()));
-    assert!(g.cancel_t > 0.99, "cancel bud emerged (pointer {:?})", w.with(|i| i.st.pointer()));
+    assert!(g.cancel_t > 0.99, "cancel button emerged (pointer {:?})", w.with(|i| i.st.pointer()));
+    // crossing the 8 px gap between the pill and the detached button keeps the hover alive
+    let gap = ((g.pill.r + 4.0) * scale) as i32;
+    send(hwnd, MOVE, 0, lparam(gap, py));
+    pump(100);
+    assert!(w.with(|i| i.st.pointer().group), "hover survives the gap");
     let (cx, cy) = ((g.cancel.0 * scale) as i32, (g.cancel.1 * scale) as i32);
+    send(hwnd, MOVE, 0, lparam(cx, cy));
+    assert!(w.with(|i| i.st.pointer().cancel), "pointer is on the button");
     send(hwnd, WM_LBUTTONDOWN, 1, lparam(cx, cy));
     send(hwnd, WM_LBUTTONUP, 0, lparam(cx, cy));
     assert_eq!(events.borrow().as_slice(), &[PillEvent::CancelClicked]);

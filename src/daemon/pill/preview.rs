@@ -37,6 +37,7 @@ pub const STATES: &[&str] = &[
     "unavailable",
     "cancel",
     "cancel-hot",
+    "cancel-out",
     "error",
     "error-noretry",
     "error-long",
@@ -180,7 +181,7 @@ pub fn build(scene: &Scene) -> Result<(RenderState, f64), String> {
             st.settle();
             st.set_pointer(tip, 0.0);
         }
-        "thinking" | "unavailable" | "cancel" | "cancel-hot" => {
+        "thinking" | "unavailable" | "cancel" | "cancel-hot" | "cancel-out" => {
             st.set_mode(PillMode::Recording, -PREROLL_MS);
             run(&mut st, -PREROLL_MS, 0.0, &level);
             st.settle();
@@ -188,6 +189,12 @@ pub fn build(scene: &Scene) -> Result<(RenderState, f64), String> {
                 "thinking" => st.set_mode(PillMode::Thinking, 0.0),
                 "unavailable" => st.set_mode(PillMode::Unavailable, 0.0),
                 "cancel" => st.set_pointer(hover, 0.0),
+                // hover settled with the button out, then the pointer leaves at t = 0: the retraction
+                "cancel-out" => {
+                    st.set_pointer(hover, -1000.0);
+                    st.settle();
+                    st.set_pointer(Pointer::default(), 0.0);
+                }
                 _ => st.set_pointer(Pointer { group: true, pill: false, bubble: false, cancel: true }, 0.0),
             }
         }

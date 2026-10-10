@@ -3,7 +3,7 @@
 User request: "use /liquid-glass for the entire UI". Source of truth: the `liquid-glass` skill
 (`~/.claude/skills/liquid-glass`: `SKILL.md`, `assets/liquid-glass.css`, `references/recipes.md`,
 `references/refraction.md`). The skill targets CSS; this is a native port to egui 0.36 (glow) in
-`src/ui`. The design is ported, not the web mechanics. The recording pill, cancel bud, app-icon
+`src/ui`. The design is ported, not the web mechanics. The recording pill, cancel button, app-icon
 bubble, tooltip and error card (`src/daemon/pill*`) have their own port of the same skill in the daemon's
 software renderer, over a captured copy of the screen: see "Pill surface material" in `docs/SPEC.md`
 (`src/daemon/pill/glass.rs`, `capture.rs`). This document covers the Settings process only.

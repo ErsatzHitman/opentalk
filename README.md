@@ -12,7 +12,8 @@ the same floating recording pill, and adds a deterministic filler-word cleaner, 
 - **Tiny and idle.** The daemon is plain Win32 + WASAPI. No GPU, no web view, no polling: ~0% CPU when idle (see
   [docs/BENCHMARK.md](docs/BENCHMARK.md)). The settings window is a separate process that only exists while it is open.
 - **The OpenWhispr pill.** A 40 px circle that grows into a capsule with a live 11-bar waveform, a signal glow while it
-  transcribes, cancel button, tooltip and error card, plus a round bubble showing the app you are dictating into.
+  transcribes, tooltip and error card, plus a round bubble showing the app you are dictating into and, while you hover
+  the pill, a round cancel button that detaches beside it (the bubble's twin, on the right).
   The surfaces are **liquid glass**: they frost and refract the screen behind them. Because that needs a clean copy of the
   screen, the pill is excluded from screen capture, so it does **not appear in screenshots, screen recordings or screen
   sharing** (Windows 10 2004 or newer; on older builds, or when a capture fails, it falls back to neutral frosted glass).
@@ -108,7 +109,8 @@ EXE=target/x86_64-pc-windows-gnu/debug/opentalk.exe     # cargo build --target x
 wine $EXE --render-pill recording 1500 rec.png --backdrop busy-text --composite \
      --app-icon tests/golden/fixtures/explorer_icon.png --upscale 2
 wine $EXE --render-pill error 400 err.png --dark --backdrop gradient --composite
-# states: idle hover tooltip recording recording-tooltip thinking unavailable cancel cancel-hot error error-noretry error-long
+# states: idle hover tooltip recording recording-tooltip thinking unavailable cancel cancel-hot cancel-out error error-noretry error-long
+# cancel: t = ms since hover began (the button slides out); cancel-out: t = ms since the pointer left (it retracts)
 # backdrops: white black gradient busy-text (or a PNG path)
 ```
 
