@@ -446,6 +446,8 @@ impl App {
             ipc::WM_OT_SUSPEND_HOTKEYS => self.suspend_hotkeys(wparam != 0),
             ipc::WM_OT_OPEN_SETTINGS => self.settings.open(settings::PAGE_HISTORY),
             ipc::WM_OT_TOGGLE => self.step(Input::Toggle, t0),
+            ipc::WM_OT_START => self.step(Input::Start, t0),
+            ipc::WM_OT_STOP => self.step(Input::Stop, t0),
             ipc::WM_OT_CANCEL => self.step(Input::Cancel, t0),
             ipc::WM_OT_RETRY_LAST => self.retry_last(),
             ipc::WM_OT_QUIT => self.quit(),
@@ -572,6 +574,9 @@ fn event_from_code(code: usize) -> Option<PillEvent> {
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     let t0 = now_ms();
+    if msg == ipc::WM_OT_QUERY_PHASE {
+        return LRESULT(query_phase() as isize);
+    }
     match dispatch(hwnd, msg, wparam.0, lparam.0, t0) {
         Some(true) => LRESULT(0),
         // The app was busy (a nested loop up the stack): the outermost call replays it on return.
@@ -582,6 +587,22 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         // SAFETY: default handling of a message we do not own.
         None => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
     }
+}
+
+/// Answer [`ipc::WM_OT_QUERY_PHASE`]: the dictation phase code, or 0 when the app is busy (a
+/// nested loop up the stack). Never parked: the sender wants the answer now and retries.
+fn query_phase() -> usize {
+    let mut code = 0;
+    with_app(|a| {
+        code = match a.machine.phase {
+            Phase::Idle => ipc::DaemonPhase::Idle,
+            Phase::Arming => ipc::DaemonPhase::Arming,
+            Phase::Recording { .. } => ipc::DaemonPhase::Recording,
+            Phase::Thinking => ipc::DaemonPhase::Thinking,
+        }
+        .code();
+    });
+    code
 }
 
 /// Handle one message. `None`: not ours. `Some(false)`: the app was busy, so nothing ran.
@@ -617,7 +638,7 @@ fn dispatch(hwnd: HWND, msg: u32, wparam: usize, lparam: isize, t0: f64) -> Opti
             }
         })),
         WM_TRAY_EVT => Some(on_tray_message(hwnd, LPARAM(lparam), t0)),
-        m if (ipc::WM_APP + 1..=ipc::WM_OT_QUIT).contains(&m) => Some(with_app(|a| a.on_ipc(m, wparam, t0))),
+        m if (ipc::WM_APP + 1..=ipc::WM_OT_STOP).contains(&m) => Some(with_app(|a| a.on_ipc(m, wparam, t0))),
         m if m != 0 && m == TASKBAR_CREATED.load(Ordering::Relaxed) => Some(with_app(|a| {
             if let Some(t) = a.tray.as_mut() {
                 t.readd();
@@ -664,7 +685,7 @@ unsafe fn wide_eq(p: *const u16, s: &str) -> bool {
 /// daemon itself runs elevated) post our IPC messages, which UIPI would otherwise drop.
 fn allow_ipc_from_lower_integrity(hwnd: HWND) {
     let taskbar = TASKBAR_CREATED.load(Ordering::Relaxed);
-    let msgs = (ipc::WM_OT_RELOAD..=ipc::WM_OT_QUIT).chain((taskbar != 0).then_some(taskbar));
+    let msgs = (ipc::WM_OT_RELOAD..=ipc::WM_OT_LAST).chain((taskbar != 0).then_some(taskbar));
     for m in msgs {
         // SAFETY: changes the message filter of our own window only.
         if let Err(e) = unsafe { ChangeWindowMessageFilterEx(hwnd, m, MSGFLT_ALLOW, None) } {
