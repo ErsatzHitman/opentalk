@@ -17,9 +17,9 @@
 //!    the first 300 ms it only tracks downwards (a seed taken from the room, not from a hot mic);
 //! 4. gate with hysteresis: opens above `max(floor + 9 dB, -48 dBFS)`, closes after 150 ms below
 //!    `max(floor + 5 dB, -52 dBFS)`; a closed gate publishes exactly 0.0;
-//! 5. display level: linear in dB between the close threshold and an auto reference (a slowly
-//!    decaying running speech peak, -34 .. -10 dBFS), so quiet and hot microphones both use the whole
-//!    bar range.
+//! 5. bar level: OpenWhispr's `min(1, (rms * 8)^0.75)` of the latest 20 ms, with a dead zone under
+//!    -48 dBFS so a quiet room is a flat line. The gate, floor and reference above only feed the
+//!    per-recording diagnostics.
 //!
 //! Pure and allocation-free after construction: unit-tested without audio hardware.
 
@@ -52,13 +52,27 @@ pub const REF_MIN_DB: f32 = -34.0;
 pub const REF_MAX_DB: f32 = -10.0;
 const REF_ATTACK_MS: f32 = 50.0;
 const REF_DECAY_DB_S: f32 = 3.0;
-/// Narrowest dB span between the close threshold and the reference.
-const MIN_SPAN_DB: f32 = 10.0;
+
+/// RMS under this is room noise: the bars stay flat (about -48 dBFS).
+pub const DEAD_ZONE_RMS: f32 = 0.004;
+/// OpenWhispr's mapping (`waveformMath.ts`): conversational speech RMS is about 0.02 - 0.15; the gain
+/// puts loud voicing at the top of the lane and the 0.75 exponent keeps quiet speech visible while
+/// leaving contrast between neighbouring bars.
+const LEVEL_GAIN: f32 = 8.0;
+const LEVEL_EXPONENT: f32 = 0.75;
+
+/// Bar level 0..=1 of an RMS amplitude (full scale 1.0); exactly 0.0 inside the dead zone.
+pub fn bar_level(rms: f32) -> f32 {
+    if !rms.is_finite() || rms < DEAD_ZONE_RMS {
+        return 0.0;
+    }
+    (rms * LEVEL_GAIN).powf(LEVEL_EXPONENT).min(1.0)
+}
 
 /// Result of one 10 ms hop.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Hop {
-    /// Display level in 0..=1; exactly 0.0 while the gate is shut.
+    /// Bar level in 0..=1 ([`bar_level`] of the latest 20 ms); exactly 0.0 in the dead zone.
     pub level: f32,
     /// The gate is open.
     pub open: bool,
@@ -198,15 +212,12 @@ impl Meter {
         self.ref_db = self.ref_db.clamp(REF_MIN_DB, REF_MAX_DB);
 
         self.hops += 1;
-        let level = if self.open {
+        if self.open {
             self.open_hops += 1;
-            let lo = close_db;
-            let hi = self.ref_db.max(lo + MIN_SPAN_DB);
-            ((db - lo) / (hi - lo)).clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
-        Hop { level, open: self.open, db }
+        }
+        // The bar level is OpenWhispr's: straight from the RMS, no gate in the way (the gate and floor
+        // above only feed the diagnostics). A quiet room sits under the dead zone and shows a flat line.
+        Hop { level: bar_level(10f32.powf(db / 20.0)), open: self.open, db }
     }
 }
 
