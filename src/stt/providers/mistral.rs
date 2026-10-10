@@ -1,6 +1,6 @@
 //! Mistral `POST {base}/audio/transcriptions` (multipart, `x-api-key`). The dictionary is
 //! sent as repeated `context_bias` tokens (comma/whitespace split, at most 100).
-use super::{BYOK_FILE_LIMIT, api_key, base_lang, base_url, check_size, model_or, text_json, timeout};
+use super::{BYOK_FILE_LIMIT, api_key, base_lang, base_url, check_size, model_or, text_json_with, timeout};
 use crate::core::config::SttProviderId;
 use crate::core::http::{self, Multipart};
 use crate::stt::errors::{self, SttError};
@@ -40,8 +40,8 @@ impl BatchProvider for Mistral {
 
         let url = format!("{}/audio/transcriptions", base_url(creds, DEFAULT_BASE));
         let res = http::post(&url, &[("x-api-key", key)], &content_type, &body, timeout(opts));
-        let resp = errors::check_response("Mistral", Some(model), false, res)?;
-        text_json("Mistral", false, &resp)
+        let resp = errors::check_response_with("Mistral", Some(model), false, res, &[key])?;
+        text_json_with("Mistral", false, &resp, &[key])
     }
 }
 
@@ -87,5 +87,16 @@ mod tests {
         let e = Mistral.transcribe(&audio(), &opts(""), &creds(&mock, "mistral-key-1")).unwrap_err();
         assert_eq!((e.code, e.message.as_str()), (SttErrorCode::AuthFailed, "Mistral rejected your API key."));
         assert_eq!(mock.one().multipart().text("model"), ["voxtral-mini-latest"]);
+    }
+
+    #[test]
+    fn configured_key_echoed_by_the_provider_is_redacted() {
+        const KEY: &str = "mi9Zq3Lw7Tn2Vb8Xc5Rd1Fh4Jk6Pa0Sy";
+        let mock = serve(vec![Resp::json(401, &format!(r#"{{"message":"Unauthorized","detail":"api key {KEY} is invalid"}}"#))]);
+        let e = Mistral.transcribe(&audio(), &opts(""), &creds(&mock, KEY)).unwrap_err();
+        assert_eq!(e.code, SttErrorCode::AuthFailed);
+        assert_no_leak(&e, KEY);
+        let mock = serve(vec![Resp::json(200, &format!(r#"{{"note":"{KEY}"}}"#))]);
+        assert_no_leak(&Mistral.transcribe(&audio(), &opts(""), &creds(&mock, KEY)).unwrap_err(), KEY);
     }
 }
