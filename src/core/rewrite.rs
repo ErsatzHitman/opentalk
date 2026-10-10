@@ -116,7 +116,12 @@ pub const COURTESY: &[&[&str]] = &[&["please"], &["thanks"], &["thank", "you"]];
 
 /// Characters trimmed from the end of the body once the trigger is cut off (a clause break that
 /// led into the phrase). Sentence-final `. ! ?` are kept.
-const TRAILING_SEPARATORS: &[char] = &[',', ';', ':', '-', '\u{2013}', '\u{2014}', '\u{2026}', '\u{FF0C}', '\u{3001}', '\u{FF1B}', '\u{FF1A}', '\u{FF0D}'];
+/// Opening quotes and brackets are included: an STT that quotes the phrase (`Friday "rewrite this concisely"`
+/// with curly quotes) must not leave the opening mark dangling at the end of the body. Closing marks stay.
+const TRAILING_SEPARATORS: &[char] = &[
+    ',', ';', ':', '-', '\u{2013}', '\u{2014}', '\u{2026}', '\u{FF0C}', '\u{3001}', '\u{FF1B}', '\u{FF1A}', '\u{FF0D}', '\u{201C}', '\u{201E}', '\u{00AB}',
+    '\u{2039}', '(', '[', '{', '\u{300C}', '\u{300E}',
+];
 
 fn is_separator(c: char) -> bool {
     c.is_whitespace() || TRAILING_SEPARATORS.contains(&c)
@@ -480,6 +485,14 @@ mod tests {
         assert_eq!(body("Send it Friday \u{2014} rewrite this concisely"), "Send it Friday");
         assert_eq!(body("Send it Friday\u{2026} rewrite this concisely"), "Send it Friday");
         assert_eq!(body("Send it Friday... rewrite this concisely"), "Send it Friday...");
+    }
+
+    #[test]
+    fn a_quoted_phrase_leaves_no_dangling_opening_mark() {
+        assert_eq!(body("Send it Friday \u{201C}rewrite this concisely\u{201D}"), "Send it Friday");
+        assert_eq!(body("Send it Friday (rewrite this concisely)"), "Send it Friday");
+        // A closing mark that belongs to the body stays.
+        assert_eq!(body("She said \u{201C}yes\u{201D} rewrite this concisely"), "She said \u{201C}yes\u{201D}");
     }
 
     #[test]

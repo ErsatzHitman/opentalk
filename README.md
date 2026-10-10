@@ -209,8 +209,8 @@ merged build:
    afternoon because the client is out on Thursday, rewrite this concisely."* OpenTalk sends the text (without the phrase)
    to your AI cleanup provider, model and key and pastes the shorter version instead. It works even when *Enable AI
    cleanup* is off, as long as a key is set.
-   - The phrase must be the **last** thing you say; one "please" / "thanks" / "thank you" after it is fine, and a leading
-     "and", "then", "so", "please" or "also" is dropped. Case, punctuation and "re-write" spellings do not matter; there is
+   - The phrase must be the **last** thing you say; one "please" / "thanks" / "thank you" after it is fine, and an
+     "and", "then", "so", "please" or "also" right before it is dropped. Case, punctuation and "re-write" spellings do not matter; there is
      no fuzzy matching ("write this concisely" does not trigger it).
    - Change or switch off the phrase in **Settings > Cleanup & AI**: it needs two words (six letters), at most 80 characters,
      and no filler words (they are removed from dictations before matching). An empty phrase turns the feature off.
