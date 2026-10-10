@@ -87,15 +87,6 @@ impl SettingsProc {
     pub fn pid(&mut self) -> Option<u32> {
         self.is_open().then(|| self.child.as_ref().map(Child::id)).flatten()
     }
-
-    /// Ask the child to go away (tests only; a daemon quit leaves an open window alone).
-    #[cfg(test)]
-    pub fn kill(&mut self) {
-        if let Some(mut c) = self.child.take() {
-            let _ = c.kill();
-            let _ = c.wait();
-        }
-    }
 }
 
 /// Tell the Settings window `hwnd` to show `page` (event-driven: a registered window message the

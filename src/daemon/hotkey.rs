@@ -517,11 +517,6 @@ impl<K: KeyState> Matcher<K> {
     }
 
     #[cfg(test)]
-    pub fn spec(&self) -> &HotkeySpec {
-        &self.spec
-    }
-
-    #[cfg(test)]
     pub fn is_active(&self) -> bool {
         self.active
     }
@@ -2070,10 +2065,6 @@ mod tests {
             }
             // SAFETY: default processing for everything else.
             unsafe { DefWindowProcW(h, m, w, l) }
-        }
-
-        fn key(vk: u32, up: bool) -> INPUT {
-            key_extra(vk, up, 0)
         }
 
         fn key_extra(vk: u32, up: bool, extra: usize) -> INPUT {

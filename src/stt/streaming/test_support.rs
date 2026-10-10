@@ -21,16 +21,6 @@ impl Req {
     pub fn header(&self, name: &str) -> Option<&str> {
         self.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
     }
-    pub fn path(&self) -> &str {
-        self.target.split('?').next().unwrap_or("")
-    }
-    /// Decoded-as-sent (still percent-encoded) values of a query parameter.
-    pub fn query(&self, key: &str) -> Vec<String> {
-        self.target
-            .split_once('?')
-            .map(|(_, q)| q.split('&').filter_map(|kv| kv.strip_prefix(key).and_then(|r| r.strip_prefix('='))).map(String::from).collect())
-            .unwrap_or_default()
-    }
 }
 
 /// Server side of one accepted WebSocket.
