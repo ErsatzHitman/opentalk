@@ -519,4 +519,40 @@ mod tests {
         assert!((w.height(WAVE_BARS - 2, 200.0) - target).abs() < 1e-4);
         assert!((w.height(WAVE_BARS - 1, 200.0) - 4.0).abs() < 1e-4);
     }
+
+    /// Bars glide: at every sample instant the new target starts from where the bar is, so no frame
+    /// steps, whatever the cadence ticks arrive at, and a bar never overshoots its target.
+    #[test]
+    fn bars_glide_through_every_sample_instant_at_any_cadence() {
+        for hz in [30.0f64, 60.0, 72.0, 100.0, 144.0] {
+            let mut w = Waveform::new();
+            let dt = 1000.0 / hz;
+            let (mut t, mut k) = (0.0, 0u32);
+            let mut prev = w.heights(0.0);
+            while t < 3000.0 {
+                // a loud / quiet / medium pattern, so bars move both ways
+                let lvl = [0.2, 0.01, 0.08, 0.0, 0.15][(k % 5) as usize];
+                let before = w.heights(t);
+                let sampled = w.tick(t, lvl);
+                let after = w.heights(t);
+                for i in 0..WAVE_BARS {
+                    assert!((after[i] - before[i]).abs() < 1e-3, "{hz} Hz bar {i}: stepped by {} at {t:.1} ms", after[i] - before[i]);
+                    assert!((WAVE_MIN_PX - 1e-3..=WAVE_MAX_PX + 1e-3).contains(&after[i]), "{hz} Hz bar {i}: {} out of range", after[i]);
+                }
+                if sampled {
+                    k += 1;
+                }
+                // between samples a bar only moves toward its target, never past it
+                if !sampled {
+                    for i in 0..WAVE_BARS {
+                        let target = bar_height(w.levels[i]);
+                        assert!((after[i] - prev[i]) * (target - prev[i]) >= -1e-4, "{hz} Hz bar {i}: moved away from its target");
+                        assert!((after[i] - target).abs() <= (prev[i] - target).abs() + 1e-3, "{hz} Hz bar {i}: overshot");
+                    }
+                }
+                prev = w.heights(t);
+                t += dt;
+            }
+        }
+    }
 }

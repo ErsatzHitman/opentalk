@@ -6,6 +6,7 @@ use super::anim::{QuietRun, SLOW_TICK_MS, TICK_MS, level_band};
 use super::capture::{GlassHost, Refresh, ScreenEvents, WM_APP_GLASS, WM_APP_SCREEN_EVENT};
 use super::card::CardHover;
 use super::model::{Hit, Pointer, RenderState, TickOutcome};
+use super::pacer::{Hint, Vsync};
 use super::raster::DevRect;
 use super::render::{BAR_EPS, FrameCache, FrameOutcome, pixel_size};
 use super::theme::{Palette, resolve_dark};
@@ -19,7 +20,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use tiny_skia::Pixmap;
-use windows::Win32::Foundation::{COLORREF, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WAIT_OBJECT_0, WPARAM, CloseHandle};
+use windows::Win32::Foundation::{COLORREF, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WAIT_OBJECT_0, WAIT_TIMEOUT, WPARAM, CloseHandle};
 use windows::Win32::Graphics::Gdi::{
     AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS, DeleteDC,
     DeleteObject, GetMonitorInfoW, HBITMAP, HDC, HGDIOBJ, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint,
@@ -131,6 +132,8 @@ struct TimerCore {
     woken: AtomicBool,
     /// Token of the capture-side level wake armed for the current slow spell (0: none).
     wake_token: AtomicU64,
+    /// When the frame of the tick being handled is shown (set by the vsync-paced thread).
+    hint: Hint,
 }
 
 impl TimerCore {
@@ -210,6 +213,7 @@ impl AnimTimer {
             slow: AtomicBool::new(false),
             woken: AtomicBool::new(false),
             wake_token: AtomicU64::new(0),
+            hint: Hint::new(),
         });
         let c = core.clone();
         let join = std::thread::Builder::new().name("pill-anim".into()).spawn(move || anim_thread(c, sink)).map_err(|e| e.to_string())?;
@@ -240,6 +244,11 @@ impl AnimTimer {
         self.core.slow.load(Ordering::Acquire)
     }
 
+    /// Ticking at the full cadence: the next frame is at most one refresh away.
+    pub fn is_full_rate(&self) -> bool {
+        self.core.active.load(Ordering::Acquire) && !self.core.slow.load(Ordering::Acquire)
+    }
+
     /// Switch to the slow cadence. Nothing brings the timer back unless the caller arranges a
     /// [`AnimTimer::wake`] (see `Inner::go_slow`).
     fn slow_down(&self) {
@@ -268,6 +277,12 @@ impl AnimTimer {
         self.core.woken.swap(false, Ordering::AcqRel)
     }
 
+    /// Time to sample the animation at for a frame drawn at `now`: when it will be shown (the next
+    /// vertical blank) while the thread is vsync-paced, else `now`.
+    pub fn present_time(&self, now: f64) -> f64 {
+        self.core.hint.present_time(now)
+    }
+
     /// Called by the window procedure when it consumed a tick.
     pub fn ack(&self) {
         self.pending.store(false, Ordering::Release);
@@ -294,11 +309,26 @@ fn anim_thread(core: Arc<TimerCore>, sink: Box<dyn Fn() + Send>) {
         let timer = CreateWaitableTimerExW(None, PCWSTR::null(), CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS.0)
             .or_else(|_| CreateWaitableTimerExW(None, PCWSTR::null(), Default::default(), TIMER_ALL_ACCESS.0));
         let Ok(timer) = timer else { return };
+        // The compositor's clock paces the full-rate cadence (see `pacer`); the fixed-rate timer
+        // remains for the slow cadence and for a machine whose compositor does not block.
+        let mut vsync = Vsync::new();
         // first tick one period from now, then periodic
         let arm = |slow: bool| {
             let ms = if slow { SLOW_TICK_MS } else { TICK_MS };
             let due = -(ms as i64) * 10_000;
             SetWaitableTimer(timer, &due, ms as i32, None, None, false).is_ok()
+        };
+        // Pick the pacing for a cadence: vsync at full rate when available (the timer is disarmed),
+        // else the timer. Returns whether vsync paces.
+        let pace = |slow: bool, vsync: &Option<Vsync>| -> Option<bool> {
+            if !slow && vsync.is_some() {
+                let _ = CancelWaitableTimer(timer);
+                core.hint.clear();
+                Some(true)
+            } else {
+                core.hint.clear();
+                arm(slow).then_some(false)
+            }
         };
         loop {
             let r = WaitForMultipleObjects(&[start, quit], false, INFINITE);
@@ -311,19 +341,43 @@ fn anim_thread(core: Arc<TimerCore>, sink: Box<dyn Fn() + Send>) {
                 continue;
             }
             let mut slow = core.slow.load(Ordering::Acquire);
-            if !arm(slow) {
-                continue;
-            }
+            let Some(mut paced) = pace(slow, &vsync) else { continue };
             loop {
-                let r = WaitForMultipleObjects(&[timer, stop, quit, rate], false, INFINITE);
-                match r.0.wrapping_sub(WAIT_OBJECT_0.0) {
+                // 0: timer, 1: stop, 2: quit, 3: rate. Vsync-paced, the control events are polled
+                // between frames (a frame is at most one refresh long).
+                let idx = if paced {
+                    let r = WaitForMultipleObjects(&[stop, quit, rate], false, 0);
+                    if r == WAIT_TIMEOUT {
+                        match vsync.as_mut().and_then(|v| v.wait()) {
+                            Some((to_next, period)) => {
+                                core.hint.set(crate::core::timing::now_ms() + to_next, period);
+                                sink();
+                            }
+                            None => {
+                                // the compositor stopped pacing (remote session, DWM off): timer from now on
+                                vsync = None;
+                                match pace(slow, &vsync) {
+                                    Some(p) => paced = p,
+                                    None => break,
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    r.0.wrapping_sub(WAIT_OBJECT_0.0) + 1
+                } else {
+                    WaitForMultipleObjects(&[timer, stop, quit, rate], false, INFINITE).0.wrapping_sub(WAIT_OBJECT_0.0)
+                };
+                match idx {
                     0 => sink(),
                     1 => {
                         let _ = CancelWaitableTimer(timer);
+                        core.hint.clear();
                         // stop followed by start before this thread ran: keep going
                         if core.active.load(Ordering::Acquire) {
                             slow = core.slow.load(Ordering::Acquire);
-                            if arm(slow) {
+                            if let Some(p) = pace(slow, &vsync) {
+                                paced = p;
                                 continue;
                             }
                         }
@@ -334,13 +388,17 @@ fn anim_thread(core: Arc<TimerCore>, sink: Box<dyn Fn() + Send>) {
                         let want = core.slow.load(Ordering::Acquire);
                         if want != slow {
                             slow = want;
-                            if arm(slow) {
-                                if !slow {
-                                    // woken: the first full-rate frame must not wait a period
-                                    sink();
+                            match pace(slow, &vsync) {
+                                Some(p) => {
+                                    paced = p;
+                                    if !slow {
+                                        // woken: the first full-rate frame must not wait a period
+                                        sink();
+                                    }
                                 }
-                            } else {
-                                let _ = CancelWaitableTimer(timer);
+                                None => {
+                                    let _ = CancelWaitableTimer(timer);
+                                }
                             }
                         }
                     }
@@ -472,6 +530,12 @@ pub(super) struct Inner {
     pub partial: u64,
     /// Consecutive recording frames that changed nothing; a long run slows the animation timer.
     quiet: QuietRun,
+    /// Time of the newest frame handed to the compositor (ms). Frames are sampled at the time they
+    /// will be shown, which can be a vblank ahead of the clock; every later frame and every state
+    /// change is stamped no earlier than this, so the animation never steps back.
+    last_t: f64,
+    /// Presentation time of the tick being handled (set only around that tick's frame).
+    frame_t: Option<f64>,
     /// Screen capture under the window (the glass backdrop); see `capture.rs`.
     glass: GlassHost,
     /// Full rect of the monitor the window is on (device px).
@@ -543,7 +607,7 @@ fn cursor_monitor() -> HMONITOR {
 
 impl Inner {
     fn now(&self) -> f64 {
-        now_ms()
+        now_ms().max(self.last_t)
     }
 
     fn client_size(&self) -> (i32, i32) {
@@ -577,7 +641,16 @@ impl Inner {
             self.mon = m;
         }
         let s = monitor_scale(hmon);
+        let before = self.st.scale;
         self.st.set_scale(s);
+        if (self.st.scale - before).abs() > f32::EPSILON {
+            // another DPI: build the glow sprites for it off the UI thread now, so the first stop on
+            // this monitor does not pay ~25 ms of blur in the middle of the shrink
+            let scale = self.st.scale;
+            let _ = std::thread::Builder::new().name("pill-sprites".into()).spawn(move || {
+                let _ = super::glow::Sprites::get(scale);
+            });
+        }
     }
 
     /// Re-layout (window size may have changed) and push a frame.
@@ -628,6 +701,14 @@ impl Inner {
         (((self.mon.2 - self.mon.0) as f32 / s).max(1.0), ((self.mon.3 - self.mon.1) as f32 / s).max(1.0))
     }
 
+    /// The pill is changing size (expand, shrink, the cancel bud, the app bubble). The backdrop is
+    /// frozen while it does: a capture mid-motion costs the compositor and the worker CPU exactly when
+    /// every frame counts, and the ~10 px of screen the glass frosts does not change in 300 ms. The
+    /// capture the motion postponed is taken as soon as it ends (the periodic timer, or a deferral).
+    fn backdrop_frozen(&self, now: f64) -> bool {
+        self.st.is_resizing(now)
+    }
+
     /// Ask the worker for the screen under the window (no-op while one request is in flight; the
     /// result arrives as `WM_APP_GLASS`).
     fn request_backdrop(&mut self, now: f64) -> bool {
@@ -664,14 +745,16 @@ impl Inner {
         let now = self.now();
         if self.glass.dirty {
             let wait = GLASS_MIN_GAP_MS - (now - self.glass.last_ms);
-            if wait <= 0.0 {
+            if wait <= 0.0 && !self.backdrop_frozen(now) {
                 self.request_backdrop(now);
             } else if self.glass_ms == 0 {
                 // no periodic timer to pick it up: capture once the rate limit allows
                 self.glass_defer(wait.ceil() as u32);
             }
         }
-        if changed {
+        // a full-rate animation draws the new picture with its next frame, a vblank away: drawing it
+        // here as well would cost a second frame inside the same refresh
+        if changed && !self.timer.as_ref().is_some_and(|t| t.is_full_rate()) {
             self.present();
         }
     }
@@ -694,7 +777,7 @@ impl Inner {
                 self.st.set_backdrop(None);
             }
             self.request_backdrop(now);
-        } else if !self.glass.covers(self.win_rect(), self.mon, self.st.scale) || (self.glass.dirty && due) {
+        } else if !self.glass.covers(self.win_rect(), self.mon, self.st.scale) || (self.glass.dirty && due && !self.backdrop_frozen(now)) {
             if !self.glass.scale_matches(self.st.scale) {
                 // another DPI: the picture's cells are the wrong size, paint the neutral glass until the new one lands
                 self.st.set_backdrop(None);
@@ -775,6 +858,11 @@ impl Inner {
         }
         self.glass.dirty = true;
         let now = self.now();
+        if self.backdrop_frozen(now) {
+            // the pill is still moving: look again shortly after it settles
+            self.glass_defer(60);
+            return;
+        }
         let wait = GLASS_MIN_GAP_MS - (now - self.glass.last_ms);
         if wait <= 0.0 {
             self.request_backdrop(now);
@@ -821,14 +909,15 @@ impl Inner {
             self.glass_done();
         }
         let now = self.now();
-        if self.visible && self.glass.available() && now - self.glass.last_ms >= GLASS_MIN_GAP_MS {
+        if self.visible && self.glass.available() && now - self.glass.last_ms >= GLASS_MIN_GAP_MS && !self.backdrop_frozen(now) {
             self.request_backdrop(now);
         }
         self.glass_retune();
     }
 
     fn present_frame(&mut self) {
-        let t = self.now();
+        let t = self.frame_t.take().unwrap_or_else(|| self.now()).max(self.last_t);
+        self.last_t = t;
         let visible = self.st.wants_visible(t, self.opts.auto_hide) || self.st.is_animating(t);
         if !visible {
             // nothing to draw while hidden; the next visible frame is rendered from scratch
@@ -1136,17 +1225,22 @@ impl Inner {
                         self.quiet.reset();
                     }
                 }
+                // The frame is sampled when it will be shown (the next vblank), not when this
+                // message happens to be handled: a late tick cannot slow the animation down.
                 let now = self.now();
+                let now = self.timer.as_ref().map_or(now, |t| t.present_time(now));
                 let rms = f32::from_bits(self.level.load(Ordering::Relaxed));
                 let o: TickOutcome = self.st.tick(now, rms);
                 if o.error_expired {
                     out.events.push(PillEvent::ErrorDismissed);
                 }
+                self.frame_t = Some(now);
                 if o.error_gone {
                     self.relayout();
                 } else {
                     self.present();
                 }
+                self.frame_t = None;
                 // the frame above was the final one at rest (it also hid an idle auto-hide pill)
                 if !self.st.is_animating(now) {
                     if let Some(t) = &self.timer {
@@ -1344,6 +1438,8 @@ impl Window {
                 skipped: 0,
                 partial: 0,
                 quiet: QuietRun::default(),
+                last_t: f64::NEG_INFINITY,
+                frame_t: None,
                 glass: GlassHost::new(hwnd),
                 mon: monitor_rect(hmon).unwrap_or((0, 0, 1920, 1080)),
                 glass_ms: 0,

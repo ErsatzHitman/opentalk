@@ -504,7 +504,7 @@ const BAKE_SLOTS: usize = 8;
 /// pill, the bubble and a few animation frames, or the card alone; the least recently used maps go first.
 pub const DISP_BUDGET_BYTES: usize = 2 << 20;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct DispKey {
     w: u32,
     h: u32,
@@ -523,6 +523,141 @@ pub struct DispMap {
     data: Vec<[f32; 2]>,
 }
 
+// --- the field by table lookup -------------------------------------------------------------------
+
+/// Table step (logical px) of the depth profiles.
+const LUT_STEP: f32 = 1.0 / 64.0;
+/// Depth (logical px) beyond which the edge and rim terms are below 0.03 px: dropped.
+const PROFILE_REACH: f32 = 16.0;
+/// Depth beyond which the ripple (it falls off with `exp(-1.7 d)`) is below 0.03 px: dropped.
+const RIPPLE_REACH: f32 = 8.0;
+const PROFILE_N: usize = (PROFILE_REACH / LUT_STEP) as usize + 2;
+const RIPPLE_N: usize = (RIPPLE_REACH / LUT_STEP) as usize + 2;
+/// Capacity of the column / row factor buffers (device px across the largest pill surface at 2x).
+const AXIS_CAP: usize = 1024;
+/// `exp(-0.3 * CORNER_REACH)`: a corner term below this is under 0.1 px.
+const CORNER_CUT: f32 = 7.5e-4;
+
+/// The depth profiles of [`GLASS_PRESET`] that do not depend on the box: `edge + rim` falloff of the
+/// total, and the rim falloff the ripple rides on.
+struct Profiles {
+    total: [f32; PROFILE_N],
+    rim: [f32; RIPPLE_N],
+}
+
+fn profiles() -> &'static Profiles {
+    static P: std::sync::OnceLock<Box<Profiles>> = std::sync::OnceLock::new();
+    P.get_or_init(|| {
+        let p = &GLASS_PRESET;
+        let mut t = Box::new(Profiles { total: [0.0; PROFILE_N], rim: [0.0; RIPPLE_N] });
+        for (i, v) in t.total.iter_mut().enumerate() {
+            let d = i as f32 * LUT_STEP;
+            let base = if p.warp { (1.0 - (-d * p.base_distance).exp()) * p.base_intensity } else { 0.0 };
+            *v = base + (-d * p.edge_distance).exp() * p.edge_intensity + (-d * p.rim_distance).exp() * p.rim_intensity;
+        }
+        for (i, v) in t.rim.iter_mut().enumerate() {
+            *v = (-(i as f32 * LUT_STEP) * p.rim_distance).exp();
+        }
+        t
+    })
+}
+
+#[inline]
+fn lerp_table(t: &[f32], depth: f32) -> f32 {
+    let f = depth * (1.0 / LUT_STEP);
+    let i = f as usize;
+    let a = f - i as f32;
+    t[i] + (t[i + 1] - t[i]) * a
+}
+
+/// [`displacement`] for a rounded box without a transcendental per pixel: the edge / rim profile is a
+/// table of the depth, the ripple a table built per box size, and the corner term
+/// `exp(-0.3 * max(ax, ay))` is the smaller of one factor per column and one per row. Within 0.05 px
+/// of the direct formula. Build one per painted box (or per baked map), then call [`Field::at`] per
+/// pixel.
+struct Field {
+    profiles: &'static Profiles,
+    ripple: [f32; RIPPLE_N],
+    /// `exp(-0.3 * ax)` per column / `exp(-0.3 * ay)` per row.
+    cols: Vec<f32>,
+    rows: Vec<f32>,
+    inv_bw: f32,
+    inv_bh: f32,
+    page: (f32, f32),
+    scale: f32,
+}
+
+thread_local! {
+    /// Column / row factor buffers, reused so painting a box allocates nothing in the steady state.
+    static AXES: RefCell<(Vec<f32>, Vec<f32>)> = const { RefCell::new((Vec::new(), Vec::new())) };
+}
+
+impl Field {
+    /// Field of a `bw` x `bh` box (logical px) on `page`, in device px at `scale`.
+    fn new(bw: f32, bh: f32, page: (f32, f32), scale: f32) -> Field {
+        let pf = profiles();
+        let k = 25.0 / bw.min(bh);
+        let mut ripple = [0.0f32; RIPPLE_N];
+        for (i, v) in ripple.iter_mut().enumerate() {
+            *v = (i as f32 * LUT_STEP * k).sin() * GLASS_PRESET.ripple_effect * pf.rim[i];
+        }
+        let (mut cols, mut rows) = AXES.with(|a| std::mem::take(&mut *a.borrow_mut()));
+        // room for the widest pill window frame (an expand grows the box by a few px per frame): the
+        // buffers are sized once and never reallocate while it animates
+        for v in [&mut cols, &mut rows] {
+            v.clear();
+            v.reserve(AXIS_CAP);
+        }
+        Field { profiles: pf, ripple, cols, rows, inv_bw: 1.0 / bw, inv_bh: 1.0 / bh, page, scale }
+    }
+
+    /// Per-column factors for columns at box-relative logical x `us`, per-row ones for `vs`.
+    fn set_axes(&mut self, bw: f32, bh: f32, us: impl Iterator<Item = f32>, vs: impl Iterator<Item = f32>) {
+        let min_dim = bw.min(bh);
+        let (ibw, ibh) = (self.inv_bw, self.inv_bh);
+        self.cols.clear();
+        self.cols.extend(us.map(|u| {
+            let cx = u * ibw;
+            (-0.3 * cx.min(1.0 - cx) * min_dim).exp()
+        }));
+        self.rows.clear();
+        self.rows.extend(vs.map(|v| {
+            let cy = v * ibh;
+            (-0.3 * cy.min(1.0 - cy) * min_dim).exp()
+        }));
+    }
+
+    /// Offset (device px) for the pixel in column `col`, row `row` of the axes, `depth` logical px
+    /// inside the edge, at box-relative logical position `(u, v)`.
+    #[inline]
+    fn at(&self, depth: f32, col: usize, row: usize, u: f32, v: f32) -> [f32; 2] {
+        let corner = self.cols[col].min(self.rows[row]);
+        let near_edge = depth < PROFILE_REACH;
+        if !near_edge && corner < CORNER_CUT {
+            return [0.0, 0.0];
+        }
+        let (total, ripple) = if near_edge {
+            (lerp_table(&self.profiles.total, depth), if depth < RIPPLE_REACH { lerp_table(&self.ripple, depth) } else { 0.0 })
+        } else {
+            (0.0, 0.0)
+        };
+        let (mut nx, mut ny) = (u * self.inv_bw - 0.5, v * self.inv_bh - 0.5);
+        let len2 = nx * nx + ny * ny;
+        if len2 > 0.0 {
+            let inv = 1.0 / len2.sqrt();
+            nx *= inv;
+            ny *= inv;
+        }
+        let lift = total + corner * GLASS_PRESET.corner_boost;
+        [(nx * lift - ny * ripple) * self.page.0 * self.scale, (ny * lift + nx * ripple) * self.page.1 * self.scale]
+    }
+
+    /// Give the axis buffers back for the next box.
+    fn release(self) {
+        AXES.with(|a| *a.borrow_mut() = (self.cols, self.rows));
+    }
+}
+
 impl DispMap {
     fn bytes(&self) -> usize {
         self.data.len() * std::mem::size_of::<[f32; 2]>()
@@ -535,24 +670,23 @@ impl DispMap {
         let gw = (bw * scale).ceil() as usize + 2 * pad as usize + 3;
         let gh = (bh * scale).ceil() as usize + 2 * pad as usize + 3;
         let (px, py) = (key.phase_x as f32 / PHASE_STEPS, key.phase_y as f32 / PHASE_STEPS);
-        let min_dim = bw.min(bh);
+        let u_of = |i: usize| (i as f32 - pad as f32 + 0.5 - px) / scale;
+        let v_of = |j: usize| (j as f32 - pad as f32 + 0.5 - py) / scale;
+        let mut field = Field::new(bw, bh, page, scale);
+        field.set_axes(bw, bh, (0..gw).map(u_of), (0..gh).map(v_of));
         let mut data = vec![[0.0f32; 2]; gw * gh];
         for j in 0..gh {
-            let v = (j as f32 - pad as f32 + 0.5 - py) / scale;
+            let v = v_of(j);
             for i in 0..gw {
-                let u = (i as f32 - pad as f32 + 0.5 - px) / scale;
+                let u = u_of(i);
                 let sd = sd_round_box(u, v, bw * 0.5, bh * 0.5, bw * 0.5, bh * 0.5, r);
                 if sd > 1.0 {
                     continue; // outside, beyond the anti-aliased edge pixels
                 }
-                let depth = (-sd).max(0.0);
-                let (cx, cy) = (u / bw, v / bh);
-                if field_matters(depth, cx, cy, min_dim) {
-                    let (fx, fy) = displacement(&GLASS_PRESET, depth, cx, cy, min_dim, page);
-                    data[j * gw + i] = [fx * scale, fy * scale];
-                }
+                data[j * gw + i] = field.at((-sd).max(0.0), i, j, u, v);
             }
         }
+        field.release();
         #[cfg(test)]
         BAKES.with(|b| b.set(b.get() + 1));
         DispMap { gw, gh, data }
@@ -570,6 +704,11 @@ impl DispMap {
 
 thread_local! {
     static DISP: RefCell<Vec<(DispKey, Rc<DispMap>)>> = const { RefCell::new(Vec::new()) };
+    /// The last box asked for that was not in the cache. A box seen once is a frame of an animation
+    /// (the capsule has a new size every frame of the expand / shrink): it is evaluated inline, not
+    /// baked and not allowed to evict the maps of the boxes that stay. Seen twice in a row it is a
+    /// steady shape, and is baked.
+    static SEEN: std::cell::Cell<Option<DispKey>> = const { std::cell::Cell::new(None) };
 }
 #[cfg(test)]
 thread_local! {
@@ -595,7 +734,8 @@ pub fn bake_count() -> u32 {
 }
 
 /// Fetch (or bake) the map for a rounded box; returns it with the device origin `(gx0, gy0)` of its
-/// grid.
+/// grid. `None` for a box seen for the first time (an animation frame, see `SEEN`) and for one too big
+/// to bake: the caller evaluates the field inline.
 fn disp_map(field: Rect, radius: f32, page: (f32, f32), scale: f32) -> Option<(Rc<DispMap>, i32, i32)> {
     let (ax, ay) = (field.l * scale, field.t * scale);
     let (mut fx, mut fy) = (ax.floor(), ay.floor());
@@ -630,7 +770,10 @@ fn disp_map(field: Rect, radius: f32, page: (f32, f32), scale: f32) -> Option<(R
             let hit = c.remove(i);
             let m = hit.1.clone();
             c.insert(0, hit);
-            return m;
+            return Some(m);
+        }
+        if SEEN.with(|s| s.replace(Some(key))) != Some(key) {
+            return None; // first sighting: an animation frame
         }
         let m = Rc::new(DispMap::bake(&key, scale));
         c.insert(0, (key, m.clone()));
@@ -639,8 +782,8 @@ fn disp_map(field: Rect, radius: f32, page: (f32, f32), scale: f32) -> Option<(R
         while c.len() > 1 && c.iter().map(|(_, m)| m.bytes()).sum::<usize>() > DISP_BUDGET_BYTES {
             c.pop();
         }
-        m
-    });
+        Some(m)
+    })?;
     Some((map, fx as i32 - pad, fy as i32 - pad))
 }
 
@@ -704,6 +847,15 @@ pub fn paint(cv: &mut Canvas, ctx: &Ctx, surf: &Surface, p: &Params) {
     let page = ctx.backdrop.page;
     let range = DevRect::of(field.inflate(1.5), s, cv.w, cv.h);
     let baked = surf.radius.and_then(|r| disp_map(field, r, page, s));
+    // an exact rounded box that is not (yet) baked, e.g. a frame of the expand animation: the same
+    // field, evaluated per pixel by table lookup
+    let mut inline = (surf.radius.is_some() && baked.is_none()).then(|| {
+        let mut f = Field::new(bw, bh, page, s);
+        let u_of = |x: i32| (x as f32 + 0.5) * inv - field.l;
+        let v_of = |y: i32| (y as f32 + 0.5) * inv - field.t;
+        f.set_axes(bw, bh, (range.x0..range.x1).map(u_of), (range.y0..range.y1).map(v_of));
+        f
+    });
     let tint_a = tk.tint_alpha + (tk.tint_alpha_hover - tk.tint_alpha) * p.lift.clamp(0.0, 1.0);
     let border_rgb = [tk.border.r, tk.border.g, tk.border.b];
     let border_a = tk.border.a * p.edge;
@@ -722,6 +874,10 @@ pub fn paint(cv: &mut Canvas, ctx: &Ctx, surf: &Surface, p: &Params) {
             let (mut sx, mut sy) = (x as f32 + 0.5, y as f32 + 0.5);
             if let Some((m, gx0, gy0)) = &baked {
                 let o = m.at(x, y, *gx0, *gy0);
+                sx += o[0];
+                sy += o[1];
+            } else if let Some(f) = &inline {
+                let o = f.at((-d).max(0.0), (x - range.x0) as usize, (y - range.y0) as usize, lx - field.l, ly - field.t);
                 sx += o[0];
                 sy += o[1];
             } else {
@@ -757,6 +913,9 @@ pub fn paint(cv: &mut Canvas, ctx: &Ctx, surf: &Surface, p: &Params) {
             let a = c * p.alpha;
             cv.blend(x, y, [col[0] * a, col[1] * a, col[2] * a, a]);
         }
+    }
+    if let Some(f) = inline.take() {
+        f.release();
     }
 }
 
@@ -863,6 +1022,40 @@ mod tests {
         // the perpendicular ripple appears off the edge: sin(1/36*25) * 0.26 * exp(-1.7) of the page
         let (_, ry) = displacement(&p, 1.0, 1.0, 0.5, 36.0, (1920.0, 1080.0));
         assert!((ry - (25.0f32 / 36.0).sin() * 0.26 * (-1.7f32).exp() * 1080.0).abs() < 0.5, "{ry}");
+    }
+
+    #[test]
+    fn table_field_matches_the_direct_formula() {
+        // every pixel of boxes from the circle to the error card, at three scales: the table lookup
+        // (depth profile, ripple table, per-column / per-row corner factor) stays within 0.1 device px
+        // of the transcribed formula (the size of its own cut-off step at the corner reach)
+        for (bw, bh) in [(40.0f32, 40.0f32), (62.0, 38.0), (98.0, 36.0), (442.0, 108.0)] {
+            for scale in [1.0f32, 1.5, 2.0] {
+                let r = bh.min(bw) * 0.5;
+                let mut f = Field::new(bw, bh, DEFAULT_PAGE, scale);
+                let (nx, ny) = ((bw * scale) as i32, (bh * scale) as i32);
+                let u_of = |x: i32| (x as f32 + 0.5) / scale;
+                f.set_axes(bw, bh, (0..nx).map(u_of), (0..ny).map(u_of));
+                let mut worst = 0.0f32;
+                for y in 0..ny {
+                    for x in 0..nx {
+                        let (u, v) = (u_of(x), u_of(y));
+                        let sd = sd_round_box(u, v, bw * 0.5, bh * 0.5, bw * 0.5, bh * 0.5, r);
+                        let depth = (-sd).max(0.0);
+                        let want = if field_matters(depth, u / bw, v / bh, bw.min(bh)) {
+                            let (dx, dy) = displacement(&GLASS_PRESET, depth, u / bw, v / bh, bw.min(bh), DEFAULT_PAGE);
+                            [dx * scale, dy * scale]
+                        } else {
+                            [0.0, 0.0]
+                        };
+                        let got = f.at(depth, x as usize, y as usize, u, v);
+                        worst = worst.max((got[0] - want[0]).abs()).max((got[1] - want[1]).abs());
+                    }
+                }
+                f.release();
+                assert!(worst < 0.1 * scale, "{bw}x{bh} at {scale}x: worst {worst} px");
+            }
+        }
     }
 
     #[test]
@@ -982,13 +1175,17 @@ mod tests {
         let b = flat_backdrop([128, 128, 128]);
         let before = bake_count();
         let _ = paint_capsule(&b, false, 1.0);
-        assert_eq!(bake_count(), before + 1);
+        assert_eq!(bake_count(), before, "a shape seen once is an animation frame: evaluated inline, not baked");
         let _ = paint_capsule(&b, true, 1.0); // theme does not matter
+        assert_eq!(bake_count(), before + 1, "the same shape again is steady: baked");
         let _ = paint_capsule(&b, false, 1.0);
+        let _ = paint_capsule(&b, true, 1.0);
         assert_eq!(bake_count(), before + 1, "same size, radius, page and scale: baked once");
+        let _ = paint_capsule(&b, false, 2.0);
         let _ = paint_capsule(&b, false, 2.0);
         assert_eq!(bake_count(), before + 2, "a new scale bakes again");
         let other = Backdrop::new(b.frosted.clone(), 0, 0, (2560.0, 1440.0));
+        let _ = paint_capsule(&other, false, 1.0);
         let _ = paint_capsule(&other, false, 1.0);
         assert_eq!(bake_count(), before + 3, "a new monitor size bakes again");
     }
@@ -1017,20 +1214,27 @@ mod tests {
     #[test]
     fn baked_displacement_cache_is_bounded_in_slots_and_bytes() {
         let b = flat_backdrop([128, 128, 128]);
-        // the expand animation changes the capsule's width every frame: one bake per frame, never more
-        // than BAKE_SLOTS kept
-        for w in 40..=98 {
+        // the expand animation changes the capsule's width every frame: no frame is baked, nothing is
+        // kept (a steady map the animation runs over must not be evicted by its frames)
+        paint_box(&b, 98.0, 36.0, 2.0, (208.0, 120.0));
+        paint_box(&b, 98.0, 36.0, 2.0, (208.0, 120.0));
+        let (held, bakes) = (disp_cache_len(), bake_count());
+        assert!(held >= 1);
+        for w in 40..=97 {
             paint_box(&b, w as f32, 36.0, 2.0, (208.0, 120.0));
             assert!(disp_cache_len() <= BAKE_SLOTS);
             assert!(disp_cache_bytes() <= DISP_BUDGET_BYTES, "{} bytes", disp_cache_bytes());
         }
+        assert_eq!((disp_cache_len(), bake_count()), (held, bakes), "animation frames neither bake nor evict");
         // the error card at 2x is the largest map worth baking (just under MAX_BAKE_CELLS cells)
         for scale in [1.0, 1.5, 2.0, 3.0] {
+            paint_box(&b, 442.0, 96.0, scale, (466.0, 120.0));
             paint_box(&b, 442.0, 96.0, scale, (466.0, 120.0));
             assert!(disp_cache_bytes() <= DISP_BUDGET_BYTES.max(MAX_BAKE_CELLS * 8), "scale {scale}: {} bytes", disp_cache_bytes());
         }
         // several large maps in a row evict each other: the total stays within the budget
         for h in [90.0, 94.0, 98.0, 102.0] {
+            paint_box(&b, 442.0, h, 2.0, (466.0, 120.0));
             paint_box(&b, 442.0, h, 2.0, (466.0, 120.0));
             assert!(disp_cache_bytes() <= DISP_BUDGET_BYTES, "{} bytes", disp_cache_bytes());
             assert!(disp_cache_len() >= 1);

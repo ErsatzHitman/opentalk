@@ -1435,4 +1435,217 @@ mod tests {
         // not a timing gate (CI noise): the steady path just must not be the slower one
         assert!(cached < full, "cached {cached:?} vs full {full:?}");
     }
+
+    // --- transitions ----------------------------------------------------------------------------
+
+    fn busy_backdrop(scale: f32, seed: usize) -> Arc<glass::Backdrop> {
+        use crate::daemon::pill::glass::{Backdrop, Cells, DEFAULT_PAGE, FROST_SIGMA, cell_for};
+        let (w, h) = (((208.0 + 192.0) * scale) as usize, ((120.0 + 192.0) * scale) as usize);
+        let raw: Vec<u8> = (0..w * h).flat_map(|i| { let (x, y) = (i % w + seed * 7, i / w); let v = if (x / 9 + y / 11) % 2 == 0 { 30 } else { 225 }; [v, v ^ (x as u8), v ^ (y as u8), 255] }).collect();
+        let f = Cells::from_bgra(&raw, w, h, cell_for(scale)).unwrap().frost(FROST_SIGMA, scale);
+        let o = (-96.0 * scale) as i32;
+        Arc::new(Backdrop::new(Arc::new(f), o, o, DEFAULT_PAGE))
+    }
+
+    /// Per-frame cost of the expand (260..560 ms after the start) and of the stop shrink, as the window
+    /// draws them: `FrameCache::render` once per 60 fps tick over a busy captured backdrop. Prints the
+    /// numbers (`-- --nocapture transition_frame_cost`). The assertions are structural: while the capsule
+    /// changes size every frame, no displacement map is baked or evicted (a bake per frame is what made
+    /// these frames cost several times a steady one), and a very loose time ceiling.
+    #[test]
+    fn transition_frame_cost_is_measured_and_no_frame_bakes_a_map() {
+        let median = |mut v: Vec<f64>| {
+            v.sort_by(|a, b| a.total_cmp(b));
+            v[v.len() / 2]
+        };
+        for scale in [1.0f32, 2.0] {
+            let bd = busy_backdrop(scale, 0);
+            let _ = glow::Sprites::get(scale); // the window builds them when it is created
+            let mut s = RenderState::new(Palette::LIGHT, scale, PanelPosition::BottomRight);
+            s.set_backdrop(Some(bd));
+            let mut pm = new_pm(&s);
+            let mut cache = FrameCache::new();
+            // the resting circle for a while (steady shape), then the recording starts
+            let mut t = -400.0;
+            while t < 0.0 {
+                s.tick(t, 0.0);
+                cache.render(&s, t, &mut pm);
+                t += FRAME;
+            }
+            s.set_mode(PillMode::Recording, 0.0);
+            let (mut expand, mut hold, mut shrink) = (Vec::new(), Vec::new(), Vec::new());
+            let (bakes, held) = (glass::bake_count(), glass::disp_cache_len());
+            let mut expand_bakes = 0;
+            while t <= 2200.0 {
+                s.tick(t, speech(t));
+                let before = glass::bake_count();
+                let t0 = std::time::Instant::now();
+                cache.render(&s, t, &mut pm);
+                let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                if (275.0..=545.0).contains(&t) {
+                    expand.push(ms);
+                    expand_bakes += glass::bake_count() - before;
+                } else if t < 260.0 {
+                    hold.push(ms);
+                }
+                t += FRAME;
+            }
+            assert_eq!(expand_bakes, 0, "{scale}x: a frame of the expand baked a displacement map");
+            assert!(glass::bake_count() - bakes <= 2, "{scale}x: only the settled shapes are baked");
+            assert!(glass::disp_cache_len() >= held, "{scale}x: the expand evicted a steady map");
+            // stop: the shrink back to the circle and the glow fade-in
+            s.set_mode(PillMode::Thinking, t);
+            let t_stop = t;
+            let mut shrink_bakes = 0;
+            while t <= t_stop + 320.0 {
+                s.tick(t, 0.0);
+                let before = glass::bake_count();
+                let t0 = std::time::Instant::now();
+                cache.render(&s, t, &mut pm);
+                shrink.push(t0.elapsed().as_secs_f64() * 1000.0);
+                if t > t_stop + 20.0 && t < t_stop + 280.0 {
+                    shrink_bakes += glass::bake_count() - before;
+                }
+                t += FRAME;
+            }
+            assert_eq!(shrink_bakes, 0, "{scale}x: a frame of the shrink baked a displacement map");
+            let (e, h, k) = (median(expand.clone()), median(hold), median(shrink.clone()));
+            let worst = expand.iter().chain(&shrink).cloned().fold(0.0, f64::max);
+            println!("transition frames {scale}x: expand median {e:.3} ms, hold {h:.3} ms, shrink median {k:.3} ms, worst {worst:.3} ms");
+            assert!(e < 60.0 && k < 60.0, "{scale}x: expand {e:.1} ms, shrink {k:.1} ms");
+        }
+    }
+
+    /// The animation is a pure function of time: however the ticks arrive (every frame, every third
+    /// frame, jittered, none at all in between), the picture at the same instant is the same.
+    #[test]
+    fn animation_state_is_a_pure_function_of_time() {
+        for dark in [false, true] {
+            let mk = || {
+                let mut s = RenderState::new(Palette::get(dark), 2.0, PanelPosition::BottomRight);
+                s.set_mode(PillMode::Recording, 0.0);
+                s
+            };
+            // silence, so the (tick-sampled) waveform is the same whatever the cadence
+            let mut steady = mk();
+            let mut t = 0.0;
+            while t <= 2000.0 {
+                steady.tick(t, 0.0);
+                t += FRAME;
+            }
+            let mut sparse = mk();
+            for (i, t) in (0..).map(|i| (i, i as f64 * 41.0 + (i % 3) as f64 * 7.0)).take_while(|(_, t)| *t <= 2000.0) {
+                if i % 2 == 0 {
+                    sparse.tick(t, 0.0);
+                }
+            }
+            for st in [&mut steady, &mut sparse] {
+                st.set_mode(PillMode::Thinking, 2000.0);
+            }
+            for t in (0..140).map(|i| i as f64 * 17.3) {
+                let (a, b) = (render(&steady, t), render(&sparse, t));
+                assert_eq!(a.data(), b.data(), "dark {dark}: the picture at {t} ms depends on how it got there");
+                let (ga, gb) = (steady.geometry(t), sparse.geometry(t));
+                assert_eq!((ga.pill, ga.compact), (gb.pill, gb.compact));
+            }
+            // and rendering the same instant twice, in any order, gives the same pixels
+            let (x, y) = (render(&steady, 400.0), render(&steady, 1234.5));
+            assert_eq!(x.data(), render(&steady, 400.0).data());
+            assert_eq!(y.data(), render(&steady, 1234.5).data());
+            assert_eq!(x.data(), render(&steady, 400.0).data());
+        }
+    }
+
+    /// The expand follows `cubic-bezier(.2, 0, 0, 1)` from 40x40 to 98x36 over 300 ms starting at 260
+    /// ms, and the stop shrink returns over 300 ms: sampled at any rate, width and height move
+    /// monotonically, and a frame never moves the capsule by more than the curve allows.
+    #[test]
+    fn expand_and_shrink_progress_smoothly_at_any_frame_rate() {
+        for hz in [30.0f64, 60.0, 72.0, 100.0, 144.0] {
+            let mut s = RenderState::new(Palette::LIGHT, 1.0, PanelPosition::BottomRight);
+            s.set_mode(PillMode::Recording, 0.0);
+            let dt = 1000.0 / hz;
+            let (mut prev_w, mut prev_h) = (40.0f32, 40.0f32);
+            let mut t = 0.0;
+            let mut max_step = 0.0f32;
+            while t <= 700.0 {
+                let p = s.geometry(t).pill;
+                assert!(p.w() >= prev_w - 1e-4 && p.h() <= prev_h + 1e-4, "{hz} Hz: not monotonic at {t}");
+                max_step = max_step.max(p.w() - prev_w);
+                (prev_w, prev_h) = (p.w(), p.h());
+                t += dt;
+            }
+            assert!((prev_w - 98.0).abs() < 1e-3 && (prev_h - 36.0).abs() < 1e-3);
+            // the house curve moves 58 px in 300 ms with a steepest slope of about 4x the mean
+            let steepest = 58.0 * 4.1 * (dt as f32 / 300.0);
+            assert!(max_step <= steepest + 0.5, "{hz} Hz: widest step {max_step} px (curve allows {steepest:.1})");
+            // nothing happens during the 260 ms hold
+            assert_eq!(s.geometry(259.0).pill.w(), 40.0);
+            // stop: back to the circle
+            s.set_mode(PillMode::Thinking, 1000.0);
+            let (mut prev_w, mut t) = (98.0f32, 1000.0);
+            while t <= 1400.0 {
+                let w = s.geometry(t).pill.w();
+                assert!(w <= prev_w + 1e-4, "{hz} Hz: shrink not monotonic at {t}");
+                prev_w = w;
+                t += dt;
+            }
+            assert!((prev_w - 40.0).abs() < 1e-3);
+        }
+    }
+
+    /// Steady frames and transition frames allocate nothing once the buffers exist.
+    #[test]
+    fn steady_and_transition_frames_do_not_allocate() {
+        use crate::daemon::pill::allocs;
+        for scale in [1.0f32, 2.0] {
+            let bd = busy_backdrop(scale, 0);
+            let mut s = RenderState::new(Palette::LIGHT, scale, PanelPosition::BottomRight);
+            s.set_backdrop(Some(bd));
+            let mut pm = new_pm(&s);
+            let mut cache = FrameCache::new();
+            s.set_mode(PillMode::Recording, 0.0);
+            let mut t = 0.0;
+            // warm: thread-local tables, the cached base, the glow sprites (built when the window is created)
+            let _ = glow::Sprites::get(scale);
+            while t <= 300.0 {
+                s.tick(t, speech(t));
+                cache.render(&s, t, &mut pm);
+                t += FRAME;
+            }
+            let ((), expand) = allocs::count(|| {
+                while t <= 540.0 {
+                    s.tick(t, speech(t));
+                    cache.render(&s, t, &mut pm);
+                    t += FRAME;
+                }
+            });
+            while t <= 2000.0 {
+                s.tick(t, speech(t));
+                cache.render(&s, t, &mut pm);
+                t += FRAME;
+            }
+            let ((), steady) = allocs::count(|| {
+                for _ in 0..60 {
+                    s.tick(t, speech(t));
+                    cache.render(&s, t, &mut pm);
+                    t += FRAME;
+                }
+            });
+            s.set_mode(PillMode::Thinking, t);
+            let t_stop = t;
+            let ((), shrink) = allocs::count(|| {
+                while t <= t_stop + 250.0 {
+                    s.tick(t, 0.0);
+                    cache.render(&s, t, &mut pm);
+                    t += FRAME;
+                }
+            });
+            // the shrink also fades the signal glow in, whose two sprite blits go through tiny-skia's
+            // pipeline (a handful of small allocations per blit, for 300 ms only); not asserted
+            println!("allocations at {scale}x: expand {expand}, steady (60 frames) {steady}, shrink {shrink} (tiny-skia blits of the glow)");
+            assert_eq!(steady, 0, "{scale}x: steady recording frames allocate");
+            assert_eq!(expand, 0, "{scale}x: expand frames allocate");
+        }
+    }
 }
