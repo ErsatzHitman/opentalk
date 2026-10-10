@@ -1,6 +1,6 @@
 # OpenTalk benchmark (docs/PLAN.md section 11). Writes docs\BENCHMARK.md (or -OutFile) and bench\out\results.json.
 #
-#   powershell -File bench\bench.ps1 [-Exe path] [-Quick] [-SkipLive] [-SkipMic] [-OutFile path] [-CheckSizeOnly]
+#   powershell -File bench\bench.ps1 [-Exe path] [-Quick] [-SkipLive] [-SkipMic] [-SkipPackaged] [-OutFile path] [-CheckSizeOnly]
 #
 # -OutFile       report path (default docs\BENCHMARK.md). Blocks between `<!-- keep:begin NAME -->` and
 #                `<!-- keep:end NAME -->` lines in the existing file are re-emitted byte for byte (see
@@ -14,6 +14,8 @@
 #   idle         daemon doing nothing for 60 s
 #   dictations   10 dictations of an 8.5 s injected recording through a local mock STT (no network:
 #                this isolates OpenTalk's own CPU, memory and latency)
+#   packaged     the dictations scenario again with a packaged app (new Notepad, Windows Terminal, ...) in front,
+#                app bubble on: the daemon must stay within the working-set budget and find the app icon
 #   recording    30 s continuous recording: injected WAV, and the real microphone (cancelled, no upload)
 #   settings     Settings window open and idle (child process) + daemon after it closes
 #   e2e          one dictation pasted for real (SendInput) into a scratch text box, batch and streaming
@@ -33,6 +35,7 @@ param(
     [switch]$SkipLive,
     [switch]$SkipMic,
     [switch]$SkipE2E,
+    [switch]$SkipPackaged,
     [string]$OutFile = (Join-Path $PSScriptRoot '..\docs\BENCHMARK.md'),
     [switch]$CheckSizeOnly
 )
@@ -240,9 +243,22 @@ try {
     $d = Start-Ot $Exe @('--bench', 'dictate', $Dictations, ('"{0}"' -f $wav)) $e -redirectOut
     $R['dictations'] = Measure-Until $daemon $d
     $out = $d.StandardOutput.ReadToEnd()
-    $rounds = @($out -split "`n" | Where-Object { $_.Trim().StartsWith('{') } | ForEach-Object { $_ | ConvertFrom-Json })
-    $R.dictations | Add-Member rounds_ok (@($rounds | Where-Object { $_.status -eq 'ok' }).Count)
-    $R.dictations | Add-Member rounds_total $rounds.Count
+    # Start/stop are explicit (never a toggle) and every round first checks the daemon is idle, so a stray
+    # press cannot shift later rounds. Per-round status, recorded_ms and upload bytes go into results.json;
+    # the daemon log is kept in bench\out when a round fails, times out or uploads under half the median.
+    $sum = Get-DictateSummary (ConvertFrom-DictateOutput $out)
+    $R.dictations | Add-Member rounds_ok $sum.ok
+    $R.dictations | Add-Member rounds_total $sum.total
+    $R.dictations | Add-Member -NotePropertyName rounds -NotePropertyValue @($sum.rounds)
+    $R.dictations | Add-Member -NotePropertyName upload_median_bytes -NotePropertyValue $sum.upload_median
+    $R.dictations | Add-Member disturbed_attempts $sum.disturbed_attempts
+    $R.dictations | Add-Member -NotePropertyName flagged_rounds -NotePropertyValue @($sum.flagged)
+    $R.dictations | Add-Member -NotePropertyName log_kept -NotePropertyValue $null
+    if ($sum.flagged.Count -or $sum.total -lt $Dictations) {
+        $R.dictations.log_kept = Save-DaemonLog $h $outDir 'dictations'
+        Write-Host ("dictations: round(s) {0} failed, timed out or uploaded under half the median; daemon log kept as bench\out\{1}" -f (($sum.flagged -join ', ')), $R.dictations.log_kept) -ForegroundColor Yellow
+    }
+    if ($sum.disturbed_attempts) { Write-Host ("dictations: {0} attempt(s) were cut short by something else and redone" -f $sum.disturbed_attempts) -ForegroundColor Yellow }
     $lat = (Invoke-Ot $Exe @('--bench', 'latency') $e 30).Out | ConvertFrom-Json
     $R['latency'] = $lat
     Write-Host ("dictations: {0}/{1} ok; CPU {2}% of all cores over {3}s; WS peak {4} MB, private peak {5} MB" -f $R.dictations.rounds_ok, $R.dictations.rounds_total, $R.dictations.CpuPctAll, $R.dictations.Seconds, $R.dictations.WsPeakMB, $R.dictations.PrivPeakMB)
@@ -253,14 +269,14 @@ try {
     # ---- 30 s recording, injected -----------------------------------------------------
     Section "recording $RecordSec s (injected WAV, then silence)"
     $before = (Read-History $h).Count
-    Invoke-Ot $Exe @('--bench', 'toggle') $e 15 | Out-Null
+    Invoke-Ot $Exe @('--bench', 'start') $e 15 | Out-Null
     $thr0 = Get-ThreadTimes $daemon.Id
     $R['recording_injected'] = Measure-Process $daemon $RecordSec
     $thr1 = Get-ThreadTimes $daemon.Id
     $R.recording_injected | Add-Member top_threads (Get-TopThreads $thr0 $thr1 $RecordSec)
     $R.recording_injected | Add-Member main_thread_pct (Get-ThreadPct $thr0 $thr1 $RecordSec 'main')
     $R.recording_injected | Add-Member private_ws_mb (Get-PrivateWsMB $daemon.Id)
-    Invoke-Ot $Exe @('--bench', 'toggle') $e 15 | Out-Null
+    Invoke-Ot $Exe @('--bench', 'stop') $e 15 | Out-Null
     Wait-History $h ($before + 1) 30 | Out-Null
     Write-Host ("recording (injected): {0}% of all cores ({1}% of one core), WS peak {2} MB, private peak {3} MB; busiest threads: {4}" -f $R.recording_injected.CpuPctAll, $R.recording_injected.CpuPctCore, $R.recording_injected.WsPeakMB, $R.recording_injected.PrivPeakMB, ($R.recording_injected.top_threads -join ', '))
 
@@ -293,6 +309,87 @@ finally {
     Remove-Item -Recurse -Force $h -ErrorAction SilentlyContinue
 }
 
+# ---- packaged app in front ------------------------------------------------------------------
+# A packaged (MSIX / UWP) foreground app (new Notepad, Windows Terminal, Calculator, ...) once sent the bubble's
+# icon through IShellItemImageFactory, which maps ~35 shell DLLs into the daemon for good (WS 37-40 MB). The
+# icon now comes from the package manifest's PNGs; this runs the dictations scenario with such an app in front
+# and the bubble on, and checks the daemon log for the icon it found.
+# Process id of the window that is in front right now (0 when none).
+function Get-ForegroundPid {
+    Add-Win32
+    $p = [uint32]0
+    [void][OtWin32]::GetWindowThreadProcessId([OtWin32]::GetForegroundWindow(), [ref]$p)
+    return [int]$p
+}
+# A packaged app with a window: the one already in front when it is packaged (Windows Terminal hosting this very
+# shell, say), else any packaged app that has a window.
+function Find-PackagedWindow {
+    $session = (Get-Process -Id $PID).SessionId
+    $all = @(Get-Process -ErrorAction SilentlyContinue | Where-Object {
+        $_.SessionId -eq $session -and $_.MainWindowHandle -ne [IntPtr]::Zero -and $_.Path -like '*\WindowsApps\*'
+    })
+    $fgPid = Get-ForegroundPid
+    $front = $all | Where-Object { $_.Id -eq $fgPid } | Select-Object -First 1
+    if ($front) { return $front }
+    return ($all | Select-Object -First 1)
+}
+# Executable of an installed packaged app (Terminal, new Notepad, Calculator, Paint), from its manifest.
+function Find-PackagedExe {
+    foreach ($n in 'Microsoft.WindowsTerminal', 'Microsoft.WindowsNotepad', 'Microsoft.WindowsCalculator', 'Microsoft.Paint') {
+        $pkg = Get-AppxPackage -Name $n -ErrorAction SilentlyContinue | Select-Object -First 1
+        if (-not $pkg) { continue }
+        try { $rel = (Get-AppxPackageManifest $pkg).Package.Applications.Application | Select-Object -First 1 -ExpandProperty Executable } catch { continue }
+        $p = Join-Path $pkg.InstallLocation $rel
+        if (Test-Path -LiteralPath $p) { return $p }
+    }
+}
+$R['packaged'] = $null
+if (-not $SkipPackaged) {
+    Section "$Dictations dictations with a packaged app in front (mock STT, app bubble on)"
+    # A packaged app that really is in front (Windows Terminal hosting this shell, say) is the honest case. When none
+    # is (locked desktop, another app in front), the daemon is told which packaged exe to look up the icon of instead
+    # (OPENTALK_BENCH_APP_EXE), which exercises the same icon path and the same memory.
+    $win = Find-PackagedWindow
+    $front = [bool]$win -and ((Get-ForegroundPid) -eq $win.Id)
+    $appExe = if ($win) { $win.Path } else { Find-PackagedExe }
+    $synthetic = $appExe -and -not $front
+    if (-not $appExe) { Write-Host 'no packaged app installed (new Notepad or Windows Terminal); scenario skipped' -ForegroundColor Yellow }
+    else {
+        $h = New-TempHome 'ot-bench-pkg'
+        $extra = $baseEnv.Clone()
+        if ($synthetic) { $extra['OPENTALK_BENCH_APP_EXE'] = $appExe }
+        # The icon lookup is logged at debug level only (it names the app being dictated into).
+        $extra['OPENTALK_LOG'] = 'debug'
+        $e = New-Env $h $extra
+        Write-Config $h @{ audio_cues = $false; auto_paste = $false; keep_in_clipboard = $true; show_app_bubble = $true; stt = @{ provider = 'openai' } }
+        $daemon = Start-Daemon $Exe $e
+        try {
+            Start-Sleep -Seconds 3
+            $d = Start-Ot $Exe @('--bench', 'dictate', $Dictations, ('"{0}"' -f $wav)) $e -redirectOut
+            $m = Measure-Until $daemon $d
+            $out = $d.StandardOutput.ReadToEnd()
+            $rounds = @($out -split "`n" | Where-Object { $_.Trim().StartsWith('{') } | ForEach-Object { $_ | ConvertFrom-Json })
+            # With a real foreground app the lookup is for that app; whatever else was in front is not counted.
+            $exeName = [IO.Path]::GetFileName($appExe).ToLowerInvariant()
+            $icons = @(Read-Log $h | Where-Object { $_ -match "app icon for $([regex]::Escape($exeName)): " })
+            $found = @($icons | Where-Object { $_ -notmatch ': none in ' })
+            $R['packaged'] = [ordered]@{
+                app = [IO.Path]::GetFileNameWithoutExtension($appExe); exe = $appExe; foreground = $front; synthetic_target = [bool]$synthetic
+                rounds_ok = @($rounds | Where-Object { $_.status -eq 'ok' }).Count; rounds_total = $rounds.Count
+                WsMeanMB = $m.WsMeanMB; WsPeakMB = $m.WsPeakMB; PrivPeakMB = $m.PrivPeakMB; CpuPctAll = $m.CpuPctAll
+                private_ws_mb = Get-PrivateWsMB $daemon.Id
+                icon_lines = $icons.Count; icon_found = $found.Count
+                icon_sample = if ($found.Count) { ($found | Select-Object -First 1) -replace '^\[[^\]]*\]\s+\S+\s+', '' } elseif ($icons.Count) { ($icons | Select-Object -First 1) -replace '^\[[^\]]*\]\s+\S+\s+', '' } else { 'no icon lookup logged' }
+            }
+            Write-Host ("packaged ({0}, {1}): {2}/{3} dictations ok; WS peak {4} MB (mean {5}), private peak {6} MB; icon found in {7}/{8} lookups: {9}" -f $R.packaged.app, $(if ($synthetic) { 'synthetic target' } else { 'in front' }), $R.packaged.rounds_ok, $R.packaged.rounds_total, $m.WsPeakMB, $m.WsMeanMB, $m.PrivPeakMB, $found.Count, $icons.Count, $R.packaged.icon_sample)
+        }
+        finally {
+            Stop-Daemon $Exe $daemon $e
+            Remove-Item -Recurse -Force $h -ErrorAction SilentlyContinue
+        }
+    }
+}
+
 # ---- real microphone ----------------------------------------------------------------------
 if (-not $SkipMic) {
     Section "recording $RecordSec s (real microphone, cancelled, no upload)"
@@ -304,7 +401,7 @@ if (-not $SkipMic) {
     $daemon = Start-Daemon $Exe $e
     try {
         Start-Sleep -Seconds 2
-        Invoke-Ot $Exe @('--bench', 'toggle') $e 15 | Out-Null
+        Invoke-Ot $Exe @('--bench', 'start') $e 15 | Out-Null
         Start-Sleep -Milliseconds 1500
         $log = (Read-Log $h) -join "`n"
         if ($log -match 'cannot start the microphone') {
@@ -380,7 +477,8 @@ if (-not $SkipLive) {
                 $dr = Invoke-Ot $Exe @('--bench', 'dictate', $n, $wav, '150') $e 900
                 $round += $n
                 $hist = Read-History $h
-                $dictateStatus = @($dr.Out -split "`n" | Where-Object { $_.Trim().StartsWith('{') } | ForEach-Object { try { ($_ | ConvertFrom-Json).status } catch {} })
+                $dsum = Get-DictateSummary (ConvertFrom-DictateOutput $dr.Out)
+                $dictateStatus = @($dsum.rounds | ForEach-Object { $_.status })
                 $ok = @($hist | Where-Object { $_.status -eq 'ok' })
                 # A dictation only counts as verified when the transcript has the words in the fixture (tts_fillers.wav).
                 $verified = @($ok | Where-Object { $_.text -match '(?i)friday|release' })
@@ -389,6 +487,13 @@ if (-not $SkipLive) {
                     ok = $ok.Count; verified = $verified.Count; total = $hist.Count
                     errors = @(@($hist | Where-Object { $_.status -ne 'ok' } | ForEach-Object { if ($_.error) { $_.error } else { "status $($_.status)" } }) + $(if ($hist.Count -eq 0) { "no history entry within 150 s (dictation $($dictateStatus -join '/'); the free tier answered slowly or kept rate limiting)" }) | Select-Object -Unique)
                     texts = @($ok | ForEach-Object { $_.text })
+                    rounds = @($dsum.rounds)
+                    log_kept = $null
+                }
+                # Keep the daemon log whenever a round did not come back ok (including no history entry at all).
+                if ($dsum.flagged.Count -or $dsum.total -lt $n -or $hist.Count -eq 0 -or $ok.Count -lt $hist.Count) {
+                    $live.per_model[$m].log_kept = Save-DaemonLog $h $outDir ('live-' + (($m -split '/')[-1] -replace '[^A-Za-z0-9._-]', '_'))
+                    Write-Host ("live {0}: daemon log kept as bench\out\{1}" -f $m, $live.per_model[$m].log_kept) -ForegroundColor Yellow
                 }
                 if ($ok.Count) { $live.latency = (Invoke-Ot $Exe @('--bench', 'latency') $e 30).Out | ConvertFrom-Json }
                 $verdict = if ($verified.Count) { 'VERIFIED' } else { 'UNVERIFIED' }
@@ -455,6 +560,7 @@ $(if ($R.recording_mic -and $R.recording_mic.top_threads) { "| Busiest daemon th
 | Daemon private bytes, idle (mean / peak) | $($R.idle.PrivMeanMB) / $($R.idle.PrivPeakMB) MB | <= 15 MB | n/a | $(Verdict ($R.idle.PrivPeakMB -le 15)) |
 | Daemon private working set, idle (Task Manager "Memory") | $(Fmt $R.idle.private_ws_mb ' MB') | n/a | ~110 MB | - |
 | Daemon working set during $Dictations dictations (peak) | $($R.dictations.WsPeakMB) MB | <= 25 MB | ~110 MB | $(Verdict ($R.dictations.WsPeakMB -le 25)) |
+$(if ($R.packaged) { "| Daemon working set during $Dictations dictations, packaged app in front ($($R.packaged.app)), app bubble on (peak / private WS) | $($R.packaged.WsPeakMB) / $(Fmt $R.packaged.private_ws_mb ' MB'); icon found in $($R.packaged.icon_found) of $($R.packaged.icon_lines) lookups | <= 25 MB | ~110 MB | $(Verdict ($R.packaged.WsPeakMB -le 25 -and $R.packaged.icon_found -gt 0)) |" })
 | Daemon working set while recording, app bubble on (peak / private WS) | $($R.recording_injected.WsPeakMB) / $(Fmt $R.recording_injected.private_ws_mb ' MB') | <= 25 MB | ~110 MB | $(Verdict ($R.recording_injected.WsPeakMB -le 25)) |
 $(if ($R.recording_mic) { "| Daemon working set while recording, real mic, app bubble off (peak / private WS) | $($R.recording_mic.WsPeakMB) / $(Fmt $R.recording_mic.private_ws_mb ' MB') | <= 25 MB | ~110 MB | $(Verdict ($R.recording_mic.WsPeakMB -le 25)) |" })
 | Settings window working set (mean / peak) | $(if ($R.settings) { "$($R.settings.WsMeanMB) / $($R.settings.WsPeakMB) MB" } else { 'n/a' }) | <= 80 MB, only while open | n/a | $(if ($R.settings) { Verdict ($R.settings.WsPeakMB -le 80) } else { '-' }) |
@@ -533,8 +639,11 @@ network path, not a latency reference; the table above is measured against a loc
 ## Method
 
 - Release build, GNU toolchain, ``opt-level = 3``, fat LTO, stripped. One executable; Settings is the same exe started as ``--settings``.
-- Each scenario starts a fresh daemon with its own ``OPENTALK_HOME``. Dictations are driven through the same message the hotkey
-  produces (``--bench toggle`` / ``--bench dictate``); the microphone is replaced by ``OPENTALK_INJECT_WAV`` (real-time playback of
+- Each scenario starts a fresh daemon with its own ``OPENTALK_HOME``. Dictations are driven by explicit start / stop messages
+  (``--bench start`` / ``--bench stop`` / ``--bench dictate``; a toggle would flip for good on one stray press, and the bench
+  daemons use the hotkey ``Control+Alt+Shift+F24`` so nobody's real Ctrl+Win reaches them). Before each round ``--bench dictate``
+  checks the daemon is idle and the previous history entry exists; per-round status, recorded_ms and upload bytes are in
+  ``bench/out/results.json`` and the daemon log is copied to ``bench/out/`` when a round fails, times out or uploads under half the median; the microphone is replaced by ``OPENTALK_INJECT_WAV`` (real-time playback of
   ``tests/fixtures/tts_fillers.wav``, $($R.env.wav_ms) ms) except where stated.
 - STT goes to ``opentalk --bench mock-stt``, an in-repo OpenAI-shaped server on 127.0.0.1 that answers instantly, so network
   speed does not enter the numbers.
@@ -562,13 +671,14 @@ network path, not a latency reference; the table above is measured against a loc
   VAD/level meter stay well under 1% of one core. The row "Main thread while recording" is the figure the pill is judged by
   (<= 6% of one core is <= 1.5% on a 4-core laptop).
 - **Working set and the app bubble**: the active-app icon of a classic Win32 executable comes from ``PrivateExtractIconsW``
-  (user32 only), then ``SHGetFileInfoW`` (in its own COM apartment). ``IShellItemImageFactory`` is the last resort, used
-  only for packaged (UWP / MSIX) apps or when both lighter paths return nothing, because it loads ~35 shell DLLs (XAML,
-  StateRepository, thumbcache, ...) into the daemon for the rest of its life (~+17 MB working set of shared image pages,
-  ~2-4 MB private). Since commits d53ba4d and 7fbcd92 those shell DLLs stay out of the daemon for Win32 apps. The
-  bubble-on working set on an unlocked desktop with a real foreground app has not been re-measured since the change and is
-  still to be done: the "app bubble on" rows of this report use whichever window was in front of the benchmark, and the
-  earlier unlocked-desktop section predates it.
+  (user32 only), then ``SHGetFileInfoW`` (in its own COM apartment). A packaged (UWP / MSIX) app reads the logo its
+  package declares: ``AppxManifest.xml`` -> ``Square44x44Logo`` -> the nearest ``targetsize-N`` / ``scale-N`` PNG, decoded
+  in process (no COM, no shell DLLs, on the icon helper thread, cached per exe). ``IShellItemImageFactory`` loads ~35 shell
+  DLLs (XAML, StateRepository, thumbcache, ...) into the daemon for the rest of its life (~+17 MB working set), so only a
+  Win32 exe that both lighter paths fail on may still reach it; a packaged app never does. The "packaged app in front"
+  row measures the dictations scenario with Windows Terminal / new Notepad as the target (a synthetic target through
+  ``OPENTALK_BENCH_APP_EXE`` when no packaged app can be brought to the foreground, e.g. on a locked desktop) and
+  must find the app's icon. Before that change a packaged foreground app cost 37-40 MB of working set.
 $clipNote
 "@
 $kept = @(Write-ReportKeepingBlocks $OutFile $md)

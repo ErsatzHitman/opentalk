@@ -3,8 +3,11 @@
 //!
 //! ```text
 //! --transcribe-file <wav> [--provider id] [--model m] [--llm | --no-llm]
-//! --bench dictate <n> <wav> [secs] toggle a running daemon twice per round, wait (default 45 s) for history
+//! --bench dictate <n> <wav> [secs] per round: check the daemon is idle, start, play the file, stop,
+//!                                  wait (default 45 s) for history; one JSON line per round
 //! --bench latency [n]              print the daemon log's latency lines + median/p95 summary
+//! --bench start | stop             idempotent: start only from idle, stop only while recording
+//! --bench phase                    print the daemon's phase (idle | arming | recording | thinking)
 //! --bench toggle | cancel | quit | settings   one IPC message to the running daemon
 //! --bench wait-ready [secs]        block until the daemon window exists
 //! --bench mock-stt [--port P] [--delay-ms D] [--text T]   local STT server: OpenAI/Deepgram REST
@@ -144,6 +147,9 @@ pub fn bench(args: &[String]) -> i32 {
         Some("dictate") => bench_dictate(&args[1..]),
         Some("latency") => bench_latency(&args[1..]),
         Some("toggle") => send(IpcMsg::Toggle),
+        Some("start") => send(IpcMsg::Start),
+        Some("stop") => send(IpcMsg::Stop),
+        Some("phase") => bench_phase(),
         Some("cancel") => send(IpcMsg::Cancel),
         Some("quit") => send(IpcMsg::Quit),
         Some("settings") => send(IpcMsg::OpenSettings),
@@ -151,7 +157,7 @@ pub fn bench(args: &[String]) -> i32 {
         Some("mock-stt") => bench_mock(&args[1..]),
         Some("info") => bench_info(),
         _ => {
-            eprintln!("usage: opentalk --bench dictate <n> <wav> [secs] | latency [n] | toggle | cancel | quit | wait-ready [secs] | mock-stt [--port P] [--delay-ms D] [--text T]");
+            eprintln!("usage: opentalk --bench dictate <n> <wav> [secs] | latency [n] | start | stop | phase | toggle | cancel | quit | wait-ready [secs] | mock-stt [--port P] [--delay-ms D] [--text T]");
             2
         }
     }
@@ -163,6 +169,23 @@ fn send(msg: IpcMsg) -> i32 {
     } else {
         eprintln!("no OpenTalk daemon is running");
         1
+    }
+}
+
+fn bench_phase() -> i32 {
+    if !ipc::daemon_running() {
+        eprintln!("no OpenTalk daemon is running");
+        return 1;
+    }
+    match ipc::query_daemon_phase() {
+        Some(p) => {
+            print_json(&json!({ "phase": p.name() }));
+            0
+        }
+        None => {
+            eprintln!("the daemon did not answer (busy or hung)");
+            1
+        }
     }
 }
 
@@ -180,8 +203,100 @@ fn bench_wait_ready(args: &[String]) -> i32 {
     1
 }
 
+/// How often the bench polls the daemon for its phase.
+const PHASE_POLL: Duration = Duration::from_millis(10);
+/// Longest a round waits for the previous dictation to finish before cancelling it.
+const IDLE_WAIT: Duration = Duration::from_secs(10);
+/// A round is tried this many times when something else (a stray hotkey press, a toggle) ended
+/// the recording before the bench did.
+const MAX_ATTEMPTS: u32 = 3;
+
+/// Poll the daemon until its phase satisfies `pred` or `within` passes. The bool says whether it
+/// did; the phase is the last one the daemon reported (`None`: it never answered).
+fn wait_phase(pred: impl Fn(ipc::DaemonPhase) -> bool, within: Duration) -> (bool, Option<ipc::DaemonPhase>) {
+    let t0 = Instant::now();
+    let mut last = None;
+    loop {
+        if let Some(p) = ipc::query_daemon_phase() {
+            last = Some(p);
+            if pred(p) {
+                return (true, last);
+            }
+        }
+        if t0.elapsed() >= within {
+            return (false, last);
+        }
+        std::thread::sleep(PHASE_POLL);
+    }
+}
+
+fn phase_name(p: Option<ipc::DaemonPhase>) -> &'static str {
+    p.map_or("unknown", ipc::DaemonPhase::name)
+}
+
+/// What the pre-round check found and did.
+#[derive(Debug, Default, PartialEq)]
+struct Precheck {
+    waited_idle_ms: f64,
+    /// The daemon was still busy after [`IDLE_WAIT`]; it was cancelled.
+    cancelled_stale: bool,
+    /// History holds fewer entries than right after the previous round (an entry vanished).
+    prev_entry_missing: bool,
+}
+
+/// Newest history entry's id (0 when empty): a round is over when it changes.
+fn newest_id() -> i64 {
+    history::load_all().first().map_or(0, |e| e.id)
+}
+
+/// Make sure the daemon is idle and the previous round's history entry exists before recording.
+/// `expected_len` is the history length after the previous round (None for the first).
+fn prepare_round(expected_len: Option<usize>) -> Result<Precheck, String> {
+    let t0 = Instant::now();
+    let mut pre = Precheck::default();
+    let (idle, last) = wait_phase(|p| p == ipc::DaemonPhase::Idle, IDLE_WAIT);
+    if !idle {
+        if last.is_none() {
+            return Err("the daemon does not answer phase queries".into());
+        }
+        eprintln!("daemon still {} after {} s; cancelling it", phase_name(last), IDLE_WAIT.as_secs());
+        if !ipc::notify_daemon(IpcMsg::Cancel) {
+            return Err("daemon went away".into());
+        }
+        pre.cancelled_stale = true;
+        let (idle, last) = wait_phase(|p| p == ipc::DaemonPhase::Idle, Duration::from_secs(5));
+        if !idle {
+            return Err(format!("the daemon is not idle (phase {})", phase_name(last)));
+        }
+    }
+    pre.waited_idle_ms = round1(t0.elapsed().as_secs_f64() * 1000.0);
+    pre.prev_entry_missing = expected_len.is_some_and(|e| history::load_all().len() < e);
+    Ok(pre)
+}
+
+/// Latency samples in the daemon log (oldest first).
+fn log_samples() -> Vec<Sample> {
+    let text = std::fs::read_to_string(paths::log_dir().join("daemon.log")).unwrap_or_default();
+    text.lines().filter_map(latency::parse_line).collect()
+}
+
+/// How one dictation attempt ended.
+#[derive(Debug)]
+enum Attempt {
+    /// A history entry landed.
+    Done { status: String },
+    /// No entry within the wait.
+    Timeout,
+    /// The recording never started, or something other than the bench ended it before the stop.
+    Disturbed { why: String },
+}
+
 /// `--bench dictate <n> <wav> [secs]`: needs a daemon started with `OPENTALK_INJECT_WAV=<wav>`.
-/// Each round waits up to `secs` (default 45) after the stop for its history entry.
+/// Rounds use explicit start / stop messages (never a toggle, whose parity one stray press flips),
+/// each preceded by a check that the daemon is idle and the previous entry is in history. Each
+/// round waits up to `secs` (default 45) after the stop for its history entry and prints one JSON
+/// line: status, recorded_ms, audio_ms and upload_bytes (from the daemon log's latency line).
+/// A round whose recording something else ended is reported (`"status":"disturbed"`) and redone.
 fn bench_dictate(args: &[String]) -> i32 {
     let (Some(n), Some(wav)) = (args.first().and_then(|s| s.parse::<u32>().ok()), args.get(1)) else {
         eprintln!("usage: opentalk --bench dictate <n> <wav> [secs]");
@@ -200,36 +315,110 @@ fn bench_dictate(args: &[String]) -> i32 {
         return 1;
     }
     let mut failures = 0;
+    let mut expected_len = None;
     for i in 1..=n {
-        let before = history::load_all().len();
-        let started = Instant::now();
-        if !ipc::notify_daemon(IpcMsg::Toggle) {
-            eprintln!("daemon went away");
-            return 1;
-        }
-        // The injected file plays in real time; leave a little tail so the VAD sees its end.
-        std::thread::sleep(Duration::from_millis(wav_ms + 600));
-        let stop = Instant::now();
-        ipc::notify_daemon(IpcMsg::Toggle);
-        let mut status = "timeout".to_string();
-        while stop.elapsed() < wait {
-            let all = history::load_all();
-            if all.len() > before {
-                status = format!("{:?}", all[0].status).to_ascii_lowercase();
-                break;
+        for attempt in 1..=MAX_ATTEMPTS {
+            let pre = match prepare_round(expected_len) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("round {i}: {e}");
+                    print_json(&json!({ "round": i, "attempt": attempt, "status": "not-idle", "error": e }));
+                    return 1;
+                }
+            };
+            let before_id = newest_id();
+            let samples_before = log_samples().len();
+            let started = Instant::now();
+            let mut stop = started;
+            let outcome = dictate_once(wav_ms, wait, before_id, &mut stop);
+            let (status, retry) = match &outcome {
+                Attempt::Done { status } => (status.clone(), false),
+                Attempt::Timeout => ("timeout".to_string(), false),
+                Attempt::Disturbed { .. } => ("disturbed".to_string(), attempt < MAX_ATTEMPTS),
+            };
+            // The latency line may land just after the history entry.
+            let mut sample = None;
+            if matches!(outcome, Attempt::Done { .. }) {
+                let t = Instant::now();
+                while t.elapsed() < Duration::from_secs(1) {
+                    let all = log_samples();
+                    if all.len() > samples_before {
+                        sample = all.last().cloned();
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
             }
-            std::thread::sleep(Duration::from_millis(20));
+            let mut row = json!({
+                "round": i, "attempt": attempt, "status": status,
+                "recorded_ms": round1(stop.duration_since(started).as_secs_f64() * 1000.0),
+                "stop_to_history_ms": round1(stop.elapsed().as_secs_f64() * 1000.0),
+                "audio_ms": sample.as_ref().map(|s| s.audio_ms),
+                "upload_bytes": sample.as_ref().map(|s| s.upload_bytes),
+                "waited_idle_ms": pre.waited_idle_ms,
+                "cancelled_stale": pre.cancelled_stale,
+                "prev_entry_missing": pre.prev_entry_missing,
+            });
+            if let Attempt::Disturbed { why } = &outcome {
+                row["why"] = json!(why);
+                row["retry"] = json!(retry);
+            }
+            print_json(&row);
+            if matches!(outcome, Attempt::Disturbed { .. }) {
+                // Let an entry for the cut-short recording land before the next check reads history.
+                let t = Instant::now();
+                while t.elapsed() < Duration::from_secs(2) && newest_id() == before_id {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+            expected_len = Some(history::load_all().len());
+            if retry {
+                continue;
+            }
+            failures += (status != "ok") as i32;
+            break;
         }
-        let ok = status == "ok";
-        failures += (!ok) as i32;
-        print_json(&json!({
-            "round": i, "status": status,
-            "recorded_ms": round1(stop.duration_since(started).as_secs_f64() * 1000.0),
-            "stop_to_history_ms": round1(stop.elapsed().as_secs_f64() * 1000.0),
-        }));
         std::thread::sleep(Duration::from_millis(400));
     }
     (failures > 0) as i32
+}
+
+/// One start / play / stop cycle. `stop` is set to the instant the stop was sent.
+fn dictate_once(wav_ms: u64, wait: Duration, before_id: i64, stop: &mut Instant) -> Attempt {
+    use ipc::DaemonPhase as P;
+    if !ipc::notify_daemon(IpcMsg::Start) {
+        return Attempt::Disturbed { why: "daemon went away".into() };
+    }
+    let (recording, phase) = wait_phase(|p| p == P::Recording, Duration::from_secs(3));
+    if !recording {
+        let why = format!("start did not begin a recording (phase {})", phase_name(phase));
+        if phase.is_some_and(|p| p != P::Idle) {
+            ipc::notify_daemon(IpcMsg::Cancel);
+        }
+        return Attempt::Disturbed { why };
+    }
+    // The injected file plays in real time; leave a little tail so the VAD sees its end.
+    std::thread::sleep(Duration::from_millis(wav_ms + 600));
+    let at_stop = wait_phase(|_| true, Duration::from_millis(500)).1;
+    *stop = Instant::now();
+    match at_stop {
+        Some(P::Recording) => {
+            ipc::notify_daemon(IpcMsg::Stop);
+        }
+        // Something else already ended it (a stray toggle); any entry it leaves is short.
+        other => {
+            return Attempt::Disturbed { why: format!("phase {} when the bench went to stop", phase_name(other)) };
+        }
+    }
+    while stop.elapsed() < wait {
+        if let Some(e) = history::load_all().first()
+            && e.id != before_id
+        {
+            return Attempt::Done { status: format!("{:?}", e.status).to_ascii_lowercase() };
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    Attempt::Timeout
 }
 
 /// `--bench latency [n]`: the latency lines of the daemon log plus a median / p95 summary.

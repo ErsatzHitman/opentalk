@@ -6,6 +6,7 @@
 //! Idle --down(hold)--> Arming --150 ms--> Recording(hold) --up--> Thinking
 //!                        '--up (early)--> Idle (cancelled)
 //! Recording/Thinking --Esc/cancel--> Idle
+//! Idle --start--> Recording --stop--> Thinking   (idempotent; toggle flips whatever it finds)
 //! ```
 use crate::core::config::ActivationMode;
 
@@ -41,6 +42,10 @@ pub enum Input {
     Toggle,
     /// IPC cancel.
     Cancel,
+    /// IPC start: begins a dictation only when idle (a second start is a no-op).
+    Start,
+    /// IPC stop: ends a running recording only (a stop while idle or transcribing is a no-op).
+    Stop,
     /// The worker finished (or the stop found nothing to transcribe).
     JobDone,
     /// Starting the recorder failed.
@@ -98,7 +103,7 @@ impl Machine {
                     A::BeginArming
                 }
             },
-            (P::Idle, I::PillClick | I::Toggle) => {
+            (P::Idle, I::PillClick | I::Toggle | I::Start) => {
                 self.phase = P::Recording { hold: false };
                 A::StartRecording { hold: false }
             }
@@ -118,7 +123,7 @@ impl Machine {
 
             (P::Recording { hold }, I::HotkeyDown) if !hold => self.stop(),
             (P::Recording { hold }, I::HotkeyUp) if hold => self.stop(),
-            (P::Recording { .. }, I::PillClick | I::Toggle | I::CapTimer) => self.stop(),
+            (P::Recording { .. }, I::PillClick | I::Toggle | I::CapTimer | I::Stop) => self.stop(),
             (P::Recording { .. }, I::Escape | I::CancelClick | I::Cancel) => {
                 self.phase = P::Idle;
                 A::CancelRecording
@@ -250,6 +255,49 @@ mod tests {
     }
 
     #[test]
+    fn start_and_stop_are_idempotent() {
+        for m in [tap(), hold()] {
+            let mut m = m;
+            assert_eq!(m.step(I::Stop), A::None, "stop while idle does nothing");
+            assert_eq!(m.phase, Phase::Idle);
+            assert_eq!(m.step(I::Start), A::StartRecording { hold: false });
+            assert_eq!(m.step(I::Start), A::None, "a second start while recording does nothing");
+            assert_eq!(m.phase, Phase::Recording { hold: false });
+            assert_eq!(m.step(I::Stop), A::StopRecording);
+            assert_eq!(m.phase, Phase::Thinking);
+            assert_eq!(m.step(I::Stop), A::None, "a second stop does nothing");
+            assert_eq!(m.step(I::Start), A::None, "start while transcribing does nothing");
+            assert_eq!(m.phase, Phase::Thinking);
+            assert_eq!(m.step(I::JobDone), A::None);
+            assert_eq!(m.phase, Phase::Idle);
+            assert_eq!(m.step(I::Stop), A::None);
+            assert_eq!(m.step(I::Start), A::StartRecording { hold: false }, "idle again: starts");
+        }
+    }
+
+    #[test]
+    fn start_and_stop_ignore_the_hold_arming_window() {
+        let mut m = hold();
+        assert_eq!(m.step(I::HotkeyDown), A::BeginArming);
+        assert_eq!(m.step(I::Start), A::None);
+        assert_eq!(m.step(I::Stop), A::None);
+        assert_eq!(m.phase, Phase::Arming);
+    }
+
+    #[test]
+    fn a_stray_toggle_flips_parity_but_start_stop_recover() {
+        // The failure the bench hit: an extra Toggle (a real hotkey press) inverts every later
+        // Toggle pair. Start/Stop pairs always end where they began.
+        let mut m = tap();
+        m.step(I::Toggle); // stray press starts a recording
+        assert_eq!(m.step(I::Start), A::None, "the bench's start finds a recording already running");
+        assert_eq!(m.step(I::Stop), A::StopRecording);
+        assert_eq!(m.step(I::JobDone), A::None);
+        assert_eq!(m.step(I::Start), A::StartRecording { hold: false });
+        assert_eq!(m.step(I::Stop), A::StopRecording);
+    }
+
+    #[test]
     fn start_failure_and_empty_stop_return_to_idle() {
         let mut m = tap();
         m.step(I::HotkeyDown);
@@ -274,7 +322,7 @@ mod tests {
     #[test]
     fn stale_events_are_ignored_when_idle() {
         let mut m = tap();
-        for i in [I::HotkeyUp, I::ArmTimer, I::CapTimer, I::JobDone, I::StartFailed, I::Cancel] {
+        for i in [I::HotkeyUp, I::ArmTimer, I::CapTimer, I::JobDone, I::StartFailed, I::Cancel, I::Stop] {
             assert_eq!(m.step(i), A::None, "{i:?}");
             assert_eq!(m.phase, Phase::Idle);
         }

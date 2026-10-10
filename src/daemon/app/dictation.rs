@@ -25,7 +25,7 @@ use crate::daemon::paste::{self, PasteOptions, PasteOutcome, Target};
 use crate::daemon::pill::PillMode;
 use crate::daemon::{media, sound};
 use crate::stt::{self, Audio, StreamingSession, SttError, SttErrorCode};
-use crate::{log_info, log_warn};
+use crate::{log_debug, log_info, log_warn};
 
 /// Shared slot for the streaming session: the capture thread feeds it, `stop` takes it.
 type Feed = Arc<Mutex<Option<Box<dyn StreamingSession>>>>;
@@ -324,11 +324,26 @@ impl App {
             return;
         }
         if cfg.show_app_bubble {
-            if let Some(t) = target.clone() {
+            // Bench hook: `OPENTALK_BENCH_APP_EXE=<exe>` looks up that app's icon whatever is in front, or
+            // when nothing is (bench/bench.ps1 uses it where no packaged app can be brought to the
+            // foreground, e.g. a locked desktop that has no foreground window at all).
+            let bench_exe = std::env::var("OPENTALK_BENCH_APP_EXE").ok().filter(|p| !p.is_empty());
+            let icon_target = match (bench_exe, target.clone()) {
+                (Some(p), t) => Some(Target { exe_path: p, pid: 0, ..t.unwrap_or_default() }),
+                (None, t) => t,
+            };
+            if let Some(t) = icon_target {
                 let hwnd = self.hwnd;
                 let _ = std::thread::Builder::new().name("app-icon".into()).spawn(move || {
-                    if let Some(icon) = appicon::load(&t, APP_ICON_PX) {
-                        notify(hwnd, Note::Icon { seq, icon });
+                    // Off the message loop: packaged apps read their manifest and PNGs from disk.
+                    let started = now_ms();
+                    let exe = t.exe_path.rsplit(['\\', '/']).next().unwrap_or("").to_ascii_lowercase();
+                    match appicon::load(&t, APP_ICON_PX) {
+                        Some(icon) => {
+                            log_debug!("app icon for {exe}: {:?} in {:.0} ms", icon.name, now_ms() - started);
+                            notify(hwnd, Note::Icon { seq, icon });
+                        }
+                        None => log_debug!("app icon for {exe}: none in {:.0} ms", now_ms() - started),
                     }
                 });
             }
