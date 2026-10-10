@@ -13,19 +13,15 @@ pub use snippets::{expand_snippets, trigger_ranges};
 pub use terms::{case_fix, fuzzy_fix};
 
 /// Groq rejects prompts > 896 chars; 890 leaves margin for UTF-16 vs codepoint counting drift.
-#[allow(dead_code)] // ported OpenWhispr API: pinned by tests, not yet wired into the pipeline
 pub const GROQ_PROMPT_CHARS: usize = 890;
 /// Whisper-family decoders read at most 223 prompt tokens; 900 chars only bounds the request.
-#[allow(dead_code)] // ported OpenWhispr API: pinned by tests, not yet wired into the pipeline
 pub const WHISPER_PROMPT_CHARS: usize = 900;
 /// What the decoder's 223-token window is worth in characters (UI warning, not a trim).
 #[allow(dead_code)] // ported OpenWhispr API: pinned by tests, not yet wired into the pipeline
 pub const WHISPER_DECODER_PROMPT_CHARS: usize = 550;
 /// gpt-4o-transcribe family: a guard against absurd lists, not a limit anyone should hit.
-#[allow(dead_code)] // ported OpenWhispr API: pinned by tests, not yet wired into the pipeline
 pub const TRANSCRIBE_PROMPT_CHARS: usize = 8000;
 /// OpenAI accepts exactly 65,536 characters of overflow prompt for gpt-transcribe.
-#[allow(dead_code)] // ported OpenWhispr API: pinned by tests, not yet wired into the pipeline
 pub const TRANSCRIPTION_OVERFLOW_PROMPT_CHARS: usize = 65536;
 
 /// Words fed to STT/LLM as hints: dictionary words + snippet triggers (deduped, case-insensitive).
