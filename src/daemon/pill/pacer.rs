@@ -2,13 +2,18 @@
 //!
 //! A free-running ~16 ms timer beats against the display's refresh (60 / 75 / 120 / 144 Hz): some
 //! frames are shown twice and some never, which reads as judder. At full rate the animation thread
-//! therefore waits for the compositor (`DwmFlush`, blocking and zero CPU) and tells the window the
-//! time at which the frame it is about to draw will be *shown* (the next vertical blank), so the
-//! animation state is sampled at presentation time, not at message-handling time. A late or
-//! coalesced tick never slows the animation: the state is a pure function of that time.
+//! therefore reads the compositor's vblank clock (`DwmGetCompositionTimingInfo`, non-blocking), sleeps
+//! on its high-resolution timer until just after the next vblank, and tells the window the time at
+//! which the frame it is about to draw will be *shown*, so the animation state is sampled at
+//! presentation time, not at message-handling time. A late or coalesced tick never slows the
+//! animation: the state is a pure function of that time.
+//!
+//! It never waits *for* the compositor (`DwmFlush`): DWM does not compose an unchanged desktop, so a
+//! flush on a quiet screen blocks until something else moves (the pointer), and a silent pill then
+//! stalls the animation thread, deaf to the stop / wake events, until the user hovers it.
 //!
 //! Everything that decides anything is a pure function here (unit-tested); only [`Vsync`] touches
-//! Win32, and it degrades to the fixed-rate timer on a machine where the compositor does not block.
+//! Win32, and the caller keeps its fixed-rate timer when the compositor cannot say when vblanks are.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -54,11 +59,11 @@ pub fn present_time(hint: f64, period: f64, now: f64) -> f64 {
     (hint + late * period).min(now + 4.0 * period)
 }
 
-/// Share of a tick period a flush must block for to count as pacing (see [`Guard::observe_in`]).
-const PACING_SHARE: f64 = 0.5;
 /// A tick never follows the previous one sooner than this share of its period (`divisor` vblanks),
-/// whatever a misbehaving flush returns: bounds the tick rate at roughly 1.3x the display's.
+/// whatever the clock says: bounds the tick rate at roughly 1.3x the display's.
 const TICK_FLOOR_SHARE: f64 = 0.75;
+/// The timer is set this long after the vblank, so it never fires a hair before it (timer slack).
+pub const WAKE_AFTER_VBLANK_MS: f64 = 0.5;
 
 /// Shortest allowed gap between two ticks (ms) for a display with vblank `period_ms`, ticked every
 /// `divisor` vblanks.
@@ -69,42 +74,21 @@ pub fn min_tick_gap_ms(period_ms: f64, divisor: u32) -> f64 {
     TICK_FLOOR_SHARE * period_ms * divisor.max(1) as f64
 }
 
-/// Detects a `DwmFlush` that does not pace: one that does not block (remote session, DWM off, a
-/// wrapper layer: under [`Guard::MIN_BLOCK_MS`], or under half a period when the period is known,
-/// four times in a row), or one that blocks far longer than any refresh ([`Guard::MAX_BLOCK_MS`]: a
-/// compositor that idles when nothing changes).
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Guard {
-    fast: u32,
-}
-
-impl Guard {
-    pub const MIN_BLOCK_MS: f64 = 1.0;
-    pub const MAX_BLOCK_MS: f64 = 100.0;
-    const STREAK: u32 = 4;
-
-    /// Record how long one flush blocked (period unknown); `false` once the flush cannot be trusted.
-    #[cfg(test)]
-    pub fn observe(&mut self, blocked_ms: f64, ok: bool) -> bool {
-        self.observe_in(blocked_ms, ok, 0.0)
+/// How long to sleep before the next tick: until just after the next vblank (`to_next` ms away,
+/// `period` apart), pushed out by whole periods while that would come sooner than the tick floor
+/// after the previous tick (`since_last` ms ago; `None`: first tick).
+pub fn tick_wait_ms(to_next: f64, period: f64, divisor: u32, since_last: Option<f64>) -> f64 {
+    let mut wait = to_next.max(0.0) + WAKE_AFTER_VBLANK_MS;
+    if !(period.is_finite() && period > 0.0) {
+        return wait;
     }
-
-    /// Like [`Guard::observe`], with the refresh period known: a flush that returns within half a
-    /// period does not pace either (a path that completes every 1.5-5 ms would otherwise tick at
-    /// 200-600 Hz), so the minimum is relative to the display, not an absolute millisecond.
-    pub fn observe_in(&mut self, blocked_ms: f64, ok: bool, period_ms: f64) -> bool {
-        if blocked_ms > Self::MAX_BLOCK_MS {
-            self.fast = Self::STREAK;
-            return false;
+    if let Some(since) = since_last.filter(|s| s.is_finite() && *s >= 0.0) {
+        let floor = min_tick_gap_ms(period, divisor);
+        while since + wait < floor {
+            wait += period;
         }
-        let min = if period_ms.is_finite() && period_ms > 0.0 { Self::MIN_BLOCK_MS.max(PACING_SHARE * period_ms) } else { Self::MIN_BLOCK_MS };
-        if ok && blocked_ms >= min {
-            self.fast = 0;
-        } else {
-            self.fast += 1;
-        }
-        self.fast < Self::STREAK
     }
+    wait
 }
 
 /// The animation thread's forecast for the frame it just ticked, read by the window.
@@ -165,13 +149,13 @@ pub struct PaceSnapshot {
 }
 
 impl PaceStats {
-    /// One tick's wait: `blocked_ms` per flush, `period_ms` the display's (0: unknown).
+    /// One tick's sleep until its vblank: `blocked_ms`, `period_ms` the display's (0: unknown).
     pub fn record(&self, blocked_ms: f64, period_ms: f64) {
         let us = (blocked_ms.max(0.0) * 1000.0) as u64;
         self.flushes.fetch_add(1, Ordering::Relaxed);
         self.blocked_us.fetch_add(us, Ordering::Relaxed);
         self.max_us.fetch_max(us, Ordering::Relaxed);
-        if period_ms > 0.0 && blocked_ms < PACING_SHARE * period_ms {
+        if period_ms > 0.0 && blocked_ms < 0.5 * period_ms {
             self.early.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -197,12 +181,11 @@ impl PaceStats {
 // --- Win32 -------------------------------------------------------------------------------------
 
 use windows::Win32::Foundation::HWND;
-use windows::Win32::Graphics::Dwm::{DWM_TIMING_INFO, DwmFlush, DwmGetCompositionTimingInfo};
+use windows::Win32::Graphics::Dwm::{DWM_TIMING_INFO, DwmGetCompositionTimingInfo};
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 
-/// The compositor's clock: blocks for vblanks and says when the next one is.
+/// The compositor's clock: says when the next vblank is, without ever blocking on it.
 pub struct Vsync {
-    guard: Guard,
     freq: f64,
     /// Vblanks per tick, from the measured refresh rate.
     divisor: u32,
@@ -221,7 +204,7 @@ impl Vsync {
         if f <= 0 {
             return None;
         }
-        let mut v = Vsync { guard: Guard::default(), freq: f as f64, divisor: 1, period_ms: 0.0, stats, last_tick: None };
+        let mut v = Vsync { freq: f as f64, divisor: 1, period_ms: 0.0, stats, last_tick: None };
         let (_, period) = v.timing()?;
         v.period_ms = period;
         v.divisor = vsync_divisor(1000.0 / period);
@@ -252,39 +235,27 @@ impl Vsync {
         Some((ms_to_next_vblank(now_ms, vblank_ms, period), period))
     }
 
-    /// Block until the next tick's vblank. Returns the forecast `(ms from now until the frame about
-    /// to be drawn is shown, period)`, or `None` once the compositor stopped pacing (then the caller
-    /// falls back to its timer).
-    pub fn wait(&mut self) -> Option<(f64, f64)> {
-        let t0 = std::time::Instant::now();
-        let mut ok = true;
-        for _ in 0..self.divisor {
-            // SAFETY: plain call, no arguments.
-            ok &= unsafe { DwmFlush() }.is_ok();
-        }
-        let blocked = t0.elapsed().as_secs_f64() * 1000.0;
-        // each flush of a divisor run is judged on its own share
-        let share = blocked / self.divisor as f64;
-        self.stats.record(share, self.period_ms);
-        if !self.guard.observe_in(share, ok, self.period_ms) {
+    /// How long to sleep until the next tick (just after a vblank, see [`tick_wait_ms`]); `None`
+    /// once the compositor cannot say (then the caller falls back to its fixed-rate timer).
+    pub fn next_wait_ms(&mut self) -> Option<f64> {
+        let Some((to_next, period)) = self.timing() else {
             self.stats.trip();
             return None;
-        }
-        // a flush that returned early (but not often enough to trip the guard) must not double the rate
-        if let Some(prev) = self.last_tick {
-            let floor = min_tick_gap_ms(self.period_ms, self.divisor);
-            let since = prev.elapsed().as_secs_f64() * 1000.0;
-            if since < floor {
-                std::thread::sleep(std::time::Duration::from_secs_f64((floor - since) / 1000.0));
-            }
-        }
-        self.last_tick = Some(std::time::Instant::now());
-        // the frame drawn now goes out at the first vblank to come
-        let (to_next, period) = self.timing().unwrap_or((0.0, self.period_ms));
+        };
         self.period_ms = period;
-        // a display mode change (another refresh rate) is picked up by the next wait
+        // a display mode change (another refresh rate) is picked up here
         self.divisor = vsync_divisor(1000.0 / period);
-        Some((to_next, period))
+        let since = self.last_tick.map(|t| t.elapsed().as_secs_f64() * 1000.0);
+        let wait = tick_wait_ms(to_next, period, self.divisor, since);
+        self.stats.record(wait, period);
+        Some(wait)
+    }
+
+    /// The tick is released now: the forecast `(ms from now until the frame about to be drawn is
+    /// shown, period)`.
+    pub fn ticked(&mut self) -> (f64, f64) {
+        self.last_tick = Some(std::time::Instant::now());
+        self.timing().unwrap_or((0.0, self.period_ms))
     }
 }
 
@@ -348,52 +319,21 @@ mod tests {
     }
 
     #[test]
-    fn guard_distrusts_a_flush_that_does_not_block() {
-        let mut g = Guard::default();
-        assert!(g.observe(16.0, true));
-        assert!(g.observe(0.1, true));
-        assert!(g.observe(0.1, true));
-        assert!(g.observe(16.0, true), "a good flush resets the streak");
-        for _ in 0..3 {
-            assert!(g.observe(0.0, true));
-        }
-        assert!(!g.observe(0.0, true), "four instant flushes in a row");
-        let mut g = Guard::default();
-        for _ in 0..3 {
-            assert!(g.observe(16.0, false));
-        }
-        assert!(!g.observe(16.0, false), "four failures in a row");
-        let mut g = Guard::default();
-        assert!(g.observe(16.0, true));
-        assert!(!g.observe(400.0, true), "a flush that waits for ever is no vsync");
-    }
-
-    #[test]
-    fn guard_distrusts_a_flush_that_returns_in_under_half_a_period() {
+    fn tick_waits_for_the_next_vblank_and_respects_the_floor() {
         let p = 1000.0 / 60.0;
-        // 3-4 ms on a 16.7 ms period passes the absolute 1 ms minimum but does not pace
-        let mut g = Guard::default();
-        for _ in 0..3 {
-            assert!(g.observe_in(3.5, true, p));
-        }
-        assert!(!g.observe_in(3.5, true, p), "four flushes under half a period in a row");
-        // the absolute rule alone would have trusted them
-        let mut g = Guard::default();
-        for _ in 0..10 {
-            assert!(g.observe(3.5, true));
-        }
-        // a real flush (most of a period, even with a busy frame before it) is fine, and resets the streak
-        let mut g = Guard::default();
-        for _ in 0..20 {
-            assert!(g.observe_in(9.0, true, p));
-            assert!(g.observe_in(3.0, true, p));
-            assert!(g.observe_in(3.0, true, p));
-        }
-        // unknown period: the absolute minimum, as before
-        let mut g = Guard::default();
-        for _ in 0..10 {
-            assert!(g.observe_in(2.0, true, 0.0));
-        }
+        // first tick: just after the next vblank
+        assert!((tick_wait_ms(5.0, p, 1, None) - (5.0 + WAKE_AFTER_VBLANK_MS)).abs() < 1e-9);
+        // a tick one period ago: the next vblank is fine
+        assert!((tick_wait_ms(3.0, p, 1, Some(p - 3.0)) - (3.0 + WAKE_AFTER_VBLANK_MS)).abs() < 1e-9);
+        // a tick a moment ago (a vblank is 1 ms away): skip to the one after
+        let w = tick_wait_ms(1.0, p, 1, Some(0.5));
+        assert!((w - (1.0 + WAKE_AFTER_VBLANK_MS + p)).abs() < 1e-9, "{w}");
+        // 144 Hz ticked every second vblank: two periods apart
+        let p = 1000.0 / 144.0;
+        let w = tick_wait_ms(0.2, p, 2, Some(p - 0.2));
+        assert!(w + p - 0.2 >= min_tick_gap_ms(p, 2), "{w}");
+        // no period: just the vblank offset
+        assert!((tick_wait_ms(2.0, f64::NAN, 1, Some(0.0)) - (2.0 + WAKE_AFTER_VBLANK_MS)).abs() < 1e-9);
     }
 
     #[test]

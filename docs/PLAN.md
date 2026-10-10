@@ -40,7 +40,7 @@ opentalk.exe            (daemon, default: Win32 only, no GPU, no WebView)
  ├─ main thread         hidden message window, tray, pill window, state machine
  ├─ hook thread         WH_KEYBOARD_LL → PostMessage(WM_APP_*)
  ├─ capture thread      WASAPI event-driven, started on hotkey only
- ├─ anim thread         compositor-paced (DwmFlush) at full rate, waitable timer for the slow cadence and as fallback; posts WM_APP_TICK only while animating
+ ├─ anim thread         vblank-timed (one-shot waitable timer to just after the next vblank) at full rate, periodic timer for the slow cadence and as fallback; posts WM_APP_TICK only while animating
  └─ worker thread(s)    HTTP: prewarm, transcribe, cleanup
 
 opentalk.exe --settings [page]
@@ -174,7 +174,7 @@ Every number below comes from `docs/SPEC.md`.
 - **Logo.** Ring of r=10 with stroke 2, plus three bars, drawn as tiny-skia paths at 22 px.
 - **Theme.** Follows the Windows app theme (`AppsUseLightTheme`), with the light and dark tokens from SPEC.
 - **Rendering cost.** Rendering happens only while animating (recording or thinking) at 60 fps, using a cached background. Idle does no work.
-- **Frame pacing.** At full rate the anim thread waits for the compositor (`DwmFlush`, blocking, no CPU) instead of a free-running 16 ms timer, which beats against the display's refresh and judders. It ticks at every vblank up to 100 Hz and every second to fourth one above (144 Hz runs at 72 fps), and tells the window when the frame will be shown (`DwmGetCompositionTimingInfo`); the animation is sampled at that time, never at message-handling time, so a late tick cannot slow it, and frame times never run backwards. A flush that does not block (remote session, Wine) or blocks for 100 ms drops back to the fixed timer. The slow cadence (a silent recording) and the idle pill are unchanged: no timer while idle.
+- **Frame pacing.** At full rate the anim thread reads the compositor's vblank clock (`DwmGetCompositionTimingInfo`, non-blocking) and sleeps on a one-shot high-resolution waitable timer until just after the next vblank, instead of a free-running 16 ms timer that beats against the display's refresh. It ticks at every vblank up to 100 Hz and every second to fourth one above (144 Hz runs at 72 fps), and tells the window when the frame will be shown; the animation is sampled at that time, so a late tick cannot slow it. It never waits *for* the compositor (`DwmFlush`): DWM does not compose an unchanged desktop, so a flush blocks until something else on screen moves, which froze the waveform of a silent pill (and kept it deaf to the wake on speech) until the pointer moved over it. Without timing info (remote session, Wine) it drops back to the fixed timer. The slow cadence (a silent recording) and the idle pill are unchanged: no timer while idle.
 - **Transition frames.** The expand and shrink change the capsule's size every frame, so nothing cached by size can help: the refraction field is evaluated per pixel by table lookup (depth profile, per-column / per-row corner factor; within 0.1 px of the transcribed formula), the shadow uses a CDF table, nothing is baked or stored, and the backdrop capture is held back until the motion ends. A shape seen twice in a row (a steady pill) is baked as before.
 - **Verification.**
   - `--render-pill <state> <t_ms> out.png` produces golden PNGs.

@@ -22,7 +22,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use tiny_skia::Pixmap;
-use windows::Win32::Foundation::{COLORREF, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WAIT_OBJECT_0, WAIT_TIMEOUT, WPARAM, CloseHandle};
+use windows::Win32::Foundation::{COLORREF, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WAIT_OBJECT_0, WPARAM, CloseHandle};
 use windows::Win32::Graphics::Gdi::{
     AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS, DeleteDC,
     DeleteObject, GetMonitorInfoW, HBITMAP, HDC, HGDIOBJ, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint,
@@ -340,8 +340,8 @@ fn anim_thread(core: Arc<TimerCore>, sink: Box<dyn Fn() + Send>) {
         let timer = CreateWaitableTimerExW(None, PCWSTR::null(), CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS.0)
             .or_else(|_| CreateWaitableTimerExW(None, PCWSTR::null(), Default::default(), TIMER_ALL_ACCESS.0));
         let Ok(timer) = timer else { return };
-        // The compositor's clock paces the full-rate cadence (see `pacer`); the fixed-rate timer
-        // remains for the slow cadence and for a machine whose compositor does not block.
+        // The compositor's vblank clock paces the full-rate cadence (see `pacer`; it is read, never
+        // waited on); the fixed-rate timer remains for the slow cadence and for a machine without it.
         let mut vsync = Vsync::new(core.pace.clone());
         // first tick one period from now, then periodic
         let arm = |slow: bool| {
@@ -374,37 +374,32 @@ fn anim_thread(core: Arc<TimerCore>, sink: Box<dyn Fn() + Send>) {
             let mut slow = core.slow.load(Ordering::Acquire);
             let Some(mut paced) = pace(slow, &vsync) else { continue };
             loop {
-                // 0: timer, 1: stop, 2: quit, 3: rate. Vsync-paced, the control events are polled
-                // between frames (a frame is at most one refresh long).
-                let idx = if paced {
-                    let r = WaitForMultipleObjects(&[stop, quit, rate], false, 0);
-                    if r == WAIT_TIMEOUT {
-                        match vsync.as_mut().and_then(|v| v.wait()) {
-                            Some((to_next, period)) => {
-                                core.hint.set(crate::core::timing::now_ms() + to_next, period);
-                                sink();
-                            }
-                            None => {
-                                // the compositor stopped pacing (remote session, DWM off): timer from now on
-                                vsync = None;
-                                match pace(slow, &vsync) {
-                                    Some(p) => paced = p,
-                                    None => break,
-                                }
-                            }
+                // 0: timer, 1: stop, 2: quit, 3: rate. Vsync-paced, the timer is re-armed one-shot
+                // for just after the next vblank, so the control events are always heard at once.
+                if paced {
+                    let wait = vsync.as_mut().and_then(|v| v.next_wait_ms());
+                    let armed = wait.is_some_and(|ms| {
+                        let due = -((ms * 10_000.0).round() as i64).max(1);
+                        SetWaitableTimer(timer, &due, 0, None, None, false).is_ok()
+                    });
+                    if !armed {
+                        // the compositor cannot say when vblanks are (remote session, DWM off): timer from now on
+                        vsync = None;
+                        match pace(slow, &vsync) {
+                            Some(p) => paced = p,
+                            None => break,
                         }
-                        continue;
                     }
-                    // a failed wait (not 0..=2) counts as quit, like in the timer branch
-                    match r.0.wrapping_sub(WAIT_OBJECT_0.0) {
-                        k @ 0..=2 => k + 1,
-                        _ => u32::MAX,
-                    }
-                } else {
-                    WaitForMultipleObjects(&[timer, stop, quit, rate], false, INFINITE).0.wrapping_sub(WAIT_OBJECT_0.0)
-                };
+                }
+                let idx = WaitForMultipleObjects(&[timer, stop, quit, rate], false, INFINITE).0.wrapping_sub(WAIT_OBJECT_0.0);
                 match idx {
-                    0 => sink(),
+                    0 => {
+                        if paced && let Some(v) = vsync.as_mut() {
+                            let (to_next, period) = v.ticked();
+                            core.hint.set(crate::core::timing::now_ms() + to_next, period);
+                        }
+                        sink();
+                    }
                     1 => {
                         let _ = CancelWaitableTimer(timer);
                         core.hint.clear();
