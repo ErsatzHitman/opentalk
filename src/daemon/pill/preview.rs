@@ -6,7 +6,7 @@
 
 use super::PillMode;
 use super::model::{AppBubble, Pointer, RenderState};
-use super::render::{pixel_size, render, render_into};
+use super::render::{pixel_size, render_frame, render_into};
 use super::theme::Palette;
 use crate::core::config::PanelPosition;
 use tiny_skia::Pixmap;
@@ -141,7 +141,7 @@ pub fn build(scene: &Scene) -> Result<(RenderState, f64), String> {
 
 pub fn render_scene(scene: &Scene) -> Result<Pixmap, String> {
     let (st, t) = build(scene)?;
-    Ok(render(&st, t))
+    render_frame(&st, t).ok_or_else(|| "pill window size is not representable".to_string())
 }
 
 // --- icons ------------------------------------------------------------------------------------

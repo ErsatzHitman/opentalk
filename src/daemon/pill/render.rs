@@ -32,12 +32,19 @@ pub fn pixel_size(st: &RenderState) -> (u32, u32) {
     ((w * st.scale).ceil().max(1.0) as u32, (h * st.scale).ceil().max(1.0) as u32)
 }
 
-/// Render one frame into a fresh pixmap.
-pub fn render(st: &RenderState, t: f64) -> Pixmap {
+/// Render one frame into a fresh pixmap; `None` when the window size is not representable (a
+/// degenerate scale), so a bad DPI/monitor query can never panic the daemon.
+pub fn render_frame(st: &RenderState, t: f64) -> Option<Pixmap> {
     let (w, h) = pixel_size(st);
-    let mut pm = Pixmap::new(w, h).expect("pill window size");
+    let mut pm = Pixmap::new(w, h)?;
     render_into(st, t, &mut pm);
-    pm
+    Some(pm)
+}
+
+/// [`render_frame`] for tests and goldens, where a size failure is a bug.
+#[cfg(test)]
+pub fn render(st: &RenderState, t: f64) -> Pixmap {
+    render_frame(st, t).expect("pill window size")
 }
 
 /// Render into an existing pixmap of exactly `pixel_size(st)`; the pixmap is cleared first.
@@ -72,7 +79,7 @@ pub fn render_layers(st: &RenderState, t: f64, pm: &mut Pixmap, mask: u8) {
 fn draw_glow(cv: &mut Canvas, st: &RenderState, g: &Geometry, t: f64) {
     let glow_op = st.glow.value(t);
     if glow_op > 0.002 {
-        let sprites = Sprites::get(st.scale);
+        let Some(sprites) = Sprites::get(st.scale) else { return };
         glow::draw(cv, &st.pal, &GlowFrame { pill: g.pill, opacity: glow_op, elapsed: st.glow_since.map(|s| t - s) }, &sprites);
     }
 }
@@ -198,7 +205,6 @@ struct Contents {
     lane_w: f32,
     div_x: f32,
     div_w: f32,
-    div_h: f32,
 }
 
 fn contents_layout(g: &Geometry, divider: f32) -> Contents {
@@ -218,7 +224,6 @@ fn contents_layout(g: &Geometry, divider: f32) -> Contents {
         lane_w,
         div_x: x0 + LOGO_SLOT + dm,
         div_w: dw,
-        div_h: 20.0 - 4.0 * c,
     }
 }
 
@@ -471,7 +476,7 @@ fn arrow_sd(px: f32, py: f32, ax: f32, ay: f32) -> f32 {
 fn render_error(st: &RenderState, e: &card::ErrorCard, t: f64, pm: &mut Pixmap) {
     let scale = st.scale;
     let layout = e.layout(scale);
-    let base = card::base_layer(e, scale, &st.pal);
+    let Some(base) = card::base_layer(e, scale, &st.pal) else { return };
     let (op, ty, sc) = e.presence(t);
     if op <= 0.001 {
         return;
@@ -509,7 +514,7 @@ enum Kind {
 
 /// Bars are redrawn only when one moved by more than this many pixels (1/255 of a pixel is below
 /// what an 8-bit coverage value can show).
-const BAR_EPS: f32 = 1.0 / 255.0;
+pub const BAR_EPS: f32 = 1.0 / 255.0;
 
 /// 64-bit FNV-1a, for the cheap per-frame "did anything static change" signature.
 struct Fnv(u64);
@@ -794,6 +799,44 @@ mod tests {
 
     fn alpha_at(pm: &Pixmap, x: u32, y: u32) -> u8 {
         pm.pixel(x, y).unwrap().alpha()
+    }
+
+    /// A failed DPI/monitor query (scale 0, NaN, inf, absurd) must not panic the daemon's render path.
+    #[test]
+    fn degenerate_scales_render_without_panicking() {
+        for scale in [0.0f32, -2.0, f32::MIN_POSITIVE, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            for dark in [false, true] {
+                for mode in [PillMode::Idle, PillMode::Preparing, PillMode::Recording, PillMode::Thinking, PillMode::Unavailable] {
+                    let mut s = RenderState::new(Palette::get(dark), scale, PanelPosition::BottomRight);
+                    s.set_app(AppBubble::new("App", &[200u8; 8 * 8 * 4], 8, scale), 0.0);
+                    s.set_mode(mode, 0.0);
+                    let pm = render_frame(&s, 1500.0).unwrap_or_else(|| panic!("scale {scale}: no frame"));
+                    assert_eq!((pm.width(), pm.height()), pixel_size(&s), "scale {scale}");
+                    // the incremental path too
+                    let mut cache = FrameCache::new();
+                    let mut target = Pixmap::new(pm.width(), pm.height()).unwrap();
+                    cache.render(&s, 1500.0, &mut target);
+                    cache.render(&s, 1520.0, &mut target);
+                }
+                // the error card, with and without the retry button
+                let mut s = RenderState::new(Palette::get(dark), scale, PanelPosition::BottomCenter);
+                s.set_scale(scale);
+                s.error = Some(card::ErrorCard::new("Transcription failed", "The speech provider rejected your key.", true, 0.0));
+                assert!(render_frame(&s, 400.0).is_some(), "scale {scale}: error card");
+            }
+        }
+        // an absurd scale is clamped, never allocated (not rendered: a 16x frame is slow in debug builds)
+        let huge = RenderState::new(Palette::LIGHT, 1e9, PanelPosition::BottomRight);
+        assert_eq!(pixel_size(&huge), pixel_size(&RenderState::new(Palette::LIGHT, 16.0, PanelPosition::BottomRight)));
+        // zero sizes straight into the helpers
+        let mut s = RenderState::new(Palette::LIGHT, 0.0, PanelPosition::BottomRight);
+        assert_eq!(pixel_size(&s), pixel_size(&RenderState::new(Palette::LIGHT, 0.25, PanelPosition::BottomRight)), "clamped to the smallest usable scale");
+        s.set_scale(f32::NAN);
+        assert_eq!(s.scale, 1.0);
+        let src = Pixmap::new(4, 4).unwrap();
+        assert_eq!(resample(&src, 0).map(|p| p.width()), Some(1));
+        assert!(Sprites::get(0.0).is_some());
+        assert!(AppBubble::new("x", &[], 0, 1.0).is_none());
     }
 
     #[test]

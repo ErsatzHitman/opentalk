@@ -7,6 +7,7 @@
 use crate::stt::Audio;
 
 pub const FRAME_MS: u64 = 20;
+#[cfg(test)]
 pub const SILENCE_RMS: f32 = 0.002;
 pub const SPEECH_RMS: f32 = 0.003;
 pub const SPEECH_PEAK: f32 = 0.02;
