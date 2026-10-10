@@ -1,0 +1,16 @@
+# Settings
+
+## AI rewrite
+  row #20 Rewrite trigger > -- Off
+
+## App
+  row #1 Preferences > -- Theme, sounds, language, microphone
+  row #2 Hotkeys F8 > -- Dictation hotkey and activation
+
+## AI Models
+  row #3 Speech-to-Text Groq > -- Provider, API key, model
+  row #4 Cleanup & AI > -- AI rewrite, filler words, AI cleanup
+
+## System
+  row #5 Privacy & Data > -- History, retention, your data
+  row #6 About > -- Version, folders, reset

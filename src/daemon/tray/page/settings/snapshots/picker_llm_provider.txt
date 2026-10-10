@@ -1,0 +1,12 @@
+# AI provider
+
+## Providers
+  ( ) #100 OpenAI
+  ( ) #101 Anthropic
+  ( ) #102 Gemini
+  ( ) #103 Groq
+  (*) #104 OpenRouter
+  ( ) #105 Custom
+  ( ) #106 Azure OpenAI -- Enterprise
+  ( ) #107 AWS Bedrock -- Enterprise
+  ( ) #108 Google Vertex AI -- Enterprise

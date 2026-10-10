@@ -1,0 +1,6 @@
+# Language
+  field #1 Filter [text] = "" (hint "Type a language")
+
+## Languages
+  (*) #100 Auto-detect
+  ( ) #101 Afrikaans

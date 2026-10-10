@@ -1,0 +1,7 @@
+# Input device
+  button #2 Refresh devices <Outline>
+
+## Microphones
+  (*) #100 System default -- Follows the Windows default input device.
+  ( ) #101 Headset Microphone
+  ( ) #102 Studio USB

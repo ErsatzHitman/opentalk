@@ -22,8 +22,8 @@ pub fn run(hidden: bool) -> i32 {
 /// daemon is running). `hidden` (launch at login) never opens a view. `None` = the normal
 /// start: first run opens Settings > Speech-to-Text, otherwise nothing.
 ///
-/// CONTRACT STUB: `initial` is ignored until the host wiring lands (agent S).
+/// If another daemon already runs, this asks it to open `initial` (Home when `None`, nothing
+/// when `hidden`) and exits.
 pub fn run_with(hidden: bool, initial: Option<crate::core::nav::Route>) -> i32 {
-    let _ = initial;
-    app::run(hidden)
+    app::run(hidden, initial)
 }

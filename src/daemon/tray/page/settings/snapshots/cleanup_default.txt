@@ -1,0 +1,32 @@
+# Cleanup & AI
+
+## AI rewrite
+  note: Say a trigger phrase at the end of a dictation. The text before it is rewritten concisely by your AI provider and pasted instead.
+  [x] #1 Enable AI rewrite -- Uses the AI provider below, even when AI cleanup is off.
+  field #2 Trigger phrase [text] = "rewrite this concisely" (hint "rewrite this concisely", max 80)
+  button #3 Reset to default <Link> (disabled)
+  note: Pick words you would not say otherwise; leave it empty to turn the rewrite off. Avoid digits and filler words such as "um".
+  banner[warn]: No API key is saved for the AI provider below. Add one, or the rewrite pastes your plain text.
+
+## On-device cleanup
+  note: Always on and instant: runs on your device before anything is pasted.
+  seg #10 Filler word removal: Off | (Standard) | Aggressive
+  note: Removes um, uh, stutters and false starts. Aggressive also drops "basically", "actually" and similar.
+  [x] #11 Fuzzy dictionary correction -- Fix near-misses of your dictionary words, for example "open whisper" to "OpenWhispr".
+  [ ] #12 Spoken line breaks -- Turn "new line" and "new paragraph" into real line breaks.
+
+## AI cleanup
+  note: An optional language model polishes punctuation and grammar after the on-device pass.
+  [ ] #20 Enable AI cleanup -- Send the transcript (never the audio) to the model below. It adds a moment of latency; a failure falls back to the on-device result.
+
+## AI provider
+  choice #21 Provider > OpenRouter
+  field #100 API key [secret] = "" (hint "Paste your API key")
+  button #101 Save key <Primary> (disabled)
+  button #103 Get a key <Link>
+  field #22 Model [text] = "nvidia/nemotron-3-super-120b-a12b:free" (hint "Model id")
+  choice #23 Suggested models > Choose...
+
+## Test
+  note: Runs a built-in rough sentence through the model above.
+  button #42 Run on sample <Primary> (disabled)

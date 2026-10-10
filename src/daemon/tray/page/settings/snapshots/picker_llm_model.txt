@@ -1,0 +1,7 @@
+# AI model
+  note: Suggestions for the current provider. Type any other model id in the Model field.
+
+## Models
+  (*) #100 nvidia/nemotron-3-super-120b-a12b:free
+  ( ) #101 google/gemma-4-31b-it:free
+  ( ) #102 nvidia/nemotron-3.5-lightning:free

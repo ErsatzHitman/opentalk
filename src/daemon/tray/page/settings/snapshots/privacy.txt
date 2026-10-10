@@ -1,0 +1,16 @@
+# Privacy & Data
+
+## History
+  note: Your dictations are stored only on this PC.
+  [x] #1 Save history -- Keep a list of your dictations in History. Turn off to save nothing.
+  choice #2 Keep transcripts for > Keep forever
+
+## Recordings
+  note: Audio is never kept on disk.
+  [x] #3 Keep the last failed recording -- Hold it in memory so you can retry after a network or key error. Cleared when OpenTalk exits.
+  [ ] #4 Save discarded dictations -- Also list dictations that were cancelled or contained no speech, under "Show discarded" in History.
+
+## Your data
+  note: Everything lives in <data folder>
+  button #10 Open data folder <Outline>
+  button #11 Clear history... <Destructive>
