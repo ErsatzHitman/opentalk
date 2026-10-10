@@ -314,15 +314,27 @@ fn run_e2e_script(stt: &str, limit: std::time::Duration) -> bool {
 
 #[test]
 fn a_hung_child_is_killed_with_what_it_started() {
+    // A reply timeout unique to this run marks our ping: other processes on the machine (parallel
+    // worktrees, scripts) may start their own PING.EXE meanwhile, and those are not leftovers.
+    let marker = format!("-w {}", 3000 + std::process::id() % 50_000);
     let mut cmd = Command::new("cmd");
-    cmd.args(["/C", "ping -n 60 127.0.0.1 >nul"]);
-    let before = pids_of("PING.EXE");
+    cmd.args(["/C", &format!("ping -n 60 {marker} 127.0.0.1 >nul")]);
     let t0 = std::time::Instant::now();
     assert!(!run_limited(cmd, std::time::Duration::from_millis(1500), &["PING.EXE"]));
     assert!(t0.elapsed() < std::time::Duration::from_secs(10), "the limit was not enforced");
     std::thread::sleep(std::time::Duration::from_millis(300));
-    let leftovers: Vec<_> = pids_of("PING.EXE").difference(&before).copied().collect();
+    let leftovers = pings_with(&marker);
     assert!(leftovers.is_empty(), "the hung child's ping outlived the limit: {leftovers:?}");
+}
+
+/// PIDs of running PING.EXE processes whose command line contains `marker`.
+fn pings_with(marker: &str) -> Vec<u32> {
+    let script = format!(
+        "Get-CimInstance Win32_Process -Filter \"Name='PING.EXE'\" | Where-Object {{ $_.CommandLine -like '*{marker}*' }} | ForEach-Object {{ $_.ProcessId }}"
+    );
+    let out = Command::new("powershell").args(["-NoProfile", "-NonInteractive", "-Command", &script]).output();
+    let text = out.map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
+    text.lines().filter_map(|l| l.trim().parse().ok()).collect()
 }
 
 /// Upper bound for one e2e script run (it normally takes ~15-25 s).
