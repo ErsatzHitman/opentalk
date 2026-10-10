@@ -1,101 +1,10 @@
 //! Embeds the app icon, the application manifest (PerMonitorV2 DPI, asInvoker, Win10/11,
 //! long paths, UTF-8 code page) and version info into `opentalk.exe`.
 //! The resource script is generated here so the version always follows Cargo.toml.
-//!
-//! It also makes `opengl32.dll` a delay-loaded import (see [`delay_load_opengl`]), so the daemon,
-//! which never draws with OpenGL, does not load it at all.
-use std::path::{Path, PathBuf};
-use std::process::Command;
-
-/// The WGL entry points `glutin_wgl_sys` links statically (`#[link(name = "opengl32")]`).
-const WGL_EXPORTS: &[&str] = &[
-    "wglCopyContext",
-    "wglCreateContext",
-    "wglCreateLayerContext",
-    "wglDeleteContext",
-    "wglDescribeLayerPlane",
-    "wglGetCurrentContext",
-    "wglGetCurrentDC",
-    "wglGetLayerPaletteEntries",
-    "wglGetProcAddress",
-    "wglMakeCurrent",
-    "wglRealizeLayerPalette",
-    "wglSetLayerPaletteEntries",
-    "wglShareLists",
-    "wglSwapLayerBuffers",
-    "wglUseFontBitmapsA",
-    "wglUseFontBitmapsW",
-    "wglUseFontOutlinesA",
-    "wglUseFontOutlinesW",
-];
-
-/// Only the Settings window (`--settings`, egui on glow) uses OpenGL, yet a normal import loads
-/// `opengl32.dll` into every process start. In the daemon that costs working set and, worse, makes
-/// overlay injectors that hook GL processes (RivaTuner/MSI Afterburner, game overlays) treat the
-/// daemon as a 3D app: with RTSS running, the daemon's private commit went from ~2 MB to ~58 MB at
-/// the first STA `CoInitializeEx`. A delay-load import library (dlltool `--output-delaylib`,
-/// resolved by mingw-w64's `__delayLoadHelper2`) is found before the system `libopengl32.a`
-/// through the link search path, so the DLL is only loaded on the first WGL call.
-/// Best effort: without dlltool the normal import is used (see [`dlltool_candidates`]).
-fn delay_load_opengl(out: &Path) {
-    if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() != Ok("gnu") || std::env::var_os("OPENTALK_NO_DELAYLOAD").is_some() {
-        return;
-    }
-    let dir = out.join("delayload");
-    if std::fs::create_dir_all(&dir).is_err() {
-        return;
-    }
-    let def = dir.join("opengl32.def");
-    let body = format!("LIBRARY opengl32.dll\nEXPORTS\n{}\n", WGL_EXPORTS.join("\n"));
-    if std::fs::write(&def, body).is_err() {
-        return;
-    }
-    let lib = dir.join("libopengl32.a");
-    let ok = dlltool_candidates().iter().any(|tool| {
-        Command::new(tool)
-            .arg("--input-def")
-            .arg(&def)
-            .args(["--dllname", "opengl32.dll", "--output-delaylib"])
-            .arg(&lib)
-            .status()
-            .is_ok_and(|s| s.success())
-    });
-    if ok {
-        println!("cargo:rustc-link-search=native={}", dir.display());
-    } else {
-        println!("cargo:warning=dlltool unavailable: opengl32.dll stays a load-time import");
-    }
-}
-
-/// The dlltool programs to try, in order: `$DLLTOOL` when set; on a non-Windows host the
-/// target-prefixed mingw-w64 one (`x86_64-w64-mingw32-dlltool`), because a bare `dlltool` there is
-/// the host's binutils and fails (it drives the host assembler); then a plain `dlltool` (what WinLibs
-/// and MSYS2 put on PATH on Windows).
-fn dlltool_candidates() -> Vec<String> {
-    let mut tools = Vec::new();
-    if let Some(t) = std::env::var("DLLTOOL").ok().filter(|t| !t.trim().is_empty()) {
-        tools.push(t);
-    }
-    let host_is_windows = std::env::var("HOST").is_ok_and(|h| h.contains("windows"));
-    if !host_is_windows {
-        let prefix = match std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() {
-            Ok("x86") => Some("i686"),
-            Ok("x86_64") => Some("x86_64"),
-            Ok("aarch64") => Some("aarch64"),
-            _ => None,
-        };
-        if let Some(p) = prefix {
-            tools.push(format!("{p}-w64-mingw32-dlltool"));
-        }
-    }
-    tools.push("dlltool".to_string());
-    tools
-}
+use std::path::PathBuf;
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-env-changed=OPENTALK_NO_DELAYLOAD");
-    println!("cargo:rerun-if-env-changed=DLLTOOL");
     println!("cargo:rerun-if-changed=assets/opentalk.ico");
     println!("cargo:rerun-if-changed=assets/opentalk.manifest");
     println!("cargo:rerun-if-env-changed=OPENTALK_NO_RESOURCES");
@@ -103,7 +12,6 @@ fn main() {
         return;
     }
     let out = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
-    delay_load_opengl(&out);
     // OPENTALK_NO_RESOURCES=1 skips embedding (needed once to bootstrap `cargo run --example make_icon`
     // before assets/opentalk.ico exists, or when windres is unavailable).
     if std::env::var_os("OPENTALK_NO_RESOURCES").is_some() {

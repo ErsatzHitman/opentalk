@@ -20,7 +20,7 @@ pub fn run(hidden: bool) -> i32 {
 
 /// Daemon entry with a route to open once the tray icon exists (`--settings [page]` when no
 /// daemon is running). `hidden` (launch at login) never opens a view. `None` = the normal
-/// start: first run opens Settings > Speech-to-Text, otherwise nothing.
+/// interactive start: the first run opens Settings > Speech-to-Text, otherwise the Home popup.
 ///
 /// If another daemon already runs, this asks it to open `initial` (Home when `None`, nothing
 /// when `hidden`) and exits.

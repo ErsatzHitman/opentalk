@@ -1,14 +1,6 @@
-//! Pure history view logic shared by the tray pages: filtering, day grouping, stats and the
-//! number/meta formatting. No Win32 and no file access; everything is unit-tested below.
+//! Pure history view logic shared by the tray pages: filtering, stats and the number/meta
+//! formatting. No Win32 and no file access; everything is unit-tested below.
 use super::history::{Entry, Status};
-use super::timefmt;
-
-/// One day's worth of rows (indices into the entry list).
-#[derive(Debug, PartialEq, Eq)]
-pub struct Group {
-    pub label: String,
-    pub items: Vec<usize>,
-}
 
 /// Lower-cased words of a search query.
 pub fn query_words(query: &str) -> Vec<String> {
@@ -30,19 +22,6 @@ pub fn matches(e: &Entry, words: &[String]) -> bool {
 pub fn visible(entries: &[Entry], query: &str, show_discarded: bool) -> Vec<usize> {
     let words = query_words(query);
     entries.iter().enumerate().filter(|(_, e)| show_discarded || e.status != Status::Discarded).filter(|(_, e)| matches(e, &words)).map(|(i, _)| i).collect()
-}
-
-/// Group consecutive visible rows (newest first) by local calendar day.
-pub fn group_by_day(entries: &[Entry], idx: &[usize], now_ms: i64, offset_of: &dyn Fn(i64) -> i64) -> Vec<Group> {
-    let mut groups: Vec<Group> = Vec::new();
-    for &i in idx {
-        let label = timefmt::day_label(entries[i].ts, now_ms, offset_of);
-        match groups.last_mut() {
-            Some(g) if g.label == label => g.items.push(i),
-            _ => groups.push(Group { label, items: vec![i] }),
-        }
-    }
-    groups
 }
 
 #[derive(Debug, PartialEq, Eq, Default)]
@@ -153,10 +132,6 @@ mod tests {
         Entry { id, ts, text: text.into(), raw: format!("raw {text}"), status, ..Default::default() }
     }
 
-    fn day_ms(y: i32, m: u32, d: u32, h: i64) -> i64 {
-        (timefmt::days_from_civil(y, m, d) * 86_400 + h * 3600) * 1000
-    }
-
     #[test]
     fn filter_hides_discarded_and_matches_all_words() {
         let mut es = vec![
@@ -171,31 +146,6 @@ mod tests {
         assert_eq!(visible(&es, "OUTLOOK", false), vec![0]);
         assert_eq!(visible(&es, "raw buy", false), vec![2], "raw transcript is searchable");
         assert!(visible(&es, "zzz", true).is_empty());
-    }
-
-    #[test]
-    fn grouping_splits_on_local_day() {
-        let now = day_ms(2026, 10, 9, 12);
-        let es = vec![
-            entry(5, day_ms(2026, 10, 9, 11), "a", Status::Ok),
-            entry(4, day_ms(2026, 10, 9, 1), "b", Status::Ok),
-            entry(3, day_ms(2026, 10, 8, 20), "c", Status::Ok),
-            entry(2, day_ms(2026, 10, 2, 9), "d", Status::Ok),
-            entry(1, day_ms(2026, 10, 2, 8), "e", Status::Ok),
-        ];
-        let idx: Vec<usize> = (0..es.len()).collect();
-        let g = group_by_day(&es, &idx, now, &|_| 0);
-        assert_eq!(g.iter().map(|g| g.label.as_str()).collect::<Vec<_>>(), vec!["Today", "Yesterday", "Oct 2, 2026"]);
-        assert_eq!(g[0].items, vec![0, 1]);
-        assert_eq!(g[2].items, vec![3, 4]);
-    }
-
-    #[test]
-    fn grouping_respects_timezone_offset() {
-        let now = day_ms(2026, 10, 9, 12);
-        let es = vec![entry(1, day_ms(2026, 10, 8, 23) + 1_800_000, "x", Status::Ok)];
-        let g = group_by_day(&es, &[0], now, &|_| 3600);
-        assert_eq!(g[0].label, "Today");
     }
 
     #[test]

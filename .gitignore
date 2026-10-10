@@ -3,4 +3,3 @@
 *.secret
 /bench/out
 /bench/flac_probe/target
-/bench/renderer_probe/target

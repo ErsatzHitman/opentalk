@@ -171,24 +171,12 @@ pub fn export_words_json(words: &[String]) -> String {
     serde_json::to_string_pretty(&serde_json::json!({ "dictionary": words })).unwrap_or_default()
 }
 
-pub fn export_words_txt(words: &[String]) -> String {
-    words.join("\n")
-}
-
 pub fn export_snippets_json(snippets: &[Snippet]) -> String {
     serde_json::to_string_pretty(&serde_json::json!({ "snippets": snippets })).unwrap_or_default()
 }
 
-/// Largest dictionary/snippet file we import (a real word list is a few KB).
+/// Largest dictionary/snippet import we accept (a real word list is a few KB).
 pub const MAX_IMPORT_BYTES: u64 = 4 * 1024 * 1024;
-
-pub fn read_import_file(path: &str) -> std::io::Result<String> {
-    let len = std::fs::metadata(path)?.len();
-    if len > MAX_IMPORT_BYTES {
-        return Err(std::io::Error::other("the file is larger than 4 MB"));
-    }
-    std::fs::read_to_string(path)
-}
 
 /// Append imported snippets, trimming triggers and skipping blank ones and triggers already in
 /// use (case-insensitive, as the editor enforces). Returns how many were added.
@@ -338,7 +326,7 @@ mod tests {
     fn export_roundtrips() {
         let words = vec!["A".to_string(), "B c".to_string()];
         assert_eq!(parse_import(&export_words_json(&words)).0, words);
-        assert_eq!(parse_import(&export_words_txt(&words)).0, words);
+        assert_eq!(parse_import(&words.join("\n")).0, words, "a plain word list too");
         let snips = vec![sn("t", "multi\nline")];
         assert_eq!(parse_import(&export_snippets_json(&snips)).1, snips);
     }

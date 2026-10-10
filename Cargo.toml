@@ -5,7 +5,6 @@ edition = "2024"
 
 [dependencies]
 base64 = "0.23.1"
-eframe = { version = "0.36", default-features = false, features = ["glow"] }
 hmac = "0.13.0"
 native-tls = "0.2.18"
 rsa = { version = "0.9", default-features = false, features = ["std", "pem"] }
@@ -18,7 +17,6 @@ ureq = { version = "2.12", default-features = false, features = ["native-tls", "
 windows = { version = "0.62", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Input_Ime", "Win32_Graphics_Gdi", "Win32_Graphics_Dwm", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Variant", "Win32_Media_Audio", "Win32_Media_Audio_Endpoints", "Win32_Media_KernelStreaming", "Win32_Media_Multimedia", "Win32_System_Threading", "Win32_System_LibraryLoader", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_System_Ole", "Win32_Security", "Win32_Security_Cryptography", "Win32_UI_Shell", "Win32_UI_Shell_PropertiesSystem", "Win32_Devices_FunctionDiscovery", "Win32_System_Registry", "Win32_Storage_FileSystem", "Win32_UI_HiDpi", "Win32_System_RemoteDesktop", "Win32_System_Performance", "Win32_System_WindowsProgramming", "Win32_System_ProcessStatus", "Win32_System_SystemInformation", "Win32_System_SystemServices", "Win32_UI_Controls", "Win32_System_Diagnostics_ToolHelp", "Win32_UI_Accessibility", "Win32_System_Console", "Win32_Storage_Packaging_Appx", "Media_Control", "Foundation", "Foundation_Collections", "Win32_System_Time", "Win32_UI_Shell_Common", "Win32_Globalization", "Win32_System_StationsAndDesktops"] }
 png = { version = "0.18", default-features = false }
 windows-core = "0.62"
-winit = { version = "0.30", default-features = false }
 
 [build-dependencies]
 embed-resource = "3"
@@ -34,54 +32,10 @@ codegen-units = 1
 strip = true
 debug = false
 
-# Size, not speed, for code off the dictation hot path: the Settings window stack (egui, GL, fonts),
-# Vertex RS256 signing, and network/JSON plumbing that waits on the network anyway. tiny-skia (pill
-# rendering), windows and the crate itself stay at opt-level 3. Saves ~700 KiB (PLAN section 1 budget).
-[profile.release.package.eframe]
-opt-level = "s"
-[profile.release.package.egui]
-opt-level = "s"
-[profile.release.package.epaint]
-opt-level = "s"
-[profile.release.package.emath]
-opt-level = "s"
-[profile.release.package.ecolor]
-opt-level = "s"
-[profile.release.package.egui_glow]
-opt-level = "s"
-[profile.release.package.egui-winit]
-opt-level = "s"
-[profile.release.package.glow]
-opt-level = "s"
-[profile.release.package.glutin]
-opt-level = "s"
-[profile.release.package.winit]
-opt-level = "s"
-[profile.release.package.accesskit]
-opt-level = "s"
-[profile.release.package.arboard]
-opt-level = "s"
-[profile.release.package.skrifa]
-opt-level = "s"
-[profile.release.package.read-fonts]
-opt-level = "s"
-[profile.release.package.harfrust]
-opt-level = "s"
-[profile.release.package.vello_cpu]
-opt-level = "s"
-[profile.release.package.vello_common]
-opt-level = "s"
-[profile.release.package.kurbo]
-opt-level = "s"
-[profile.release.package.peniko]
-opt-level = "s"
-[profile.release.package.guillotiere]
-opt-level = "s"
-[profile.release.package.image]
-opt-level = "s"
+# Size, not speed, for code off the dictation hot path: PNG decoding (packaged app icons), Vertex
+# RS256 signing, and network/JSON plumbing that waits on the network anyway. tiny-skia (pill and
+# popup rendering), windows and the crate itself stay at opt-level 3 (PLAN section 1 budget).
 [profile.release.package.png]
-opt-level = "s"
-[profile.release.package.moxcms]
 opt-level = "s"
 [profile.release.package.rsa]
 opt-level = "s"

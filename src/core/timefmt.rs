@@ -41,20 +41,6 @@ pub fn day_number(ts_ms: i64, offset_secs: i64) -> i64 {
     (ts_ms.div_euclid(1000) + offset_secs).div_euclid(86_400)
 }
 
-/// "Today", "Yesterday" or "Oct 9, 2026" (OpenWhispr's `formatDateGroup`).
-pub fn day_label(ts_ms: i64, now_ms: i64, offset_of: &dyn Fn(i64) -> i64) -> String {
-    let d = day_number(ts_ms, offset_of(ts_ms));
-    let today = day_number(now_ms, offset_of(now_ms));
-    match today - d {
-        0 => "Today".into(),
-        1 => "Yesterday".into(),
-        _ => {
-            let c = civil(ts_ms, offset_of(ts_ms));
-            format!("{} {}, {}", MONTHS[(c.month - 1) as usize], c.day, c.year)
-        }
-    }
-}
-
 /// "14:05" (24 h; matches the default `toLocaleTimeString` 2-digit style closely enough).
 pub fn clock(ts_ms: i64, offset_secs: i64) -> String {
     let c = civil(ts_ms, offset_secs);
@@ -155,18 +141,6 @@ mod tests {
         assert_eq!((c.year, c.month, c.day, c.hour, c.minute), (2026, 10, 10, 1, 30));
         assert_eq!(clock(ts, 0), "23:30");
         assert_eq!(full(ts, 0), "Oct 9, 2026, 23:30");
-    }
-
-    #[test]
-    fn labels() {
-        let day = |d: u32, h: i64| (days_from_civil(2026, 10, d) * 86_400 + h * 3600) * 1000;
-        let now = day(9, 12);
-        assert_eq!(day_label(day(9, 1), now, UTC), "Today");
-        assert_eq!(day_label(day(8, 23), now, UTC), "Yesterday");
-        assert_eq!(day_label(day(2, 5), now, UTC), "Oct 2, 2026");
-        // Same instant, different zone: 23:30 UTC on the 8th is already "Today" at +01:00.
-        let plus1: &dyn Fn(i64) -> i64 = &|_| 3600;
-        assert_eq!(day_label(day(8, 23) + 30 * 60_000, now, plus1), "Today");
     }
 
     #[test]
