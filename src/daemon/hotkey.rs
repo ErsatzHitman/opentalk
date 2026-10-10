@@ -699,6 +699,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
 /// `dwExtraInfo` stamped on our own mask key so the hook never reacts to it ("OTK1").
 const OWN_MAGIC: usize = 0x4F54_4B31;
 
+/// Should the hook feed an event to the matcher? Our own keystrokes (the Start-menu mask and the
+/// paste/focus taps from `paste.rs`) are never processed, even when injected input is allowed.
+fn hook_accepts(extra_info: usize) -> bool {
+    extra_info != OWN_MAGIC && extra_info != crate::daemon::paste::PASTE_EXTRA_INFO
+}
+
 static MATCHER: Mutex<Matcher<SysKeys>> = Mutex::new(Matcher::with_keys(SysKeys, HotkeySpec::EMPTY));
 static TARGET_HWND: AtomicIsize = AtomicIsize::new(0);
 static TARGET_MSG: AtomicU32 = AtomicU32::new(0);
@@ -747,7 +753,7 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
         let w = wparam.0 as u32;
         let down = w == WM_KEYDOWN || w == WM_SYSKEYDOWN;
         let up = w == WM_KEYUP || w == WM_SYSKEYUP;
-        if (down || up) && kbd.dwExtraInfo != OWN_MAGIC {
+        if (down || up) && hook_accepts(kbd.dwExtraInfo) {
             let injected = kbd.flags.0 & (LLKHF_INJECTED.0 | LLKHF_LOWER_IL_INJECTED.0) != 0;
             let out = match MATCHER.try_lock() {
                 Ok(mut m) => m.step(kbd.vkCode, down, injected),
@@ -1454,6 +1460,14 @@ mod tests {
         // Injected Ctrl is ignored by the tracker; the OS state is empty so nothing is held.
         m.on_key(VK_LCONTROL, true, true);
         assert!(m.on_key(VK_SPACE, true, false).0.is_empty());
+    }
+
+    #[test]
+    fn hook_filter_skips_own_keystrokes() {
+        assert!(!hook_accepts(OWN_MAGIC));
+        assert!(!hook_accepts(crate::daemon::paste::PASTE_EXTRA_INFO));
+        assert!(hook_accepts(0));
+        assert!(hook_accepts(0x1234));
     }
 
     // ---- Start-menu mask ----
