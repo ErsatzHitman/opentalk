@@ -1,6 +1,6 @@
 # Settings
 
-## Voice rewrite
+## AI rewrite
   row #20 Rewrite trigger > -- "rewrite this concisely"
 
 ## App
@@ -9,7 +9,7 @@
 
 ## AI Models
   row #3 Speech-to-Text OpenAI > -- Provider, API key, model
-  row #4 Cleanup & AI > -- Voice rewrite, filler words, AI cleanup
+  row #4 Cleanup & AI > -- AI rewrite, filler words, AI cleanup
 
 ## System
   row #5 Privacy & Data > -- History, retention, your data

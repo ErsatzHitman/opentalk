@@ -1,4 +1,4 @@
-//! Settings > Cleanup & AI: the voice rewrite trigger (first group), on-device cleanup options,
+//! Settings > Cleanup & AI: the AI rewrite trigger (first group), on-device cleanup options,
 //! the AI cleanup provider (also used by the rewrite) and the prompt editor.
 use super::keyfield::{KeyField, SecretStore, SysSecrets};
 use super::kit::{ToggleDef, apply_toggle, button, choice, group, note, saved, segmented, text_field};
@@ -64,7 +64,7 @@ const OPTIONS: &[ToggleDef] = &[
     },
     ToggleDef {
         id: ID_RW_TOGGLE,
-        label: "Voice rewrite",
+        label: "Enable AI rewrite",
         desc: "Uses the AI provider below, even when AI cleanup is off.",
         get: |c| c.ai_cleanup.rewrite_enabled,
         set: |c, v| c.ai_cleanup.rewrite_enabled = v,

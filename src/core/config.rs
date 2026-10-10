@@ -1,7 +1,9 @@
 //! Persistent settings (`config.json`). Secrets are NOT stored here — see `secrets.rs`.
 //!
 //! Every field has a default (`#[serde(default)]`), so old/partial files always load.
-//! The settings UI writes this file and then calls `ipc::notify_daemon(IpcMsg::Reload)`.
+//! The tray popup's Settings pages hand the edited config to the daemon, which applies it live and
+//! saves it (`App::apply_config`); `ipc::notify_daemon(IpcMsg::Reload)` re-reads the file after an
+//! external edit.
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 

@@ -2,7 +2,7 @@
 
 ## AI rewrite
   note: Say a trigger phrase at the end of a dictation. The text before it is rewritten concisely by your AI provider and pasted instead.
-  [ ] #1 Voice rewrite -- Uses the AI provider below, even when AI cleanup is off.
+  [ ] #1 Enable AI rewrite -- Uses the AI provider below, even when AI cleanup is off.
 
 ## On-device cleanup
   note: Always on and instant: runs on your device before anything is pasted.

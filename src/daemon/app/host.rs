@@ -67,6 +67,12 @@ static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 /// Result of the latest provider test with the token it was started under.
 static TEST_SLOT: std::sync::Mutex<Option<(u64, TestResult)>> = std::sync::Mutex::new(None);
 
+/// Take the pending test result; `None` when there is none or it was started under an older token.
+fn take_fresh_result(slot: &std::sync::Mutex<Option<(u64, TestResult)>>, current: u64) -> Option<TestResult> {
+    let (token, result) = slot.lock().unwrap_or_else(|e| e.into_inner()).take()?;
+    (token == current).then_some(result)
+}
+
 /// What a finished test shows on its page.
 fn test_result(kind: TestKind, outcome: crate::core::settings_logic::TestOutcome) -> TestResult {
     use crate::core::settings_logic::TestOutcome;
@@ -703,11 +709,9 @@ impl App {
 
     /// A test worker posted its result.
     fn on_test_done(&mut self) {
-        let Some((token, result)) = TEST_SLOT.lock().unwrap_or_else(|e| e.into_inner()).take() else { return };
-        if token == self.test_token {
-            crate::daemon::tray::popup_test_done(result);
-        } else {
-            log_info!("dropped the result of a superseded provider test");
+        match take_fresh_result(&TEST_SLOT, self.test_token) {
+            Some(result) => crate::daemon::tray::popup_test_done(result),
+            None => log_info!("dropped the result of a superseded provider test"),
         }
     }
 
@@ -1336,6 +1340,18 @@ mod tests {
         assert_eq!((ok.ok, ok.badge.as_str(), ok.kind), (true, "Cleaned in 12 ms", TestKind::Llm));
         let bad = test_result(TestKind::Stt, TestOutcome::Err("HTTP 401".into()));
         assert_eq!((bad.ok, bad.badge.as_str(), bad.text.as_str()), (false, "Failed", "HTTP 401"));
+    }
+
+    #[test]
+    fn a_stale_test_result_is_dropped_and_a_fresh_one_delivered() {
+        let slot = std::sync::Mutex::new(None);
+        let r = |t: &str| TestResult { kind: TestKind::Stt, ok: true, badge: "b".into(), text: t.into() };
+        assert_eq!(take_fresh_result(&slot, 3), None, "nothing pending");
+        *slot.lock().unwrap() = Some((2, r("old")));
+        assert_eq!(take_fresh_result(&slot, 3), None, "started under token 2, current is 3");
+        assert!(slot.lock().unwrap().is_none(), "the stale result is consumed, not kept");
+        *slot.lock().unwrap() = Some((3, r("new")));
+        assert_eq!(take_fresh_result(&slot, 3).map(|x| x.text), Some("new".into()));
     }
 
     #[test]

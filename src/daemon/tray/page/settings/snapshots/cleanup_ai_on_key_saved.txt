@@ -2,7 +2,7 @@
 
 ## AI rewrite
   note: Say a trigger phrase at the end of a dictation. The text before it is rewritten concisely by your AI provider and pasted instead.
-  [x] #1 Voice rewrite -- Uses the AI provider below, even when AI cleanup is off.
+  [x] #1 Enable AI rewrite -- Uses the AI provider below, even when AI cleanup is off.
   field #2 Trigger phrase [text] = "rewrite this concisely" (hint "rewrite this concisely", max 80)
   button #3 Reset to default <Link> (disabled)
   note: Pick words you would not say otherwise; leave it empty to turn the rewrite off. Avoid digits and filler words such as "um".

@@ -19,7 +19,7 @@ fn blurb(s: Section) -> &'static str {
         Section::Preferences => "Theme, sounds, language, microphone",
         Section::Hotkeys => "Dictation hotkey and activation",
         Section::SpeechToText => "Provider, API key, model",
-        Section::Cleanup => "Voice rewrite, filler words, AI cleanup",
+        Section::Cleanup => "AI rewrite, filler words, AI cleanup",
         Section::Privacy => "History, retention, your data",
         Section::About => "Version, folders, reset",
     }
@@ -50,7 +50,7 @@ impl PageModel for IndexPage {
 
     fn items(&self, cx: &Cx) -> Vec<Item> {
         let cfg = &*cx.cfg;
-        let mut v = vec![group("Voice rewrite")];
+        let mut v = vec![group("AI rewrite")];
         let (phrase, trailing) = match cfg.rewrite_trigger_effective() {
             Some(p) => (format!("\"{p}\""), Trailing::Chevron),
             None if !cfg.ai_cleanup.rewrite_enabled => ("Off".to_string(), Trailing::Chevron),

@@ -3,7 +3,8 @@
 //! order, missed key-up self-heal, left/right Win) plus: ignore LLKHF_INJECTED, swallow Esc only
 //! while `set_esc_capture(true)`, swallow the main key of a matched combo (down, repeats and
 //! up) so it never reaches the focused app, Start-menu / menu-bar suppression (send mask key
-//! VK 0xE8 down/up before a Win or Alt key-up passes through), suspend during hotkey capture.
+//! VK 0xE8 down/up before a Win or Alt key-up passes through), and a capture mode (Settings >
+//! Hotkeys): the hook records and swallows the next key combination instead of matching it.
 //!
 //! Layout: [`parse`]/[`label`] (accelerator text), [`Matcher`] (pure state machine, unit-tested
 //! with an injected [`KeyState`]), and the thin Win32 shell (hook thread, `PostMessageW`, mask
@@ -600,6 +601,54 @@ pub fn key_name(vk: u32) -> Option<String> {
     })
 }
 
+/// `key_name(vk).is_some()` without building the name: the hook decides with this, so it never
+/// allocates.
+fn is_nameable(vk: u32) -> bool {
+    matches!(
+        vk,
+        0x30..=0x39
+            | 0x41..=0x5A
+            | 0x70..=0x87
+            | 0x60..=0x69
+            | VK_MULTIPLY
+            | VK_ADD
+            | VK_SUBTRACT
+            | VK_DECIMAL
+            | VK_DIVIDE
+            | VK_SPACE
+            | VK_RETURN
+            | VK_TAB
+            | VK_BACK
+            | VK_ESCAPE
+            | VK_CAPITAL
+            | VK_PAUSE
+            | VK_PRIOR
+            | VK_NEXT
+            | VK_END
+            | VK_HOME
+            | VK_LEFT
+            | VK_UP
+            | VK_RIGHT
+            | VK_DOWN
+            | VK_SNAPSHOT
+            | VK_INSERT
+            | VK_DELETE
+            | VK_NUMLOCK
+            | VK_SCROLL
+            | VK_OEM_1
+            | VK_OEM_PLUS
+            | VK_OEM_COMMA
+            | VK_OEM_MINUS
+            | VK_OEM_PERIOD
+            | VK_OEM_2
+            | VK_OEM_3
+            | VK_OEM_4
+            | VK_OEM_5
+            | VK_OEM_6
+            | VK_OEM_7
+    )
+}
+
 /// Why an accelerator cannot be used as the dictation hotkey (`None` = fine).
 pub fn validate(accel: &str) -> Option<&'static str> {
     let parts: Vec<&str> = accel.split('+').collect();
@@ -710,7 +759,7 @@ impl Capture {
             let known = self.held.remove(vk);
             let mut ev = None;
             if known && self.held.is_empty() && self.done == CapDone::Open {
-                if self.accelerator().is_some() {
+                if self.usable() {
                     self.done = CapDone::Combo;
                     ev = Some(HotkeyEvent::CaptureDone);
                 } else {
@@ -720,6 +769,13 @@ impl Capture {
             }
             (known, ev)
         }
+    }
+
+    /// Does the recording hold a combination worth reporting? (`accelerator().is_some()` without
+    /// allocating: this runs inside the hook.)
+    fn usable(&self) -> bool {
+        let any_mod = [VK_CONTROL, VK_MENU, VK_SHIFT, VK_LWIN].iter().any(|&m| self.seen.contains(m));
+        if self.last_main != 0 { is_nameable(self.last_main as u32) } else { any_mod }
     }
 
     /// The accelerator of the keys seen so far.
@@ -3054,6 +3110,25 @@ mod capture_tests {
         assert!(!o.swallow);
         assert_eq!(o.events().collect::<Vec<_>>(), vec![HotkeyEvent::CaptureCancel]);
         assert!(!m.capture_active());
+    }
+
+    #[test]
+    fn the_hook_side_checks_agree_with_the_naming_code() {
+        for vk in 0u32..=0xFF {
+            assert_eq!(is_nameable(vk), key_name(vk).is_some(), "vk {vk:#x}");
+        }
+        // `usable` is `accelerator().is_some()` for every kind of recording.
+        for (mods, main) in [(&[][..], 0u32), (&[VK_CONTROL][..], 0), (&[VK_LWIN, VK_SHIFT][..], 0), (&[][..], 0x41), (&[VK_MENU][..], 0x77), (&[][..], 0xFF), (&[VK_CONTROL][..], 0xFF)] {
+            let mut c = Capture::new();
+            for m in mods {
+                c.seen.insert(*m);
+            }
+            if main != 0 {
+                c.seen.insert(main);
+                c.last_main = main as u8;
+            }
+            assert_eq!(c.usable(), c.accelerator().is_some(), "{mods:?} + {main:#x}");
+        }
     }
 
     #[test]
