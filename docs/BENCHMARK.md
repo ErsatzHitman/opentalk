@@ -129,10 +129,20 @@ network path, not a latency reference; the table above is measured against a loc
   (~0.7 ms per frame); WASAPI capture and the VAD/level meter stay well under 1% of one core. On this 24-core machine that is far
   below the 1.5% target; the 4-core projection above is the number to watch (the pill could drop to 30 fps once its
   entrance has finished, see the open issues).
-- **Working set and the app bubble**: the active-app icon is fetched with `IShellItemImageFactory`, which loads ~35 shell
-  DLLs (XAML, StateRepository, thumbcache, ...) into the daemon on the first dictation. They are shared image pages, so the
-  working set grows by ~17 MB while the private working set (Task Manager's "Memory") grows by ~2-4 MB. With the bubble off
-  the daemon stays at ~19 MB WS / ~3.6 MB private WS while recording. A lighter icon path for plain Win32 executables
-  (`SHGetFileInfoW`/`PrivateExtractIconsW`) is an open follow-up for the app-icon module.
+- **Working set and the app bubble**: the active-app icon used to be fetched with `IShellItemImageFactory` first, which loads
+  ~35 shell DLLs (windows.storage, XAML, StateRepository, thumbcache, ...) into the daemon on the first dictation. They are
+  shared image pages, so the working set grew by ~17 MB (peak 38-39 MB against 19.6 MB with the bubble off) while the private
+  working set (Task Manager's "Memory") grew by only ~2-4 MB. `src/daemon/appicon.rs` now routes by executable: classic Win32
+  programs use `PrivateExtractIconsW` (exact size, user32 only) and then `SHGetFileInfoW`; the shell factory is reserved for
+  packaged apps (a `WindowsApps` path or `ApplicationFrameHost.exe`) and for Win32 files where both cheap paths return nothing.
+  The per-exe cache and the rendering (straight alpha, current-DPI size) are unchanged. Guards: the unit test
+  `win32_exe_never_reaches_shell_factory` injects the shell backend and fails if a Win32 exe reaches it, and the desktop test
+  `desktop_win32_icon_loads_no_shell_dlls` (run alone with `--ignored`) checks `windows.storage.dll`, `StateRepository.Core.dll`
+  and `thumbcache.dll` stay unloaded (its positive control, a `shell_backend` call, loads them) and prints the working-set
+  change: 9.3 MB -> 10.7 MB for the Notepad and Explorer icons, versus ~+17 MB through the shell factory.
+  The acceptance run (bench.ps1 on an unlocked desktop, Notepad or Explorer as the target, WS peak <= 25 MB over the 10
+  dictations) needs a foreground window, so it has to be repeated on an unlocked desktop. Status: the fix was verified on a
+  locked workstation (LogonUI active, no foreground window), so the table above still shows the pre-fix 38-39 MB figures until
+  `benchench.ps1` is re-run unlocked.
 - Clipboard and paste timings are only meaningful on an unlocked desktop: Windows refuses clipboard access while the
   workstation is locked, so `copy_to_clipboard` exhausts its retries (~95 ms) and real-paste e2e runs are skipped.
