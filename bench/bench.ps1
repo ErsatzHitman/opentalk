@@ -39,6 +39,17 @@ $R = @{}
 
 function Section([string]$t) { Write-Host ("`n== {0}" -f $t) -ForegroundColor Cyan }
 
+# CPU of the thread(s) named $name between two Get-ThreadTimes snapshots, as % of one core.
+function Get-ThreadPct($before, $after, [double]$seconds, [string]$name) {
+    $ms = 0.0
+    foreach ($id in $after.Keys) {
+        if ($after[$id].Name -ne $name) { continue }
+        $b = if ($before.ContainsKey($id)) { $before[$id].Ms } else { 0 }
+        $ms += $after[$id].Ms - $b
+    }
+    return [math]::Round($ms / ($seconds * 1000) * 100, 2)
+}
+
 # Sample $proc until $until (a process) exits, or for $seconds.
 function Measure-Until($proc, $until) {
     $cores = [Environment]::ProcessorCount
@@ -177,7 +188,9 @@ try {
     Invoke-Ot $Exe @('--bench', 'toggle') $e 15 | Out-Null
     $thr0 = Get-ThreadTimes $daemon.Id
     $R['recording_injected'] = Measure-Process $daemon $RecordSec
-    $R.recording_injected | Add-Member top_threads (Get-TopThreads $thr0 (Get-ThreadTimes $daemon.Id) $RecordSec)
+    $thr1 = Get-ThreadTimes $daemon.Id
+    $R.recording_injected | Add-Member top_threads (Get-TopThreads $thr0 $thr1 $RecordSec)
+    $R.recording_injected | Add-Member main_thread_pct (Get-ThreadPct $thr0 $thr1 $RecordSec 'main')
     $R.recording_injected | Add-Member private_ws_mb (Get-PrivateWsMB $daemon.Id)
     Invoke-Ot $Exe @('--bench', 'toggle') $e 15 | Out-Null
     Wait-History $h ($before + 1) 30 | Out-Null
@@ -230,9 +243,14 @@ if (-not $SkipMic) {
             Write-Host 'no usable microphone on this machine; skipped' -ForegroundColor Yellow
             $R['recording_mic'] = $null
         } else {
+            $thr0 = Get-ThreadTimes $daemon.Id
             $R['recording_mic'] = Measure-Process $daemon $RecordSec
+            $thr1 = Get-ThreadTimes $daemon.Id
             $R.recording_mic | Add-Member private_ws_mb (Get-PrivateWsMB $daemon.Id)
-            Write-Host ("recording (mic): {0}% of all cores ({1}% of one core), WS peak {2} MB, private peak {3} MB" -f $R.recording_mic.CpuPctAll, $R.recording_mic.CpuPctCore, $R.recording_mic.WsPeakMB, $R.recording_mic.PrivPeakMB)
+            $R.recording_mic | Add-Member top_threads (Get-TopThreads $thr0 $thr1 $RecordSec)
+            # the main thread owns the message loop and the pill; this is the number the pill work is judged by
+            $R.recording_mic | Add-Member main_thread_pct (Get-ThreadPct $thr0 $thr1 $RecordSec 'main')
+            Write-Host ("recording (mic): {0}% of all cores ({1}% of one core), main thread {4}% of one core, WS peak {2} MB, private peak {3} MB; busiest threads: {5}" -f $R.recording_mic.CpuPctAll, $R.recording_mic.CpuPctCore, $R.recording_mic.WsPeakMB, $R.recording_mic.PrivPeakMB, $R.recording_mic.main_thread_pct, ($R.recording_mic.top_threads -join ', '))
             Invoke-Ot $Exe @('--bench', 'cancel') $e 15 | Out-Null
         }
     }
@@ -333,6 +351,8 @@ the one-core figure (100% = one fully busy core) is given in brackets.
 | Recording CPU ($recLabel, $RecordSec s) | $($rec.CpuPctAll)% ($($rec.CpuPctCore)% of one core) | <= 1.5% | ~3% | $(Verdict ($rec.CpuPctAll -le 1.5)) |
 | Recording CPU, projected on a 4-core laptop (one-core % / 4) | $([math]::Round($rec.CpuPctCore / 4, 2))% | <= 1.5% | ~3% | $(Verdict ($rec.CpuPctCore / 4 -le 1.5)) |
 | Busiest daemon threads while recording (injected, % of one core) | $(if ($R.recording_injected.top_threads) { $R.recording_injected.top_threads -join ', ' } else { 'n/a' }) | - | - | - |
+$(if ($null -ne $R.recording_mic.main_thread_pct) { "| Main thread while recording (real mic, % of one core; message loop + pill) | $($R.recording_mic.main_thread_pct)% (projected on 4 cores: $([math]::Round($R.recording_mic.main_thread_pct / 4, 2))%) | <= 6% (<= 1.5% on 4 cores) | - | $(Verdict ($R.recording_mic.main_thread_pct -le 6)) |" })
+$(if ($R.recording_mic.top_threads) { "| Busiest daemon threads while recording (real mic, % of one core) | $($R.recording_mic.top_threads -join ', ') | - | - | - |" })
 | Daemon working set, idle (mean / peak) | $($R.idle.WsMeanMB) / $($R.idle.WsPeakMB) MB | <= 25 MB | ~110 MB | $(Verdict ($R.idle.WsPeakMB -le 25)) |
 | Daemon private bytes, idle (mean / peak) | $($R.idle.PrivMeanMB) / $($R.idle.PrivPeakMB) MB | <= 15 MB | n/a | $(Verdict ($R.idle.PrivPeakMB -le 15)) |
 | Daemon private working set, idle (Task Manager "Memory") | $(Fmt $R.idle.private_ws_mb ' MB') | n/a | ~110 MB | - |
@@ -437,10 +457,12 @@ network path, not a latency reference; the table above is measured against a loc
   ``ui/app.rs::native_options`` already asks for no depth, stencil or MSAA (eframe's defaults), and vsync or
   ``hardware_acceleration`` do not change it; software GL is 1.1, which ``egui_glow`` rejects. Only a non-GL renderer would
   avoid it. Documented deviation; the daemon never loads ``opengl32.dll`` and does not pay it.
-- **Recording CPU is dominated by the pill**: the ``main`` thread renders and uploads the 60 fps capsule animation
-  (~0.7 ms per frame); WASAPI capture and the VAD/level meter stay well under 1% of one core. On this 24-core machine that is far
-  below the 1.5% target; the 4-core projection above is the number to watch (the pill could drop to 30 fps once its
-  entrance has finished, see the open issues).
+- **Recording CPU is the pill, kept to the lane**: once the entrance has settled the pill caches its static layer (shadow,
+  body, logo) and each frame redraws only the 52x24 waveform lane, uploads only that rectangle and presents it with
+  ``UpdateLayeredWindowIndirect`` (``prcDirty``). A frame whose bars all moved by <= 1/255 px is skipped, which is every
+  frame while the input is silent. The thinking glow keeps its 60 fps but also caches the chrome. WASAPI capture and the
+  VAD/level meter stay well under 1% of one core. The row "Main thread while recording" is the figure the pill is judged by
+  (<= 6% of one core is <= 1.5% on a 4-core laptop).
 - **Working set and the app bubble**: the active-app icon is fetched with ``IShellItemImageFactory``, which loads ~35 shell
   DLLs (XAML, StateRepository, thumbcache, ...) into the daemon on the first dictation. They are shared image pages, so the
   working set grows by ~17 MB while the private working set (Task Manager's "Memory") grows by ~2-4 MB. With the bubble off

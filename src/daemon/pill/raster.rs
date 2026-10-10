@@ -46,6 +46,123 @@ impl Rect {
     }
 }
 
+/// Device-pixel rectangle `[x0, x1) x [y0, y1)` (a dirty region of the frame buffer).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DevRect {
+    pub x0: i32,
+    pub y0: i32,
+    pub x1: i32,
+    pub y1: i32,
+}
+
+impl DevRect {
+    /// The whole `w` x `h` buffer.
+    pub fn full(w: i32, h: i32) -> DevRect {
+        DevRect { x0: 0, y0: 0, x1: w, y1: h }
+    }
+
+    /// Device pixels that a logical rect can touch when drawn with the SDF fills (same rounding as
+    /// `Canvas`: floor/ceil plus one pixel of slack), clipped to the `w` x `h` buffer.
+    pub fn of(r: Rect, scale: f32, w: i32, h: i32) -> DevRect {
+        DevRect {
+            x0: ((r.l * scale).floor() as i32).clamp(0, w),
+            y0: ((r.t * scale).floor() as i32).clamp(0, h),
+            x1: ((r.r * scale).ceil() as i32 + 1).clamp(0, w),
+            y1: ((r.b * scale).ceil() as i32 + 1).clamp(0, h),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.x1 <= self.x0 || self.y1 <= self.y0
+    }
+
+    pub fn is_full(&self, w: i32, h: i32) -> bool {
+        *self == DevRect::full(w, h)
+    }
+
+    pub fn width(&self) -> i32 {
+        (self.x1 - self.x0).max(0)
+    }
+
+    pub fn height(&self) -> i32 {
+        (self.y1 - self.y0).max(0)
+    }
+
+    pub fn area(&self) -> i64 {
+        self.width() as i64 * self.height() as i64
+    }
+
+    pub fn intersects(&self, o: &DevRect) -> bool {
+        self.x0 < o.x1 && o.x0 < self.x1 && self.y0 < o.y1 && o.y0 < self.y1
+    }
+
+    pub fn contains_pixel(&self, x: i32, y: i32) -> bool {
+        x >= self.x0 && x < self.x1 && y >= self.y0 && y < self.y1
+    }
+}
+
+/// Byte range of row `y`, columns `r.x0..r.x1` in a `w`-wide RGBA8 buffer.
+#[inline]
+fn row_span(w: i32, y: i32, r: DevRect) -> std::ops::Range<usize> {
+    let base = (y as usize * w as usize + r.x0 as usize) * 4;
+    base..base + r.width() as usize * 4
+}
+
+/// `dst[r] = src[r]` for two buffers of the same width.
+pub fn copy_rect(dst: &mut [u8], src: &[u8], w: i32, r: DevRect) {
+    for y in r.y0..r.y1 {
+        let s = row_span(w, y, r);
+        dst[s.clone()].copy_from_slice(&src[s]);
+    }
+}
+
+/// Zero the rect.
+pub fn clear_rect(dst: &mut [u8], w: i32, r: DevRect) {
+    for y in r.y0..r.y1 {
+        dst[row_span(w, y, r)].fill(0);
+    }
+}
+
+/// `dst[r] = top over under` (premultiplied source-over) for three buffers of the same width.
+pub fn over_rect(dst: &mut [u8], top: &[u8], under: &[u8], w: i32, r: DevRect) {
+    for y in r.y0..r.y1 {
+        let s = row_span(w, y, r);
+        let (d, t, u) = (&mut dst[s.clone()], &top[s.clone()], &under[s]);
+        for ((d, t), u) in d.chunks_exact_mut(4).zip(t.chunks_exact(4)).zip(u.chunks_exact(4)) {
+            let inv = 255 - t[3] as u32;
+            if inv == 0 {
+                d.copy_from_slice(t);
+            } else {
+                for c in 0..4 {
+                    d[c] = (t[c] as u32 + (u[c] as u32 * inv + 127) / 255).min(255) as u8;
+                }
+            }
+        }
+    }
+}
+
+/// `dst[r] = top over dst[r]` (premultiplied source-over, in place) for two buffers of the same width.
+pub fn over_in_place(dst: &mut [u8], top: &[u8], w: i32, r: DevRect) {
+    for y in r.y0..r.y1 {
+        let s = row_span(w, y, r);
+        for (d, t) in dst[s.clone()].chunks_exact_mut(4).zip(top[s].chunks_exact(4)) {
+            let inv = 255 - t[3] as u32;
+            if inv == 0 {
+                d.copy_from_slice(t);
+            } else if t[3] != 0 {
+                for c in 0..4 {
+                    d[c] = (t[c] as u32 + (d[c] as u32 * inv + 127) / 255).min(255) as u8;
+                }
+            }
+        }
+    }
+}
+
+/// `true` when any pixel of `r` has non-zero alpha.
+pub fn any_alpha(buf: &[u8], w: i32, r: DevRect) -> bool {
+    (r.y0..r.y1).any(|y| buf[row_span(w, y, r)].chunks_exact(4).any(|p| p[3] != 0))
+}
+
 /// Coverage of a pixel whose centre is `d` device pixels from the edge (negative = inside).
 #[inline]
 pub fn cov(d_dev: f32) -> f32 {
@@ -134,12 +251,8 @@ impl<'a> Canvas<'a> {
 
     /// Device pixel range covering a logical rect (clipped to the canvas).
     fn dev_range(&self, r: Rect) -> (i32, i32, i32, i32) {
-        let s = self.scale;
-        let x0 = ((r.l * s).floor() as i32).clamp(0, self.w);
-        let y0 = ((r.t * s).floor() as i32).clamp(0, self.h);
-        let x1 = ((r.r * s).ceil() as i32 + 1).clamp(0, self.w);
-        let y1 = ((r.b * s).ceil() as i32 + 1).clamp(0, self.h);
-        (x0, y0, x1, y1)
+        let d = DevRect::of(r, self.scale, self.w, self.h);
+        (d.x0, d.y0, d.x1, d.y1)
     }
 
     /// Fill `color * alpha` wherever `sdf` (logical-px distance, negative inside) is inside.
@@ -306,6 +419,43 @@ mod tests {
         let a = pm.pixel(10, 5).unwrap().alpha();
         assert!((a as i32 - 64).abs() <= 2, "alpha {a}");
         assert_eq!(pm.pixel(11, 5).unwrap().alpha(), 0);
+    }
+
+    #[test]
+    fn dev_rect_matches_canvas_rounding() {
+        let r = Rect::new(10.2, 5.7, 30.1, 20.0);
+        let d = DevRect::of(r, 1.5, 100, 60);
+        assert_eq!(d, DevRect { x0: 15, y0: 8, x1: 47, y1: 31 });
+        assert_eq!(DevRect::of(Rect::new(-9.0, -9.0, 500.0, 500.0), 1.0, 100, 60), DevRect::full(100, 60));
+        assert!(DevRect::of(Rect::new(-9.0, -9.0, -3.0, -3.0), 1.0, 100, 60).is_empty());
+    }
+
+    #[test]
+    fn rect_helpers_touch_only_the_rect() {
+        let (w, h) = (6, 4);
+        let mut a = vec![10u8; (w * h * 4) as usize];
+        let b = vec![200u8; (w * h * 4) as usize];
+        let r = DevRect { x0: 1, y0: 1, x1: 3, y1: 3 };
+        copy_rect(&mut a, &b, w, r);
+        for y in 0..h {
+            for x in 0..w {
+                let v = a[((y * w + x) * 4) as usize];
+                assert_eq!(v, if r.contains_pixel(x, y) { 200 } else { 10 }, "({x},{y})");
+            }
+        }
+        clear_rect(&mut a, w, r);
+        assert_eq!(a[((w + 1) * 4) as usize], 0);
+        assert_eq!(a[0], 10);
+        // source-over: an opaque top wins, a translucent one lets the backdrop through
+        let mut out = vec![0u8; (w * h * 4) as usize];
+        let mut top = vec![0u8; (w * h * 4) as usize];
+        top[0..4].copy_from_slice(&[9, 9, 9, 255]);
+        top[4..8].copy_from_slice(&[50, 0, 0, 128]);
+        let under = vec![100u8; (w * h * 4) as usize];
+        over_rect(&mut out, &top, &under, w, DevRect::full(w, h));
+        assert_eq!(&out[0..4], &[9, 9, 9, 255]);
+        assert_eq!(&out[8..12], &[100, 100, 100, 100]);
+        assert_eq!(out[4], (50 + (100u32 * 127 + 127) / 255) as u8);
     }
 
     #[test]
