@@ -88,6 +88,10 @@ impl Protocol for DeepgramProto {
         Ok(ConnectSpec { url: self.url.clone(), headers: vec![("Authorization".into(), format!("Token {}", self.key))] })
     }
 
+    fn credentials(&self) -> Vec<String> {
+        vec![self.key.clone()]
+    }
+
     fn ready(&self) -> bool {
         true
     }
@@ -120,7 +124,7 @@ impl Protocol for DeepgramProto {
             }
             Some("Error") => {
                 let desc = v["description"].as_str().or_else(|| v["message"].as_str()).unwrap_or("Deepgram error");
-                self.err = Some(util::err(SttErrorCode::Other, "Deepgram reported an error.", util::scrub(desc, &self.key)));
+                self.err = Some(util::err(SttErrorCode::Other, "Deepgram reported an error.", util::scrub(desc, &self.credentials())));
                 true
             }
             _ => false,
@@ -132,7 +136,7 @@ impl Protocol for DeepgramProto {
             self.err = Some(util::err(
                 SttErrorCode::Unreachable,
                 "Deepgram closed the connection.",
-                format!("close {code}: {}", util::scrub(reason, &self.key)),
+                format!("close {code}: {}", util::scrub(reason, &self.credentials())),
             ));
         }
     }

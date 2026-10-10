@@ -162,15 +162,16 @@ pub(crate) fn trim_prompt(prompt: String, max_chars: usize) -> String {
 
 /// Prompt budget by endpoint/model (OpenWhispr `dictionaryPromptLimit`).
 pub(crate) fn prompt_limit(groq: bool, model: &str) -> usize {
+    use crate::core::dictionary as d;
     let m = model.trim().to_ascii_lowercase();
     if groq {
-        890
+        d::GROQ_PROMPT_CHARS
     } else if m.starts_with("gpt-4o") {
-        8000
+        d::TRANSCRIBE_PROMPT_CHARS
     } else if m == "gpt-transcribe" {
-        65_536
+        d::TRANSCRIPTION_OVERFLOW_PROMPT_CHARS
     } else {
-        900
+        d::WHISPER_PROMPT_CHARS
     }
 }
 

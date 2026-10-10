@@ -309,46 +309,33 @@ mod tests {
         ids
     }
 
-    /// What a live run proved. Only `Verified` is a verification; the rest is reported as such.
-    #[derive(Debug, PartialEq)]
-    enum Live {
-        /// A free model returned a transcript containing the spoken words.
-        Verified(String),
-        /// No free model produced a transcript (limits, gated models, audio dropped upstream).
-        Unverified(String),
-        /// A fault on our side or a bad key (auth, bad request, unknown model).
-        Failed(String),
+    /// Verdict logic shared with `tests/e2e.rs` (one definition: `tests/common/live.rs`).
+    #[allow(dead_code)]
+    mod live {
+        include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/common/live.rs"));
     }
+    use live::{Live, report_live, try_model};
 
-    /// `Unverified` passes unless `require` (`OPENTALK_LIVE_REQUIRE=1`); `Failed` never passes.
-    fn live_result(outcome: &Live, require: bool) -> Result<(), String> {
-        match outcome {
-            Live::Verified(_) => Ok(()),
-            Live::Unverified(_) if !require => Ok(()),
-            Live::Unverified(why) => Err(format!("OPENTALK_LIVE_REQUIRE=1 and STT was not verified: {why}")),
-            Live::Failed(why) => Err(format!("live STT failed: {why}")),
-        }
-    }
-
-    fn report_live(outcome: Live) {
-        match &outcome {
-            Live::Verified(t) => eprintln!("live_openrouter_transcribe: VERIFIED live transcript: {t:?}"),
-            Live::Unverified(why) => eprintln!("live_openrouter_transcribe: UNVERIFIED - no free model produced a transcript of the audio: {why}"),
-            Live::Failed(why) => eprintln!("live_openrouter_transcribe: FAILED - {why}"),
-        }
-        let require = std::env::var("OPENTALK_LIVE_REQUIRE").is_ok_and(|v| v == "1");
-        if let Err(e) = live_result(&outcome, require) {
-            panic!("live_openrouter_transcribe: {e}");
-        }
-    }
-
+    /// The live classifier reads user-facing sentences; pin it to the real ones so a reworded
+    /// message cannot turn a rate limit into a `Failed` live run (or a bad key into a retry).
     #[test]
-    fn live_verdicts_distinguish_verified_unverified_and_failed() {
-        let (v, u, f) = (Live::Verified("t".into()), Live::Unverified("x".into()), Live::Failed("y".into()));
-        assert!(live_result(&v, false).is_ok() && live_result(&v, true).is_ok());
-        assert!(live_result(&u, false).is_ok());
-        assert!(live_result(&u, true).unwrap_err().contains("not verified"));
-        assert!(live_result(&f, false).is_err() && live_result(&f, true).is_err());
+    fn live_classifier_matches_the_real_error_messages() {
+        use SttErrorCode as C;
+        use live::{Attempt, classify_message};
+        let cases = [
+            (C::RateLimited, Attempt::Retry),
+            (C::Unavailable, Attempt::Retry),
+            (C::Timeout, Attempt::Retry),
+            (C::NoSpeech, Attempt::DroppedAudio),
+            (C::AccessDenied, Attempt::AccessDenied),
+            (C::AuthFailed, Attempt::Failed),
+            (C::ModelNotFound, Attempt::Failed),
+            (C::BadRequest, Attempt::Failed),
+        ];
+        for (code, want) in cases {
+            let msg = errors::message_for(code, "OpenRouter", Some("m:free"), false);
+            assert_eq!(classify_message(&msg), want, "{code:?}: {msg}");
+        }
     }
 
     /// Live: transcribes tests/fixtures/tts_clean.wav through a free OpenRouter audio model.
@@ -356,15 +343,17 @@ mod tests {
     ///
     /// Prints `VERIFIED` (a transcript with the spoken words), `UNVERIFIED` or `FAILED`.
     /// Upstream limits are `UNVERIFIED`: 429/5xx/timeouts (retried with backoff), 403 "only
-    /// available on agentic harnesses" (the inkling models), and providers that accept
-    /// `input_audio` but drop the audio (the NVIDIA Nemotron free endpoint answers "no audio
-    /// provided", audio_tokens 0). `UNVERIFIED` passes unless `OPENTALK_LIVE_REQUIRE=1`, which
-    /// turns it into a failure. Anything else (bad key, bad request) is `FAILED`.
+    /// available on agentic harnesses" (the inkling models, one attempt), and a free endpoint
+    /// that answers but drops the audio before the model (NVIDIA Nemotron: prompt_tokens=28
+    /// with or without the WAV, so a `NoSpeech` error or a reply without the spoken words;
+    /// one attempt, PLAN section 10). `UNVERIFIED` passes unless `OPENTALK_LIVE_REQUIRE=1`,
+    /// which turns it into a failure. Anything else (bad key, bad request) is `FAILED`.
     #[test]
     #[ignore]
     fn live_openrouter_transcribe() {
+        const TEST: &str = "live_openrouter_transcribe";
         let Ok(key) = std::env::var("OPENTALK_SECRET_OPENROUTER") else {
-            return report_live(Live::Unverified("OPENTALK_SECRET_OPENROUTER not set".into()));
+            return report_live(TEST, Live::Unverified("OPENTALK_SECRET_OPENROUTER not set".into()));
         };
         let wav = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/tts_clean.wav")).expect("fixture");
         let audio = Audio::from_wav(&wav).expect("fixture is PCM16 WAV");
@@ -378,35 +367,26 @@ mod tests {
             o.language = Some("en".into());
             o.hints = vec!["Priya".into()];
             o.timeout_ms = 60_000;
-            for (attempt, backoff_s) in [0u64, 3, 8].into_iter().enumerate() {
-                std::thread::sleep(std::time::Duration::from_secs(backoff_s));
-                let t0 = std::time::Instant::now();
-                match Openrouter.transcribe(&audio, &o, &creds) {
-                    Ok(t) => {
-                        let ms = t0.elapsed().as_millis();
-                        eprintln!("LIVE model={model} attempt={} latency={ms} ms transcript={:?}", attempt + 1, t.text);
-                        let lower = t.text.to_lowercase();
-                        if lower.contains("report") || lower.contains("priya") {
-                            return report_live(Live::Verified(t.text));
-                        }
-                        notes.push(format!("{model}: reply without the speech ({:?})", t.text));
-                        break;
+            let verdict = try_model(
+                model,
+                &["report", "priya"],
+                &[0, 3, 8],
+                || {
+                    let t0 = std::time::Instant::now();
+                    let res = Openrouter.transcribe(&audio, &o, &creds);
+                    match &res {
+                        Ok(t) => eprintln!("LIVE model={model} latency={} ms transcript={:?}", t0.elapsed().as_millis(), t.text),
+                        Err(e) => eprintln!("LIVE model={model} {:?}: {}", e.code, e.detail),
                     }
-                    Err(e) if matches!(e.code, SttErrorCode::RateLimited | SttErrorCode::Unavailable | SttErrorCode::Timeout | SttErrorCode::NoSpeech) => {
-                        eprintln!("LIVE model={model} attempt={} upstream {:?}: {}", attempt + 1, e.code, e.detail);
-                        if attempt == 2 {
-                            notes.push(format!("{model}: {:?}", e.code));
-                        }
-                    }
-                    Err(e) if e.code == SttErrorCode::AccessDenied => {
-                        eprintln!("LIVE model={model} blocked upstream: {}", e.detail);
-                        notes.push(format!("{model}: access denied"));
-                        break;
-                    }
-                    Err(e) => return report_live(Live::Failed(format!("model={model}: {:?} {} ({})", e.code, e.message, e.detail))),
-                }
+                    res.map(|t| t.text).map_err(|e| e.message)
+                },
+                std::thread::sleep,
+            );
+            match verdict {
+                Live::Unverified(why) => notes.push(why),
+                done => return report_live(TEST, done),
             }
         }
-        report_live(Live::Unverified(if notes.is_empty() { "no candidate models were tried".into() } else { notes.join("; ") }));
+        report_live(TEST, Live::Unverified(if notes.is_empty() { "no candidate models were tried".into() } else { notes.join("; ") }));
     }
 }

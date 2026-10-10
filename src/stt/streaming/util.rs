@@ -6,11 +6,12 @@ pub fn err(code: SttErrorCode, message: impl Into<String>, detail: impl Into<Str
     SttError { code, message: message.into(), detail: detail.into(), status: None }
 }
 
-/// Remove `secret` (and its percent-encoded form) plus pattern-shaped keys from `text`, then
-/// bound its length, so it is safe for `SttError::detail`. Redaction runs first, so a key
-/// straddling the length bound cannot survive as a prefix.
-pub fn scrub(text: &str, secret: &str) -> String {
-    let mut out = crate::stt::errors::redact_with(text, &[secret]);
+/// Remove every one of `secrets` (and their percent-encoded forms) plus pattern-shaped keys
+/// from `text`, then bound its length, so it is safe for `SttError::detail`. Redaction runs
+/// first, so a key straddling the length bound cannot survive as a prefix.
+pub fn scrub<S: AsRef<str>>(text: &str, secrets: &[S]) -> String {
+    let refs: Vec<&str> = secrets.iter().map(AsRef::as_ref).collect();
+    let mut out = crate::stt::errors::redact_with(text, &refs);
     if out.len() > 300 {
         let mut cut = 300;
         while !out.is_char_boundary(cut) {
@@ -22,7 +23,7 @@ pub fn scrub(text: &str, secret: &str) -> String {
 }
 
 /// Map an HTTP status (WebSocket upgrade refusal or token mint) to a classified error.
-pub fn status_error(provider: &str, status: u16, body: &str, secret: &str) -> SttError {
+pub fn status_error<S: AsRef<str>>(provider: &str, status: u16, body: &str, secrets: &[S]) -> SttError {
     let (code, message) = match status {
         401 => (SttErrorCode::AuthFailed, format!("{provider} rejected your API key.")),
         402 => (SttErrorCode::QuotaExhausted, format!("{provider} quota or credit exhausted.")),
@@ -34,24 +35,24 @@ pub fn status_error(provider: &str, status: u16, body: &str, secret: &str) -> St
         500..=599 => (SttErrorCode::Unavailable, format!("{provider} is temporarily unavailable.")),
         _ => (SttErrorCode::BadRequest, format!("{provider} rejected the request (HTTP {status}).")),
     };
-    SttError { code, message, detail: scrub(body, secret), status: Some(status) }
+    SttError { code, message, detail: scrub(body, secrets), status: Some(status) }
 }
 
 /// Classify a transport-level WebSocket failure.
-pub fn ws_error(provider: &str, e: &tungstenite::Error, secret: &str) -> SttError {
+pub fn ws_error<S: AsRef<str>>(provider: &str, e: &tungstenite::Error, secrets: &[S]) -> SttError {
     use tungstenite::Error as E;
     match e {
         E::Http(resp) => {
             let body = resp.body().as_deref().map(String::from_utf8_lossy).unwrap_or_default();
-            status_error(provider, resp.status().as_u16(), &body, secret)
+            status_error(provider, resp.status().as_u16(), &body, secrets)
         }
-        E::Io(io) if is_timeout(io) => err(SttErrorCode::Timeout, format!("{provider} did not respond in time."), scrub(&io.to_string(), secret)),
-        E::Io(io) => err(SttErrorCode::Unreachable, format!("Could not reach {provider}."), scrub(&io.to_string(), secret)),
-        E::Tls(t) => err(SttErrorCode::Unreachable, format!("Secure connection to {provider} failed."), scrub(&t.to_string(), secret)),
+        E::Io(io) if is_timeout(io) => err(SttErrorCode::Timeout, format!("{provider} did not respond in time."), scrub(&io.to_string(), secrets)),
+        E::Io(io) => err(SttErrorCode::Unreachable, format!("Could not reach {provider}."), scrub(&io.to_string(), secrets)),
+        E::Tls(t) => err(SttErrorCode::Unreachable, format!("Secure connection to {provider} failed."), scrub(&t.to_string(), secrets)),
         E::ConnectionClosed | E::AlreadyClosed | E::Protocol(tungstenite::error::ProtocolError::ResetWithoutClosingHandshake) => {
             err(SttErrorCode::Unreachable, format!("{provider} closed the connection."), "connection closed")
         }
-        other => err(SttErrorCode::Other, format!("{provider} streaming failed."), scrub(&other.to_string(), secret)),
+        other => err(SttErrorCode::Other, format!("{provider} streaming failed."), scrub(&other.to_string(), secrets)),
     }
 }
 
@@ -192,7 +193,7 @@ mod tests {
 
     #[test]
     fn scrub_hides_secret_and_truncates() {
-        let s = scrub(&format!("bad key sk-secret {}", "x".repeat(400)), "sk-secret");
+        let s = scrub(&format!("bad key sk-secret {}", "x".repeat(400)), &["sk-secret"]);
         assert!(!s.contains("sk-secret") && s.len() <= 300);
     }
 
@@ -207,21 +208,21 @@ mod tests {
     #[test]
     fn scrub_catches_prefixless_and_encoded_keys_and_cut_keys() {
         let enc_key = "key with/odd+chars=1";
-        assert!(!scrub(&format!("GET /?token={}", percent_encode(enc_key)), enc_key).contains("odd"));
-        assert!(!scrub(&format!("{}{KEY}", "x".repeat(297)), KEY).contains("dg3f"), "redacted before the cut");
-        assert!(!scrub(&format!("Bearer {KEY} sk-abcdefgh1234"), "").contains("abcdefgh1234"));
+        assert!(!scrub(&format!("GET /?token={}", percent_encode(enc_key)), &[enc_key]).contains("odd"));
+        assert!(!scrub(&format!("{}{KEY}", "x".repeat(297)), &[KEY]).contains("dg3f"), "redacted before the cut");
+        assert!(!scrub(&format!("Bearer {KEY} sk-abcdefgh1234"), &[""]).contains("abcdefgh1234"));
     }
 
     #[test]
     fn upgrade_refusal_echoing_the_key_is_clean() {
         let body = format!(r#"{{"err_code":"INVALID_AUTH","err_msg":"Invalid credentials. Token {KEY}"}}"#);
-        let e = status_error("Deepgram", 401, &body, KEY);
+        let e = status_error("Deepgram", 401, &body, &[KEY]);
         assert_eq!(e.code, SttErrorCode::AuthFailed);
         assert_clean(&e);
         // the same through a tungstenite HTTP refusal
         let resp = tungstenite::http::Response::builder().status(401).body(Some(body.into_bytes())).unwrap();
-        assert_clean(&ws_error("Deepgram", &tungstenite::Error::Http(Box::new(resp)), KEY));
-        assert_clean(&ws_error("Deepgram", &tungstenite::Error::Io(std::io::Error::other(format!("connect {KEY}"))), KEY));
+        assert_clean(&ws_error("Deepgram", &tungstenite::Error::Http(Box::new(resp)), &[KEY]));
+        assert_clean(&ws_error("Deepgram", &tungstenite::Error::Io(std::io::Error::other(format!("connect {KEY}"))), &[KEY]));
     }
 
     #[test]

@@ -20,7 +20,7 @@ mod timefmt;
 mod widgets;
 
 use crate::core::config::Config;
-use settings::Section;
+pub use settings::Section;
 use theme::Palette;
 
 /// Top-level pages of the shell.

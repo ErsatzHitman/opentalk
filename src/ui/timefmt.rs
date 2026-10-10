@@ -62,6 +62,7 @@ pub fn clock(ts_ms: i64, offset_secs: i64) -> String {
 }
 
 /// "Oct 9, 2026, 14:05"
+#[cfg(test)]
 pub fn full(ts_ms: i64, offset_secs: i64) -> String {
     let c = civil(ts_ms, offset_secs);
     format!("{} {}, {}, {:02}:{:02}", MONTHS[(c.month - 1) as usize], c.day, c.year, c.hour, c.minute)

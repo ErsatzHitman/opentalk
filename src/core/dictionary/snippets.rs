@@ -268,6 +268,7 @@ pub fn expand_snippets(text: &str, snippets: &[Snippet]) -> String {
 
 /// Byte ranges of every trigger occurrence that [`expand_snippets`] would replace, matched against
 /// `text` exactly as given. (Wake-word style callers must ignore text that only opens a trigger.)
+#[allow(dead_code)] // wake-word API kept for callers; pinned by tests
 pub fn trigger_ranges(text: &str, snippets: &[Snippet]) -> Vec<Range<usize>> {
     if text.is_empty() {
         return Vec::new();

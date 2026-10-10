@@ -204,6 +204,7 @@ fn generic_message(code: SttErrorCode, provider: &str, model: Option<&str>) -> S
 }
 
 /// Classify an HTTP failure for `provider` (display name). Body is redacted before use.
+#[cfg(test)] // production code goes through `classify_for` / `check_response`
 pub fn classify(provider: &str, status: u16, body: &str) -> SttError {
     classify_for(provider, None, false, status, body)
 }
@@ -259,6 +260,7 @@ pub fn check_response_with(
 }
 
 /// Transport-level failure (DNS/connect/TLS/timeout).
+#[cfg(test)] // production code goes through `check_response_with` / `from_transport_with`
 pub fn from_transport(provider: &str, self_hosted: bool, e: &HttpError) -> SttError {
     from_transport_with(provider, self_hosted, e, &[])
 }
@@ -307,8 +309,32 @@ fn run_len(b: &[u8], from: usize, ok: impl Fn(u8) -> bool) -> usize {
     b[from..].iter().take_while(|c| ok(**c)).count()
 }
 
-/// Secrets shorter than this are not matched literally (too likely to mangle ordinary text).
+/// Secrets shorter than this are not matched literally anywhere in a text (too likely to
+/// mangle ordinary words). Shorter secrets (down to [`MIN_CONTEXT_SECRET_LEN`]) are still
+/// redacted as a whole token right after a credential context (`key=`, `Bearer `, ...), see
+/// [`redact_short`]. Remaining limit: a short secret echoed outside such a context (a bare
+/// word in prose, a JSON value under another field name) is left alone, and secrets under
+/// [`MIN_CONTEXT_SECRET_LEN`] characters are never matched.
 const MIN_SECRET_LEN: usize = 8;
+
+/// Shortest configured secret that is redacted in credential context.
+const MIN_CONTEXT_SECRET_LEN: usize = 3;
+
+/// Credential contexts for short secrets, matched ASCII-case-insensitively. The flag says
+/// whether at least one whitespace must follow (`Bearer x`) instead of an optional run (`key: x`).
+/// Suffix matches also cover `api_key=`, `apikey=`, `x-api-key:`, `access_token=`, ...
+const SHORT_CONTEXTS: &[(&str, bool)] =
+    &[
+    ("key=", false),
+    ("token=", false),
+    ("key:", false),
+    ("token:", false),
+    ("key\":", false),
+    ("token\":", false),
+    ("authorization:", false),
+    ("bearer", true),
+    ("token", true),
+];
 
 thread_local! {
     /// Credentials of the batch call running on this thread (see [`scope_secrets`]).
@@ -333,16 +359,26 @@ pub fn scope_secrets(secrets: impl IntoIterator<Item = String>) -> SecretScope {
 }
 
 /// Replace every occurrence of each configured secret (and its percent-encoded form, which is
-/// how URL-borne keys show up) with `[redacted]`. Longest first; secrets shorter than
-/// [`MIN_SECRET_LEN`] after trimming are ignored.
+/// how URL-borne keys show up, with the hex digits matched in either case) with `[redacted]`.
+/// Longest first. Secrets shorter than [`MIN_SECRET_LEN`] after trimming are only redacted as a
+/// whole token in credential context (see [`redact_short`]).
 fn strip_secrets(text: &str, secrets: &[&str]) -> String {
-    let mut all: Vec<String> = Vec::new();
+    let mut long: Vec<String> = Vec::new();
+    let mut short: Vec<String> = Vec::new();
     let mut add = |s: &str| {
         let s = s.trim();
-        if s.len() < MIN_SECRET_LEN {
+        if s.len() < MIN_CONTEXT_SECRET_LEN {
             return;
         }
         let enc = super::providers::percent_encode(s);
+        if s.len() < MIN_SECRET_LEN {
+            for v in [s.to_string(), enc] {
+                if !short.contains(&v) {
+                    short.push(v);
+                }
+            }
+            return;
+        }
         // The streaming encoder also escapes `!*'()` (strict RFC 3986 unreserved set).
         let strict: String = enc
             .chars()
@@ -352,20 +388,111 @@ fn strip_secrets(text: &str, secrets: &[&str]) -> String {
             })
             .collect();
         for v in [s.to_string(), enc, strict] {
-            if !all.contains(&v) {
-                all.push(v);
+            if !long.contains(&v) {
+                long.push(v);
             }
         }
     };
     secrets.iter().for_each(|s| add(s));
     AMBIENT_SECRETS.with(|a| a.borrow().iter().for_each(|s| add(s)));
-    all.sort_by_key(|s| std::cmp::Reverse(s.len()));
+    long.sort_by_key(|s| std::cmp::Reverse(s.len()));
     let mut out = text.to_string();
-    for s in &all {
-        if out.contains(s.as_str()) {
-            out = out.replace(s.as_str(), "[redacted]");
+    for s in &long {
+        out = replace_all(&out, s);
+    }
+    if !short.is_empty() {
+        out = redact_short(&out, &short);
+    }
+    out
+}
+
+/// `text` with every occurrence of `needle` replaced by `[redacted]`. Hex digits of `%XX`
+/// escapes in `needle` match in either case (`%2f` = `%2F`); everything else is exact.
+fn replace_all(text: &str, needle: &str) -> String {
+    if !needle.contains('%') {
+        return if text.contains(needle) { text.replace(needle, "[redacted]") } else { text.to_string() };
+    }
+    let (h, n) = (text.as_bytes(), needle.as_bytes());
+    let mut out = String::with_capacity(text.len());
+    let (mut i, mut copied) = (0, 0);
+    while i + n.len() <= h.len() {
+        if eq_pct_insensitive(&h[i..i + n.len()], n) {
+            out.push_str(&text[copied..i]);
+            out.push_str("[redacted]");
+            i += n.len();
+            copied = i;
+        } else {
+            i += 1;
         }
     }
+    out.push_str(&text[copied..]);
+    out
+}
+
+/// Byte equality where the two characters after each `%` compare ASCII-case-insensitively.
+fn eq_pct_insensitive(hay: &[u8], needle: &[u8]) -> bool {
+    let mut hex_left = 0;
+    for (a, b) in hay.iter().zip(needle) {
+        let same = if hex_left > 0 { a.eq_ignore_ascii_case(b) } else { a == b };
+        if !same {
+            return false;
+        }
+        hex_left = if hex_left > 0 { hex_left - 1 } else if *b == b'%' { 2 } else { 0 };
+    }
+    true
+}
+
+/// Bytes that continue a token (so a match must not be followed by one).
+fn is_token_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b"_-~%+/=".contains(&b)
+}
+
+/// Redact the short configured `secrets` where one appears as a whole token right after a
+/// credential context (`key=`, `token=`, `Bearer `, `Authorization: `, ...; case-insensitive).
+/// Anywhere else the same characters are an ordinary word and stay.
+fn redact_short(text: &str, secrets: &[String]) -> String {
+    let lower = text.to_ascii_lowercase(); // same byte offsets as `text`
+    let b = text.as_bytes();
+    let mut hits: Vec<(usize, usize)> = Vec::new();
+    for (ctx, needs_ws) in SHORT_CONTEXTS {
+        for (at, _) in lower.match_indices(ctx) {
+            let mut p = at + ctx.len();
+            let ws = run_len(b, p, |c| c == b' ' || c == b'\t');
+            if *needs_ws && ws == 0 {
+                continue;
+            }
+            p += ws;
+            if matches!(b.get(p), Some(b'"' | b'\'')) {
+                p += 1;
+            }
+            let end = secrets.iter().filter(|s| b[p..].starts_with(s.as_bytes())).map(|s| p + s.len()).max();
+            let Some(end) = end else { continue };
+            // Whole token: not followed by more token characters (a trailing sentence period is fine).
+            let glued = match b.get(end) {
+                Some(c) if *c == b'.' => b.get(end + 1).is_some_and(|n| n.is_ascii_alphanumeric()),
+                Some(c) => is_token_byte(*c),
+                None => false,
+            };
+            if !glued {
+                hits.push((p, end));
+            }
+        }
+    }
+    if hits.is_empty() {
+        return text.to_string();
+    }
+    hits.sort_unstable();
+    let mut out = String::with_capacity(text.len());
+    let mut copied = 0;
+    for (start, end) in hits {
+        if start < copied {
+            continue; // overlaps a span already redacted
+        }
+        out.push_str(&text[copied..start]);
+        out.push_str("[redacted]");
+        copied = end;
+    }
+    out.push_str(&text[copied..]);
     out
 }
 
@@ -556,6 +683,75 @@ mod tests {
         // short secrets are ignored, long ones win over a contained shorter one
         assert_eq!(redact_with("abc abc", &["abc"]), "abc abc");
         assert_eq!(redact_with("xx 12345678-abcd yy", &["12345678", "12345678-abcd"]), "xx [redacted] yy");
+    }
+
+    #[test]
+    fn short_secret_is_redacted_only_in_credential_context() {
+        let key = "k9x2Q"; // 5 characters: below MIN_SECRET_LEN
+        let e = classify_with("Custom", None, true, 401, &format!("bad credentials: Bearer {key} rejected"), &[key]);
+        assert!(!e.detail.contains(key), "{}", e.detail);
+        assert!(e.detail.contains("Bearer [redacted]"), "{}", e.detail);
+        let e = classify_with("Custom", None, true, 401, &format!("GET /v1/x?key={key}&b=1 failed"), &[key]);
+        assert_eq!(e.detail, "HTTP 401: GET /v1/x?key=[redacted]&b=1 failed");
+        // contexts are case-insensitive and cover the header spellings
+        for ctx in ["API_KEY=", "Token=", "x-api-key: ", "Api-Key: ", "AUTHORIZATION: ", "token ", "\"key\": \""] {
+            let r = redact_with(&format!("sent {ctx}{key} ok"), &[key]);
+            assert!(!r.contains(key), "{ctx:?} -> {r}");
+        }
+        // the same characters as an ordinary word, or as part of a longer token, stay
+        assert_eq!(redact_with("the k9x2Q word", &[key]), "the k9x2Q word");
+        assert_eq!(redact_with("key=k9x2Qz and key=ak9x2Q", &[key]), "key=k9x2Qz and key=ak9x2Q");
+        assert_eq!(redact_with("monkey business k9x2Q", &[key]), "monkey business k9x2Q");
+        assert_eq!(redact_with("Bearer other", &[key]), "Bearer [redacted]", "pattern rule still applies");
+        // a trailing sentence period does not glue to the token
+        assert_eq!(redact_with("failed with key=k9x2Q.", &[key]), "failed with key=[redacted].");
+        // shorter than the context minimum: never matched
+        assert_eq!(redact_with("key=ab", &["ab"]), "key=ab");
+    }
+
+    #[test]
+    fn percent_encoded_hex_matches_in_either_case() {
+        let key = "a/b+c=d key/with+odd=chars";
+        let enc = crate::stt::providers::percent_encode(key);
+        assert!(enc.contains("%2F"), "{enc}");
+        let lower: String = {
+            // lowercase only the hex digits of each escape
+            let b = enc.as_bytes();
+            let mut o = String::new();
+            let mut i = 0;
+            while i < b.len() {
+                if b[i] == b'%' {
+                    o.push('%');
+                    o.push_str(&enc[i + 1..i + 3].to_ascii_lowercase());
+                    i += 3;
+                } else {
+                    o.push(b[i] as char);
+                    i += 1;
+                }
+            }
+            o
+        };
+        assert_ne!(lower, enc);
+        for form in [enc.as_str(), lower.as_str()] {
+            let r = redact_with(&format!("GET /x?token={form}&y=1"), &[key]);
+            assert!(!r.contains("odd") && !r.contains("%2") && !r.contains("%3"), "{r}");
+            assert_eq!(r, "GET /x?token=[redacted]&y=1");
+        }
+        // mixed case within one escape sequence list
+        let mixed = enc.replacen("%2F", "%2f", 1);
+        assert_eq!(redact_with(&format!("k={mixed}"), &[key]), "k=[redacted]");
+    }
+
+    #[test]
+    fn short_secret_redaction_is_safe_on_non_ascii_and_edges() {
+        let key = "k9x2Q";
+        assert_eq!(redact_with("Ünï cödé → key=k9x2Q ✓ Bearer k9x2Q", &[key]), "Ünï cödé → key=[redacted] ✓ Bearer [redacted]");
+        assert_eq!(redact_with("key=k9x2Q", &[key]), "key=[redacted]");
+        assert_eq!(redact_with("key=", &[key]), "key=");
+        assert_eq!(redact_with("Bearer ", &[key]), "Bearer ");
+        assert_eq!(redact_with("{\"key\":\"k9x2Q\"}", &[key]), "{\"key\":\"[redacted]\"}");
+        // a secret that is a prefix of another short secret: the longer one wins
+        assert_eq!(redact_with("key=k9x2Qab", &[key, "k9x2Qab"]), "key=[redacted]");
     }
 
     #[test]

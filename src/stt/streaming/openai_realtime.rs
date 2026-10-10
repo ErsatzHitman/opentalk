@@ -99,6 +99,10 @@ impl Protocol for RealtimeProto {
         Ok(ConnectSpec { url: self.url.clone(), headers: vec![("Authorization".into(), format!("Bearer {}", self.key))] })
     }
 
+    fn credentials(&self) -> Vec<String> {
+        vec![self.key.clone()]
+    }
+
     fn ready(&self) -> bool {
         self.ready
     }
@@ -169,7 +173,7 @@ impl Protocol for RealtimeProto {
                     }
                     return true;
                 }
-                self.err = Some(util::err(SttErrorCode::Other, "OpenAI Realtime reported an error.", util::scrub(msg, &self.key)));
+                self.err = Some(util::err(SttErrorCode::Other, "OpenAI Realtime reported an error.", util::scrub(msg, &self.credentials())));
                 if self.finalize_sent {
                     self.commit_resolved = true;
                 }
@@ -184,7 +188,7 @@ impl Protocol for RealtimeProto {
             self.err = Some(util::err(
                 SttErrorCode::Unreachable,
                 "OpenAI closed the connection.",
-                format!("close {code}: {}", util::scrub(reason, &self.key)),
+                format!("close {code}: {}", util::scrub(reason, &self.credentials())),
             ));
         }
     }

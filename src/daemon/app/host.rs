@@ -2,10 +2,13 @@
 //! the [`App`] that owns every component. Everything here runs on the main thread; the hook,
 //! capture, animation and worker threads reach it only through posted messages.
 //!
-//! Re-entrancy: the window procedure keeps the `App` in a `RefCell`. A message that arrives while
-//! it is borrowed (a nested loop inside a popup menu, a COM call that pumps) is re-posted instead
-//! of handled, and long modal calls (the tray menu) run with the `App` released.
+//! Re-entrancy: the window procedure keeps the `App` in a [`Gate`]. A message that arrives while
+//! it is borrowed (a nested loop inside a popup menu, a COM call that pumps) is parked in a
+//! bounded queue and replayed, in arrival order, as soon as the outermost borrow ends (no
+//! re-post, so a nested loop never spins on its own message). Long modal calls (the tray menu)
+//! run with the `App` released.
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -58,6 +61,7 @@ const SUSPEND_LIMIT_MS: u32 = 2 * 60 * 1000;
 const WM_POWERBROADCAST: u32 = 0x0218;
 const PBT_APMRESUMEAUTOMATIC: usize = 0x12;
 const WM_WTSSESSION_CHANGE: u32 = 0x02B1;
+const WTS_SESSION_LOCK: usize = 0x7;
 const WTS_SESSION_UNLOCK: usize = 0x8;
 
 /// The registered `TaskbarCreated` broadcast id (0 until the window exists).
@@ -86,23 +90,159 @@ pub struct App {
     pub hotkeys_suspended: bool,
 }
 
+/// Most messages parked while the app is busy; beyond it the oldest is dropped.
+const DEFER_CAP: usize = 256;
+
+/// What a [`Deferrals::push`] did to the queue.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Overflow {
+    /// Queued, nothing lost.
+    No,
+    /// Queue full: the oldest entry was dropped to make room (the first time).
+    First,
+    /// As [`Overflow::First`], on a later occasion.
+    Again,
+}
+
+/// Bounded FIFO of parked messages plus the "a drain is running" flag.
+struct Deferrals<T> {
+    queue: VecDeque<T>,
+    cap: usize,
+    dropped: u64,
+    draining: bool,
+}
+
+impl<T> Deferrals<T> {
+    const fn new(cap: usize) -> Self {
+        Deferrals { queue: VecDeque::new(), cap, dropped: 0, draining: false }
+    }
+
+    /// Park `item` at the back, dropping the oldest entry when full.
+    fn push(&mut self, item: T) -> Overflow {
+        let mut overflow = Overflow::No;
+        if self.queue.len() >= self.cap {
+            self.queue.pop_front();
+            self.dropped += 1;
+            overflow = if self.dropped == 1 { Overflow::First } else { Overflow::Again };
+        }
+        self.queue.push_back(item);
+        overflow
+    }
+
+    /// Claim the drain: `false` when there is nothing to replay or a drain is already running
+    /// (it will also pick up whatever is parked meanwhile).
+    fn begin_drain(&mut self) -> bool {
+        if self.draining || self.queue.is_empty() {
+            return false;
+        }
+        self.draining = true;
+        true
+    }
+
+    /// Next entry to replay, oldest first; `None` (and the drain ends) once the queue is empty.
+    fn next(&mut self) -> Option<T> {
+        let item = self.queue.pop_front();
+        if item.is_none() {
+            self.draining = false;
+        }
+        item
+    }
+}
+
+/// A value that only one caller may use at a time, with a parking lot for the messages that find
+/// it in use. The `RefCell` is the lock: a nested message loop (popup menu, COM) re-enters the
+/// window procedure while the outer handler still holds the borrow.
+struct Gate<S, M> {
+    state: RefCell<Option<S>>,
+    deferred: RefCell<Deferrals<M>>,
+}
+
+impl<S, M> Gate<S, M> {
+    const fn new(cap: usize) -> Self {
+        Gate { state: RefCell::new(None), deferred: RefCell::new(Deferrals::new(cap)) }
+    }
+
+    fn set(&self, state: S) {
+        *self.state.borrow_mut() = Some(state);
+    }
+
+    fn take(&self) -> Option<S> {
+        self.state.borrow_mut().take()
+    }
+
+    /// Run `f` on the state. `false` means it was busy (a re-entrant call) and `f` did not run;
+    /// the caller then [`defer`](Self::defer)s its message. When the outermost call ends, every
+    /// parked message is handed to `replay`, in order.
+    fn run(&self, f: impl FnOnce(&mut S), replay: &mut dyn FnMut(M)) -> bool {
+        let ran = match self.state.try_borrow_mut() {
+            Ok(mut guard) => {
+                if let Some(state) = guard.as_mut() {
+                    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(state))).is_err() {
+                        log_err!("panic while handling a window message (recovered)");
+                    }
+                }
+                true
+            }
+            Err(_) => false,
+        };
+        if ran {
+            self.drain(replay);
+        }
+        ran
+    }
+
+    /// Park a message the busy state could not take.
+    fn defer(&self, item: M) {
+        let overflow = self.deferred.borrow_mut().push(item);
+        if overflow == Overflow::First {
+            log_warn!("window messages piled up while busy; dropping the oldest (capacity {DEFER_CAP})");
+        }
+    }
+
+    /// Replay parked messages until none are left, including those parked while replaying. A
+    /// replay that runs `f` again is not outermost for long: its own drain call is a no-op while
+    /// this loop runs, so the recursion depth stays at one.
+    fn drain(&self, replay: &mut dyn FnMut(M)) {
+        if !self.deferred.borrow_mut().begin_drain() {
+            return;
+        }
+        // Each entry is taken in its own statement: the queue is not borrowed while `replay` runs.
+        loop {
+            let next = self.deferred.borrow_mut().next();
+            let Some(item) = next else { break };
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| replay(item))).is_err() {
+                log_err!("panic while replaying a deferred window message (recovered)");
+            }
+        }
+    }
+}
+
+/// A window message parked while the app was busy.
+struct Deferred {
+    hwnd: isize,
+    msg: u32,
+    wparam: usize,
+    lparam: isize,
+    /// When the window procedure first saw it.
+    t0: f64,
+}
+
 thread_local! {
-    static APP: RefCell<Option<App>> = const { RefCell::new(None) };
+    static APP: Gate<App, Deferred> = const { Gate::new(DEFER_CAP) };
 }
 
 /// Run `f` on the app. `false` means the app was busy (re-entrant call) and `f` did not run.
+/// Returning from the outermost call replays the messages parked meanwhile.
 pub(super) fn with_app(f: impl FnOnce(&mut App)) -> bool {
-    APP.with(|cell| match cell.try_borrow_mut() {
-        Ok(mut guard) => {
-            if let Some(app) = guard.as_mut() {
-                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(app))).is_err() {
-                    log_err!("panic while handling a window message (recovered)");
-                }
-            }
-            true
-        }
-        Err(_) => false,
-    })
+    APP.with(|gate| gate.run(f, &mut replay))
+}
+
+/// Handle a parked message now that the app is free.
+fn replay(d: Deferred) {
+    if dispatch(hwnd_of(d.hwnd), d.msg, d.wparam, d.lparam, d.t0) == Some(false) {
+        // Unreachable while only the outermost call drains; never park it again (it would spin).
+        log_warn!("deferred window message {:#x} found the app busy; dropped", d.msg);
+    }
 }
 
 pub(super) fn hwnd_of(h: isize) -> HWND {
@@ -432,10 +572,29 @@ fn event_from_code(code: usize) -> Option<PillEvent> {
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     let t0 = now_ms();
-    let handled = match msg {
-        WM_HOTKEY_EVT => Some(with_app(|a| a.on_hotkey(wparam.0, t0))),
+    match dispatch(hwnd, msg, wparam.0, lparam.0, t0) {
+        Some(true) => LRESULT(0),
+        // The app was busy (a nested loop up the stack): the outermost call replays it on return.
+        Some(false) => {
+            APP.with(|gate| gate.defer(Deferred { hwnd: hwnd.0 as isize, msg, wparam: wparam.0, lparam: lparam.0, t0 }));
+            LRESULT(0)
+        }
+        // SAFETY: default handling of a message we do not own.
+        None => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+    }
+}
+
+/// Handle one message. `None`: not ours. `Some(false)`: the app was busy, so nothing ran.
+/// `t0` is when the window procedure first saw the message (kept across a deferral).
+fn dispatch(hwnd: HWND, msg: u32, wparam: usize, lparam: isize, t0: f64) -> Option<bool> {
+    match msg {
+        WM_HOTKEY_EVT => {
+            // The hook thread stamped when it saw the key, so the time spent queued counts.
+            let t_event = hotkey::event_time(lparam, t0);
+            Some(with_app(|a| a.on_hotkey(wparam, t_event)))
+        }
         WM_PILL_EVT => Some(with_app(|a| {
-            if let Some(ev) = event_from_code(wparam.0) {
+            if let Some(ev) = event_from_code(wparam) {
                 a.on_pill_event(ev, t0);
             }
         })),
@@ -445,46 +604,32 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             Ok(t) => a.tray = Some(t),
             Err(e) => log_warn!("tray unavailable: {e}"),
         })),
-        WM_TIMER => Some(with_app(|a| a.on_timer(wparam.0))),
-        WM_POWERBROADCAST if wparam.0 == PBT_APMRESUMEAUTOMATIC => Some(with_app(|a| a.reinstall_hook("resume"))),
-        WM_WTSSESSION_CHANGE if wparam.0 == WTS_SESSION_UNLOCK => Some(with_app(|a| a.reinstall_hook("unlock"))),
+        WM_TIMER => Some(with_app(|a| a.on_timer(wparam))),
+        WM_POWERBROADCAST if wparam == PBT_APMRESUMEAUTOMATIC => Some(with_app(|a| a.reinstall_hook("resume"))),
+        // A swallowed hotkey released on the secure desktop never sends its key-up: end the press.
+        WM_WTSSESSION_CHANGE if wparam == WTS_SESSION_LOCK => Some(with_app(|_| hotkey::reset())),
+        WM_WTSSESSION_CHANGE if wparam == WTS_SESSION_UNLOCK => Some(with_app(|a| a.reinstall_hook("unlock"))),
         // The light/dark theme changed: re-add the tray icon so its glyph follows the taskbar
         // (the pill window receives the broadcast itself).
-        WM_SETTINGCHANGE if is_color_set_change(lparam) => Some(with_app(|a| {
+        WM_SETTINGCHANGE if is_color_set_change(LPARAM(lparam)) => Some(with_app(|a| {
             if let Some(t) = a.tray.as_mut() {
                 t.readd();
             }
         })),
-        WM_TRAY_EVT => {
-            on_tray_message(hwnd, lparam, t0);
-            Some(true)
-        }
-        m if (ipc::WM_APP + 1..=ipc::WM_OT_QUIT).contains(&m) => Some(with_app(|a| a.on_ipc(m, wparam.0, t0))),
+        WM_TRAY_EVT => Some(on_tray_message(hwnd, LPARAM(lparam), t0)),
+        m if (ipc::WM_APP + 1..=ipc::WM_OT_QUIT).contains(&m) => Some(with_app(|a| a.on_ipc(m, wparam, t0))),
         m if m != 0 && m == TASKBAR_CREATED.load(Ordering::Relaxed) => Some(with_app(|a| {
             if let Some(t) = a.tray.as_mut() {
                 t.readd();
             }
         })),
-        WM_ENDSESSION if wparam.0 != 0 => Some(with_app(|a| a.quit())),
+        WM_ENDSESSION if wparam != 0 => Some(with_app(|a| a.quit())),
         WM_DESTROY => {
             // SAFETY: normal teardown of the main window.
             unsafe { PostQuitMessage(0) };
             Some(true)
         }
         _ => None,
-    };
-    match handled {
-        Some(true) => LRESULT(0),
-        // The app was busy (a nested loop up the stack): handle the message later.
-        Some(false) => {
-            // SAFETY: re-posting the same message to the same window.
-            unsafe {
-                let _ = PostMessageW(Some(hwnd), msg, wparam, lparam);
-            }
-            LRESULT(0)
-        }
-        // SAFETY: default handling of a message we do not own.
-        None => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
     }
 }
 
@@ -538,16 +683,17 @@ fn register_session_notifications(hwnd: HWND) {
 }
 
 /// Tray callback. The popup menu runs a modal loop, so the tray is taken out of the app for it.
-fn on_tray_message(hwnd: HWND, lparam: LPARAM, t0: f64) {
+/// `false` when the app was busy: the caller defers the message instead of dropping the click.
+fn on_tray_message(hwnd: HWND, lparam: LPARAM, t0: f64) -> bool {
     let mut taken = None;
     let mut state = TrayState::default();
     if !with_app(|a| {
         taken = a.tray.take();
         state = a.tray_state();
     }) {
-        return;
+        return false;
     }
-    let Some(mut tray) = taken else { return };
+    let Some(mut tray) = taken else { return true };
     let cmd = tray.handle(hwnd.0 as isize, lparam.0, state);
     with_app(|a| {
         a.tray = Some(tray);
@@ -555,6 +701,7 @@ fn on_tray_message(hwnd: HWND, lparam: LPARAM, t0: f64) {
             a.on_tray_cmd(cmd, t0);
         }
     });
+    true
 }
 
 fn register_and_create() -> Result<isize, String> {
@@ -656,7 +803,7 @@ pub fn run(hidden: bool) -> i32 {
     // icon from the message loop, after the hotkey is already live.
     post(hwnd, WM_CREATE_TRAY, 0);
     let retention = app.cfg.history_retention_days;
-    APP.with(|cell| *cell.borrow_mut() = Some(app));
+    APP.with(|gate| gate.set(app));
 
     // Warm-ups run on one short-lived thread so the message loop (and the hotkey) is live at once.
     // None of them opens the microphone: a prepared stream is initialised but not started, so the
@@ -704,11 +851,176 @@ pub fn run(hidden: bool) -> i32 {
         }
     }
     // Teardown: drop the app (pill window, tray) before the window goes away.
-    APP.with(|cell| cell.borrow_mut().take());
+    drop(APP.with(|gate| gate.take()));
     // SAFETY: destroying our own window (it may already be gone).
     unsafe {
         let _ = DestroyWindow(hwnd_of(hwnd));
     }
     log_info!("exited");
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn drained<T>(d: &mut Deferrals<T>) -> Vec<T> {
+        assert!(d.begin_drain() || d.queue.is_empty());
+        std::iter::from_fn(|| d.next()).collect()
+    }
+
+    #[test]
+    fn deferrals_keep_arrival_order() {
+        let mut d = Deferrals::new(8);
+        for i in 0..5 {
+            assert_eq!(d.push(i), Overflow::No);
+        }
+        assert_eq!(drained(&mut d), vec![0, 1, 2, 3, 4]);
+        assert!(!d.begin_drain(), "empty: nothing to drain");
+    }
+
+    #[test]
+    fn deferrals_drop_the_oldest_and_report_the_first_overflow_once() {
+        let mut d = Deferrals::new(3);
+        assert_eq!(d.push(1), Overflow::No);
+        assert_eq!(d.push(2), Overflow::No);
+        assert_eq!(d.push(3), Overflow::No);
+        assert_eq!(d.push(4), Overflow::First);
+        assert_eq!(d.push(5), Overflow::Again);
+        assert_eq!(d.dropped, 2);
+        assert_eq!(drained(&mut d), vec![3, 4, 5], "newest kept, oldest dropped");
+    }
+
+    #[test]
+    fn a_running_drain_cannot_be_claimed_twice() {
+        let mut d = Deferrals::new(4);
+        d.push(1);
+        assert!(d.begin_drain());
+        d.push(2);
+        assert!(!d.begin_drain(), "already draining");
+        assert_eq!(d.next(), Some(1));
+        assert_eq!(d.next(), Some(2), "parked meanwhile, same pass");
+        assert_eq!(d.next(), None);
+        d.push(3);
+        assert!(d.begin_drain(), "the next burst gets a new drain");
+    }
+
+    /// The window procedure in miniature: each message runs on the gate or is parked; the
+    /// handler of message 1 pumps messages 2 and 3 the way a nested modal loop would.
+    struct Harness {
+        gate: Gate<Vec<u32>, u32>,
+        /// Order in which messages ran.
+        ran: RefCell<Vec<u32>>,
+        /// Messages a handler pumps while it holds the gate.
+        nested: RefCell<Vec<(u32, Vec<u32>)>>,
+        depth: std::cell::Cell<u32>,
+        max_depth: std::cell::Cell<u32>,
+    }
+
+    impl Harness {
+        fn new(cap: usize) -> Self {
+            let h = Harness {
+                gate: Gate::new(cap),
+                ran: RefCell::default(),
+                nested: RefCell::default(),
+                depth: Default::default(),
+                max_depth: Default::default(),
+            };
+            h.gate.set(Vec::new());
+            h
+        }
+
+        fn deliver(&self, msg: u32) {
+            self.depth.set(self.depth.get() + 1);
+            self.max_depth.set(self.max_depth.get().max(self.depth.get()));
+            let ran = self.gate.run(
+                |log| {
+                    log.push(msg);
+                    self.ran.borrow_mut().push(msg);
+                    let pumped = {
+                        let mut n = self.nested.borrow_mut();
+                        n.iter().position(|(m, _)| *m == msg).map(|i| n.remove(i).1).unwrap_or_default()
+                    };
+                    for p in pumped {
+                        self.deliver(p); // arrives while the gate is borrowed
+                    }
+                },
+                &mut |m| self.deliver(m),
+            );
+            if !ran {
+                self.gate.defer(msg);
+            }
+            self.depth.set(self.depth.get() - 1);
+        }
+    }
+
+    #[test]
+    fn busy_messages_run_in_order_after_the_outermost_call() {
+        let h = Harness::new(16);
+        h.nested.borrow_mut().push((1, vec![2, 3]));
+        h.deliver(1);
+        assert_eq!(*h.ran.borrow(), vec![1, 2, 3], "parked while 1 ran, replayed in order after it");
+        assert_eq!(h.gate.state.borrow().as_deref(), Some(&[1, 2, 3][..]));
+        assert!(h.gate.deferred.borrow().queue.is_empty());
+    }
+
+    #[test]
+    fn a_message_parked_during_the_drain_is_drained_in_the_same_pass() {
+        let h = Harness::new(16);
+        // 1 pumps 2 and 4; replaying 2 pumps 3, which must run before 4 would only if parked
+        // earlier: 4 was parked first, so the order is 1, 2, 4, 3.
+        h.nested.borrow_mut().push((1, vec![2, 4]));
+        h.nested.borrow_mut().push((2, vec![3]));
+        h.deliver(1);
+        assert_eq!(*h.ran.borrow(), vec![1, 2, 4, 3]);
+        assert!(h.gate.deferred.borrow().queue.is_empty());
+        assert!(!h.gate.deferred.borrow().draining, "the drain ended");
+    }
+
+    #[test]
+    fn replaying_does_not_recurse_without_bound() {
+        let h = Harness::new(512);
+        // A chain: every replayed message pumps the next one, 200 deep.
+        for m in 1..200u32 {
+            h.nested.borrow_mut().push((m, vec![m + 1]));
+        }
+        h.deliver(1);
+        assert_eq!(h.ran.borrow().len(), 200);
+        assert_eq!(*h.ran.borrow(), (1..=200).collect::<Vec<_>>());
+        assert!(h.max_depth.get() <= 3, "replay is a loop, not recursion (depth {})", h.max_depth.get());
+    }
+
+    #[test]
+    fn overflow_while_busy_keeps_the_newest() {
+        let h = Harness::new(3);
+        h.nested.borrow_mut().push((1, vec![10, 11, 12, 13, 14]));
+        h.deliver(1);
+        assert_eq!(*h.ran.borrow(), vec![1, 12, 13, 14]);
+    }
+
+    #[test]
+    fn a_panicking_handler_does_not_wedge_the_gate() {
+        let gate: Gate<u32, u32> = Gate::new(4);
+        gate.set(0);
+        gate.defer(7);
+        let seen = RefCell::new(Vec::new());
+        assert!(gate.run(|_| {}, &mut |m| {
+            seen.borrow_mut().push(m);
+            if m == 7 {
+                gate.defer(8);
+                panic!("boom");
+            }
+        }));
+        assert_eq!(*seen.borrow(), vec![7, 8], "later messages still replay");
+        assert!(gate.run(|s| *s += 1, &mut |_| {}), "gate usable afterwards");
+        assert_eq!(gate.take(), Some(1));
+    }
+
+    #[test]
+    fn run_without_state_still_reports_not_busy() {
+        let gate: Gate<u32, u32> = Gate::new(4);
+        let mut touched = false;
+        assert!(gate.run(|_| touched = true, &mut |_| {}));
+        assert!(!touched, "no state yet: the closure does not run, the message is dropped");
+    }
 }

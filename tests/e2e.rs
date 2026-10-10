@@ -8,6 +8,11 @@ use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 
+#[allow(dead_code)]
+#[path = "common/live.rs"]
+mod live;
+use live::{Live, report_live, try_model};
+
 const EXE: &str = env!("CARGO_BIN_EXE_opentalk");
 
 fn fixture(name: &str) -> PathBuf {
@@ -130,72 +135,18 @@ fn bench_summary_of_an_empty_log_is_valid_json() {
     assert_eq!(v["count"], 0);
 }
 
-/// Outcome of a live STT run. A live test is only a verification when a model returned a
-/// transcript of the spoken audio; everything short of that is `Unverified`, never a quiet pass.
-#[derive(Debug, PartialEq)]
-enum Live {
-    /// A free model transcribed the audio (the transcript contains the spoken keywords).
-    Verified(String),
-    /// No free model produced a transcript (rate limits, gated models, audio dropped upstream).
-    Unverified(String),
-    /// Our side is wrong or the key is bad (auth, unknown model, bad request): always a failure.
-    Failed(String),
-}
-
-/// Whether an `--transcribe-file` error message is an upstream limitation of the free tier
-/// (rate limit, capacity, timeout, gated model, a reply that dropped the audio) rather than a
-/// fault of the request or the key.
-fn is_upstream_limit(msg: &str) -> bool {
-    ["rate-limited", "having problems", "took too long", "denied access", "No audio detected"].iter().any(|k| msg.contains(k))
-}
-
-/// Maps a finished live run to a test result. `Unverified` passes unless `require` is set
-/// (`OPENTALK_LIVE_REQUIRE=1`); `Failed` never passes.
-fn live_result(outcome: &Live, require: bool) -> Result<(), String> {
-    match outcome {
-        Live::Verified(_) => Ok(()),
-        Live::Unverified(_) if !require => Ok(()),
-        Live::Unverified(why) => Err(format!("OPENTALK_LIVE_REQUIRE=1 and STT was not verified: {why}")),
-        Live::Failed(why) => Err(format!("live STT failed: {why}")),
-    }
-}
-
-/// Prints a `VERIFIED` / `UNVERIFIED` / `FAILED` line and panics when `live_result` says so.
-fn report_live(test: &str, outcome: Live) {
-    match &outcome {
-        Live::Verified(t) => eprintln!("{test}: VERIFIED live transcript: {t:?}"),
-        Live::Unverified(why) => eprintln!("{test}: UNVERIFIED - no free model produced a transcript of the audio: {why}"),
-        Live::Failed(why) => eprintln!("{test}: FAILED - {why}"),
-    }
-    let require = std::env::var("OPENTALK_LIVE_REQUIRE").is_ok_and(|v| v == "1");
-    if let Err(e) = live_result(&outcome, require) {
-        panic!("{test}: {e}");
-    }
-}
-
-#[test]
-fn live_verdicts_distinguish_verified_unverified_and_failed() {
-    let (v, u, f) = (Live::Verified("t".into()), Live::Unverified("x".into()), Live::Failed("y".into()));
-    assert!(live_result(&v, false).is_ok() && live_result(&v, true).is_ok());
-    assert!(live_result(&u, false).is_ok());
-    assert!(live_result(&u, true).unwrap_err().contains("not verified"));
-    assert!(live_result(&f, false).is_err() && live_result(&f, true).is_err());
-    assert!(is_upstream_limit("OpenRouter rate-limited the request. Wait a moment and try again."));
-    assert!(is_upstream_limit("OpenRouter denied access. Your key may not include this model."));
-    assert!(is_upstream_limit("No audio detected"));
-    assert!(!is_upstream_limit("OpenRouter rejected your API key."));
-    assert!(!is_upstream_limit("OpenRouter doesn't recognize the model “x”."));
-}
-
 /// Live OpenRouter smoke test (`:free` models only; `OPENTALK_LIVE_MODEL` may list several,
 /// comma separated). Prints `VERIFIED`, `UNVERIFIED` or `FAILED`: upstream limits (429/5xx,
-/// gated models, a free endpoint that drops the audio) are `UNVERIFIED`, never a green pass
-/// with `OPENTALK_LIVE_REQUIRE=1`; a bad key or request is `FAILED`.
+/// gated models, a free endpoint that drops the audio, see PLAN section 10) are `UNVERIFIED`,
+/// never a green pass with `OPENTALK_LIVE_REQUIRE=1`; a bad key or request is `FAILED`.
+/// Only rate limits, capacity errors and timeouts are retried; a "No audio detected" or
+/// "denied access" answer gets one attempt per model.
 #[test]
 #[ignore = "live: OpenRouter free model (needs OPENTALK_SECRET_OPENROUTER)"]
 fn live_transcribe_file_openrouter_free() {
+    const TEST: &str = "live_transcribe_file_openrouter_free";
     if std::env::var_os("OPENTALK_SECRET_OPENROUTER").is_none() {
-        report_live("live_transcribe_file_openrouter_free", Live::Unverified("OPENTALK_SECRET_OPENROUTER not set".into()));
+        report_live(TEST, Live::Unverified("OPENTALK_SECRET_OPENROUTER not set".into()));
         return;
     }
     let models = std::env::var("OPENTALK_LIVE_MODEL").unwrap_or_else(|_| "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free".into());
@@ -204,29 +155,25 @@ fn live_transcribe_file_openrouter_free() {
     let mut notes = Vec::new();
     for model in models.split(',').map(str::trim).filter(|m| !m.is_empty()) {
         assert!(model.ends_with(":free"), "live tests may only use :free models");
-        for attempt in 0..4u64 {
-            let (code, v) = transcribe(&home, &[wav.to_str().unwrap(), "--provider", "openrouter", "--model", model, "--no-llm"], &[]);
-            if code == 0 {
-                let text = v["text"].as_str().unwrap_or_default().to_lowercase();
-                if text.contains("friday") || text.contains("release") {
-                    return report_live("live_transcribe_file_openrouter_free", Live::Verified(text));
+        let verdict = try_model(
+            model,
+            &["friday", "release"],
+            &[0, 6, 12, 18],
+            || {
+                let (code, v) = transcribe(&home, &[wav.to_str().unwrap(), "--provider", "openrouter", "--model", model, "--no-llm"], &[]);
+                match code {
+                    0 => Ok(v["text"].as_str().unwrap_or_default().to_string()),
+                    _ => Err(v["error"].as_str().unwrap_or_default().to_string()),
                 }
-                notes.push(format!("{model}: reply without the spoken words ({text:?})"));
-                break;
-            }
-            let msg = v["error"].as_str().unwrap_or_default().to_string();
-            if !is_upstream_limit(&msg) {
-                return report_live("live_transcribe_file_openrouter_free", Live::Failed(format!("{model}: {msg}")));
-            }
-            eprintln!("{model} attempt {attempt}: {msg}");
-            if attempt == 3 {
-                notes.push(format!("{model}: {msg}"));
-            } else {
-                std::thread::sleep(std::time::Duration::from_secs(6 * (attempt + 1)));
-            }
+            },
+            std::thread::sleep,
+        );
+        match verdict {
+            Live::Unverified(why) => notes.push(why),
+            done => return report_live(TEST, done),
         }
     }
-    report_live("live_transcribe_file_openrouter_free", Live::Unverified(notes.join("; ")));
+    report_live(TEST, Live::Unverified(notes.join("; ")));
 }
 
 /// True when the interactive desktop can be driven: the session is not locked (the Win10/11 lock
@@ -273,32 +220,74 @@ fn require_input_desktop(test: &str) -> bool {
     ok
 }
 
-/// Process ids of every running `image` (e.g. `notepad.exe`).
-fn pids_of(image: &str) -> std::collections::HashSet<u32> {
-    let out = Command::new("tasklist").args(["/FO", "CSV", "/NH", "/FI", &format!("IMAGENAME eq {image}")]).output();
-    let text = out.map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
-    text.lines().filter_map(|l| l.split("\",\"").nth(1)?.parse().ok()).collect()
+/// One row of a process snapshot.
+struct ProcRow {
+    pid: u32,
+    parent: u32,
+    image: String,
+}
+
+/// Every running process (pid, parent pid, image name) from a Toolhelp32 snapshot.
+fn process_table() -> Vec<ProcRow> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS};
+    let mut rows = Vec::new();
+    // SAFETY: the snapshot handle is closed; `entry` is a plain struct whose `dwSize` is set as the API requires.
+    unsafe {
+        let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else { return rows };
+        let mut entry = PROCESSENTRY32W { dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32, ..Default::default() };
+        let mut more = Process32FirstW(snap, &mut entry).is_ok();
+        while more {
+            let len = entry.szExeFile.iter().position(|&c| c == 0).unwrap_or(entry.szExeFile.len());
+            rows.push(ProcRow { pid: entry.th32ProcessID, parent: entry.th32ParentProcessID, image: String::from_utf16_lossy(&entry.szExeFile[..len]) });
+            more = Process32NextW(snap, &mut entry).is_ok();
+        }
+        let _ = CloseHandle(snap);
+    }
+    rows
+}
+
+/// Pids reachable from `root` through the parent-pid chain (`root` itself excluded).
+fn descendants(table: &[ProcRow], root: u32) -> std::collections::HashSet<u32> {
+    let mut found = std::collections::HashSet::new();
+    let mut frontier = vec![root];
+    while let Some(parent) = frontier.pop() {
+        for row in table.iter().filter(|r| r.parent == parent && r.pid != root && r.pid != parent) {
+            if found.insert(row.pid) {
+                frontier.push(row.pid);
+            }
+        }
+    }
+    found
 }
 
 /// Run `cmd` with a hard time limit; true when it exits successfully in time. A hang (a lost
 /// foreground, a stuck UI Automation call) used to block the whole suite and leave Notepad and
-/// daemons behind: on timeout the process tree is killed and every `sweep` image (e.g. Notepad) that
-/// appeared since the start is ended too.
-fn run_limited(mut cmd: Command, limit: std::time::Duration, sweep: &[&str]) -> bool {
-    let before: Vec<_> = sweep.iter().map(|img| pids_of(img)).collect();
+/// daemons behind: on timeout the process tree is killed and so is every descendant of the child
+/// (found through a snapshot taken before the kill) whose image is in `sweep` (e.g. Notepad).
+/// Processes the user or another test started are never touched, even when they match `sweep`.
+fn run_limited(cmd: Command, limit: std::time::Duration, sweep: &[&str]) -> bool {
+    run_limited_family(cmd, limit, sweep).0
+}
+
+/// `run_limited`, also returning the pids the child had started when the limit hit (empty when
+/// it finished in time), so a test can check those very processes are gone.
+fn run_limited_family(mut cmd: Command, limit: std::time::Duration, sweep: &[&str]) -> (bool, std::collections::HashSet<u32>) {
     let mut child = cmd.spawn().expect("spawn");
     match child.wait_timeout_ms(limit.as_millis() as u64) {
-        Some(status) => status.success(),
+        Some(status) => (status.success(), Default::default()),
         None => {
             eprintln!("{cmd:?} exceeded {limit:?}; killing it and what it opened");
+            let table = process_table();
+            let family = descendants(&table, child.id());
             let _ = Command::new("taskkill").args(["/F", "/T", "/PID", &child.id().to_string()]).output();
             let _ = child.wait();
-            for (img, before) in sweep.iter().zip(&before) {
-                for pid in pids_of(img).difference(before) {
-                    let _ = Command::new("taskkill").args(["/F", "/T", "/PID", &pid.to_string()]).output();
+            for row in table.iter().filter(|r| family.contains(&r.pid)) {
+                if sweep.iter().any(|img| img.eq_ignore_ascii_case(&row.image)) {
+                    let _ = Command::new("taskkill").args(["/F", "/T", "/PID", &row.pid.to_string()]).output();
                 }
             }
-            false
+            (false, family)
         }
     }
 }
@@ -312,17 +301,66 @@ fn run_e2e_script(stt: &str, limit: std::time::Duration) -> bool {
     run_limited(cmd, limit, &["notepad.exe", &image])
 }
 
-#[test]
-fn a_hung_child_is_killed_with_what_it_started() {
+/// The two `run_limited` tests below watch `PING.EXE` process ids, so they must not overlap.
+static PING_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Kills the wrapped child when dropped, so a failed assertion cannot leak it.
+struct KillOnDrop(Child);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn hung_ping_cmd() -> Command {
     let mut cmd = Command::new("cmd");
     cmd.args(["/C", "ping -n 60 127.0.0.1 >nul"]);
-    let before = pids_of("PING.EXE");
+    cmd
+}
+
+#[test]
+fn a_hung_child_is_killed_with_what_it_started() {
+    let _serial = PING_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let t0 = std::time::Instant::now();
-    assert!(!run_limited(cmd, std::time::Duration::from_millis(1500), &["PING.EXE"]));
+    let (ok, family) = run_limited_family(hung_ping_cmd(), std::time::Duration::from_millis(1500), &["PING.EXE"]);
+    assert!(!ok);
     assert!(t0.elapsed() < std::time::Duration::from_secs(10), "the limit was not enforced");
+    // Judge the child's own descendants (cmd's ping), not every PING.EXE on the machine: other
+    // test runs and the user start pings of their own.
+    assert!(!family.is_empty(), "the hung child had started nothing, so the test proves nothing");
     std::thread::sleep(std::time::Duration::from_millis(300));
-    let leftovers: Vec<_> = pids_of("PING.EXE").difference(&before).copied().collect();
-    assert!(leftovers.is_empty(), "the hung child's ping outlived the limit: {leftovers:?}");
+    let alive: Vec<_> = process_table().into_iter().filter(|r| family.contains(&r.pid) && r.image.eq_ignore_ascii_case("PING.EXE")).map(|r| r.pid).collect();
+    assert!(alive.is_empty(), "the hung child's ping outlived the limit: {alive:?}");
+}
+
+#[test]
+fn the_timeout_sweep_spares_processes_the_child_did_not_start() {
+    let _serial = PING_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // An unrelated PING.EXE appears while the limited run is in flight (as a user's or another
+    // test's process would); it is not a descendant of the hung child, so it must survive.
+    let starter = std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let mut cmd = Command::new("ping");
+        cmd.args(["-n", "60", "127.0.0.1"]).stdout(Stdio::null()).stderr(Stdio::null());
+        cmd.spawn().map(KillOnDrop)
+    });
+    assert!(!run_limited(hung_ping_cmd(), std::time::Duration::from_millis(2000), &["PING.EXE"]));
+    let mut unrelated = starter.join().expect("starter thread").expect("start the unrelated ping");
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert!(matches!(unrelated.0.try_wait(), Ok(None)), "the sweep killed a process that is not a descendant of the hung child");
+}
+
+#[test]
+fn descendants_follow_the_parent_chain_only() {
+    let row = |pid, parent| ProcRow { pid, parent, image: String::new() };
+    let table = [row(10, 1), row(11, 10), row(12, 11), row(13, 2), row(1, 11), row(10, 10)];
+    let mut got: Vec<_> = descendants(&table, 10).into_iter().collect();
+    got.sort_unstable();
+    // 1 is a (bogus) child of 11 and 10 a child of itself: both cycle back to the root and are bounded.
+    assert_eq!(got, [1, 11, 12]);
+    assert!(descendants(&table, 99).is_empty());
 }
 
 /// Upper bound for one e2e script run (it normally takes ~15-25 s).
