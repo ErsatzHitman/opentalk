@@ -23,9 +23,14 @@ pub mod controls;
 pub mod dictionary;
 pub mod draw;
 pub mod edit;
+#[cfg(any(test, debug_assertions))]
+pub mod gallery;
 pub mod history;
 pub mod layout;
+pub mod metrics;
+pub mod pager;
 pub mod scroll;
+pub mod session;
 pub mod settings;
 
 use std::collections::VecDeque;

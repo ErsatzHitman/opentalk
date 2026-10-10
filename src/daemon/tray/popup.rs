@@ -7,6 +7,7 @@
 //! pixels on the monitor the tray icon is on.
 
 use super::TrayCmd;
+use super::page::Route;
 
 pub const CARD_W: f32 = 288.0;
 /// Transparent border of the window around the card (room for the shadow).
@@ -23,6 +24,8 @@ pub const SECTION_H: f32 = 26.0;
 pub const SEP_H: f32 = 9.0;
 /// Distance between the popup and the edge of the work area, like Windows' own flyouts.
 pub const EDGE_GAP: f32 = 12.0;
+/// A page card is never shorter than this, however small the work area.
+pub const PAGE_MIN_H: f32 = 240.0;
 /// How many recent dictations the popup shows.
 pub const MAX_RECENT: usize = 2;
 /// A tray click this soon after the popup closed itself (the click that deactivated it) toggles the
@@ -74,6 +77,17 @@ pub enum Target {
 }
 
 impl Target {
+    /// The page this row opens inside the popup (History, Dictionary, Settings); the others run a
+    /// command and close.
+    pub fn route(self) -> Option<Route> {
+        match self {
+            Target::History => Some(Route::History),
+            Target::Dictionary => Some(Route::Dictionary),
+            Target::Settings => Some(Route::SettingsIndex),
+            _ => None,
+        }
+    }
+
     /// The tray command this row maps to (`None` for the clipboard row, handled by the popup).
     pub fn cmd(self) -> Option<TrayCmd> {
         Some(match self {
@@ -110,9 +124,34 @@ pub struct R {
 }
 
 impl R {
-    #[cfg(test)]
+    pub const ZERO: R = R { l: 0.0, t: 0.0, r: 0.0, b: 0.0 };
+
+    pub fn new(l: f32, t: f32, r: f32, b: f32) -> R {
+        R { l, t, r, b }
+    }
+    pub fn xywh(x: f32, y: f32, w: f32, h: f32) -> R {
+        R { l: x, t: y, r: x + w, b: y + h }
+    }
+    pub fn w(&self) -> f32 {
+        self.r - self.l
+    }
     pub fn h(&self) -> f32 {
         self.b - self.t
+    }
+    pub fn cx(&self) -> f32 {
+        (self.l + self.r) * 0.5
+    }
+    pub fn cy(&self) -> f32 {
+        (self.t + self.b) * 0.5
+    }
+    pub fn offset(&self, dx: f32, dy: f32) -> R {
+        R { l: self.l + dx, t: self.t + dy, r: self.r + dx, b: self.b + dy }
+    }
+    pub fn inflate(&self, d: f32) -> R {
+        R { l: self.l - d, t: self.t - d, r: self.r + d, b: self.b + d }
+    }
+    pub fn is_empty(&self) -> bool {
+        self.r <= self.l || self.b <= self.t
     }
     pub fn contains(&self, x: f32, y: f32) -> bool {
         x >= self.l && x < self.r && y >= self.t && y < self.b
@@ -407,6 +446,13 @@ pub fn place(w: i32, h: i32, anchor: Option<IRect>, work: IRect, edge: Edge, gap
 /// Keep `[v, v + len)` inside `[lo + gap, hi - gap)`; the near edge wins when it cannot fit.
 fn clamp_axis(v: i32, len: i32, lo: i32, hi: i32, gap: i32) -> i32 {
     v.min(hi - gap - len).max(lo + gap)
+}
+
+/// Height of a page card in logical px: `min(PAGE_MAX_H, work height - 2 * EDGE_GAP)`, fixed for the
+/// life of the popup so navigating never makes it jump. `work_h` is the work area in device px.
+pub fn page_card_h(work_h: i32, scale: f32) -> f32 {
+    let avail = work_h as f32 / scale.max(0.1) - 2.0 * EDGE_GAP;
+    avail.clamp(PAGE_MIN_H, super::page::PAGE_MAX_H).floor()
 }
 
 /// Whether a tray click at `now_ms` should only close (not reopen) the popup that closed itself at

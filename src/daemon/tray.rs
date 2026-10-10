@@ -17,7 +17,8 @@ mod popup_draw;
 mod popup_win;
 
 pub use popup_draw::cli_render as cli_render_popup;
-pub use popup_win::WM_TRAY_POPUP_CMD;
+#[allow(unused_imports)] // WM_TRAY_POPUP_ACT is handled by the host (merge step)
+pub use popup_win::{WM_TRAY_POPUP_ACT, WM_TRAY_POPUP_CMD};
 
 use std::ffi::c_void;
 
@@ -125,7 +126,58 @@ pub fn activate(owner: isize, act: Activation, state: &TrayState) {
         icon_id: ICON_ID,
         keyboard: act.keyboard,
         dark: state.dark,
+        route: page::Route::Home,
     });
+}
+
+/// Show `route` in the popup now, without toggling: navigate an open popup there, or open one.
+/// `Route::Home` shows the menu. This is the entry for `--settings <page>`, a second launch, the
+/// first-run Speech-to-Text page and the pill's "Open OpenTalk". `keyboard` starts with the first
+/// row focused.
+#[allow(dead_code)] // called by the host once it is wired (merge step)
+pub fn open_route(owner: isize, route: page::Route, keyboard: bool, state: &TrayState) {
+    popup_win::open_route(popup_win::Request {
+        owner,
+        content: state.content(),
+        texts: state.recent.clone(),
+        icon_id: ICON_ID,
+        keyboard,
+        dark: state.dark,
+        route,
+    });
+}
+
+/// Hand the popup the daemon's config after applying a [`page::PopupAction::SetConfig`] (or any
+/// reload): the open page shows it and the theme follows at once. No-op when the popup is closed.
+#[allow(dead_code)] // called by the host once it is wired (merge step)
+pub fn popup_set_config(cfg: &crate::core::config::Config) {
+    popup_win::set_config(cfg.clone());
+}
+
+/// A provider test finished (any thread). Dropped when the popup is closed.
+#[allow(dead_code)] // called by the host once it is wired (merge step)
+pub fn popup_test_done(result: page::TestResult) {
+    popup_win::deliver_test(result);
+}
+
+/// Live preview of the in-daemon hotkey capture ("Control+Super" so far), on the UI thread.
+#[allow(dead_code)] // called by the host once it is wired (merge step)
+pub fn popup_capture_update(text: String) {
+    popup_win::capture_update(text);
+}
+
+/// The hotkey capture finished with this accelerator, on the UI thread. An empty string means the
+/// capture was cancelled (Esc alone): the popup just ends it and shows the old value.
+#[allow(dead_code)] // called by the host once it is wired (merge step)
+pub fn popup_capture_done(accel: String) {
+    popup_win::capture_done(accel);
+}
+
+/// Register `hotkey::begin_capture` / `hotkey::end_capture`; the popup calls them when a hotkey
+/// field starts or ends capturing (and on close, so a capture can never outlive the popup).
+#[allow(dead_code)] // called by the host once it is wired (merge step)
+pub fn set_hotkey_capture_hooks(begin: fn(), end: fn()) {
+    popup_win::set_capture_hooks(begin, end);
 }
 
 /// Is the popup open right now?
