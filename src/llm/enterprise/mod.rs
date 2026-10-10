@@ -13,13 +13,8 @@ use crate::core::config::{Config, LlmProviderId};
 use crate::core::http::HttpError;
 use std::time::{Duration, Instant};
 
-/// One-shot completion for enterprise providers (AzureOpenai | Bedrock | Vertex).
-pub fn complete(cfg: &Config, system: &str, user: &str, timeout_ms: u64) -> Result<String, LlmError> {
-    let base = std::env::var("OPENTALK_LLM_BASE_URL").ok().filter(|s| !s.trim().is_empty());
-    complete_with(cfg, system, user, timeout_ms, base.as_deref())
-}
-
-/// [`complete`] with an explicit origin override (no process-global env read).
+/// One-shot completion for enterprise providers (AzureOpenai | Bedrock | Vertex) with an
+/// explicit origin override (`None` = the real cloud).
 ///
 /// The request runs on a short-lived thread and the caller waits at most `timeout + 300 ms`, so a
 /// stall outside ureq's own deadline (DNS, TLS handshake, DPAPI) cannot hold up the paste.
