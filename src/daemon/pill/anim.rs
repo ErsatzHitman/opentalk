@@ -91,7 +91,92 @@ pub const ENTRANCE_HOLD_MS: f64 = 260.0;
 pub const WAVEFORM_AT_MS: f64 = 660.0;
 pub const WAVEFORM_FADE_MS: f64 = 200.0;
 pub const CHROME_MS: f64 = 220.0;
-pub const CANCEL_EMERGE_MS: f64 = 280.0;
+/// About how long the cancel button's pop takes to settle (tests sample the motion over it).
+#[cfg(test)]
+pub const CANCEL_EMERGE_MS: f64 = 380.0;
+
+// --- spring --------------------------------------------------------------------------------------
+
+/// A damped spring: `zeta` < 1 overshoots and bounces, 1 settles as fast as possible without one.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SpringParams {
+    /// Natural frequency (rad/s).
+    pub omega: f64,
+    pub zeta: f64,
+}
+
+/// The detached cancel button popping out: ~8 % overshoot (a few px past its spot and a slight
+/// swell), the peak at ~230 ms, settled in ~400 ms.
+pub const CANCEL_POP: SpringParams = SpringParams { omega: 17.0, zeta: 0.62 };
+/// ... and tucking back in: firm, no bounce.
+pub const CANCEL_TUCK: SpringParams = SpringParams { omega: 28.0, zeta: 1.0 };
+
+/// A value driven by a damped spring toward a target, in closed form (exact at any frame rate). A new
+/// target keeps the current position and velocity, so reversing mid-flight is seamless.
+#[derive(Clone, Copy, Debug)]
+pub struct Spring {
+    target: f32,
+    /// Offset from the target and velocity (units/s) at `t0`.
+    x0: f64,
+    v0: f64,
+    t0: f64,
+    p: SpringParams,
+}
+
+impl Spring {
+    pub fn new(v: f32) -> Spring {
+        Spring { target: v, x0: 0.0, v0: 0.0, t0: 0.0, p: CANCEL_TUCK }
+    }
+
+    /// Offset from the target and velocity `dt` ms after `t0`.
+    fn state(&self, t: f64) -> (f64, f64) {
+        if self.x0 == 0.0 && self.v0 == 0.0 {
+            return (0.0, 0.0);
+        }
+        let dt = ((t - self.t0) / 1000.0).max(0.0);
+        let (w, z) = (self.p.omega, self.p.zeta);
+        let (a, v0) = (self.x0, self.v0);
+        if z < 1.0 {
+            let wd = w * (1.0 - z * z).sqrt();
+            let b = (v0 + z * w * a) / wd;
+            let (s, c) = (wd * dt).sin_cos();
+            let e = (-z * w * dt).exp();
+            let x = e * (a * c + b * s);
+            let v = e * ((b * wd - z * w * a) * c - (a * wd + z * w * b) * s);
+            (x, v)
+        } else {
+            // critically damped
+            let b = v0 + w * a;
+            let e = (-w * dt).exp();
+            (e * (a + b * dt), e * (b - w * (a + b * dt)))
+        }
+    }
+
+    pub fn value(&self, t: f64) -> f32 {
+        self.target + self.state(t).0 as f32
+    }
+
+    pub fn target(&self) -> f32 {
+        self.target
+    }
+
+    /// Head for `to` from wherever the spring is at `now`, with `p`.
+    pub fn set(&mut self, now: f64, to: f32, p: SpringParams) {
+        let (x, v) = self.state(now);
+        let pos = self.target as f64 + x;
+        *self = Spring { target: to, x0: pos - to as f64, v0: v, t0: now, p };
+    }
+
+    /// Still visibly moving (more than 1/1000 away, or faster than 0.01 per second).
+    pub fn is_active(&self, t: f64) -> bool {
+        let (x, v) = self.state(t);
+        x.abs() > 1e-3 || v.abs() > 1e-2
+    }
+
+    pub fn snap(&mut self, v: f32) {
+        *self = Spring { target: v, x0: 0.0, v0: 0.0, t0: 0.0, p: self.p };
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 struct Seg {

@@ -338,10 +338,10 @@ fn blit_icon(cv: &mut Canvas, ic: &Pixmap, (bx, by): (f32, f32), s: f32, alpha: 
 
 // --- detached cancel button ---------------------------------------------------------------
 
-/// Opacity of the button's glass while it slides out (`cancel_t` 0..1): in by the time it has cleared
-/// the pill's end.
+/// Opacity of the button's glass while it slides out (`cancel_t` 0..1): opaque early, so the liquid
+/// neck that still joins it to the pill reads as glass.
 fn cancel_alpha(t: f32) -> f32 {
-    let c = (t / 0.7).clamp(0.0, 1.0);
+    let c = (t / 0.45).clamp(0.0, 1.0);
     c * c * (3.0 - 2.0 * c)
 }
 
@@ -350,16 +350,56 @@ fn cancel_glyph_alpha(t: f32) -> f32 {
     ((t - 0.35) / 0.65).clamp(0.0, 1.0)
 }
 
+/// Largest fillet (px) of the liquid neck between pill and button.
+const NECK_K: f32 = 18.0;
+/// The neck has pinched off by this emergence.
+const NECK_END: f32 = 0.85;
+
+/// Fillet of the neck at emergence `e`: none while the button is still inside the pill, strongest
+/// halfway out, gone (detached) at [`NECK_END`] and through the spring's bounce after it.
+fn neck_k(e: f32) -> f32 {
+    let c = (e / NECK_END).clamp(0.0, 1.0);
+    NECK_K * 4.0 * c * (1.0 - c)
+}
+
+/// Polynomial smooth minimum: the union of two distance fields with a fillet of size `k`.
+fn smin(a: f32, b: f32, k: f32) -> f32 {
+    if k <= 0.0 {
+        return a.min(b);
+    }
+    let h = (0.5 + 0.5 * (b - a) / k).clamp(0.0, 1.0);
+    b * (1.0 - h) + a * h - k * h * (1.0 - h)
+}
+
 /// The cancel button: a glass circle with the bubble's recipe (surface, rim, border, shadow), as tall as
-/// the pill and `CANCEL_GAP` beside it.
+/// the pill and `CANCEL_GAP` beside it. On its way out it is poured from the pill: a smooth union of
+/// the two shapes whose neck stretches and pinches off; the pill is painted over its own part of it.
 fn draw_cancel_button(cv: &mut Canvas, ctx: &Ctx, g: &Geometry, app: &Appearance) {
     let (cx, cy, r) = g.cancel;
     let d = r * 2.0;
     let alpha = cancel_alpha(g.cancel_t);
-    let field = Rect::new(cx - r, cy - r, cx + r, cy + r);
-    let sdf = move |x: f32, y: f32| sd_capsule(x, y, cx, cy, d, d);
-    let surf = Surface { field, radius: Some(r), sdf: &sdf };
-    glass::paint(cv, ctx, &surf, &Params { alpha, shadow: app.shadow, shadow_alpha: alpha, lift: app.lift, edge: app.edge, frost: None });
+    let k = neck_k(g.cancel_t);
+    let params = Params { alpha, shadow: app.shadow, shadow_alpha: alpha, lift: app.lift, edge: app.edge, frost: None };
+    if k <= 0.05 {
+        let field = Rect::new(cx - r, cy - r, cx + r, cy + r);
+        let sdf = move |x: f32, y: f32| sd_capsule(x, y, cx, cy, d, d);
+        glass::paint(cv, ctx, &Surface { field, radius: Some(r), sdf: &sdf }, &params);
+        return;
+    }
+    let p = g.pill;
+    let (pcx, pcy, pw, ph) = (p.cx(), p.cy(), p.w(), p.h());
+    // the fused outline outside the pill (1 px under its edge, so no seam shows)
+    let sdf = move |x: f32, y: f32| {
+        let pill = sd_capsule(x, y, pcx, pcy, pw, ph);
+        smin(sd_capsule(x, y, cx, cy, d, d), pill, k).max(-(pill + 1.0))
+    };
+    // the shadow is the circle's alone: the fused field's box would clip it into a hard-edged block
+    // under the pill (which casts its own)
+    let circle = move |x: f32, y: f32| sd_capsule(x, y, cx, cy, d, d);
+    let cfield = Rect::new(cx - r, cy - r, cx + r, cy + r);
+    glass::paint_shadow(cv, &Surface { field: cfield, radius: Some(r), sdf: &circle }, app.shadow, alpha);
+    let field = Rect::new((p.r - ph * 0.5).min(cx - r), p.t.min(cy - r), cx + r, p.b.max(cy + r));
+    glass::paint(cv, ctx, &Surface { field, radius: Some(r), sdf: &sdf }, &Params { shadow_alpha: 0.0, ..params });
 }
 
 // --- tooltip -----------------------------------------------------------------------------
@@ -497,8 +537,8 @@ fn classify(st: &RenderState, t: f64) -> Option<Kind> {
     if st.error().is_some() || st.pulse_since.is_some() {
         return None;
     }
-    let tracks = [&st.compact, &st.grad, &st.wave_live, &st.wave_rest, &st.divider, &st.glow, &st.cancel, &st.bubble, &st.cancel_hot, &st.icon_swap];
-    if tracks.iter().any(|tr| tr.is_active(t)) || st.appearance.is_active(t) {
+    let tracks = [&st.compact, &st.grad, &st.wave_live, &st.wave_rest, &st.divider, &st.glow, &st.bubble, &st.cancel_hot, &st.icon_swap];
+    if tracks.iter().any(|tr| tr.is_active(t)) || st.cancel.is_active(t) || st.appearance.is_active(t) {
         return None;
     }
     let (live, rest, glow) = (st.wave_live.value(t), st.wave_rest.value(t), st.glow.value(t));

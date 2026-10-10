@@ -288,7 +288,7 @@ pub struct RenderState {
     pub(crate) wave_rest: Track,
     pub(crate) divider: Track,
     pub(crate) glow: Track,
-    pub(crate) cancel: Track,
+    pub(crate) cancel: Spring,
     pub(crate) bubble: Track,
     pub(crate) cancel_hot: Track,
     pub(crate) appearance: Blend<Appearance>,
@@ -331,7 +331,7 @@ impl RenderState {
             wave_rest: Track::new(0.0),
             divider: Track::new(0.0),
             glow: Track::new(0.0),
-            cancel: Track::new(0.0),
+            cancel: Spring::new(0.0),
             bubble: Track::new(0.0),
             cancel_hot: Track::new(0.0),
             appearance: Blend::new(appearance(look, &pal)),
@@ -496,12 +496,11 @@ impl RenderState {
         // hover gradient
         let grad_to = if matches!(self.mode, PillMode::Idle | PillMode::Hidden) && self.pointer.group { 0.72 } else { 0.0 };
         retarget(&mut self.grad, now, grad_to, 200.0, TW_EASE_OUT);
-        // cancel button emergence (rAF-driven, 280 ms * |delta|, house curve)
+        // cancel button emergence
         let want = if self.cancel_wanted() { 1.0 } else { 0.0 };
         if (self.cancel.target() - want).abs() > 1e-4 {
-            let cur = self.cancel.value(now);
-            let dur = CANCEL_EMERGE_MS * (want - cur).abs() as f64;
-            self.cancel.set_at(now, want, dur.max(1.0), HOUSE);
+            // pops out on an underdamped spring (overshoot + bounce), tucks back in without one
+            self.cancel.set(now, want, if want > 0.5 { CANCEL_POP } else { CANCEL_TUCK });
         }
         // cancel glyph colour (hover)
         retarget(&mut self.cancel_hot, now, if self.pointer.cancel { 1.0 } else { 0.0 }, 150.0, Bezier::new(0.4, 0.0, 0.2, 1.0));
@@ -597,7 +596,9 @@ impl RenderState {
         let c = self.compact.value(t).clamp(0.0, 1.0);
         let w = IDLE_SIZE.0 + (REC_SIZE.0 - IDLE_SIZE.0) * c;
         let h = IDLE_SIZE.1 + (REC_SIZE.1 - IDLE_SIZE.1) * c;
-        let cancel_t = self.cancel.value(t).clamp(0.0, 1.0);
+        // the spring overshoots past 1 (and the button with it); everything else uses 0..1
+        let cancel_e = self.cancel.value(t).clamp(0.0, 1.25);
+        let cancel_t = cancel_e.min(1.0);
         let bubble_t = if self.app.is_some() { self.bubble.value(t).clamp(0.0, 1.0) } else { 0.0 };
         let slot_b = bubble_t * (h + BUBBLE_GAP);
         let ww = win_w(self.position);
@@ -613,7 +614,7 @@ impl RenderState {
         let pill = Rect::from_xywh(x, y, w, h);
         let cy = pill.cy();
         let bubble = (pill.l - slot_b + h * 0.5, cy, h * 0.5);
-        Geometry { compact: c, pill, cancel_t, bubble_t, cancel: cancel_circle(pill, cancel_t), bubble }
+        Geometry { compact: c, pill, cancel_t, bubble_t, cancel: cancel_circle(pill, cancel_e), bubble }
     }
 
     /// Hit test in logical window coordinates.
@@ -722,12 +723,11 @@ impl RenderState {
             &self.wave_rest,
             &self.divider,
             &self.glow,
-            &self.cancel,
             &self.bubble,
             &self.cancel_hot,
             &self.icon_swap,
         ];
-        if tracks.iter().any(|tr| tr.is_active(t)) || self.appearance.is_active(t) {
+        if tracks.iter().any(|tr| tr.is_active(t)) || self.cancel.is_active(t) || self.appearance.is_active(t) {
             return true;
         }
         if self.pulse_since.is_some() || self.glow_since.is_some() {
@@ -768,7 +768,6 @@ impl RenderState {
             &mut self.wave_rest,
             &mut self.divider,
             &mut self.glow,
-            &mut self.cancel,
             &mut self.bubble,
             &mut self.cancel_hot,
             &mut self.icon_swap,
@@ -776,6 +775,8 @@ impl RenderState {
             let v = t.target();
             t.snap(v);
         }
+        let c = self.cancel.target();
+        self.cancel.snap(c);
         let to = self.appearance.to();
         self.appearance = Blend::new(to);
     }
@@ -809,8 +810,9 @@ pub fn win_w(pos: PanelPosition) -> f32 {
 
 /// The detached cancel button for an emergence `e` (0 hidden inside the pill's right end, 1 at rest):
 /// a circle as tall as the pill, `CANCEL_GAP` right of it, sliding out of the right end while it grows.
+/// `e` above 1 is the spring's overshoot: a little further out and a little rounder.
 pub fn cancel_circle(pill: Rect, e: f32) -> (f32, f32, f32) {
-    let e = e.clamp(0.0, 1.0);
+    let e = e.clamp(0.0, 1.25);
     let rad = pill.h() * 0.5;
     let cx = (pill.r - rad) + e * (CANCEL_GAP + 2.0 * rad);
     (cx, pill.cy(), rad * (CANCEL_FROM + (1.0 - CANCEL_FROM) * e))
