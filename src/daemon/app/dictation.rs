@@ -712,7 +712,7 @@ fn run_job(job: Job) -> Outcome {
         // Esc during the paste step (the modifier wait, the focus return) stops the keystroke.
         match paste_note(paste::paste_text_cancellable(&cleaned.text, target.as_ref(), opts, &cancelled)) {
             Ok(note) => note,
-            Err(cancelled) => return cancelled,
+            Err(outcome) => return outcome,
         }
     } else if paste::copy_to_clipboard(&cleaned.text) {
         None
