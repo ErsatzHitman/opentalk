@@ -273,7 +273,7 @@ if (-not $SkipLive) {
     if (-not $key -or $models.Count -eq 0) {
         Write-Host 'skipped (no key, or no :free model)' -ForegroundColor Yellow
     } else {
-        $live = [ordered]@{ models = $models; rounds = 0; ok = 0; per_model = [ordered]@{} }
+        $live = [ordered]@{ models = $models; rounds = 0; ok = 0; verified = 0; per_model = [ordered]@{} }
         $round = 0
         foreach ($m in $models) {
             if ($round -ge $LiveDictations) { break }
@@ -287,14 +287,17 @@ if (-not $SkipLive) {
                 $round += $n
                 $hist = Read-History $h
                 $ok = @($hist | Where-Object { $_.status -eq 'ok' })
-                $live.rounds += $hist.Count; $live.ok += $ok.Count
+                # A dictation only counts as verified when the transcript has the words in the fixture (tts_fillers.wav).
+                $verified = @($ok | Where-Object { $_.text -match '(?i)friday|release' })
+                $live.rounds += $hist.Count; $live.ok += $ok.Count; $live.verified += $verified.Count
                 $live.per_model[$m] = [ordered]@{
-                    ok = $ok.Count; total = $hist.Count
+                    ok = $ok.Count; verified = $verified.Count; total = $hist.Count
                     errors = @($hist | Where-Object { $_.status -ne 'ok' } | ForEach-Object { if ($_.error) { $_.error } else { "status $($_.status)" } } | Select-Object -Unique)
                     texts = @($ok | ForEach-Object { $_.text })
                 }
                 if ($ok.Count) { $live.latency = (Invoke-Ot $Exe @('--bench', 'latency') $e 30).Out | ConvertFrom-Json }
-                Write-Host ("live {0}: {1}/{2} ok {3}" -f $m, $ok.Count, $hist.Count, (($live.per_model[$m].errors) -join ' | '))
+                $verdict = if ($verified.Count) { 'VERIFIED' } else { 'UNVERIFIED' }
+                Write-Host ("live {0}: {4} - {1}/{2} ok, {5} with the spoken words {3}" -f $m, $ok.Count, $hist.Count, (($live.per_model[$m].errors) -join ' | '), $verdict, $verified.Count)
             }
             finally {
                 Stop-Daemon $Exe $daemon $e
@@ -403,7 +406,7 @@ $(if ($R.settings) { "Settings window: opened in $($R.settings_open_ms) ms; priv
 
 ## Live check (OpenRouter, ``:free`` models only)
 
-$(if ($R.live) { "$($R.live.ok) of $($R.live.rounds) live dictations succeeded.`n`n| Model | OK | Errors reported (redacted by OpenTalk) |`n|---|---|---|`n" + (($R.live.per_model.Keys | ForEach-Object { $pm = $R.live.per_model[$_]; "| ``$_`` | $($pm.ok) / $($pm.total) | $((@($pm.errors) | ForEach-Object { $_ -replace '\|', '/' }) -join '; ') |" }) -join "`n") } else { 'Not run.' })
+$(if ($R.live) { "$($R.live.verified) of $($R.live.rounds) live dictations VERIFIED (transcript contains the spoken words); $($R.live.ok) returned any text. $(if ($R.live.verified -eq 0) { '**UNVERIFIED:** no free model produced a transcript of the audio, so this run says nothing about live STT correctness.' })`n`n| Model | OK | Errors reported (redacted by OpenTalk) |`n|---|---|---|`n" + (($R.live.per_model.Keys | ForEach-Object { $pm = $R.live.per_model[$_]; "| ``$_`` | $($pm.ok) / $($pm.total) | $((@($pm.errors) | ForEach-Object { $_ -replace '\|', '/' }) -join '; ') |" }) -join "`n") } else { 'Not run.' })
 
 Free OpenRouter models are rate limited and sometimes not available to non-agent clients, so this section is a smoke test of the real
 network path, not a latency reference; the table above is measured against a local mock to isolate OpenTalk's own cost.
