@@ -62,6 +62,7 @@ $wavMs = Get-WavMs $wav
 $outDir = Join-Path $PSScriptRoot 'out'
 New-Item -ItemType Directory -Force -Path $outDir | Out-Null
 $R = @{}
+$mock = $null   # set by the idle section; the trap below reads it under strict mode
 # Optional scenarios leave their key null (the report reads them under strict mode).
 foreach ($k in 'recording_mic', 'settings', 'settings_open_ms', 'daemon_with_settings', 'daemon_after_settings') { $R[$k] = $null }
 
@@ -219,6 +220,8 @@ Write-Host ("startup: process->window median {0} ms; daemon-reported ready {1} m
 
 # ---- idle -------------------------------------------------------------------------------
 $mock = Start-Mock $Exe 0
+# An error that ends the script must not leave the mock STT running (each daemon has its own finally).
+trap { if ($mock) { Stop-Quietly $mock.Proc }; break }
 $baseEnv = @{ OPENTALK_INJECT_WAV = $wav; OPENTALK_STT_BASE_URL = $mock.Url; OPENTALK_SECRET_OPENAI = 'bench-dummy-key-123456' }
 $h = New-TempHome 'ot-bench'
 $e = New-Env $h $baseEnv

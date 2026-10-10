@@ -327,7 +327,7 @@ function Read-KeepBlocks([string]$text) {
         $bare = $line.TrimEnd("`r", "`n")
         if ($null -eq $cur) {
             if ($bare.Trim() -match '^<!-- keep:begin (\S+) -->$') {
-                $cur = @{ Name = $Matches[1]; Text = New-Object Text.StringBuilder; Anchor = $anchor; Heading = $null }
+                $cur = @{ Name = $Matches[1]; Text = New-Object Text.StringBuilder; Anchor = $anchor; Heading = $null; Unterminated = $false }
                 [void]$cur.Text.Append($line)
             } elseif ($bare -match '^## ') { $anchor = Get-HeadingKey $bare }
         } else {
@@ -340,7 +340,7 @@ function Read-KeepBlocks([string]$text) {
     }
     if ($null -ne $cur) {   # unterminated: keep the rest of the file rather than lose it
         Write-Warning ("keep block '{0}' has no end marker; keeping the rest of the file verbatim" -f $cur.Name)
-        $cur.Text = $cur.Text.ToString(); $blocks.Add([pscustomobject]$cur)
+        $cur.Text = $cur.Text.ToString(); $cur.Unterminated = $true; $blocks.Add([pscustomobject]$cur)
     }
     return $blocks.ToArray()
 }
@@ -404,9 +404,12 @@ function Write-ReportKeepingBlocks([string]$path, [string]$generated) {
         try { $oldText = (New-Object Text.UTF8Encoding($false, $true)).GetString($bytes, $skip, $bytes.Length - $skip) }
         catch { throw "$path is not valid UTF-8; refusing to overwrite it" }
     }
+    $old = @(if ($oldText) { Read-KeepBlocks $oldText })
+    foreach ($b in $old) {
+        if ($b.Unterminated) { throw "keep block '$($b.Name)' in $path has no '<!-- keep:end $($b.Name) -->' line; add it (the file was left untouched)" }
+    }
     $merged = Merge-KeepBlocks $generated $oldText
     # Invariant: every old block is present, unchanged.
-    $old = @(if ($oldText) { Read-KeepBlocks $oldText })
     $new = @(Read-KeepBlocks $merged)
     foreach ($b in $old) {
         $n = @($new | Where-Object { $_.Name -eq $b.Name })
