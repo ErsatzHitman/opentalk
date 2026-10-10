@@ -18,9 +18,19 @@ pub const WIN_H: f32 = 120.0;
 pub const DOCK: f32 = 12.0;
 pub const IDLE_SIZE: (f32, f32) = (40.0, 40.0);
 pub const REC_SIZE: (f32, f32) = (98.0, 36.0);
-pub const CANCEL_SIZE: f32 = 28.0;
+/// Gap between the pill and its detached cancel button (the app bubble's gap on the other side).
 pub const CANCEL_GAP: f32 = 8.0;
+/// The button is clickable once it has emerged this far (`cancel_t`).
+pub const CANCEL_LIVE: f32 = 0.8;
+/// Size the button grows from as it slides out of the pill (fraction of its final diameter).
+pub const CANCEL_FROM: f32 = 0.6;
 pub const BUBBLE_GAP: f32 = 8.0;
+/// Width of the layered window for the two non-right panel positions: bubble 36 + 8 + capsule 98 + 8 +
+/// cancel 36 plus the 12 px glow margin on both sides does not fit 208 px there. The window is
+/// transparent and click-through outside the surfaces, so extra width costs nothing visible; it grows
+/// on the side away from the screen edge, so the pill stays where it was.
+pub const WIN_W_LEFT: f32 = 212.0;
+pub const WIN_W_CENTER: f32 = 264.0;
 pub const ICON_PX: f32 = 22.0;
 /// Cross-fade between two app icons when the foreground app changes during a dictation.
 pub const ICON_SWAP_MS: f64 = 180.0;
@@ -241,7 +251,7 @@ pub struct Geometry {
     pub pill: Rect,
     pub cancel_t: f32,
     pub bubble_t: f32,
-    /// Cancel circle centre/radius.
+    /// Cancel circle centre/radius (the detached button; the radius grows from `CANCEL_FROM`).
     pub cancel: (f32, f32, f32),
     /// Bubble circle centre/radius.
     pub bubble: (f32, f32, f32),
@@ -279,7 +289,6 @@ pub struct RenderState {
     pub(crate) divider: Track,
     pub(crate) glow: Track,
     pub(crate) cancel: Track,
-    pub(crate) fused: Track,
     pub(crate) bubble: Track,
     pub(crate) cancel_hot: Track,
     pub(crate) appearance: Blend<Appearance>,
@@ -323,7 +332,6 @@ impl RenderState {
             divider: Track::new(0.0),
             glow: Track::new(0.0),
             cancel: Track::new(0.0),
-            fused: Track::new(0.0),
             bubble: Track::new(0.0),
             cancel_hot: Track::new(0.0),
             appearance: Blend::new(appearance(look, &pal)),
@@ -495,18 +503,6 @@ impl RenderState {
             let dur = CANCEL_EMERGE_MS * (want - cur).abs() as f64;
             self.cancel.set_at(now, want, dur.max(1.0), HOUSE);
         }
-        // the fused skin owns the surface while the bud exists
-        let fused_want = if want > 0.0 || self.cancel.value(now) > 0.0 { 1.0 } else { 0.0 };
-        if fused_want > 0.5 {
-            retarget(&mut self.fused, now, 1.0, CHROME_MS, CSS_EASE_OUT);
-        } else {
-            retarget(&mut self.fused, now, 0.0, CHROME_MS, CSS_EASE_OUT);
-        }
-        if want == 0.0 && self.cancel.value(now) > 0.0 {
-            // release the surface when the bud has been swallowed
-            let end = self.cancel.end_time();
-            self.fused.set_at(end, 0.0, CHROME_MS, CSS_EASE_OUT);
-        }
         // cancel glyph colour (hover)
         retarget(&mut self.cancel_hot, now, if self.pointer.cancel { 1.0 } else { 0.0 }, 150.0, Bezier::new(0.4, 0.0, 0.2, 1.0));
         // app bubble: fades in with the expansion
@@ -603,19 +599,21 @@ impl RenderState {
         let h = IDLE_SIZE.1 + (REC_SIZE.1 - IDLE_SIZE.1) * c;
         let cancel_t = self.cancel.value(t).clamp(0.0, 1.0);
         let bubble_t = if self.app.is_some() { self.bubble.value(t).clamp(0.0, 1.0) } else { 0.0 };
-        let slot_c = cancel_t * (CANCEL_GAP + CANCEL_SIZE);
         let slot_b = bubble_t * (h + BUBBLE_GAP);
+        let ww = win_w(self.position);
+        // The cancel button never moves the pill, except docked to the right screen edge: the window
+        // cannot grow past the edge, so there the group (pill + button) keeps its 12 px dock instead.
+        let slot_c = if self.position == PanelPosition::BottomRight { cancel_t * (CANCEL_GAP + h) } else { 0.0 };
         let x = match self.position {
-            PanelPosition::BottomRight => WIN_W - DOCK - slot_c - w,
+            PanelPosition::BottomRight => ww - DOCK - slot_c - w,
             PanelPosition::BottomLeft => DOCK + slot_b,
-            PanelPosition::BottomCenter => (WIN_W - (slot_b + w + slot_c)) * 0.5 + slot_b,
+            PanelPosition::BottomCenter => (ww - (slot_b + w)) * 0.5 + slot_b,
         };
         let y = WIN_H - DOCK - h;
         let pill = Rect::from_xywh(x, y, w, h);
         let cy = pill.cy();
-        let cancel = (pill.r + slot_c - CANCEL_SIZE * 0.5, cy, CANCEL_SIZE * 0.5);
         let bubble = (pill.l - slot_b + h * 0.5, cy, h * 0.5);
-        Geometry { compact: c, pill, cancel_t, bubble_t, cancel, bubble }
+        Geometry { compact: c, pill, cancel_t, bubble_t, cancel: cancel_circle(pill, cancel_t), bubble }
     }
 
     /// Hit test in logical window coordinates.
@@ -628,13 +626,19 @@ impl RenderState {
         if sd_capsule(lx, ly, p.cx(), p.cy(), p.w(), p.h()) <= 0.0 {
             return Hit::Pill;
         }
-        if g.cancel_t > 0.0 {
+        if g.cancel_t > 0.0 || self.cancel.target() > 0.5 {
             let (cx, cy, r) = g.cancel;
-            if (lx - cx).hypot(ly - cy) <= r && g.cancel_t * (CANCEL_GAP + CANCEL_SIZE) >= CANCEL_SIZE {
-                return Hit::Cancel;
+            if g.cancel_t > 0.0 && (lx - cx).hypot(ly - cy) <= r {
+                return if g.cancel_t >= CANCEL_LIVE { Hit::Cancel } else { Hit::Gap };
             }
-            // the row between pill and bud
-            if lx >= p.r - 1.0 && lx <= cx + r && (ly - p.cy()).abs() <= p.h() * 0.5 {
+            // the gap between pill and button, and the spot the button is heading for, count as
+            // hovered while it is wanted, so crossing the gap never drops the hover; the transparent
+            // corners beyond the circle do not
+            let rest = cancel_circle(p, if self.cancel.target() > 0.5 { 1.0 } else { g.cancel_t });
+            if (lx - rest.0).hypot(ly - rest.1) <= rest.2 {
+                return Hit::Gap;
+            }
+            if lx >= p.r - 1.0 && lx <= rest.0 - rest.2 && (ly - p.cy()).abs() <= p.h() * 0.5 {
                 return Hit::Gap;
             }
         }
@@ -658,7 +662,7 @@ impl RenderState {
 
     /// Cursor-over-cancel is only meaningful when interactive.
     pub fn cancel_interactive(&self, t: f64) -> bool {
-        self.cancel.value(t) * (CANCEL_GAP + CANCEL_SIZE) >= CANCEL_SIZE
+        self.cancel.value(t) >= CANCEL_LIVE
     }
 
     // --- tooltip ---------------------------------------------------------------------------
@@ -712,7 +716,6 @@ impl RenderState {
             &self.divider,
             &self.glow,
             &self.cancel,
-            &self.fused,
             &self.bubble,
             &self.cancel_hot,
             &self.icon_swap,
@@ -754,7 +757,6 @@ impl RenderState {
             &mut self.divider,
             &mut self.glow,
             &mut self.cancel,
-            &mut self.fused,
             &mut self.bubble,
             &mut self.cancel_hot,
             &mut self.icon_swap,
@@ -784,6 +786,24 @@ pub struct TickOutcome {
     pub error_gone: bool,
 }
 
+/// Width of the layered window for a panel position (logical px).
+pub fn win_w(pos: PanelPosition) -> f32 {
+    match pos {
+        PanelPosition::BottomRight => WIN_W,
+        PanelPosition::BottomLeft => WIN_W_LEFT,
+        PanelPosition::BottomCenter => WIN_W_CENTER,
+    }
+}
+
+/// The detached cancel button for an emergence `e` (0 hidden inside the pill's right end, 1 at rest):
+/// a circle as tall as the pill, `CANCEL_GAP` right of it, sliding out of the right end while it grows.
+pub fn cancel_circle(pill: Rect, e: f32) -> (f32, f32, f32) {
+    let e = e.clamp(0.0, 1.0);
+    let rad = pill.h() * 0.5;
+    let cx = (pill.r - rad) + e * (CANCEL_GAP + 2.0 * rad);
+    (cx, pill.cy(), rad * (CANCEL_FROM + (1.0 - CANCEL_FROM) * e))
+}
+
 /// Window size in logical px for the current content.
 pub fn window_size(st: &RenderState) -> (f32, f32) {
     match &st.error {
@@ -791,7 +811,7 @@ pub fn window_size(st: &RenderState) -> (f32, f32) {
             let l = e.layout(st.scale);
             (l.win_w, l.win_h)
         }
-        None => (WIN_W, WIN_H),
+        None => (win_w(st.position), WIN_H),
     }
 }
 
@@ -856,25 +876,97 @@ mod tests {
         assert_eq!(s.geometry(500.0).pill.w(), 40.0);
     }
 
-    #[test]
-    fn hover_cancel_and_position_shift() {
+    fn hovering(pos: PanelPosition, bubble: bool) -> RenderState {
         let mut s = st();
+        s.set_position(pos);
         s.set_mode(PillMode::Recording, 0.0);
+        if bubble {
+            s.set_app(Some(AppBubble::new("Explorer", &vec![255u8; 8 * 8 * 4], 8, 1.0).unwrap()), 0.0);
+        }
         s.settle();
+        s
+    }
+
+    #[test]
+    fn hover_detaches_a_round_cancel_button_docked_right() {
+        let mut s = hovering(PanelPosition::BottomRight, false);
         s.set_pointer(Pointer { group: true, pill: true, bubble: false, cancel: false }, 1000.0);
-        // before emergence: pill at the right dock
-        assert!((s.geometry(1000.0).pill.r - 196.0).abs() < 0.01);
-        // after: the group (pill + 8 + 28) stays anchored, pill slides left 36 px
+        // before emergence: pill at the right dock, button hidden inside its right end
+        let g0 = s.geometry(1000.0);
+        assert!((g0.pill.r - 196.0).abs() < 0.01 && g0.cancel_t == 0.0);
+        assert_eq!(s.hit_test(g0.pill.r + 10.0, 90.0, 1000.0), Hit::Gap, "the spot the button is heading for is hovered");
+        // after: a 36 px circle (the pill's height) 8 px right of the pill; the window cannot grow past the
+        // screen edge, so the group (pill + 8 + 36) keeps the pill's 12 px dock and the pill slides left 44
         let g = s.geometry(1400.0);
-        assert!((g.pill.r - 160.0).abs() < 0.01, "{g:?}");
-        assert!((g.cancel.0 - 182.0).abs() < 0.01 && g.cancel.2 == 14.0);
-        assert_eq!(s.hit_test(182.0, 90.0, 1400.0), Hit::Cancel);
-        assert_eq!(s.hit_test(164.0, 90.0, 1400.0), Hit::Gap);
+        assert!((g.pill.r - 152.0).abs() < 0.01, "{g:?}");
+        assert!((g.cancel.2 * 2.0 - 36.0).abs() < 0.01 && (g.cancel.0 - g.cancel.2 - g.pill.r - 8.0).abs() < 0.01, "{g:?}");
+        assert!((g.cancel.0 + g.cancel.2 - (208.0 - 12.0)).abs() < 0.01);
+        assert_eq!(g.cancel.1, g.pill.cy());
+        assert_eq!(s.hit_test(g.cancel.0, 90.0, 1400.0), Hit::Cancel);
+        // the gap between the surfaces keeps the hover, the transparent corners beyond the circle do not
+        assert_eq!(s.hit_test(g.pill.r + 4.0, 90.0, 1400.0), Hit::Gap);
+        assert_eq!(s.hit_test(g.cancel.0 + g.cancel.2 - 1.0, g.cancel.1 - g.cancel.2 + 1.0, 1400.0), Hit::None);
+        assert_eq!(s.hit_test(g.pill.r + 4.0, g.pill.t - 4.0, 1400.0), Hit::None);
         assert_eq!(s.hit_test(100.0, 90.0, 1400.0), Hit::Pill);
         assert_eq!(s.hit_test(5.0, 5.0, 1400.0), Hit::None);
-        // leave: the bud retracts
+        // leave: the button retracts into the pill, which slides back
         s.set_pointer(Pointer::default(), 2000.0);
-        assert!((s.geometry(2400.0).pill.r - 196.0).abs() < 0.01);
+        let g = s.geometry(2400.0);
+        assert!((g.pill.r - 196.0).abs() < 0.01 && g.cancel_t == 0.0);
+    }
+
+    #[test]
+    fn cancel_button_never_moves_the_pill_off_the_right_edge() {
+        for pos in [PanelPosition::BottomLeft, PanelPosition::BottomCenter] {
+            for bubble in [false, true] {
+                let mut s = hovering(pos, bubble);
+                let before = s.geometry(1000.0);
+                s.set_pointer(Pointer { group: true, pill: true, bubble: false, cancel: false }, 1000.0);
+                for t in (1000..1400).step_by(20) {
+                    let g = s.geometry(t as f64);
+                    assert_eq!(g.pill, before.pill, "{pos:?} bubble {bubble} t {t}");
+                    assert_eq!(g.bubble, before.bubble);
+                }
+                let g = s.geometry(1400.0);
+                // the button, its 12 px glow margin and the window all fit
+                let ww = win_w(pos);
+                assert!(g.cancel.0 + g.cancel.2 + DOCK <= ww + 0.01, "{pos:?} bubble {bubble}: {g:?} in {ww}");
+                assert!(g.bubble.0 - g.bubble.2 >= 0.0);
+                assert_eq!(s.hit_test(g.cancel.0, g.cancel.1, 1400.0), Hit::Cancel);
+            }
+        }
+    }
+
+    #[test]
+    fn cancel_is_clickable_only_once_it_has_emerged() {
+        let mut s = hovering(PanelPosition::BottomLeft, false);
+        s.set_pointer(Pointer { group: true, pill: true, bubble: false, cancel: false }, 1000.0);
+        // sliding out: the circle is part of the hovered group but not yet a button
+        let early = (4000..5120).map(|t| t as f64 * 0.25).find(|&t| s.cancel.value(t) > 0.3 && s.cancel.value(t) < 0.6).unwrap();
+        let g = s.geometry(early);
+        assert_eq!(s.hit_test(g.cancel.0 + g.cancel.2 - 2.0, g.cancel.1, early), Hit::Gap);
+        assert!(!s.cancel_interactive(early));
+        assert!(s.cancel_interactive(1300.0));
+        assert_eq!(s.pointer_for(Hit::Cancel), Pointer { group: true, pill: false, bubble: false, cancel: true });
+        assert!(s.pointer_for(Hit::Gap).group);
+    }
+
+    #[test]
+    fn cancel_circle_follows_the_pill_height() {
+        let pill = Rect::from_xywh(100.0, 70.0, 40.0, 40.0);
+        let (cx, cy, r) = cancel_circle(pill, 1.0);
+        assert_eq!((cx, cy, r), (140.0 + 8.0 + 20.0, 90.0, 20.0));
+        let (cx, _, r) = cancel_circle(pill, 0.0);
+        assert!((cx - 120.0).abs() < 1e-4 && (r - 20.0 * CANCEL_FROM).abs() < 1e-4);
+    }
+
+    #[test]
+    fn window_width_per_panel_position() {
+        assert_eq!(win_w(PanelPosition::BottomRight), 208.0);
+        assert!(win_w(PanelPosition::BottomLeft) > 208.0 && win_w(PanelPosition::BottomCenter) > win_w(PanelPosition::BottomLeft));
+        let mut s = st();
+        s.set_position(PanelPosition::BottomCenter);
+        assert_eq!(window_size(&s), (WIN_W_CENTER, WIN_H));
     }
 
     #[test]
@@ -884,7 +976,7 @@ mod tests {
         assert_eq!(s.geometry(0.0).pill.l, 12.0);
         s.set_position(PanelPosition::BottomCenter);
         let p = s.geometry(0.0).pill;
-        assert!((p.cx() - 104.0).abs() < 0.01);
+        assert!((p.cx() - win_w(PanelPosition::BottomCenter) * 0.5).abs() < 0.01);
     }
 
     #[test]

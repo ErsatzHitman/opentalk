@@ -85,13 +85,11 @@ fn draw_glow(cv: &mut Canvas, st: &RenderState, g: &Geometry, t: f64) {
     }
 }
 
-/// 2-5. App bubble, pill shadow, fused cancel skin, pill body and hover gradient; then the logo and
-/// the divider. The bubble, the pill and the skin are liquid glass over the frosted backdrop.
+/// 2-5. App bubble, cancel button, pill shadow, pill body and hover gradient; then the logo and
+/// the divider. The bubble, the cancel button and the pill are liquid glass over the frosted backdrop.
 fn draw_under(cv: &mut Canvas, st: &RenderState, g: &Geometry, t: f64) {
     let pal = st.pal;
     let app = st.appearance_at(t);
-    let fused = st.fused.value(t).clamp(0.0, 1.0);
-    let chrome_alpha = 1.0 - fused;
     let backdrop = st.backdrop_or_neutral();
     let ctx = Ctx { backdrop: &backdrop, dark: pal.dark };
 
@@ -101,22 +99,20 @@ fn draw_under(cv: &mut Canvas, st: &RenderState, g: &Geometry, t: f64) {
             draw_bubble(cv, st, &ctx, g, &app, a, t);
         }
 
-    // 3. pill shadow (fades with the chrome once the liquid skin owns the surface)
+    // 3. detached cancel button: slides out from behind the pill, so it is painted first
+    if g.cancel_t > 0.003 {
+        draw_cancel_button(cv, &ctx, g, &app);
+    }
+
+    // 3b. pill shadow
     let p = g.pill;
     let r = p.h().min(p.w()) * 0.5;
     let pill_sdf = move |x: f32, y: f32| sd_capsule(x, y, p.cx(), p.cy(), p.w(), p.h());
     let pill = Surface { field: p, radius: Some(r), sdf: &pill_sdf };
-    glass::paint_shadow(cv, &pill, app.shadow, chrome_alpha);
-
-    // 4. fused cancel skin
-    if g.cancel_t > 0.0 || fused > 0.002 {
-        draw_skin(cv, &ctx, g, &app, fused);
-    }
+    glass::paint_shadow(cv, &pill, app.shadow, 1.0);
 
     // 5. pill body
-    if chrome_alpha > 0.002 {
-        glass::paint(cv, &ctx, &pill, &Params { alpha: chrome_alpha, shadow: app.shadow, shadow_alpha: 0.0, lift: app.lift, edge: app.edge, frost: None });
-    }
+    glass::paint(cv, &ctx, &pill, &Params { alpha: 1.0, shadow: app.shadow, shadow_alpha: 0.0, lift: app.lift, edge: app.edge, frost: None });
     let grad = st.grad.value(t);
     if grad > 0.002 {
         draw_hover_gradient(cv, p, pal.fg, grad);
@@ -135,7 +131,7 @@ fn draw_over(cv: &mut Canvas, st: &RenderState, g: &Geometry, t: f64) {
 
     // 7. cancel glyph
     if g.cancel_t > 0.35 {
-        let a = ((g.cancel_t - 0.35) / 0.65).clamp(0.0, 1.0);
+        let a = cancel_glyph_alpha(g.cancel_t);
         let hot = st.cancel_hot.value(t);
         let col = pal.muted_fg.lerp(pal.fg, hot);
         draw_x_glyph(cv, g.cancel.0, g.cancel.1, col, a);
@@ -340,52 +336,30 @@ fn blit_icon(cv: &mut Canvas, ic: &Pixmap, (bx, by): (f32, f32), s: f32, alpha: 
     }
 }
 
-// --- liquid fusion skin -----------------------------------------------------------------
+// --- detached cancel button ---------------------------------------------------------------
 
-fn smin(a: f32, b: f32, k: f32) -> f32 {
-    if k <= 0.0 {
-        return a.min(b);
-    }
-    let h = (0.5 + 0.5 * (b - a) / k).clamp(0.0, 1.0);
-    b * (1.0 - h) + a * h - k * h * (1.0 - h)
+/// Opacity of the button's glass while it slides out (`cancel_t` 0..1): in by the time it has cleared
+/// the pill's end.
+fn cancel_alpha(t: f32) -> f32 {
+    let c = (t / 0.7).clamp(0.0, 1.0);
+    c * c * (3.0 - 2.0 * c)
 }
 
-/// `emergenceBlend`: smoothstep from a hard union to the full fillet (k = 24).
-pub fn emergence_blend(t: f32) -> f32 {
-    let c = t.clamp(0.0, 1.0);
-    24.0 * c * c * (3.0 - 2.0 * c)
+/// Opacity of the X glyph: it joins in the second half of the emergence.
+fn cancel_glyph_alpha(t: f32) -> f32 {
+    ((t - 0.35) / 0.65).clamp(0.0, 1.0)
 }
 
-/// Smooth-union SDF of pill capsule and cancel circle (window space).
-pub fn fusion_field(g: &Geometry, k: f32, x: f32, y: f32) -> f32 {
-    let p = g.pill;
-    let d_pill = sd_capsule(x, y, p.cx(), p.cy(), p.w(), p.h());
+/// The cancel button: a glass circle with the bubble's recipe (surface, rim, border, shadow), as tall as
+/// the pill and `CANCEL_GAP` beside it.
+fn draw_cancel_button(cv: &mut Canvas, ctx: &Ctx, g: &Geometry, app: &Appearance) {
     let (cx, cy, r) = g.cancel;
-    let d_circle = (x - cx).hypot(y - cy) - r;
-    smin(d_pill, d_circle, k)
-}
-
-/// The fused pill + cancel bud as one glass surface. `fused` (0..1) weights its shadow, which takes
-/// over from the pill's own as the bud emerges.
-fn draw_skin(cv: &mut Canvas, ctx: &Ctx, g: &Geometry, app: &Appearance, fused: f32) {
-    let k = emergence_blend(g.cancel_t);
-    let p = g.pill;
-    let (ccx, ccy, cr) = g.cancel;
-    let field = Rect::new(p.l.min(ccx - cr), p.t.min(ccy - cr), p.r.max(ccx + cr), p.b.max(ccy + cr));
-    let e = 0.25 / cv.scale;
-    let f = |x: f32, y: f32| fusion_field(g, k, x, y);
-    // distance normalised by the field gradient (smin is not a true distance), near the edge only
-    let sdf = move |x: f32, y: f32| {
-        let d = f(x, y);
-        if d.abs() > 4.0 {
-            return d;
-        }
-        let gx = (f(x + e, y) - f(x - e, y)) / (2.0 * e);
-        let gy = (f(x, y + e) - f(x, y - e)) / (2.0 * e);
-        d / gx.hypot(gy).max(0.25)
-    };
-    let surf = Surface { field, radius: None, sdf: &sdf };
-    glass::paint(cv, ctx, &surf, &Params { alpha: 1.0, shadow: app.shadow, shadow_alpha: fused, lift: app.lift, edge: app.edge, frost: None });
+    let d = r * 2.0;
+    let alpha = cancel_alpha(g.cancel_t);
+    let field = Rect::new(cx - r, cy - r, cx + r, cy + r);
+    let sdf = move |x: f32, y: f32| sd_capsule(x, y, cx, cy, d, d);
+    let surf = Surface { field, radius: Some(r), sdf: &sdf };
+    glass::paint(cv, ctx, &surf, &Params { alpha, shadow: app.shadow, shadow_alpha: alpha, lift: app.lift, edge: app.edge, frost: None });
 }
 
 // --- tooltip -----------------------------------------------------------------------------
@@ -523,7 +497,7 @@ fn classify(st: &RenderState, t: f64) -> Option<Kind> {
     if st.error().is_some() || st.pulse_since.is_some() {
         return None;
     }
-    let tracks = [&st.compact, &st.grad, &st.wave_live, &st.wave_rest, &st.divider, &st.glow, &st.cancel, &st.fused, &st.bubble, &st.cancel_hot, &st.icon_swap];
+    let tracks = [&st.compact, &st.grad, &st.wave_live, &st.wave_rest, &st.divider, &st.glow, &st.cancel, &st.bubble, &st.cancel_hot, &st.icon_swap];
     if tracks.iter().any(|tr| tr.is_active(t)) || st.appearance.is_active(t) {
         return None;
     }
@@ -577,7 +551,7 @@ fn signature(st: &RenderState, t: f64, g: &Geometry, size: (u32, u32), kind: Kin
     for v in [a.shadow.dy, a.shadow.blur, a.shadow.spread, a.shadow.alpha] {
         h.f(v);
     }
-    for v in [st.fused.value(t), st.grad.value(t), st.cancel_hot.value(t), st.divider.value(t), st.wave_live.value(t), st.wave_rest.value(t)] {
+    for v in [st.grad.value(t), st.cancel_hot.value(t), st.divider.value(t), st.wave_live.value(t), st.wave_rest.value(t)] {
         h.f(v);
     }
     // the icon's address identifies its pixels; the cache keeps the Arc alive so it cannot be reused
@@ -914,25 +888,23 @@ mod tests {
     }
 
     #[test]
-    fn emergence_blend_is_smoothstep() {
-        assert_eq!(emergence_blend(0.0), 0.0);
-        assert_eq!(emergence_blend(1.0), 24.0);
-        assert!((emergence_blend(0.5) - 12.0).abs() < 1e-4);
-    }
-
-    #[test]
-    fn fusion_field_matches_hard_union_at_zero_blend() {
+    fn cancel_button_is_a_separate_glass_circle_beside_the_pill() {
         let mut s = rec_state(false);
         s.settle();
         s.set_pointer(Pointer { group: true, pill: true, bubble: false, cancel: false }, 1000.0);
-        let g = s.geometry(2000.0);
-        let a = fusion_field(&g, 0.0, g.pill.cx(), g.pill.cy());
-        assert!(a < -17.0);
-        // inside the neck between pill and bud the smooth union is more inside than the hard union
-        let x = g.pill.r + 4.0;
-        let hard = fusion_field(&g, 0.0, x, g.pill.cy());
-        let soft = fusion_field(&g, 24.0, x, g.pill.cy());
-        assert!(soft < hard);
+        let t = 2000.0;
+        let g = s.geometry(t);
+        let (cx, cy, r) = g.cancel;
+        // as tall as the pill, 8 px to its right
+        assert!((r * 2.0 - g.pill.h()).abs() < 0.01 && (cx - r - g.pill.r - 8.0).abs() < 0.01, "{g:?}");
+        let pm = render(&s, t);
+        // glass in the button, X glyph on top of it, and the 8 px gap between the two surfaces shows
+        // (almost) nothing but the soft shadows: no neck
+        assert_eq!(alpha_at(&pm, (cx - r + 3.0) as u32, cy as u32), 255);
+        let mid = alpha_at(&pm, (g.pill.r + 4.0) as u32, cy as u32);
+        assert!(mid < 120, "gap alpha {mid}");
+        let glyph = pm.pixel(cx as u32, cy as u32).unwrap();
+        assert!(glyph.red() < 0xa0, "X glyph {glyph:?}");
     }
 
     #[test]
@@ -1320,7 +1292,7 @@ mod tests {
     #[test]
     fn glass_follows_the_backdrop_in_every_surface() {
         use crate::daemon::pill::glass::{Backdrop, DEFAULT_PAGE, Frosted};
-        // pill, bubble and the fused cancel bud all take their colour from what is behind them
+        // pill, bubble and the detached cancel button all take their colour from what is behind them
         let mut s = rec_state(false);
         s.set_app(Some(AppBubble::new("App", &[0u8; 8 * 8 * 4], 8, 1.0).unwrap()), 0.0);
         let mut t = 0.0;
@@ -1336,7 +1308,7 @@ mod tests {
         let dark = probe(&mut s, [0, 0, 0]);
         let bright = probe(&mut s, [255, 255, 255]);
         let lum = |pm: &Pixmap, x: f32, y: f32| pm.pixel(x as u32, y as u32).unwrap().red() as i32;
-        for (name, x, y) in [("pill", g.pill.l + 4.0, g.pill.cy()), ("bubble", g.bubble.0 - g.bubble.2 + 3.0, g.bubble.1), ("cancel bud", g.cancel.0, g.cancel.1 + g.cancel.2 - 4.0)] {
+        for (name, x, y) in [("pill", g.pill.l + 4.0, g.pill.cy()), ("bubble", g.bubble.0 - g.bubble.2 + 3.0, g.bubble.1), ("cancel button", g.cancel.0, g.cancel.1 + g.cancel.2 - 4.0)] {
             assert!(lum(&bright, x, y) > lum(&dark, x, y) + 30, "{name}: {} vs {}", lum(&bright, x, y), lum(&dark, x, y));
         }
     }
