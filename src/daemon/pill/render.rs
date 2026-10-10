@@ -989,6 +989,27 @@ mod tests {
     }
 
     #[test]
+    fn lane_updates_match_the_full_render_at_every_dock_position() {
+        for pos in [PanelPosition::BottomLeft, PanelPosition::BottomCenter, PanelPosition::BottomRight] {
+            let mut s = RenderState::new(Palette::get(true), 1.5, pos);
+            s.set_mode(PillMode::Recording, 0.0);
+            let mut t = 0.0;
+            run(&mut s, &mut t, 1500.0, &speech);
+            let mut pm = new_pm(&s);
+            let mut cache = FrameCache::new();
+            cache.render(&s, t, &mut pm);
+            for _ in 0..60 {
+                s.tick(t, speech(t));
+                if let FrameOutcome::Dirty(r) = cache.render(&s, t, &mut pm) {
+                    assert!(r.area() * 10 < full_rect(&pm).area(), "{pos:?}: {r:?} is not small");
+                }
+                assert!(max_diff(&pm, &render(&s, t)) <= 2, "{pos:?}: drifted at {t}");
+                t += FRAME;
+            }
+        }
+    }
+
+    #[test]
     fn silent_recording_frames_are_skipped() {
         let mut s = rec_state(true);
         let mut t = 0.0;
