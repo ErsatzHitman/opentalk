@@ -175,10 +175,7 @@ impl Drop for HiResTimer {
     }
 }
 
-/// Paced upload of `body` over loopback at `mbps`; returns milliseconds until the receiver replied.
-///
-/// Deadline pacing: write `i` is due at `start + i * interval`. A write that is late is sent at once, so
-/// sub-granularity intervals (234 us at 50 Mbps) average out to the right rate in bursts.
+/// Sets 4 MiB `SO_RCVBUF`/`SO_SNDBUF` on `sock` (see README, "Why 4 MiB socket buffers").
 fn set_buffers(sock: &impl AsRawSocket) {
     use windows::Win32::Networking::WinSock::{SO_RCVBUF, SO_SNDBUF, SOCKET, SOL_SOCKET, setsockopt};
     let v = BIG_BUF.to_ne_bytes();
@@ -190,6 +187,10 @@ fn set_buffers(sock: &impl AsRawSocket) {
     }
 }
 
+/// Paced upload of `body` over loopback at `mbps`; returns the timings of the run.
+///
+/// Deadline pacing: write `i` is due at `start + i * interval`. A write that is late is sent at once, so
+/// sub-granularity intervals (234 us at 50 Mbps) average out to the right rate in bursts.
 fn paced_upload(body: &[u8], mbps: f64, timer: &HiResTimer, spin: bool, big: bool) -> Run {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     if big {
@@ -344,5 +345,50 @@ fn main() {
     };
     if !skip_upload {
         run_upload(&enc, spin, big, verbose);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixtures() -> PathBuf {
+        PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/fixtures"))
+    }
+
+    #[test]
+    fn noise_is_deterministic_and_bounded() {
+        let clip = Clip { name: "z".into(), samples: vec![0; 10_000], wav_bytes: 0 };
+        let a = with_noise(&clip, 30, 7);
+        let b = with_noise(&clip, 30, 7);
+        assert_eq!(a.samples, b.samples);
+        assert!(a.samples.iter().all(|s| (-30..=30).contains(s)));
+        assert!(a.samples.iter().any(|&s| s != 0));
+    }
+
+    #[test]
+    fn flac_round_trip_is_lossless() {
+        let mut rng = Rng(42);
+        let samples: Vec<i32> = (0..16_000).map(|i| ((i as f64 * 0.05).sin() * 8000.0) as i32 + rng.uniform(50)).collect();
+        let flac = encode_flac(&samples);
+        assert_eq!(decode_flac(&flac).expect("decode"), samples);
+        assert!(flac.len() < samples.len() * 2);
+    }
+
+    #[test]
+    fn clean_fixture_matches_the_benchmark_table() {
+        let clip = read_wav(&fixtures().join("tts_clean.wav"));
+        assert_eq!(clip.wav_bytes, 193_004);
+        assert_eq!(encode_flac(&clip.samples).len(), 83_207);
+    }
+
+    #[test]
+    fn paced_upload_tracks_the_formula() {
+        let timer = HiResTimer::new().expect("timer");
+        let body = vec![7u8; 100_000];
+        let run = paced_upload(&body, 20.0, &timer, false, true);
+        let formula = body.len() as f64 * 8.0 / 20e6 * 1000.0; // 40 ms
+        assert!(run.total_ms > formula * 0.8, "too fast: {} ms", run.total_ms);
+        assert!(run.total_ms < formula * 1.5 + 50.0, "too slow: {} ms", run.total_ms);
     }
 }
