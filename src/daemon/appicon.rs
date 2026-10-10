@@ -9,9 +9,9 @@
 //! read the logo the package declares instead: the install folder (from the executable's path or the
 //! process's package identity), `AppxManifest.xml`'s `Square44x44Logo`, the nearest `targetsize-N` /
 //! `scale-N` PNG next to it, decoded with the `png` crate. No COM and no shell DLLs; callers run
-//! this on a helper thread and the result stays in the per-exe cache.
+//! this on a helper thread and the result stays in a small LRU cache (see [`cached`] / [`prefetch`]:
+//! the foreground tracker fills it when an app comes to the front, the hotkey press only reads it).
 //! Icons from `HICON`s are rasterised on black and white to recover their alpha channel.
-use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::Mutex;
 
@@ -49,48 +49,89 @@ pub struct AppIcon {
     pub size: u32,
 }
 
-type Cache = Mutex<HashMap<(String, u32), AppIcon>>;
+mod cache;
 
-fn cache() -> &'static Cache {
-    static CACHE: std::sync::OnceLock<Cache> = std::sync::OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+/// Icon size the active-app bubble asks for (the pill downsamples it to its DPI).
+pub const BUBBLE_ICON_PX: u32 = 64;
+/// The cache keeps the apps the user just worked in, not every app ever seen: at the bubble's 64 px
+/// an entry is 16 KB, so 16 entries are ~256 KB, and the byte cap bounds a (rare) larger request.
+const MAX_ICONS: usize = 16;
+const MAX_ICON_BYTES: usize = 1 << 20;
+
+type Cache = Mutex<cache::Lru<(String, u32), AppIcon>>;
+
+fn lock_cache() -> std::sync::MutexGuard<'static, cache::Lru<(String, u32), AppIcon>> {
+    static CACHE: Cache = Mutex::new(cache::Lru::new(MAX_ICONS, MAX_ICON_BYTES));
+    // The cache survives a panic elsewhere while it was held (it only ever holds whole entries).
+    CACHE.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// The cache survives a panic elsewhere while it was held (it only ever holds whole entries).
-fn lock_cache() -> std::sync::MutexGuard<'static, HashMap<(String, u32), AppIcon>> {
-    cache().lock().unwrap_or_else(|e| e.into_inner())
+fn remember(key: (String, u32), icon: &AppIcon) {
+    lock_cache().insert(key, icon.clone(), icon.rgba.len() + icon.name.len() + icon.exe_name.len());
 }
 
 /// Largest icon we ever produce (a bigger request is clamped).
 const MAX_PX: u32 = 256;
 
-/// Icon for the target's process at roughly `px` pixels (cached).
-pub fn load(target: &Target, px: u32) -> Option<AppIcon> {
-    let px = px.clamp(16, MAX_PX);
+fn key_of(path: &str, px: u32) -> (String, u32) {
+    (path.to_ascii_lowercase(), px.clamp(16, MAX_PX))
+}
+
+/// The icon if it is already resolved: no I/O, a lookup under a lock. This is what the hotkey press
+/// uses so the bubble appears with the pill; a miss falls back to [`load`] on a helper thread.
+pub fn cached(target: &Target, px: u32) -> Option<AppIcon> {
     if target.exe_path.is_empty() {
         return None;
     }
-    let key = (target.exe_path.to_ascii_lowercase(), px);
+    lock_cache().get(&key_of(&target.exe_path, px)).cloned()
+}
+
+/// Resolve and remember the icon ahead of time (the foreground tracker's worker). Never takes the
+/// shell-factory last resort of [`load`]: that loads ~35 shell DLLs (+17 MB working set) for the rest
+/// of the process's life, which a background prefetch of every app the user touches must not do. An
+/// app only that path can serve is resolved on demand when a dictation starts in it.
+pub fn prefetch(target: &Target, px: u32) -> bool {
+    if target.exe_path.is_empty() {
+        return false;
+    }
+    let key = key_of(&target.exe_path, px);
+    if lock_cache().contains(&key) {
+        return true;
+    }
+    match extract_with(&target.exe_path, target.pid, key.1, &cheap_backend, &|_, _| None, &packaged_backend) {
+        Some(icon) => {
+            remember(key, &icon);
+            true
+        }
+        None => false,
+    }
+}
+
+/// Icon for the target's process at roughly `px` pixels (cached).
+pub fn load(target: &Target, px: u32) -> Option<AppIcon> {
+    if target.exe_path.is_empty() {
+        return None;
+    }
+    let key = key_of(&target.exe_path, px);
     if let Some(hit) = lock_cache().get(&key) {
         return Some(hit.clone());
     }
-    let icon = extract(&target.exe_path, target.pid, px)?;
-    lock_cache().insert(key, icon.clone());
+    let icon = extract(&target.exe_path, target.pid, key.1)?;
+    remember(key, &icon);
     Some(icon)
 }
 
 /// Load an icon directly from an exe/ico path (used by `--render-pill --app-icon`).
 pub fn load_path(path: &str, px: u32) -> Option<AppIcon> {
-    let px = px.clamp(16, MAX_PX);
     if path.is_empty() {
         return None;
     }
-    let key = (path.to_ascii_lowercase(), px);
+    let key = key_of(path, px);
     if let Some(hit) = lock_cache().get(&key) {
         return Some(hit.clone());
     }
-    let icon = extract(path, 0, px)?;
-    lock_cache().insert(key, icon.clone());
+    let icon = extract(path, 0, key.1)?;
+    remember(key, &icon);
     Some(icon)
 }
 
@@ -950,6 +991,33 @@ mod tests {
         assert_eq!(a.size, 48);
         // different size is a different cache entry
         assert_eq!(load(&t, 32).unwrap().size, 32);
+    }
+
+    #[test]
+    fn the_cache_is_bounded_and_serves_the_hotkey_without_io() {
+        let icon = |n: usize| AppIcon { name: format!("App {n}"), exe_name: format!("app{n}.exe"), rgba: vec![9; 64 * 64 * 4], size: 64 };
+        let target = |n: usize| Target { exe_path: format!(r"C:\Apps\bounded-{n}.exe"), ..Default::default() };
+        for n in 0..(MAX_ICONS * 3) {
+            remember(key_of(&target(n).exe_path, 64), &icon(n));
+            assert!(lock_cache().len() <= MAX_ICONS && lock_cache().bytes() <= MAX_ICON_BYTES);
+        }
+        // the newest apps are hits (a lookup, no extraction), the oldest are gone
+        let last = MAX_ICONS * 3 - 1;
+        assert_eq!(cached(&target(last), 64).map(|i| i.name), Some(format!("App {last}")));
+        assert!(cached(&target(0), 64).is_none());
+        // keys ignore case; no path is never a hit
+        let upper = Target { exe_path: target(last).exe_path.to_ascii_uppercase(), ..Default::default() };
+        assert!(cached(&upper, 64).is_some());
+        assert!(cached(&Target::default(), 64).is_none());
+    }
+
+    #[test]
+    fn prefetch_resolves_a_win32_app_and_a_miss_is_not_an_error() {
+        let t = Target { exe_path: system_exe("notepad.exe"), ..Default::default() };
+        assert!(prefetch(&t, 64), "a classic exe resolves without the shell factory");
+        assert!(cached(&t, 64).is_some());
+        assert!(!prefetch(&Target { exe_path: r"C:\no\such\app.exe".into(), ..Default::default() }, 64));
+        assert!(!prefetch(&Target::default(), 64));
     }
 
     #[test]

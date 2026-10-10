@@ -22,6 +22,8 @@ pub const CANCEL_SIZE: f32 = 28.0;
 pub const CANCEL_GAP: f32 = 8.0;
 pub const BUBBLE_GAP: f32 = 8.0;
 pub const ICON_PX: f32 = 22.0;
+/// Cross-fade between two app icons when the foreground app changes during a dictation.
+pub const ICON_SWAP_MS: f64 = 180.0;
 pub const LOGO_SLOT: f32 = 22.0;
 pub const LANE_W: f32 = 52.0;
 pub const LANE_H: f32 = 24.0;
@@ -130,6 +132,11 @@ impl AppBubble {
         let src = Arc::new(src);
         let icon = Arc::new(resample(&src, (ICON_PX * scale).round().max(1.0) as u32)?);
         Some(AppBubble { name: name.to_string(), src, icon })
+    }
+
+    /// Same picture (not necessarily the same allocation): a swap to it is invisible.
+    pub fn same_image(&self, other: &AppBubble) -> bool {
+        Arc::ptr_eq(&self.src, &other.src) || (self.src.width() == other.src.width() && self.src.data() == other.src.data())
     }
 
     /// Re-prepare for a new device scale.
@@ -282,6 +289,9 @@ pub struct RenderState {
     pub(crate) rec_start: Option<f64>,
     pub(crate) wave: Waveform,
     pub(crate) app: Option<AppBubble>,
+    /// The icon being replaced and the 0..1 progress of the cross-fade to `app` (see `set_app`).
+    pub(crate) prev_icon: Option<Arc<Pixmap>>,
+    pub(crate) icon_swap: Track,
     pub(crate) error: Option<ErrorCard>,
     pub(crate) dragging: bool,
     /// The frosted screen under the window; `None` renders the glass over a flat neutral backdrop.
@@ -322,6 +332,8 @@ impl RenderState {
             rec_start: None,
             wave: Waveform::new(),
             app: None,
+            prev_icon: None,
+            icon_swap: Track::new(1.0),
             error: None,
             dragging: false,
             backdrop: None,
@@ -558,8 +570,29 @@ impl RenderState {
     }
 
     pub fn set_app(&mut self, app: Option<AppBubble>, now: f64) {
+        // A different icon replacing a visible one cross-fades; the first icon of a dictation (or a
+        // re-evaluation with the same one) does not, the bubble's own fade-in covers it.
+        let swap = match (&self.app, &app) {
+            (Some(old), Some(new)) => !old.same_image(new) && self.bubble.value(now) > 0.02,
+            _ => false,
+        };
+        if swap {
+            // a swap interrupted by another keeps the icon that is currently on screen as the "from"
+            self.prev_icon = self.app.as_ref().map(|a| a.icon.clone());
+            self.icon_swap.snap(0.0);
+            self.icon_swap.set_at(now, 1.0, ICON_SWAP_MS, CSS_EASE_OUT);
+        } else if app.is_none() {
+            self.prev_icon = None;
+            self.icon_swap.snap(1.0);
+        }
         self.app = app;
         self.sync(now, false);
+    }
+
+    /// Opacity weight of the current icon (1 when settled) and the icon fading out, if any.
+    pub fn icon_mix(&self, t: f64) -> (f32, Option<&Arc<Pixmap>>) {
+        let w = self.icon_swap.value(t).clamp(0.0, 1.0);
+        (w, if w < 0.999 { self.prev_icon.as_ref() } else { None })
     }
 
     // --- layout --------------------------------------------------------------------------
@@ -682,6 +715,7 @@ impl RenderState {
             &self.fused,
             &self.bubble,
             &self.cancel_hot,
+            &self.icon_swap,
         ];
         if tracks.iter().any(|tr| tr.is_active(t)) || self.appearance.is_active(t) {
             return true;
@@ -723,6 +757,7 @@ impl RenderState {
             &mut self.fused,
             &mut self.bubble,
             &mut self.cancel_hot,
+            &mut self.icon_swap,
         ] {
             let v = t.target();
             t.snap(v);
@@ -864,6 +899,72 @@ mod tests {
         // bubble: diameter == pill height, 8 px gap
         assert!((g.bubble.2 * 2.0 - 36.0).abs() < 0.01);
         assert!((g.pill.l - (g.bubble.0 + g.bubble.2) - 8.0).abs() < 0.01);
+    }
+
+    fn bubble_of(name: &str, v: u8) -> AppBubble {
+        AppBubble::new(name, &vec![v; 8 * 8 * 4], 8, 1.0).unwrap()
+    }
+
+    #[test]
+    fn a_new_app_cross_fades_in_the_visible_bubble() {
+        let mut s = st();
+        s.set_mode(PillMode::Recording, 0.0);
+        s.set_app(Some(bubble_of("Notepad", 100)), 0.0);
+        s.settle();
+        // settled: nothing is fading
+        let t0 = 2000.0;
+        let (w, prev) = s.icon_mix(t0);
+        assert!(w == 1.0 && prev.is_none());
+        s.set_app(Some(bubble_of("Chrome", 200)), t0);
+        assert_eq!(s.app().unwrap().name, "Chrome");
+        let (w, prev) = s.icon_mix(t0);
+        assert!(w < 0.01 && prev.is_some(), "starts on the old icon");
+        let (w, prev) = s.icon_mix(t0 + ICON_SWAP_MS * 0.5);
+        assert!(w > 0.2 && w < 0.95 && prev.is_some(), "mid-way: {w}");
+        assert!(s.icon_swap.is_active(t0 + ICON_SWAP_MS * 0.5));
+        let (w, prev) = s.icon_mix(t0 + ICON_SWAP_MS + 1.0);
+        assert_eq!((w, prev.is_none()), (1.0, true), "done: only the new icon");
+        assert!(!s.icon_swap.is_active(t0 + ICON_SWAP_MS + 1.0));
+        // the bubble itself never moves for it
+        let a = s.geometry(t0).bubble;
+        let b = s.geometry(t0 + ICON_SWAP_MS * 0.5).bubble;
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn no_cross_fade_for_the_first_icon_the_same_picture_or_a_hidden_bubble() {
+        let mut s = st();
+        s.set_mode(PillMode::Recording, 0.0);
+        // first icon of the dictation: the bubble's own fade-in covers it
+        s.set_app(Some(bubble_of("Notepad", 100)), 0.0);
+        assert!(s.prev_icon.is_none() && !s.icon_swap.is_active(0.0));
+        s.settle();
+        // the same picture again (a config re-evaluation, a duplicate lookup)
+        s.set_app(Some(bubble_of("Notepad", 100)), 2000.0);
+        assert!(s.prev_icon.is_none() && !s.icon_swap.is_active(2000.0));
+        // clearing resets
+        s.set_app(None, 2100.0);
+        assert!(s.prev_icon.is_none());
+        s.set_app(Some(bubble_of("Chrome", 200)), 2200.0);
+        assert!(s.prev_icon.is_none(), "from nothing, not a swap");
+        // a bubble that is not on screen yet (Preparing) swaps instantly
+        let mut p = st();
+        p.set_app(Some(bubble_of("Notepad", 100)), 0.0);
+        p.set_app(Some(bubble_of("Chrome", 200)), 10.0);
+        assert!(p.prev_icon.is_none() && !p.icon_swap.is_active(10.0));
+    }
+
+    #[test]
+    fn a_swap_during_a_swap_fades_from_the_icon_on_screen() {
+        let mut s = st();
+        s.set_mode(PillMode::Recording, 0.0);
+        s.set_app(Some(bubble_of("A", 50)), 0.0);
+        s.settle();
+        s.set_app(Some(bubble_of("B", 120)), 3000.0);
+        let b_icon = s.app().unwrap().icon.clone();
+        s.set_app(Some(bubble_of("C", 220)), 3050.0);
+        assert!(Arc::ptr_eq(s.prev_icon.as_ref().unwrap(), &b_icon), "the previous icon is the one shown last");
+        assert!(s.icon_mix(3050.0).0 < 0.01);
     }
 
     #[test]
