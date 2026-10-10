@@ -351,13 +351,13 @@ fn desktop_pill_backdrop_is_captured_only_while_shown_and_hash_gated() {
     assert!(w.with(|i| i.glass.grabs) >= 1, "captured on show");
     assert!(w.with(|i| i.st.backdrop.is_some()), "a backdrop is installed");
     pump(300);
-    assert_eq!(w.with(|i| i.glass_ms), 125, "~8 Hz while recording");
+    assert_eq!(w.with(|i| i.glass_ms), 250, "4 Hz while recording");
     let g0 = w.with(|i| (i.glass.grabs, i.glass.unchanged));
     pump(1500);
     let g1 = w.with(|i| (i.glass.grabs, i.glass.unchanged));
     let (grabs, unchanged) = (g1.0 - g0.0, g1.1 - g0.1);
     println!("recording: {grabs} captures in 1.5 s, {unchanged} unchanged");
-    assert!((6..=14).contains(&grabs), "at most ~8 Hz, got {grabs} captures in 1.5 s");
+    assert!((3..=8).contains(&grabs), "at most ~4 Hz, got {grabs} captures in 1.5 s");
     assert!(unchanged * 2 >= grabs, "a static screen finds the hash unchanged ({unchanged}/{grabs})");
 
     // back to the resting circle: auto-hide hides it again, so the timer is off and the buffers are released
@@ -379,12 +379,12 @@ fn desktop_pill_resting_circle_refreshes_slowly() {
     }
     let (w, _events) = make(); // auto-hide off: the resting circle stays on screen
     pump(300);
-    assert_eq!(w.with(|i| i.glass_ms), 500, "the resting circle refreshes at 2 Hz");
+    assert_eq!(w.with(|i| i.glass_ms), 4000, "the resting circle refreshes every 4 s");
     let g0 = w.with(|i| i.glass.grabs);
-    pump(2100);
+    pump(4400);
     let grabs = w.with(|i| i.glass.grabs) - g0;
-    println!("resting circle: {grabs} captures in 2.1 s");
-    assert!((3..=6).contains(&grabs), "2 Hz, got {grabs}");
+    println!("resting circle: {grabs} captures in 4.4 s");
+    assert!((1..=2).contains(&grabs), "one every 4 s, got {grabs}");
 }
 
 #[test]
@@ -409,7 +409,7 @@ fn desktop_pill_falls_back_to_neutral_glass_when_capture_is_unavailable() {
     });
     assert!(same, "the window shows the neutral glass");
     let mut host = GlassHost::unavailable();
-    assert!(!host.request((0, 0, 100, 100), (0, 0, 1920, 1080), 1.0, (1920.0, 1080.0), 0.0));
+    assert!(!host.request((0, 0, 100, 100), (0, 0, 1920, 1080), 1.0, (1920.0, 1080.0), 0.0, true));
     assert!(host.take().is_none());
 }
 
@@ -433,7 +433,7 @@ fn desktop_pill_backdrop_follows_the_window_when_dragged() {
         let now = rect(hwnd);
         send(hwnd, MOVE, 1, lparam(target.0 - now.left, target.1 - now.top));
     }
-    // dragging: the timer runs at the active rate and recaptures the new place within a tick or two
+    // dragging: the timer runs at the fast rate and recaptures the new place within a tick or two
     assert_eq!(w.with(|i| i.glass_ms), 125);
     pump(350);
     assert!(w.with(|i| i.glass.grabs) > grabs0, "recaptured after the move");
@@ -442,7 +442,7 @@ fn desktop_pill_backdrop_follows_the_window_when_dragged() {
     send(hwnd, WM_LBUTTONUP, 0, lparam(target.0 - now.left, target.1 - now.top));
     send(hwnd, WM_MOUSELEAVE, 0, LPARAM(0)); // the cursor is elsewhere: no hover keeps the rate up
     pump(700);
-    assert_eq!(w.with(|i| i.glass_ms), 500, "back to the resting rate after the drag");
+    assert_eq!(w.with(|i| i.glass_ms), 4000, "back to the resting rate after the drag");
 }
 
 
@@ -490,7 +490,7 @@ fn desktop_pill_capture_cost() {
     let (sent, ui_ms) = w.with(|i| {
         let (win, page) = (i.win_rect(), i.page());
         let t = Instant::now();
-        let sent = i.glass.request(win, mon, scale, page, 1e12);
+        let sent = i.glass.request(win, mon, scale, page, 1e12, true);
         (sent, t.elapsed().as_secs_f64() * 1000.0)
     });
     assert!(sent, "a request is accepted");

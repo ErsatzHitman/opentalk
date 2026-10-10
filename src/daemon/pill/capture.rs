@@ -163,6 +163,9 @@ pub enum Refresh {
 struct Request {
     region: (i32, i32, i32, i32),
     scale: f32,
+    /// Keep the capture buffer for the next request (a refresh within a second or so); otherwise it is
+    /// given back right after the copy, so the resting circle does not hold up to 2 MB between captures.
+    keep: bool,
 }
 
 enum Msg {
@@ -171,6 +174,9 @@ enum Msg {
     Release,
     Quit,
 }
+
+/// A picture's identity: cell hash, captured region, scale bits.
+type Identity = (u64, (i32, i32, i32, i32), u32);
 
 enum Done {
     Unavailable,
@@ -184,7 +190,7 @@ enum Done {
 fn worker(rx: Receiver<Msg>, out: Arc<Mutex<Option<Done>>>, hwnd: isize, alive: Arc<AtomicBool>) {
     let mut cap: Option<Capturer> = None;
     // the last picture's identity: a grab with the same cell hash, region and scale changes nothing
-    let mut last: Option<(u64, (i32, i32, i32, i32), u32)> = None;
+    let mut last: Option<Identity> = None;
     while let Ok(msg) = rx.recv() {
         match msg {
             Msg::Quit => break,
@@ -193,6 +199,9 @@ fn worker(rx: Receiver<Msg>, out: Arc<Mutex<Option<Done>>>, hwnd: isize, alive: 
             }
             Msg::Grab(req) => {
                 let done = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| grab_one(&mut cap, &mut last, &req))).unwrap_or(Done::Unavailable);
+                if !req.keep {
+                    cap = None;
+                }
                 if let Ok(mut slot) = out.lock() {
                     *slot = Some(done);
                 }
@@ -207,7 +216,7 @@ fn worker(rx: Receiver<Msg>, out: Arc<Mutex<Option<Done>>>, hwnd: isize, alive: 
     }
 }
 
-fn grab_one(cap: &mut Option<Capturer>, last: &mut Option<(u64, (i32, i32, i32, i32), u32)>, req: &Request) -> Done {
+fn grab_one(cap: &mut Option<Capturer>, last: &mut Option<Identity>, req: &Request) -> Done {
     if cap.is_none() {
         *cap = Capturer::new();
     }
@@ -286,7 +295,7 @@ impl GlassHost {
     /// Ask the worker to grab the screen under the window (`win`, device px, screen coordinates) on
     /// `monitor`, clipped and extended by the refraction margin. `page` is the monitor in logical px.
     /// At most one request is in flight; returns whether one was sent.
-    pub fn request(&mut self, win: (i32, i32, i32, i32), monitor: (i32, i32, i32, i32), scale: f32, page: (f32, f32), now: f64) -> bool {
+    pub fn request(&mut self, win: (i32, i32, i32, i32), monitor: (i32, i32, i32, i32), scale: f32, page: (f32, f32), now: f64, keep: bool) -> bool {
         if !self.excluded || self.in_flight {
             return false;
         }
@@ -296,7 +305,7 @@ impl GlassHost {
             self.excluded = false;
             return false;
         }
-        let sent = self.tx.as_ref().is_some_and(|tx| tx.send(Msg::Grab(Request { region, scale })).is_ok());
+        let sent = self.tx.as_ref().is_some_and(|tx| tx.send(Msg::Grab(Request { region, scale, keep })).is_ok());
         if !sent {
             // the worker is gone: never capture again rather than wait for an answer that cannot come
             self.excluded = false;
@@ -356,10 +365,20 @@ impl GlassHost {
         Some(Arc::new(Backdrop::new(f.clone(), r.0 - origin.0, r.1 - origin.1, page)))
     }
 
+    /// Was the kept picture built at this device scale? (A picture from another DPI has cells of the
+    /// wrong size and must not be painted.)
+    pub fn scale_matches(&self, scale: f32) -> bool {
+        self.frosted.is_none() || self.scale_bits == scale.to_bits()
+    }
+
     /// Does the kept picture cover everything the glass of a window at `win` can sample (its own rect,
-    /// clipped to the monitor)? A window that grew or moved out of it needs a fresh capture.
-    pub fn covers(&self, win: (i32, i32, i32, i32), monitor: (i32, i32, i32, i32)) -> bool {
+    /// clipped to the monitor), at this scale? A window that grew, moved out of it or changed DPI needs
+    /// a fresh capture.
+    pub fn covers(&self, win: (i32, i32, i32, i32), monitor: (i32, i32, i32, i32), scale: f32) -> bool {
         let Some(r) = self.region else { return false };
+        if self.scale_bits != scale.to_bits() {
+            return false;
+        }
         let need = (win.0.max(monitor.0), win.1.max(monitor.1), win.2.min(monitor.2), win.3.min(monitor.3));
         need.0 >= r.0 && need.1 >= r.1 && need.2 <= r.2 && need.3 <= r.3
     }
@@ -412,7 +431,7 @@ mod tests {
         let mut h = GlassHost::unavailable();
         assert!(!h.available());
         assert!(h.backdrop((0, 0), (1920.0, 1080.0)).is_none(), "nothing captured yet");
-        assert!(!h.covers((0, 0, 10, 10), mon));
+        assert!(!h.covers((0, 0, 10, 10), mon, 1.0));
         h.keep(Frosted::flat([1, 2, 3]), (100, 50, 500, 350), 1.0);
         // the buffer starts 50 px left of and 30 px above a window at (150, 80)
         let b = h.backdrop((150, 80), (1920.0, 1080.0)).expect("backdrop");
@@ -423,12 +442,12 @@ mod tests {
         assert!(Arc::ptr_eq(&b.frosted, &moved.frosted));
         assert_ne!(b.id, moved.id);
         // the window must lie inside the captured region to be covered
-        assert!(h.covers((150, 80, 358, 200), mon));
-        assert!(!h.covers((90, 80, 300, 200), mon), "sticks out to the left");
-        assert!(!h.covers((150, 80, 358, 400), mon), "sticks out at the bottom");
+        assert!(h.covers((150, 80, 358, 200), mon, 1.0));
+        assert!(!h.covers((90, 80, 300, 200), mon, 1.0), "sticks out to the left");
+        assert!(!h.covers((150, 80, 358, 400), mon, 1.0), "sticks out at the bottom");
         // a window hanging off the monitor only needs its visible part
         h.keep(Frosted::flat([1, 2, 3]), (1700, 900, 1920, 1080), 1.0);
-        assert!(h.covers((1708, 956, 2000, 1100), mon));
+        assert!(h.covers((1708, 956, 2000, 1100), mon, 1.0));
         // hiding keeps the small picture for the next show and asks for a fresh capture
         h.release();
         assert!(h.dirty && h.backdrop((1708, 956), (1.0, 1.0)).is_some());
@@ -438,11 +457,122 @@ mod tests {
     fn an_unavailable_host_never_requests_or_reports() {
         let mut h = GlassHost::unavailable();
         for _ in 0..3 {
-            assert!(!h.request((100, 100, 300, 220), (0, 0, 1920, 1080), 1.0, (1920.0, 1080.0), 5.0));
+            assert!(!h.request((100, 100, 300, 220), (0, 0, 1920, 1080), 1.0, (1920.0, 1080.0), 5.0, true));
         }
         assert!(!h.in_flight && h.take().is_none());
         assert_eq!((h.grabs, h.unchanged), (0, 0));
         assert!(h.backdrop((100, 100), (1920.0, 1080.0)).is_none());
+    }
+
+    /// CPU time of the calling thread so far, in ms (kernel + user), or `None` when unavailable.
+    fn thread_cpu_ms() -> Option<f64> {
+        use windows::Win32::Foundation::FILETIME;
+        use windows::Win32::System::Threading::{GetCurrentThread, GetThreadTimes};
+        let (mut c, mut e, mut k, mut u) = (FILETIME::default(), FILETIME::default(), FILETIME::default(), FILETIME::default());
+        // SAFETY: valid pseudo handle and out-pointers.
+        unsafe { GetThreadTimes(GetCurrentThread(), &mut c, &mut e, &mut k, &mut u) }.ok()?;
+        let t = |f: FILETIME| ((f.dwHighDateTime as u64) << 32 | f.dwLowDateTime as u64) as f64 / 10_000.0;
+        Some(t(k) + t(u))
+    }
+
+    fn median_ms(mut v: Vec<f64>) -> f64 {
+        v.sort_by(|a, b| a.total_cmp(b));
+        v[v.len() / 2]
+    }
+
+    /// A busy synthetic screen: text-like stripes, noise and flat blocks (BGRA).
+    fn busy_bgra(w: usize, h: usize) -> Vec<u8> {
+        (0..w * h)
+            .flat_map(|i| {
+                let (x, y) = (i % w, i / w);
+                let v = if (x / 3 + y / 5) % 2 == 0 { 20 } else { 235 };
+                let n = ((x * 31 + y * 17) ^ (x * y)) as u8;
+                [v ^ (n & 15), v, v.wrapping_add(n & 31), 255]
+            })
+            .collect()
+    }
+
+    /// Bytes of the buffers one capture of the pill window touches, at a scale and monitor size: the
+    /// DIB the screen is copied into plus the cell/frost working set and the kept picture.
+    fn capture_bytes(scale: f32, mon: (i32, i32)) -> (usize, usize) {
+        let win = (0, 0, (208.0 * scale).ceil() as i32, (120.0 * scale).ceil() as i32);
+        let margin = (glass::margin_logical((mon.0 as f32 / scale, mon.1 as f32 / scale)) * scale).ceil() as i32;
+        let (l, t, r, b) = glass::capture_region(win, margin, (-100_000, -100_000, 100_000, 100_000)).unwrap();
+        let (w, h) = ((r - l) as usize, (b - t) as usize);
+        let cell = glass::cell_for(scale) as usize;
+        let cells = w.div_ceil(cell) * h.div_ceil(cell);
+        // cells (u8 x3) + 3 f32 planes + the f32 scratch + the frosted copy (u8 x3)
+        (w * h * 4, cells * (3 + 3 * 4 + 4 + 3))
+    }
+
+    #[test]
+    fn capture_buffers_are_small_and_bounded() {
+        // 1x, 1.5x, 2x on 1080p, 1440p, 4K; the DIB is the dominant buffer and exists only while shown
+        for (scale, mon) in [(1.0, (1920, 1080)), (1.5, (2560, 1440)), (2.0, (3840, 2160)), (3.0, (7680, 4320))] {
+            let (dib, work) = capture_bytes(scale, mon);
+            // the margin is capped at 96 logical px, so the DIB is at most (208 + 192) x (120 + 192) logical px
+            let cap = ((208.0 + 192.0) * scale).ceil() as usize * ((120.0 + 192.0) * scale).ceil() as usize * 4;
+            assert!(dib <= cap + 4096, "{scale}x: DIB {dib} > {cap}");
+            assert!(dib <= 12 << 20, "{scale}x on {mon:?}: DIB {dib} bytes");
+            assert!(work <= 2 << 20, "{scale}x: frost working set {work} bytes");
+            println!("capture buffers {scale}x on {}x{}: DIB {:.2} MB, frost working set {:.2} MB", mon.0, mon.1, dib as f64 / 1e6, work as f64 / 1e6);
+        }
+        // the kept picture (what stays resident while shown or hidden) is the cell grid only
+        let frosted = Cells::from_bgra(&busy_bgra(400, 312), 400, 312, 3).unwrap().frost(glass::FROST_SIGMA, 1.0);
+        assert!(frosted.w * frosted.h * 3 < 64 << 10, "kept picture {} bytes", frosted.w * frosted.h * 3);
+        // Capturer::grab refuses absurd sizes instead of allocating them
+        let mut c = Capturer::new().expect("memory DC");
+        assert!(c.grab(0, 0, 20_000, 20_000).is_none() && c.grab(0, 0, 0, 10).is_none() && c.grab(0, 0, -5, 10).is_none());
+    }
+
+    /// Cost of one capture: the screen copy, the cell average + hash, and (when the hash changed) the
+    /// frost, at 1x and 2x. Prints the numbers (`cargo test -- --nocapture capture_cost`); asserts only
+    /// a very loose ceiling so a slow or busy machine cannot make it flaky.
+    #[test]
+    fn capture_cost_is_measured_and_bounded() {
+        for scale in [1.0f32, 2.0] {
+            let (w, h) = (((208.0 + 192.0) * scale) as usize, ((120.0 + 192.0) * scale) as usize);
+            let raw = busy_bgra(w, h);
+            let cell = glass::cell_for(scale);
+            let (mut cells_ms, mut frost_ms, mut cpu) = (Vec::new(), Vec::new(), Vec::new());
+            for _ in 0..21 {
+                let c0 = thread_cpu_ms();
+                let t0 = std::time::Instant::now();
+                let cells = Cells::from_bgra(&raw, w, h, cell).unwrap();
+                cells_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
+                let t1 = std::time::Instant::now();
+                let f = cells.frost(glass::FROST_SIGMA, scale);
+                frost_ms.push(t1.elapsed().as_secs_f64() * 1000.0);
+                assert!(f.w * f.h > 0);
+                if let (Some(a), Some(b)) = (c0, thread_cpu_ms()) {
+                    cpu.push(b - a);
+                }
+            }
+            let (c, f) = (median_ms(cells_ms), median_ms(frost_ms));
+            println!("capture cost {scale}x ({w}x{h} px): cells+hash {c:.3} ms, frost {f:.3} ms, thread CPU (both) {:.3} ms", if cpu.is_empty() { f64::NAN } else { median_ms(cpu) });
+            // the fastest capture cadence is 125 ms: a result slower than that (an unoptimised Wine build included) is a bug
+            assert!(c + f < 120.0, "{scale}x: {c:.1} + {f:.1} ms");
+        }
+        // the real screen copy, when this machine has a screen to copy
+        let Some(mut cap) = Capturer::new() else { return };
+        for scale in [1.0f32, 2.0] {
+            let (w, h) = (((208.0 + 192.0) * scale) as i32, ((120.0 + 192.0) * scale) as i32);
+            if cap.grab(0, 0, 4, 4).is_none() {
+                println!("SKIPPED: the screen cannot be copied here");
+                return;
+            }
+            let (mut wall, mut cpu) = (Vec::new(), Vec::new());
+            for _ in 0..11 {
+                let c0 = thread_cpu_ms();
+                let t0 = std::time::Instant::now();
+                assert!(cap.grab(0, 0, w, h).is_some());
+                wall.push(t0.elapsed().as_secs_f64() * 1000.0);
+                if let (Some(a), Some(b)) = (c0, thread_cpu_ms()) {
+                    cpu.push(b - a);
+                }
+            }
+            println!("BitBlt {scale}x ({w}x{h} px): wall {:.3} ms, thread CPU {:.3} ms", median_ms(wall), if cpu.is_empty() { f64::NAN } else { median_ms(cpu) });
+        }
     }
 
     #[test]
@@ -455,8 +585,8 @@ mod tests {
             println!("SKIPPED: the screen cannot be copied here");
             return;
         }
-        assert!(h.request(win, mon, 1.0, page, 1.0));
-        assert!(h.in_flight && !h.request(win, mon, 1.0, page, 2.0), "one request in flight at a time");
+        assert!(h.request(win, mon, 1.0, page, 1.0, true));
+        assert!(h.in_flight && !h.request(win, mon, 1.0, page, 2.0, true), "one request in flight at a time");
         let wait = |h: &mut GlassHost| {
             let t0 = std::time::Instant::now();
             loop {
@@ -468,15 +598,15 @@ mod tests {
             }
         };
         assert_eq!(wait(&mut h), Refresh::Changed);
-        assert!(h.backdrop((win.0, win.1), page).is_some() && h.covers(win, mon));
+        assert!(h.backdrop((win.0, win.1), page).is_some() && h.covers(win, mon, 1.0));
         // the same screen again: the hash says nothing changed (the desktop may tick between two
         // grabs, so accept a change but not an unavailable)
-        assert!(h.request(win, mon, 1.0, page, 200.0));
+        assert!(h.request(win, mon, 1.0, page, 200.0, false));
         let again = wait(&mut h);
         assert!(matches!(again, Refresh::Unchanged | Refresh::Changed), "{again:?}");
         assert_eq!(h.grabs, 2);
         // a different scale is a different picture
-        assert!(h.request(win, mon, 1.5, page, 400.0));
+        assert!(h.request(win, mon, 1.5, page, 400.0, true));
         assert_eq!(wait(&mut h), Refresh::Changed);
         drop(h); // joins the worker
     }

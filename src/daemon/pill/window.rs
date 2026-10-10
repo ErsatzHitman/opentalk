@@ -51,14 +51,35 @@ const CLASS_NAME: PCWSTR = w!("OpenTalkPill");
 const DRAG_THRESHOLD_PX: f32 = 5.0;
 /// Timer id of the backdrop refresh (a USER timer on the pill window; it exists only while the window is shown).
 const GLASS_TIMER_ID: usize = 0x6c67;
-/// Backdrop refresh period while something is happening (recording, thinking, hover, drag, error): ~8 Hz at most.
-const GLASS_ACTIVE_MS: u32 = 125;
-/// Backdrop refresh period for the resting circle.
-const GLASS_IDLE_MS: u32 = 500;
+/// Backdrop refresh period while the pointer is on the pill or it is being dragged: 8 Hz (a
+/// dragged window must keep its picture under it).
+const GLASS_FAST_MS: u32 = 125;
+/// Backdrop refresh period while recording, thinking or animating: 4 Hz. The glass
+/// frosts ~10 px of the screen, so it changes slowly; every capture costs ~1 ms of CPU at 2x (PLAN
+/// section 1 caps recording at 1.5 %), and a capture of an unchanged screen repaints nothing.
+const GLASS_ACTIVE_MS: u32 = 250;
+/// Backdrop refresh period for the resting circle (it is shown all day, so this is the only thing the
+/// daemon does while idle: one ~1 ms capture every 4 s, ~0.03 % of a core). Hover, a state change, a
+/// size / scale / dock change and showing the window capture at once.
+const GLASS_IDLE_MS: u32 = 4000;
 /// Two captures are never closer than this, whatever asks for one.
 const GLASS_MIN_GAP_MS: f64 = 100.0;
 
 // --- pure helpers (unit-tested) ------------------------------------------------------------
+
+/// Period of the backdrop timer: 0 (no timer) unless the window is shown and can capture; the fast
+/// rate for hover and drag, the active rate while something is going on, the resting rate otherwise.
+fn glass_period_ms(shown_and_capturing: bool, fast: bool, busy: bool) -> u32 {
+    if !shown_and_capturing {
+        0
+    } else if fast {
+        GLASS_FAST_MS
+    } else if busy {
+        GLASS_ACTIVE_MS
+    } else {
+        GLASS_IDLE_MS
+    }
+}
 
 /// Device scale for an effective DPI (96 = 1.0).
 pub fn scale_from_dpi(dpi: u32) -> f32 {
@@ -579,6 +600,19 @@ impl Inner {
         (self.pos.0, self.pos.1, self.pos.0 + w, self.pos.1 + h)
     }
 
+    /// Follow the monitor the window is on (it can be dragged onto another one, which changes the area
+    /// that may be captured and the field's page size).
+    fn sync_monitor_rect(&mut self) {
+        let (l, t, r, b) = self.win_rect();
+        let p = POINT { x: (l + r) / 2, y: (t + b) / 2 };
+        // SAFETY: plain query.
+        let hmon = unsafe { MonitorFromPoint(p, MONITOR_DEFAULTTONEAREST) };
+        if let Some(m) = monitor_rect(hmon).filter(|m| *m != self.mon) {
+            self.mon = m;
+            self.glass.dirty = true;
+        }
+    }
+
     /// The monitor in logical px: the refraction field's `pageW` / `pageH`.
     fn page(&self) -> (f32, f32) {
         let s = self.st.scale;
@@ -588,8 +622,11 @@ impl Inner {
     /// Ask the worker for the screen under the window (no-op while one request is in flight; the
     /// result arrives as `WM_APP_GLASS`).
     fn request_backdrop(&mut self, now: f64) -> bool {
+        self.sync_monitor_rect();
         let (win, page) = (self.win_rect(), self.page());
-        self.glass.request(win, self.mon, self.st.scale, page, now)
+        // a fast refresh keeps the capture buffer; the resting circle (4 s) gives it back after each copy
+        let keep = self.glass_ms != 0 && self.glass_ms < GLASS_IDLE_MS;
+        self.glass.request(win, self.mon, self.st.scale, page, now, keep)
     }
 
     /// Install the kept picture for the window's current origin; returns whether the glass changed.
@@ -612,7 +649,7 @@ impl Inner {
             Refresh::Unchanged => self.bd_origin != self.pos && self.place_backdrop(),
             Refresh::Changed => self.place_backdrop(),
         };
-        if !self.glass.covers(self.win_rect(), self.mon) {
+        if !self.glass.covers(self.win_rect(), self.mon, self.st.scale) {
             self.glass.dirty = true;
         }
         let now = self.now();
@@ -632,15 +669,21 @@ impl Inner {
             return;
         }
         let due = now - self.glass.last_ms >= GLASS_MIN_GAP_MS;
+        if !was_visible || self.bd_origin != self.pos {
+            self.sync_monitor_rect();
+        }
         if !was_visible {
-            if self.glass.covers(self.win_rect(), self.mon) {
+            if self.glass.covers(self.win_rect(), self.mon, self.st.scale) {
                 self.place_backdrop();
             } else {
                 self.st.set_backdrop(None);
             }
             self.request_backdrop(now);
-        } else if !self.glass.covers(self.win_rect(), self.mon) || (self.glass.dirty && due) {
-            if self.bd_origin != self.pos {
+        } else if !self.glass.covers(self.win_rect(), self.mon, self.st.scale) || (self.glass.dirty && due) {
+            if !self.glass.scale_matches(self.st.scale) {
+                // another DPI: the picture's cells are the wrong size, paint the neutral glass until the new one lands
+                self.st.set_backdrop(None);
+            } else if self.bd_origin != self.pos {
                 self.place_backdrop();
             }
             self.request_backdrop(now);
@@ -649,24 +692,19 @@ impl Inner {
         }
     }
 
-    /// Something is going on: refresh at ~8 Hz instead of the resting rate.
-    fn glass_active(&self, now: f64) -> bool {
-        !matches!(self.st.mode(), PillMode::Idle | PillMode::Hidden)
-            || self.st.is_animating(now)
-            || self.st.pointer().group
-            || self.st.error().is_some()
-            || self.down.as_ref().is_some_and(|d| d.dragging)
+    /// How often the backdrop is refreshed in the current state (ms); 0 while the window is hidden or
+    /// cannot capture.
+    fn glass_period(&self, now: f64) -> u32 {
+        let fast = self.st.pointer().group || self.down.as_ref().is_some_and(|d| d.dragging);
+        // the error card sits still for 3-5 s: the capture taken as it appears is enough (rebuilding its
+        // glass costs up to ~30 ms at 2x), so it refreshes at the resting rate unless something else is going on
+        let busy = !matches!(self.st.mode(), PillMode::Idle | PillMode::Hidden) || self.st.is_animating(now);
+        glass_period_ms(self.visible && self.glass.available(), fast, busy)
     }
 
     /// Run the backdrop timer only while the window is shown, at the rate the state calls for.
     fn glass_retune(&mut self) {
-        let want = if !self.visible || !self.glass.available() {
-            0
-        } else if self.glass_active(self.now()) {
-            GLASS_ACTIVE_MS
-        } else {
-            GLASS_IDLE_MS
-        };
+        let want = self.glass_period(self.now());
         if want == self.glass_ms {
             return;
         }
@@ -696,6 +734,11 @@ impl Inner {
 
     /// `WM_TIMER`: ask for a new capture when the rate limit allows; the answer repaints.
     fn glass_tick(&mut self) {
+        // a result whose `WM_APP_GLASS` post was dropped (full message queue) is picked up here, so a
+        // lost message can never leave a request in flight forever
+        if self.glass.in_flight {
+            self.glass_done();
+        }
         let now = self.now();
         if self.visible && self.glass.available() && now - self.glass.last_ms >= GLASS_MIN_GAP_MS {
             self.request_backdrop(now);
@@ -1309,6 +1352,21 @@ impl Drop for Window {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backdrop_timer_runs_only_while_shown_and_at_the_rate_the_state_needs() {
+        // hidden or unable to capture: no timer at all (idle CPU stays flat)
+        assert_eq!(glass_period_ms(false, true, true), 0);
+        assert_eq!(glass_period_ms(false, false, false), 0);
+        // resting circle (and a still error card): the slowest rate; recording / thinking: 4 Hz; hover / drag: 8 Hz
+        assert_eq!(glass_period_ms(true, false, false), GLASS_IDLE_MS);
+        assert_eq!(glass_period_ms(true, false, true), GLASS_ACTIVE_MS);
+        assert_eq!(glass_period_ms(true, true, false), GLASS_FAST_MS);
+        assert_eq!(glass_period_ms(true, true, true), GLASS_FAST_MS);
+        // the rates are ordered and keep the rate limit meaningful
+        const { assert!(GLASS_FAST_MS < GLASS_ACTIVE_MS && GLASS_ACTIVE_MS < GLASS_IDLE_MS) };
+        const { assert!(GLASS_FAST_MS as f64 >= GLASS_MIN_GAP_MS) };
+    }
 
     #[test]
     fn dpi_scale_mapping() {

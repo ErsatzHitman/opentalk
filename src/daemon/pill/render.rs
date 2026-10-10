@@ -1184,6 +1184,78 @@ mod tests {
         assert_eq!(cache.render(&s, t, &mut pm), FrameOutcome::Dirty(full_rect(&pm)));
     }
 
+    /// Frame costs of the glass: a steady recording frame (the waveform lane only), a base rebuild
+    /// when the backdrop picture changed (at most every 250 ms while recording), and a full repaint. Prints the
+    /// numbers (`-- --nocapture glass_frame_cost`); the assertions are structural (which path ran)
+    /// plus a very loose time ceiling, so a slow or busy machine cannot make it flaky.
+    #[test]
+    fn glass_frame_cost_is_measured_and_the_steady_frame_stays_incremental() {
+        use crate::daemon::pill::glass::{Backdrop, Cells, DEFAULT_PAGE, FROST_SIGMA, cell_for};
+        let median = |mut v: Vec<f64>| {
+            v.sort_by(|a, b| a.total_cmp(b));
+            v[v.len() / 2]
+        };
+        for scale in [1.0f32, 2.0] {
+            // two different busy pictures, as the capture would deliver them (window + 96 px margin)
+            let (w, h) = (((208.0 + 192.0) * scale) as usize, ((120.0 + 192.0) * scale) as usize);
+            let pic = |seed: usize| {
+                let raw: Vec<u8> = (0..w * h).flat_map(|i| { let (x, y) = (i % w + seed * 7, i / w); let v = if (x / 9 + y / 11) % 2 == 0 { 30 } else { 225 }; [v, v ^ (x as u8), v ^ (y as u8), 255] }).collect();
+                let f = Cells::from_bgra(&raw, w, h, cell_for(scale)).unwrap().frost(FROST_SIGMA, scale);
+                let o = (-96.0 * scale) as i32;
+                Arc::new(Backdrop::new(Arc::new(f), o, o, DEFAULT_PAGE))
+            };
+            let (a, b) = (pic(0), pic(1));
+            let mut s = RenderState::new(Palette::LIGHT, scale, PanelPosition::BottomRight);
+            s.set_mode(PillMode::Recording, 0.0);
+            s.set_backdrop(Some(a.clone()));
+            let mut t = 0.0;
+            run(&mut s, &mut t, 1500.0, &speech);
+            let mut pm = new_pm(&s);
+            let mut cache = FrameCache::new();
+            cache.render(&s, t, &mut pm);
+            // steady frames: 60 fps ticks, the glass stays in the cached base
+            let (mut steady, mut lane_only) = (Vec::new(), 0);
+            for _ in 0..90 {
+                t += FRAME;
+                s.tick(t, speech(t));
+                let t0 = std::time::Instant::now();
+                let out = cache.render(&s, t, &mut pm);
+                steady.push(t0.elapsed().as_secs_f64() * 1000.0);
+                if out != FrameOutcome::Dirty(full_rect(&pm)) {
+                    lane_only += 1;
+                }
+            }
+            assert!(lane_only >= 80, "{scale}x: only {lane_only} of 90 steady frames were incremental");
+            // a new backdrop picture rebuilds the base layer (the capture cadence while recording is 250 ms)
+            let mut rebuild = Vec::new();
+            for i in 0..12 {
+                s.set_backdrop(Some(if i % 2 == 0 { b.clone() } else { a.clone() }));
+                let t0 = std::time::Instant::now();
+                assert_eq!(cache.render(&s, t, &mut pm), FrameOutcome::Dirty(full_rect(&pm)));
+                rebuild.push(t0.elapsed().as_secs_f64() * 1000.0);
+            }
+            let mut full = Vec::new();
+            for _ in 0..12 {
+                let t0 = std::time::Instant::now();
+                render_into(&s, t, &mut pm);
+                full.push(t0.elapsed().as_secs_f64() * 1000.0);
+            }
+            let (st, rb, fu) = (median(steady), median(rebuild), median(full));
+            // the error card's base layer (glass + text), rebuilt when the picture under it changes
+            let card = card::ErrorCard::new("Transcription failed", "The speech provider rejected your API key. Check it in Settings.", true, 0.0);
+            let mut card_ms = Vec::new();
+            for i in 0..6 {
+                let bd = if i % 2 == 0 { &a } else { &b };
+                let t0 = std::time::Instant::now();
+                assert!(card::draw_base(&card, scale, &Palette::LIGHT, bd).is_some());
+                card_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
+            }
+            let cd = median(card_ms);
+            println!("glass frames {scale}x: steady recording frame {st:.3} ms, base rebuild {rb:.3} ms, full repaint {fu:.3} ms, error card base {cd:.3} ms");
+            assert!(st < 50.0 && rb < 250.0 && cd < 500.0, "{scale}x: steady {st:.1} ms, rebuild {rb:.1} ms, card {cd:.1} ms");
+        }
+    }
+
     #[test]
     fn glass_follows_the_backdrop_in_every_surface() {
         use crate::daemon::pill::glass::{Backdrop, DEFAULT_PAGE, Frosted};

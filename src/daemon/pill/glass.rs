@@ -232,22 +232,30 @@ pub struct Cells {
 
 impl Cells {
     /// Box-average a top-down `w` x `h` BGRA capture (`stride` = `w * 4`) into `cell` px cells.
+    ///
+    /// Cells of 3 px or more read every second pixel of every second row (a quarter of the screen
+    /// copy; the frost that follows averages ~10 px, so the sparse mean is visually the same and a
+    /// one-pixel flicker cannot be seen anyway). The hash ignores the two low bits of each colour
+    /// channel, so noise a human cannot see (video grain, dithering) does not count as a new picture.
     pub fn from_bgra(raw: &[u8], w: usize, h: usize, cell: u32) -> Option<Cells> {
         let cell = cell.max(1) as usize;
         if w == 0 || h == 0 || raw.len() < w * h * 4 {
             return None;
         }
+        let step = if cell >= 3 { 2 } else { 1 };
         let (cw, ch) = (w.div_ceil(cell), h.div_ceil(cell));
         let mut rgb = vec![0u8; cw * ch * 3];
         let mut acc = vec![0u32; cw * 3];
         for cy in 0..ch {
             acc.fill(0);
             let (y0, y1) = (cy * cell, ((cy + 1) * cell).min(h));
-            for y in y0..y1 {
+            let mut rows = 0u32;
+            for y in (y0..y1).step_by(step) {
+                rows += 1;
                 let row = &raw[y * w * 4..(y + 1) * w * 4];
                 for (cx, a) in acc.chunks_exact_mut(3).enumerate() {
                     let (x0, x1) = (cx * cell, ((cx + 1) * cell).min(w));
-                    for p in row[x0 * 4..x1 * 4].chunks_exact(4) {
+                    for p in row[x0 * 4..x1 * 4].chunks(4 * step) {
                         a[0] += p[2] as u32;
                         a[1] += p[1] as u32;
                         a[2] += p[0] as u32;
@@ -255,7 +263,8 @@ impl Cells {
                 }
             }
             for (cx, a) in acc.chunks_exact(3).enumerate() {
-                let n = ((y1 - y0) * (((cx + 1) * cell).min(w) - cx * cell)) as u32;
+                // pixels read per sampled row of this cell
+                let n = rows * ((((cx + 1) * cell).min(w) - cx * cell).div_ceil(step)) as u32;
                 let o = (cy * cw + cx) * 3;
                 for c in 0..3 {
                     rgb[o + c] = ((a[c] + n / 2) / n.max(1)) as u8;
@@ -266,7 +275,9 @@ impl Cells {
         hs.write_usize(cw);
         hs.write_usize(ch);
         hs.write_usize(cell);
-        hs.write(&rgb);
+        for &v in &rgb {
+            hs.write_u8(v >> 2);
+        }
         Some(Cells { w: cw, h: ch, cell: cell as u32, rgb, id: hs.finish() })
     }
 
@@ -486,7 +497,12 @@ pub fn margin_logical(page: (f32, f32)) -> f32 {
 const PHASE_STEPS: f32 = 16.0;
 /// Largest map (cells) worth keeping; bigger shapes compute the field inline.
 const MAX_BAKE_CELLS: usize = 200_000;
+/// Most baked maps kept at once.
 const BAKE_SLOTS: usize = 8;
+/// Bytes of baked displacement kept in all (PLAN section 1: the daemon's private memory is capped at
+/// 15 MB). A 98x36 capsule is ~0.13 MB at 2x, the 442 px error card ~1.5 MB, so the budget holds the
+/// pill, the bubble and a few animation frames, or the card alone; the least recently used maps go first.
+pub const DISP_BUDGET_BYTES: usize = 2 << 20;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct DispKey {
@@ -508,6 +524,10 @@ pub struct DispMap {
 }
 
 impl DispMap {
+    fn bytes(&self) -> usize {
+        self.data.len() * std::mem::size_of::<[f32; 2]>()
+    }
+
     fn bake(key: &DispKey, scale: f32) -> DispMap {
         let (bw, bh, r) = (f32::from_bits(key.w), f32::from_bits(key.h), f32::from_bits(key.r));
         let page = (f32::from_bits(key.page_w), f32::from_bits(key.page_h));
@@ -556,6 +576,18 @@ thread_local! {
     static BAKES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
+/// Bytes held by this thread's baked displacement maps.
+#[cfg(test)]
+pub fn disp_cache_bytes() -> usize {
+    DISP.with(|c| c.borrow().iter().map(|(_, m)| m.bytes()).sum())
+}
+
+/// Number of baked displacement maps held by this thread.
+#[cfg(test)]
+pub fn disp_cache_len() -> usize {
+    DISP.with(|c| c.borrow().len())
+}
+
 /// Number of displacement maps baked on this thread (tests).
 #[cfg(test)]
 pub fn bake_count() -> u32 {
@@ -602,7 +634,11 @@ fn disp_map(field: Rect, radius: f32, page: (f32, f32), scale: f32) -> Option<(R
         }
         let m = Rc::new(DispMap::bake(&key, scale));
         c.insert(0, (key, m.clone()));
+        // keep the newest map; drop the least recently used until the count and the bytes fit
         c.truncate(BAKE_SLOTS);
+        while c.len() > 1 && c.iter().map(|(_, m)| m.bytes()).sum::<usize>() > DISP_BUDGET_BYTES {
+            c.pop();
+        }
         m
     });
     Some((map, fx as i32 - pad, fy as i32 - pad))
@@ -833,7 +869,7 @@ mod tests {
     fn centre_is_undistorted_and_warp_is_off() {
         let (fx, fy) = displacement(&GLASS_PRESET, 17.0, 0.5, 0.5, 36.0, (1920.0, 1080.0));
         assert!(fx.abs() < 1e-3 && fy.abs() < 1e-3, "({fx}, {fy})");
-        assert!(!GLASS_PRESET.warp);
+        const { assert!(!GLASS_PRESET.warp) };
         // with warp on the base term would show up in the middle
         let warp = Preset { warp: true, ..GLASS_PRESET };
         let (wx, wy) = displacement(&warp, 17.0, 0.7, 0.5, 36.0, (1920.0, 1080.0));
@@ -955,6 +991,78 @@ mod tests {
         let other = Backdrop::new(b.frosted.clone(), 0, 0, (2560.0, 1440.0));
         let _ = paint_capsule(&other, false, 1.0);
         assert_eq!(bake_count(), before + 3, "a new monitor size bakes again");
+    }
+
+    /// Paint a rounded box `w` x `h` (logical px) at `scale` into a window-sized pixmap.
+    fn paint_box(b: &Backdrop, w: f32, h: f32, scale: f32, win: (f32, f32)) {
+        let mut pm = Pixmap::new((win.0 * scale) as u32, (win.1 * scale) as u32).unwrap();
+        let r = Rect::from_xywh(8.0, 8.0, w, h);
+        let rad = (w.min(h) * 0.5).min(16.0);
+        let sdf = move |x: f32, y: f32| crate::daemon::pill::raster::sd_round_box(x, y, r.cx(), r.cy(), r.w() * 0.5, r.h() * 0.5, rad);
+        let surf = Surface { field: r, radius: Some(rad), sdf: &sdf };
+        paint(&mut Canvas::new(&mut pm, scale), &Ctx { backdrop: b, dark: false }, &surf, &rest_params(false));
+    }
+
+    fn paint_box_no_shadow(b: &Backdrop, w: f32, h: f32, scale: f32, win: (f32, f32)) {
+        let mut pm = Pixmap::new((win.0 * scale) as u32, (win.1 * scale) as u32).unwrap();
+        let r = Rect::from_xywh(8.0, 8.0, w, h);
+        let rad = (w.min(h) * 0.5).min(16.0);
+        let sdf = move |x: f32, y: f32| crate::daemon::pill::raster::sd_round_box(x, y, r.cx(), r.cy(), r.w() * 0.5, r.h() * 0.5, rad);
+        let surf = Surface { field: r, radius: Some(rad), sdf: &sdf };
+        let mut p = rest_params(false);
+        p.shadow_alpha = 0.0;
+        paint(&mut Canvas::new(&mut pm, scale), &Ctx { backdrop: b, dark: false }, &surf, &p);
+    }
+
+    #[test]
+    fn baked_displacement_cache_is_bounded_in_slots_and_bytes() {
+        let b = flat_backdrop([128, 128, 128]);
+        // the expand animation changes the capsule's width every frame: one bake per frame, never more
+        // than BAKE_SLOTS kept
+        for w in 40..=98 {
+            paint_box(&b, w as f32, 36.0, 2.0, (208.0, 120.0));
+            assert!(disp_cache_len() <= BAKE_SLOTS);
+            assert!(disp_cache_bytes() <= DISP_BUDGET_BYTES, "{} bytes", disp_cache_bytes());
+        }
+        // the error card at 2x is the largest map worth baking (just under MAX_BAKE_CELLS cells)
+        for scale in [1.0, 1.5, 2.0, 3.0] {
+            paint_box(&b, 442.0, 96.0, scale, (466.0, 120.0));
+            assert!(disp_cache_bytes() <= DISP_BUDGET_BYTES.max(MAX_BAKE_CELLS * 8), "scale {scale}: {} bytes", disp_cache_bytes());
+        }
+        // several large maps in a row evict each other: the total stays within the budget
+        for h in [90.0, 94.0, 98.0, 102.0] {
+            paint_box(&b, 442.0, h, 2.0, (466.0, 120.0));
+            assert!(disp_cache_bytes() <= DISP_BUDGET_BYTES, "{} bytes", disp_cache_bytes());
+            assert!(disp_cache_len() >= 1);
+        }
+        // a single map is never bigger than MAX_BAKE_CELLS cells (bigger shapes compute the field inline)
+        assert!(MAX_BAKE_CELLS * std::mem::size_of::<[f32; 2]>() <= DISP_BUDGET_BYTES);
+        let before = disp_cache_bytes();
+        paint_box(&b, 900.0, 300.0, 2.0, (940.0, 340.0));
+        assert_eq!(disp_cache_bytes(), before, "an over-size shape is not baked");
+    }
+
+    #[test]
+    fn glass_paint_cost_is_measured() {
+        // a surface the size of the 2x error card, painted from a busy picture: prints the cost of the
+        // per-pixel loop (the window's steady frames never run it, only a new backdrop picture does)
+        let raw: Vec<u8> = (0..400 * 300).flat_map(|i| { let (x, y) = (i % 400, i / 400); let v = if (x / 9 + y / 11) % 2 == 0 { 30u8 } else { 225 }; [v, v ^ x as u8, v ^ y as u8, 255] }).collect();
+        let b = Backdrop::new(Arc::new(Cells::from_bgra(&raw, 400, 300, 6).unwrap().frost(FROST_SIGMA, 2.0)), 0, 0, DEFAULT_PAGE);
+        let mut v = Vec::new();
+        for _ in 0..7 {
+            let t0 = std::time::Instant::now();
+            paint_box(&b, 442.0, 108.0, 2.0, (466.0, 130.0));
+            v.push(t0.elapsed().as_secs_f64() * 1000.0);
+        }
+        v.sort_by(|a, b| a.total_cmp(b));
+        let mut w = Vec::new();
+        for _ in 0..7 {
+            let t0 = std::time::Instant::now();
+            paint_box_no_shadow(&b, 442.0, 108.0, 2.0, (466.0, 130.0));
+            w.push(t0.elapsed().as_secs_f64() * 1000.0);
+        }
+        w.sort_by(|a, b| a.total_cmp(b));
+        println!("glass paint 442x108 at 2x (~{} px): {:.3} ms with the shadow, {:.3} ms without (median of 7)", 884 * 216, v[3], w[3]);
     }
 
     #[test]
