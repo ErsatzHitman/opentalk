@@ -40,7 +40,7 @@ opentalk.exe            (daemon, default: Win32 only, no GPU, no WebView)
  ├─ main thread         hidden message window, tray, pill window, state machine
  ├─ hook thread         WH_KEYBOARD_LL → PostMessage(WM_APP_*)
  ├─ capture thread      WASAPI event-driven, started on hotkey only
- ├─ anim thread         high-resolution waitable timer, posts WM_APP_TICK only while animating
+ ├─ anim thread         compositor-paced (DwmFlush) at full rate, waitable timer for the slow cadence and as fallback; posts WM_APP_TICK only while animating
  └─ worker thread(s)    HTTP: prewarm, transcribe, cleanup
 
 opentalk.exe --settings [--page history|dictionary|settings]
@@ -174,6 +174,8 @@ Every number below comes from `docs/SPEC.md`.
 - **Logo.** Ring of r=10 with stroke 2, plus three bars, drawn as tiny-skia paths at 22 px.
 - **Theme.** Follows the Windows app theme (`AppsUseLightTheme`), with the light and dark tokens from SPEC.
 - **Rendering cost.** Rendering happens only while animating (recording or thinking) at 60 fps, using a cached background. Idle does no work.
+- **Frame pacing.** At full rate the anim thread waits for the compositor (`DwmFlush`, blocking, no CPU) instead of a free-running 16 ms timer, which beats against the display's refresh and judders. It ticks at every vblank up to 100 Hz and every second to fourth one above (144 Hz runs at 72 fps), and tells the window when the frame will be shown (`DwmGetCompositionTimingInfo`); the animation is sampled at that time, never at message-handling time, so a late tick cannot slow it, and frame times never run backwards. A flush that does not block (remote session, Wine) or blocks for 100 ms drops back to the fixed timer. The slow cadence (a silent recording) and the idle pill are unchanged: no timer while idle.
+- **Transition frames.** The expand and shrink change the capsule's size every frame, so nothing cached by size can help: the refraction field is evaluated per pixel by table lookup (depth profile, per-column / per-row corner factor; within 0.1 px of the transcribed formula), the shadow uses a CDF table, nothing is baked or stored, and the backdrop capture is held back until the motion ends. A shape seen twice in a row (a steady pill) is baked as before.
 - **Verification.**
   - `--render-pill <state> <t_ms> out.png` produces golden PNGs.
   - A side-by-side check against OpenWhispr's real pill in each state, captured by running OpenWhispr dev, or by rendering its React component in a browser if the app can't run.

@@ -684,6 +684,90 @@ mod golden {
         assert!(vals.iter().cloned().fold(1.0, f32::min) < 0.02);
     }
 
+    /// Contact sheets of the expand (260..560 ms after the start, every 20 ms) and of the stop shrink
+    /// (0..300 ms after the stop, every 20 ms), over the gradient and busy-text backdrops, light and
+    /// dark, at 2x: what the user sees (the window composited over the fixture). Written only when
+    /// `OPENTALK_SHOT_DIR` is set, e.g.
+    /// `OPENTALK_SHOT_DIR=docs/screenshots/smooth-anim cargo test --bin opentalk transition_contact_sheets`.
+    /// Also checks, with or without the directory, that the glass never pops: the picture moves by a
+    /// smooth amount from frame to frame.
+    #[test]
+    fn transition_contact_sheets() {
+        const CROP: (u32, u32, u32, u32) = (120, 80, 296, 160); // device px at 2x: x, y, w, h
+        let out = std::env::var_os("OPENTALK_SHOT_DIR").map(PathBuf::from);
+        let steps: Vec<(&str, f64)> = (0..=15).map(|i| ("recording", 260.0 + 20.0 * i as f64)).chain((0..=15).map(|i| ("thinking", 20.0 * i as f64))).collect();
+        for dark in [false, true] {
+            for bd in ["gradient", "busy-text"] {
+                let mut frames: Vec<Pixmap> = Vec::new();
+                for (state, t) in &steps {
+                    let mut sc = Scene::new(state, *t);
+                    sc.dark = dark;
+                    sc.scale = 2.0;
+                    sc.backdrop = Some(bd.to_string());
+                    let pm = render_scene(&sc).expect("scene");
+                    frames.push(composite_scene(&sc, &pm).expect("composite"));
+                }
+                // no popping: the mean change between neighbouring frames of one run has no outlier
+                for run in frames.chunks(16) {
+                    let diffs: Vec<f64> = run
+                        .windows(2)
+                        .map(|w| {
+                            let (a, b) = (w[0].data(), w[1].data());
+                            let mut sum = 0u64;
+                            for y in CROP.1..CROP.1 + CROP.3 {
+                                for x in CROP.0..CROP.0 + CROP.2 {
+                                    let i = ((y * w[0].width() + x) * 4) as usize;
+                                    sum += (0..3).map(|c| a[i + c].abs_diff(b[i + c]) as u64).sum::<u64>();
+                                }
+                            }
+                            sum as f64 / (CROP.2 * CROP.3) as f64
+                        })
+                        .collect();
+                    let mut sorted = diffs.clone();
+                    sorted.sort_by(|a, b| a.total_cmp(b));
+                    let peak = sorted[sorted.len() - 1];
+                    println!("{} {bd}: frame-to-frame change, mean per px: {}", if dark { "dark" } else { "light" }, diffs.iter().map(|d| format!("{d:.2}")).collect::<Vec<_>>().join(" "));
+                    // the house curve is front-loaded, so the biggest steps are the early ones; they must still
+                    // be a smooth ramp: no frame changes by more than 4x its two neighbours' mean
+                    for i in 1..diffs.len().saturating_sub(1) {
+                        let nb = (diffs[i - 1] + diffs[i + 1]) * 0.5;
+                        assert!(diffs[i] <= 4.0 * nb + 1.0, "{bd}: frame {i} pops ({:.2} vs neighbours {:.2}, peak {peak:.2})", diffs[i], nb);
+                    }
+                }
+                if let Some(dir) = &out {
+                    let (cw, ch, cols) = (CROP.2, CROP.3 + 6, 4u32);
+                    let rows = (steps.len() as u32).div_ceil(cols);
+                    let mut sheet = Pixmap::new(cw * cols, ch * rows).expect("sheet");
+                    sheet.fill(tiny_skia::Color::from_rgba8(24, 24, 28, 255));
+                    for (n, f) in frames.iter().enumerate() {
+                        let (col, row) = (n as u32 % cols, n as u32 / cols);
+                        let (ox, oy) = (col * cw, row * ch);
+                        let dst = sheet.data_mut();
+                        let sw = cw * cols;
+                        for y in 0..CROP.3 {
+                            for x in 0..CROP.2 {
+                                let si = (((CROP.1 + y) * f.width() + CROP.0 + x) * 4) as usize;
+                                let di = (((oy + y) * sw + ox + x) * 4) as usize;
+                                dst[di..di + 4].copy_from_slice(&f.data()[si..si + 4]);
+                            }
+                        }
+                        // progress bar of the run (expand: white, shrink: orange)
+                        let frac = (n % 16) as f32 / 15.0;
+                        let (r, g, b) = if n < 16 { (255, 255, 255) } else { (255, 140, 0) };
+                        for y in CROP.3 + 1..CROP.3 + 4 {
+                            for x in 0..(CROP.2 as f32 * frac) as u32 {
+                                let di = (((oy + y) * sw + ox + x) * 4) as usize;
+                                dst[di..di + 4].copy_from_slice(&[r, g, b, 255]);
+                            }
+                        }
+                    }
+                    std::fs::create_dir_all(dir).unwrap();
+                    sheet.save_png(dir.join(format!("transition_{}_{}.png", if dark { "dark" } else { "light" }, bd))).unwrap();
+                }
+            }
+        }
+    }
+
     #[test]
     fn unknown_state_is_an_error() {
         assert!(render_scene(&Scene::new("nope", 0.0)).is_err());

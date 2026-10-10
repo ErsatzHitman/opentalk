@@ -174,7 +174,10 @@ pub fn sd_round_box(px: f32, py: f32, cx: f32, cy: f32, hw: f32, hh: f32, r: f32
     let rr = r.min(hw.min(hh));
     let qx = (px - cx).abs() - hw + rr;
     let qy = (py - cy).abs() - hh + rr;
-    let outside = qx.max(0.0).hypot(qy.max(0.0));
+    // sqrt, not hypot: the libm hypot guards against overflow and costs several times more, and
+    // this runs per pixel (several times in a glass pixel)
+    let (ox, oy) = (qx.max(0.0), qy.max(0.0));
+    let outside = (ox * ox + oy * oy).sqrt();
     let inside = qx.max(qy).min(0.0);
     outside + inside - rr
 }
@@ -196,7 +199,8 @@ pub fn sd_segment(px: f32, py: f32, ax: f32, ay: f32, bx: f32, by: f32) -> f32 {
     let bay = by - ay;
     let len2 = bax * bax + bay * bay;
     let h = if len2 > 0.0 { ((pax * bax + pay * bay) / len2).clamp(0.0, 1.0) } else { 0.0 };
-    (pax - bax * h).hypot(pay - bay * h)
+    let (dx, dy) = (pax - bax * h, pay - bay * h);
+    (dx * dx + dy * dy).sqrt()
 }
 
 /// erf (Abramowitz-Stegun 7.1.26, |err| < 1.5e-7).
@@ -216,6 +220,26 @@ pub fn erf(x: f32) -> f32 {
 #[inline]
 pub fn norm_cdf(x: f32) -> f32 {
     0.5 * (1.0 + erf(x * std::f32::consts::FRAC_1_SQRT_2))
+}
+
+/// [`norm_cdf`] by table lookup on -3..3 (linear between 1/128 steps: error below 3e-6, far under
+/// one 8-bit step), for the per-pixel shadow loops; `erf` costs an `exp` per call.
+#[inline]
+pub fn norm_cdf_fast(z: f32) -> f32 {
+    const STEPS_PER_UNIT: f32 = 128.0;
+    const N: usize = 6 * 128 + 2;
+    static TABLE: std::sync::OnceLock<[f32; N]> = std::sync::OnceLock::new();
+    let t = TABLE.get_or_init(|| {
+        let mut t = [0.0f32; N];
+        for (i, v) in t.iter_mut().enumerate() {
+            *v = norm_cdf(i as f32 / STEPS_PER_UNIT - 3.0);
+        }
+        t
+    });
+    let f = (z.clamp(-3.0, 3.0) + 3.0) * STEPS_PER_UNIT;
+    let i = f as usize;
+    let a = f - i as f32;
+    t[i] + (t[i + 1] - t[i]) * a
 }
 
 /// Mutable view over a premultiplied RGBA8 pixmap plus the logical->device scale.
@@ -330,7 +354,7 @@ impl<'a> Canvas<'a> {
                 if d > sigma * 3.0 {
                     continue;
                 }
-                let k = if d < -sigma * 3.0 { 1.0 } else { norm_cdf(-d / sigma) };
+                let k = if d < -sigma * 3.0 { 1.0 } else { norm_cdf_fast(-d / sigma) };
                 let pa = a * k;
                 if pa > 0.0 {
                     self.blend(x, y, [color.r * pa, color.g * pa, color.b * pa, pa]);

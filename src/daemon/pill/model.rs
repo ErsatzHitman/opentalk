@@ -735,6 +735,11 @@ impl RenderState {
         false
     }
 
+    /// `true` while the pill's footprint is changing at `t` (expand, shrink, cancel bud, app bubble).
+    pub fn is_resizing(&self, t: f64) -> bool {
+        self.compact.is_active(t) || self.cancel.is_active(t) || self.bubble.is_active(t)
+    }
+
     /// Should the layered window be shown at `t` (auto-hide aware)?
     pub fn wants_visible(&self, t: f64, auto_hide: bool) -> bool {
         if self.error.is_some() {

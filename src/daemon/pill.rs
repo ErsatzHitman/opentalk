@@ -22,12 +22,15 @@ use crate::core::config::{PanelPosition, Theme};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 
+#[cfg(test)]
+mod allocs;
 mod anim;
 mod capture;
 mod card;
 mod glass;
 mod glow;
 mod model;
+mod pacer;
 mod preview;
 mod raster;
 mod render;
