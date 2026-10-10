@@ -1,4 +1,4 @@
-# End-to-end dictation test: real daemon, real hotkey pipeline entry (IPC toggle), real paste into Notepad.
+# End-to-end dictation test: real daemon, real hotkey pipeline entry (IPC start / stop), real paste into Notepad.
 #
 #   powershell -File tests\e2e.ps1 [-Exe path] [-Stt mock|mock-stream|openrouter] [-Llm] [-Model id]
 #
@@ -145,10 +145,18 @@ try {
         Start-Sleep -Milliseconds 400
     }
 
-    # Dictate: toggle (start), let the injected WAV play, toggle (stop).
+    # Dictate: start, let the injected WAV play, stop. Explicit start / stop (never a toggle) so a stray
+    # extra message cannot flip the parity; the bench hotkey (common.ps1) is one nobody presses.
     $t0 = [Diagnostics.Stopwatch]::StartNew()
     if ($Mode -eq 'paste' -and [OtWin32]::GetForegroundWindow() -ne $hwnd) { throw 'the target lost the foreground before dictation (someone is using the desktop?)' }
-    if ((Invoke-Ot $Exe @('--bench', 'toggle') $envv 15).Code -ne 0) { throw 'toggle (start) failed' }
+    if ((Invoke-Ot $Exe @('--bench', 'start') $envv 15).Code -ne 0) { throw 'start failed' }
+    $idleSw = [Diagnostics.Stopwatch]::StartNew(); $phase = ''
+    while ($phase -ne 'recording' -and $idleSw.Elapsed.TotalSeconds -lt 3) {
+        $pr = Invoke-Ot $Exe @('--bench', 'phase') $envv 15
+        $phase = if ($pr.Code -eq 0 -and $pr.Out -match '"phase"\s*:\s*"(\w+)"') { $Matches[1] } else { '' }
+        if ($phase -ne 'recording') { Start-Sleep -Milliseconds 50 }
+    }
+    if ($phase -ne 'recording') { throw "start did not begin a recording (phase '$phase')" }
     if ($Mode -eq 'paste') {
         # The paste goes to the window that had focus at the start: never let it be someone else's.
         $expectExe = if ($result.target -eq 'notepad') { 'notepad.exe' } else { 'powershell.exe' }
@@ -163,7 +171,9 @@ try {
         }
     }
     Start-Sleep -Milliseconds ($wavMs + 700)
-    if ((Invoke-Ot $Exe @('--bench', 'toggle') $envv 15).Code -ne 0) { throw 'toggle (stop) failed' }
+    $pr = Invoke-Ot $Exe @('--bench', 'phase') $envv 15
+    if ($pr.Out -notmatch '"phase"\s*:\s*"recording"') { throw "the recording ended before the stop (daemon phase: $($pr.Out))" }
+    if ((Invoke-Ot $Exe @('--bench', 'stop') $envv 15).Code -ne 0) { throw 'stop failed' }
     $hist = Wait-History $home_ 1 $TimeoutSec
     $result.dictation_ms = [int]$t0.Elapsed.TotalMilliseconds
     if ($hist.Count -lt 1) { throw "no history entry within $TimeoutSec s" }

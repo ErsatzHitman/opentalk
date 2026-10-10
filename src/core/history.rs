@@ -291,6 +291,8 @@ mod tests {
             std::process::id(),
             N.fetch_add(1, Ordering::Relaxed)
         ));
+        // Windows reuses PIDs, so a dir left by an earlier run can already hold a history file.
+        let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d.join("history.jsonl")
     }
