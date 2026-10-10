@@ -64,8 +64,6 @@ pub enum Variant {
     Destructive,
     /// Outline in destructive colour (`text-destructive border-destructive/25`).
     DestructiveOutline,
-    /// `bg-primary/10 text-primary`.
-    Soft,
 }
 
 pub struct Btn<'a> {
@@ -132,7 +130,6 @@ pub fn button(ui: &mut Ui, p: &Palette, b: Btn) -> Response {
             Stroke::new(1.0, p.destructive_a(25 + (hov * 20.0) as u8)),
             p.destructive,
         ),
-        Variant::Soft => (p.primary_a(10 + (hov * 6.0) as u8), Stroke::NONE, p.primary),
     };
     if down {
         fill = mix(fill, Color32::BLACK, 0.06);
@@ -546,7 +543,10 @@ pub fn section_title(ui: &mut Ui, p: &Palette, title: &str, desc: &str) {
 pub enum ChipKind {
     Neutral,
     Primary,
+    // Status tints, kept for the palette's success/warning pair; no page raises them yet.
+    #[allow(dead_code)]
     Success,
+    #[allow(dead_code)]
     Warning,
     Destructive,
 }
@@ -566,15 +566,6 @@ pub fn chip(ui: &mut Ui, p: &Palette, label: &str, kind: ChipKind) -> Response {
     ui.painter().rect_filled(rect, cr(4.0), bg);
     ui.painter().text(rect.center(), Align2::CENTER_CENTER, label, font, fg);
     resp
-}
-
-/// `<kbd>`-style key hint (e.g. "Ctrl + K").
-pub fn kbd(ui: &mut Ui, p: &Palette, label: &str) {
-    let font = fonts::semibold(10.0);
-    let tw = measure(ui, label, font.clone()).x;
-    let (rect, _) = ui.allocate_exact_size(vec2(tw + 12.0, 18.0), Sense::hover());
-    ui.painter().rect_filled(rect, cr(9.0), if p.dark { with_alpha(Color32::WHITE, 8) } else { p.fg_a(6) });
-    ui.painter().text(rect.center(), Align2::CENTER_CENTER, label, font, p.muted_a(70));
 }
 
 /// Coloured circle with an initial: stand-in for the target application's icon.

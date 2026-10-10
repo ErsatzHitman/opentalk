@@ -10,11 +10,13 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::BOOL;
 
+use crate::core::ipc;
 use crate::{log_info, log_warn};
 
 /// Pages understood by `ui::run` (`--settings <page>`).
 pub const PAGE_HISTORY: &str = "history";
 pub const PAGE_DICTIONARY: &str = "dictionary";
+#[cfg(test)]
 pub const PAGE_SETTINGS: &str = "settings";
 pub const PAGE_STT: &str = "settings:stt";
 
@@ -31,18 +33,20 @@ impl SettingsProc {
         SettingsProc { child: None, notify: (hwnd, msg) }
     }
 
-    /// Open `page`, or focus the window that is already open.
+    /// Open `page`, or switch the window that is already open to it and bring it forward.
     pub fn open(&mut self, page: &str) {
         if self.is_open() {
-            if let Some(child) = &self.child {
-                focus_process_window(child.id());
+            if let Some(child) = &self.child
+                && let Some(hwnd) = search(child.id())
+            {
+                show_page_in(hwnd, page);
             }
             return;
         }
         // A Settings window started some other way (`opentalk --settings` from a shell).
         if let Some(hwnd) = find_foreign_settings_window() {
-            log_info!("settings: already open in another process; focusing it");
-            focus_window(hwnd);
+            log_info!("settings: already open in another process; showing '{page}' there");
+            show_page_in(hwnd, page);
             return;
         }
         let exe = match std::env::current_exe() {
@@ -79,17 +83,28 @@ impl SettingsProc {
     }
 
     /// Process id of the open settings window, if any.
+    #[cfg(test)]
     pub fn pid(&mut self) -> Option<u32> {
         self.is_open().then(|| self.child.as_ref().map(Child::id)).flatten()
     }
 
-    /// Ask the child to go away (daemon quit with the window open is left alone; this is for tests).
+    /// Ask the child to go away (tests only; a daemon quit leaves an open window alone).
+    #[cfg(test)]
     pub fn kill(&mut self) {
         if let Some(mut c) = self.child.take() {
             let _ = c.kill();
             let _ = c.wait();
         }
     }
+}
+
+/// Tell the Settings window `hwnd` to show `page` (event-driven: a registered window message the
+/// UI process receives in its message pump), then bring it to the foreground.
+fn show_page_in(hwnd: HWND, page: &str) {
+    if !ipc::post_settings_page(hwnd, crate::ui::parse_page(Some(page))) {
+        log_warn!("settings: could not deliver page '{page}' to the open window");
+    }
+    focus_window(hwnd);
 }
 
 /// Post `notify.1` to `notify.0` once process `pid` exits: one thread blocked in
@@ -155,13 +170,6 @@ fn search(pid: u32) -> Option<HWND> {
         let _ = EnumWindows(Some(enum_proc), LPARAM(&mut search as *mut Search as isize));
     }
     search.found
-}
-
-/// Bring the first visible top-level window of `pid` to the foreground.
-fn focus_process_window(pid: u32) {
-    if let Some(hwnd) = search(pid) {
-        focus_window(hwnd);
-    }
 }
 
 /// A visible Settings window of another process running this same executable.

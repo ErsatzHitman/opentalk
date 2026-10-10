@@ -1914,6 +1914,7 @@ dependencies = [
  "ureq",
  "windows",
  "windows-core",
+ "winit",
 ]
 
 [[package]]

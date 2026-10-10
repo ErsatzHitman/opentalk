@@ -6,6 +6,9 @@ use super::settings::{self, Section, SettingsState};
 use super::theme::{self, Palette, mix};
 use super::widgets::{self as w, cr};
 use super::{Cmd, Env, Launch, Page, fonts, icons};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use windows::Win32::UI::WindowsAndMessaging::{ChangeWindowMessageFilter, MSG, MSGFLT_ADD};
 use crate::core::config::Config;
 use crate::core::ipc::{self, IpcMsg};
 use eframe::egui::{
@@ -33,7 +36,84 @@ pub fn native_options() -> eframe::NativeOptions {
         vsync: true,
         ..Default::default()
     };
-    eframe::NativeOptions { viewport, centered: true, depth_buffer: 0, stencil_buffer: 0, multisampling: 0, glow_options, ..Default::default() }
+    eframe::NativeOptions {
+        viewport,
+        centered: true,
+        depth_buffer: 0,
+        stencil_buffer: 0,
+        multisampling: 0,
+        glow_options,
+        event_loop_builder: Some(Box::new(install_page_hook)),
+        ..Default::default()
+    }
+}
+
+// ------------------------------------------------------------ page requests from the daemon
+
+/// Page request received from the daemon (`ipc::encode_settings_page` code); 0 = none.
+static PENDING_PAGE: AtomicUsize = AtomicUsize::new(0);
+/// Context to wake when a request arrives (set by `App::new`).
+static REPAINT_CTX: OnceLock<egui::Context> = OnceLock::new();
+
+/// Hook the event loop's message pump so the "OpenTalk.SettingsPage" message the daemon posts
+/// when Settings is already open is seen with no polling: it stores the code and wakes egui.
+fn install_page_hook(builder: &mut eframe::EventLoopBuilder<eframe::UserEvent>) {
+    use winit::platform::windows::EventLoopBuilderExtWindows;
+    let id = ipc::settings_page_message();
+    if id == 0 {
+        return;
+    }
+    allow_message_across_integrity_levels(id);
+    builder.with_msg_hook(move |raw| {
+        // SAFETY: winit passes a pointer to the MSG it is about to dispatch, valid for this call.
+        let msg = unsafe { &*(raw as *const MSG) };
+        if !accept_page_message(id, msg.message, msg.wParam.0) {
+            return false;
+        }
+        if let Some(ctx) = REPAINT_CTX.get() {
+            ctx.request_repaint();
+        }
+        true
+    });
+}
+
+/// Let the message through UIPI, so a daemon running at a lower integrity level can still
+/// deliver it (process-wide, which is fine: this process only has the one window).
+fn allow_message_across_integrity_levels(id: u32) {
+    // SAFETY: plain call with a registered message id.
+    if let Err(e) = unsafe { ChangeWindowMessageFilter(id, MSGFLT_ADD) } {
+        crate::log_warn!("settings: cannot lift the message filter: {e}");
+    }
+}
+
+/// Record the page code of message `message` if it is the page request `id` and carries a valid
+/// code; true when it was consumed.
+fn accept_page_message(id: u32, message: u32, wparam: usize) -> bool {
+    if message != id {
+        return false;
+    }
+    if ipc::decode_settings_page(wparam).is_some() {
+        PENDING_PAGE.store(wparam, Ordering::Release);
+    }
+    true
+}
+
+/// The page request waiting for the next frame, if any.
+fn take_page_request() -> Option<Launch> {
+    ipc::decode_settings_page(PENDING_PAGE.swap(0, Ordering::AcqRel))
+}
+
+/// Show `launch` exactly as a fresh launch with that argument would: the page, and the settings
+/// modal only when a section is asked for (otherwise it is closed). Returns true when an open
+/// modal was closed, so the caller can run its close hook.
+fn apply_launch(page: &mut Page, settings_open: &mut bool, section: &mut Section, launch: Launch) -> bool {
+    *page = launch.page;
+    let was_open = *settings_open;
+    *settings_open = launch.settings.is_some();
+    if let Some(s) = launch.settings {
+        *section = s;
+    }
+    was_open && !*settings_open
 }
 
 pub struct App {
@@ -57,6 +137,7 @@ pub struct App {
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, launch: Launch) -> Self {
         fonts::install(&cc.egui_ctx);
+        let _ = REPAINT_CTX.set(cc.egui_ctx.clone());
         let cfg = Config::load();
         let mut app = App {
             cfg,
@@ -149,6 +230,14 @@ impl eframe::App for App {
             }
         }
         self.was_focused = focused;
+        if let Some(launch) = take_page_request() {
+            crate::log_info!("settings: switching to {launch:?}");
+            if apply_launch(&mut self.page, &mut self.settings_open, &mut self.settings.section, launch) {
+                let mut cmds = std::mem::take(&mut self.cmds);
+                self.settings.on_close(&mut cmds);
+                self.cmds = cmds;
+            }
+        }
         if let Some(t) = self.trim_at {
             let now = ctx.input(|i| i.time);
             if now >= t {
@@ -553,6 +642,75 @@ mod tests {
         let off_bar = (32 * 64 + 26) * 4;
         assert_eq!(ic.rgba[off_bar + 3], 255);
         assert!(ic.rgba[off_bar] < 120, "between bars it is the blue disc");
+    }
+
+    /// The pending-page slot is process-global: tests that use it run one at a time.
+    static SLOT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn launch(page: Page, settings: Option<Section>) -> Launch {
+        Launch { page, settings }
+    }
+
+    #[test]
+    fn apply_launch_matches_a_fresh_launch() {
+        for l in [
+            launch(Page::History, None),
+            launch(Page::Dictionary, None),
+            launch(Page::History, Some(Section::Preferences)),
+            launch(Page::History, Some(Section::SpeechToText)),
+        ] {
+            // Whatever state the window was in, the result equals what App::new sets for `l`.
+            for (page, open, sec) in [(Page::History, false, Section::Preferences), (Page::Dictionary, true, Section::Hotkeys)] {
+                let (mut p, mut o, mut s) = (page, open, sec);
+                let closed = apply_launch(&mut p, &mut o, &mut s, l);
+                assert_eq!(p, l.page);
+                assert_eq!(o, l.settings.is_some());
+                if let Some(want) = l.settings {
+                    assert_eq!(s, want);
+                } else {
+                    assert_eq!(s, sec, "section is left alone when the modal is not asked for");
+                }
+                assert_eq!(closed, open && l.settings.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn apply_launch_dictionary_while_history_is_open() {
+        let (mut p, mut o, mut s) = (Page::History, false, Section::Preferences);
+        assert!(!apply_launch(&mut p, &mut o, &mut s, crate::ui::parse_page(Some("dictionary"))));
+        assert_eq!(p, Page::Dictionary);
+        assert!(!o);
+    }
+
+    #[test]
+    fn page_message_is_consumed_and_stored_once() {
+        let _g = SLOT.lock().unwrap_or_else(|e| e.into_inner());
+        PENDING_PAGE.store(0, Ordering::SeqCst);
+        let id = 0xC123;
+        let l = launch(Page::Dictionary, Some(Section::Cleanup));
+        assert!(!accept_page_message(id, id + 1, ipc::encode_settings_page(l)), "other messages pass through");
+        assert_eq!(take_page_request(), None);
+        assert!(accept_page_message(id, id, ipc::encode_settings_page(l)));
+        assert_eq!(take_page_request(), Some(l));
+        assert_eq!(take_page_request(), None, "a request is applied once");
+    }
+
+    #[test]
+    fn invalid_page_code_is_swallowed_without_effect() {
+        let _g = SLOT.lock().unwrap_or_else(|e| e.into_inner());
+        PENDING_PAGE.store(0, Ordering::SeqCst);
+        assert!(accept_page_message(7, 7, 0));
+        assert_eq!(take_page_request(), None);
+    }
+
+    #[test]
+    fn newest_request_wins() {
+        let _g = SLOT.lock().unwrap_or_else(|e| e.into_inner());
+        PENDING_PAGE.store(0, Ordering::SeqCst);
+        accept_page_message(7, 7, ipc::encode_settings_page(launch(Page::History, None)));
+        accept_page_message(7, 7, ipc::encode_settings_page(launch(Page::Dictionary, None)));
+        assert_eq!(take_page_request(), Some(launch(Page::Dictionary, None)));
     }
 }
 
