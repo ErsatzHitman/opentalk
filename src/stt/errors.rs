@@ -342,7 +342,16 @@ fn strip_secrets(text: &str, secrets: &[&str]) -> String {
         if s.len() < MIN_SECRET_LEN {
             return;
         }
-        for v in [s.to_string(), super::providers::percent_encode(s)] {
+        let enc = super::providers::percent_encode(s);
+        // The streaming encoder also escapes `!*'()` (strict RFC 3986 unreserved set).
+        let strict: String = enc
+            .chars()
+            .map(|c| match c {
+                '!' | '*' | '\'' | '(' | ')' => format!("%{:02X}", c as u8),
+                c => c.to_string(),
+            })
+            .collect();
+        for v in [s.to_string(), enc, strict] {
             if !all.contains(&v) {
                 all.push(v);
             }
@@ -541,6 +550,9 @@ mod tests {
         assert!(!e.detail.contains(KEY) && !e.message.contains(KEY) && !e.to_string().contains(KEY));
         assert!(e.detail.contains("[redacted]"));
         assert!(!redact_with(&format!("k={}", crate::stt::providers::percent_encode("a key/with+odd=chars")), &["a key/with+odd=chars"]).contains("odd"));
+        // both encoder flavours: the batch one keeps `!*'()`, the streaming one escapes them
+        assert!(!redact_with("k=key%21%28x%29secret", &["key!(x)secret"]).contains("secret"));
+        assert!(!redact_with("k=key!(x)secret", &["key!(x)secret"]).contains("secret"));
         // short secrets are ignored, long ones win over a contained shorter one
         assert_eq!(redact_with("abc abc", &["abc"]), "abc abc");
         assert_eq!(redact_with("xx 12345678-abcd yy", &["12345678", "12345678-abcd"]), "xx [redacted] yy");
