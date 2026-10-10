@@ -17,7 +17,9 @@ the same floating recording pill, and adds a deterministic filler-word cleaner, 
   screen, the pill is excluded from screen capture, so it does **not appear in screenshots, screen recordings or screen
   sharing** (Windows 10 2004 or newer; on older builds, or when a capture fails, it falls back to neutral frosted glass).
   The capture only runs while the pill is visible: a small copy of the screen around it, about 4 times a second while
-  recording and once every 4 seconds while it rests (see "Pill surface material" in [docs/SPEC.md](docs/SPEC.md)).
+  recording. While it rests there is no timer at all: the circle's glass is refreshed only when something happens (it
+  appears, moves or changes state, you hover it, or another window is activated, moved, minimised or restored), so its
+  frost can lag a little behind the screen (see "Pill surface material" in [docs/SPEC.md](docs/SPEC.md)).
 - **Fast.** Mic stream prepared in advance, TLS connection pre-warmed at key press, silence trimmed before upload, streaming
   transport for Deepgram / AssemblyAI / OpenAI Realtime / Gemini Live. Local post-processing is a few milliseconds.
 - **Clean text.** Deterministic filler removal (um, uh, "you know", stutters, loops, hallucinated "Thanks for watching"),

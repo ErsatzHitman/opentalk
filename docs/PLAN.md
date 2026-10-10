@@ -21,7 +21,7 @@ Companion spec with exact pixel and colour values: `docs/SPEC.md`.
 
 | Metric | Target | How we measure |
 |---|---|---|
-| Idle CPU (daemon) | ≈0.0% (no timers, no polling). **One exception, accepted with the liquid-glass pill:** while the resting circle is on screen (not with auto-hide) a USER timer refreshes its glass backdrop every 4 s, one ~1 ms capture on a worker thread (~0.01% of a core); nothing runs while the pill is hidden | `bench.ps1` samples `TotalProcessorTime` over 60 s |
+| Idle CPU (daemon) | ≈0.0% (no timers, no polling) | `bench.ps1` samples `TotalProcessorTime` over 60 s |
 | Recording CPU | ≤1.5% (60 fps pill plus capture) | Same, during a scripted 30 s recording |
 | Daemon RAM | ≤25 MB working set, ≤15 MB private | `Get-Process` WS/PrivateMemorySize, idle and recording |
 | Settings window RAM | ≤80 MB working set, and only while open. **Private bytes: accepted deviation** (audit 2026-10-10, owner may override): the glow (OpenGL) process commits ~265 MB of GPU driver pools reserved at context creation that never enter the working set (WS ~13 MB, private WS ~7 MB). `bench/renderer_probe` measured the alternatives: wgpu DX12 commits ~520 MB and adds ~3.5 MB of exe; a CPU painter commits ~20 MB but redraws a full 2100×1400 window in ~10 ms and lacks eframe's viewport glue. Revisit with a CPU-painter port of `src/ui` (damage-rect redraw) only if commit charge matters on low-RAM machines | Separate process that exits on close; `bench.ps1` reports WS, private bytes and private WS |

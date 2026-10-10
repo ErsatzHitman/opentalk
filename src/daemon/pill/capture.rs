@@ -163,7 +163,7 @@ pub enum Refresh {
 struct Request {
     region: (i32, i32, i32, i32),
     scale: f32,
-    /// Keep the capture buffer for the next request (a refresh within a second or so); otherwise it is
+    /// Keep the capture buffer for the next request (a periodic refresh is running); otherwise it is
     /// given back right after the copy, so the resting circle does not hold up to 2 MB between captures.
     keep: bool,
 }
@@ -330,6 +330,12 @@ impl GlassHost {
         }
     }
 
+    /// The worker has finished a request whose `WM_APP_GLASS` has not been handled yet (a post can be
+    /// lost when the message queue is full; the next event or timer picks the result up).
+    pub fn has_result(&self) -> bool {
+        self.in_flight && self.out.lock().is_ok_and(|s| s.is_some())
+    }
+
     /// Take the worker's finished result (on `WM_APP_GLASS`); `None` when there is nothing new.
     pub fn take(&mut self) -> Option<Refresh> {
         let done = self.out.lock().ok()?.take()?;
@@ -391,6 +397,86 @@ impl GlassHost {
         }
         self.dirty = true;
         self.last_ms = f64::NEG_INFINITY;
+    }
+}
+
+// --- screen events: refresh a resting pill's glass without a timer --------------------------------
+
+use std::cell::RefCell;
+use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
+use windows::Win32::UI::WindowsAndMessaging::{
+    EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MOVESIZEEND, OBJID_WINDOW, WINEVENT_OUTOFCONTEXT,
+    WINEVENT_SKIPOWNPROCESS,
+};
+
+/// Posted to the pill window when another app's top-level window changed in a way that can change
+/// what is behind the resting pill (see [`ScreenEvents`]).
+pub const WM_APP_SCREEN_EVENT: u32 = WM_APP + 0x52;
+
+/// The system events that usually change the screen under a resting pill: another window came to the
+/// front, a move / resize of a window ended, a window was minimised or restored. All are rare (human
+/// pace). `EVENT_OBJECT_LOCATIONCHANGE` / `SHOW` / `HIDE` are deliberately left out: they fire for
+/// carets, cursors and tooltips many times a second and would turn the hook into polling.
+const SCREEN_EVENTS: [(u32, u32); 3] = [
+    (EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND),
+    (EVENT_SYSTEM_MOVESIZEEND, EVENT_SYSTEM_MOVESIZEEND),
+    (EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND),
+];
+
+thread_local! {
+    /// Which pill window each hook of this thread reports to (hook handle, window handle).
+    static SCREEN_SINKS: RefCell<Vec<(isize, isize)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Out-of-context hook callback: runs on the thread that installed the hook while it retrieves
+/// messages, so it only posts (the pill's state may be borrowed further up the stack).
+unsafe extern "system" fn on_screen_event(hook: HWINEVENTHOOK, _event: u32, _hwnd: HWND, id_object: i32, _id_child: i32, _thread: u32, _time: u32) {
+    if id_object != OBJID_WINDOW.0 {
+        return;
+    }
+    let target = SCREEN_SINKS.with(|s| s.borrow().iter().find(|(h, _)| *h == hook.0 as isize).map(|(_, w)| *w));
+    if let Some(w) = target {
+        // SAFETY: posting to a window handle is always safe; a stale handle just fails.
+        unsafe {
+            let _ = PostMessageW(Some(HWND(w as *mut core::ffi::c_void)), WM_APP_SCREEN_EVENT, WPARAM(0), LPARAM(0));
+        }
+    }
+}
+
+/// Out-of-context WinEvent hooks (`WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS`, no DLL is
+/// injected anywhere) that tell the pill window when other apps' windows were activated, moved,
+/// resized, minimised or restored, so the resting circle can refresh its backdrop on events instead
+/// of a timer (PLAN section 1: an idle daemon runs no timers). Installed while the window is shown,
+/// removed (`UnhookWinEvent`) when it hides or is destroyed. Installed on the pill's UI thread.
+pub struct ScreenEvents {
+    hooks: Vec<HWINEVENTHOOK>,
+}
+
+impl ScreenEvents {
+    /// `None` when no hook could be installed (the pill then refreshes on its own events only).
+    pub fn watch(hwnd: HWND) -> Option<ScreenEvents> {
+        let mut hooks = Vec::new();
+        for (lo, hi) in SCREEN_EVENTS {
+            // SAFETY: an out-of-context hook with a static callback; removed in Drop on this thread.
+            let h = unsafe { SetWinEventHook(lo, hi, None, Some(on_screen_event), 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS) };
+            if !h.is_invalid() {
+                SCREEN_SINKS.with(|s| s.borrow_mut().push((h.0 as isize, hwnd.0 as isize)));
+                hooks.push(h);
+            }
+        }
+        (!hooks.is_empty()).then_some(ScreenEvents { hooks })
+    }
+}
+
+impl Drop for ScreenEvents {
+    fn drop(&mut self) {
+        for h in self.hooks.drain(..) {
+            SCREEN_SINKS.with(|s| s.borrow_mut().retain(|(k, _)| *k != h.0 as isize));
+            // SAFETY: a hook this thread installed and has not removed yet.
+            unsafe {
+                let _ = UnhookWinEvent(h);
+            }
+        }
     }
 }
 

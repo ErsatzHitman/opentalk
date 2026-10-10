@@ -372,19 +372,69 @@ fn desktop_pill_backdrop_is_captured_only_while_shown_and_hash_gated() {
 
 #[test]
 #[ignore]
-fn desktop_pill_resting_circle_refreshes_slowly() {
+fn desktop_pill_resting_circle_runs_no_timer_and_refreshes_on_events() {
+    use crate::daemon::pill::capture::WM_APP_SCREEN_EVENT;
+    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
     if !can_capture() {
         println!("SKIPPED: the desktop cannot be captured (locked session?)");
         return;
     }
     let (w, _events) = make(); // auto-hide off: the resting circle stays on screen
+    let hwnd = HWND(w.hwnd() as *mut core::ffi::c_void);
     pump(300);
-    assert_eq!(w.with(|i| i.glass_ms), 4000, "the resting circle refreshes every 4 s");
+    wait_glass(&w);
+    pump(300);
+    assert!(w.with(|i| i.glass.grabs) >= 1, "captured on show");
+    // PLAN section 1: an idle daemon runs no timers and does not poll
+    let (ms, settle, hooked) = w.with(|i| (i.glass_ms, i.glass_settle, i.screen_events.is_some()));
+    assert_eq!((ms, settle), (0, false), "no periodic and no pending backdrop timer while the circle rests");
+    println!("screen-event hooks installed: {hooked}");
     let g0 = w.with(|i| i.glass.grabs);
-    pump(4400);
-    let grabs = w.with(|i| i.glass.grabs) - g0;
-    println!("resting circle: {grabs} captures in 4.4 s");
-    assert!((1..=2).contains(&grabs), "one every 4 s, got {grabs}");
+    pump(4500);
+    assert_eq!(w.with(|i| i.glass.grabs), g0, "nothing is captured while the circle rests and nothing happens");
+    // a burst of screen events (what the WinEvent hooks post): one deferred capture, then quiet again
+    for _ in 0..5 {
+        // SAFETY: posting to our own window.
+        unsafe {
+            let _ = PostMessageW(Some(hwnd), WM_APP_SCREEN_EVENT, WPARAM(0), LPARAM(0));
+        }
+    }
+    pump(GLASS_SETTLE_MS as u64 / 2);
+    assert_eq!(w.with(|i| i.glass.grabs), g0, "the capture waits for the window that changed to settle");
+    pump(GLASS_SETTLE_MS as u64 + 300);
+    wait_glass(&w);
+    assert_eq!(w.with(|i| i.glass.grabs), g0 + 1, "a burst of events costs one capture");
+    assert_eq!(w.with(|i| (i.glass_ms, i.glass_settle)), (0, false), "and leaves no timer behind");
+    // a real foreground change from another process reaches the pill through the hooks
+    if hooked {
+        let g1 = w.with(|i| i.glass.grabs);
+        if let Ok(mut child) = std::process::Command::new(r"C:\Windows\System32\notepad.exe").spawn() {
+            let pid = child.id();
+            let t0 = Instant::now();
+            let mut fg = false;
+            while t0.elapsed() < Duration::from_secs(3) && !fg {
+                pump(50);
+                let mut p = 0u32;
+                // SAFETY: plain queries.
+                unsafe {
+                    GetWindowThreadProcessId(GetForegroundWindow(), Some(&mut p));
+                }
+                fg = p == pid;
+            }
+            pump(GLASS_SETTLE_MS as u64 + 400);
+            wait_glass(&w);
+            let grabs = w.with(|i| i.glass.grabs) - g1;
+            let _ = child.kill();
+            println!("notepad came to the front: {fg}; captures after it: {grabs}");
+            if let Some(v) = crate::testenv::wine_version() {
+                println!("SKIPPED (Wine: Wine {v} does not deliver other processes' EVENT_SYSTEM_FOREGROUND to out-of-context hooks)");
+            } else if fg {
+                assert!(grabs >= 1, "a foreground change refreshes the resting circle's backdrop");
+            }
+            pump(GLASS_SETTLE_MS as u64 + 400);
+        }
+    }
+    assert_eq!(w.with(|i| (i.glass_ms, i.glass_settle)), (0, false));
 }
 
 #[test]
@@ -442,7 +492,9 @@ fn desktop_pill_backdrop_follows_the_window_when_dragged() {
     send(hwnd, WM_LBUTTONUP, 0, lparam(target.0 - now.left, target.1 - now.top));
     send(hwnd, WM_MOUSELEAVE, 0, LPARAM(0)); // the cursor is elsewhere: no hover keeps the rate up
     pump(700);
-    assert_eq!(w.with(|i| i.glass_ms), 4000, "back to the resting rate after the drag");
+    wait_glass(&w);
+    assert_eq!(w.with(|i| (i.glass_ms, i.glass_settle)), (0, false), "no backdrop timer once the dropped circle rests");
+    assert!(w.with(|i| i.bd_origin == i.pos && !i.glass.dirty), "the dropped place was captured");
 }
 
 
