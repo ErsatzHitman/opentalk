@@ -11,6 +11,7 @@
 //! of the owner must forward `callback_msg` to [`Tray::activation`] and the registered `TaskbarCreated`
 //! message (see [`taskbar_created_message`]) to [`Tray::readd`], and [`WM_TRAY_POPUP_CMD`] to
 //! [`command_from_popup`].
+pub mod page;
 mod popup;
 mod popup_draw;
 mod popup_win;

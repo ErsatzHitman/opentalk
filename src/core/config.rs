@@ -100,6 +100,11 @@ impl Default for SttConfig {
     }
 }
 
+/// Default spoken trigger for the concise rewrite.
+pub const DEFAULT_REWRITE_TRIGGER: &str = "rewrite this concisely";
+/// Default timeout of the rewrite LLM call (ms): generative and longer than the 4 s cleanup call.
+pub const DEFAULT_REWRITE_TIMEOUT_MS: u64 = 10_000;
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(default)]
 pub struct AiCleanupConfig {
@@ -110,6 +115,11 @@ pub struct AiCleanupConfig {
     /// Empty = OpenWhispr default cleanup prompt.
     pub custom_prompt: String,
     pub timeout_ms: u64,
+    /// Voice rewrite: ending a dictation with [`Config::rewrite_trigger`] sends the text to the
+    /// cleanup provider for a concise rewrite. Independent of `enabled`.
+    pub rewrite_enabled: bool,
+    /// Timeout of the rewrite call (ms); 0 = [`DEFAULT_REWRITE_TIMEOUT_MS`]. Not in the UI.
+    pub rewrite_timeout_ms: u64,
     /// Enterprise: Azure OpenAI endpoint + deployment + api-version.
     pub azure_endpoint: String,
     pub azure_deployment: String,
@@ -133,6 +143,8 @@ impl Default for AiCleanupConfig {
             custom_base_url: String::new(),
             custom_prompt: String::new(),
             timeout_ms: 4_000,
+            rewrite_enabled: true,
+            rewrite_timeout_ms: DEFAULT_REWRITE_TIMEOUT_MS,
             azure_endpoint: String::new(),
             azure_deployment: String::new(),
             azure_api_version: "2024-10-21".into(),
@@ -180,6 +192,9 @@ pub struct Config {
     pub fuzzy_dictionary: bool,
     pub spoken_line_breaks: bool,
     pub ai_cleanup: AiCleanupConfig,
+    /// Spoken phrase that ends a dictation to request a concise rewrite (see `core::rewrite`).
+    /// Empty = the feature is off. Switched on/off by `ai_cleanup.rewrite_enabled`.
+    pub rewrite_trigger: String,
     // ---- Dictionary ----
     pub dictionary: Vec<String>,
     pub snippets: Vec<Snippet>,
@@ -219,6 +234,7 @@ impl Default for Config {
             fuzzy_dictionary: true,
             spoken_line_breaks: false,
             ai_cleanup: AiCleanupConfig::default(),
+            rewrite_trigger: DEFAULT_REWRITE_TRIGGER.into(),
             dictionary: Vec::new(),
             snippets: Vec::new(),
             history_enabled: true,
@@ -261,6 +277,14 @@ impl Config {
         if self.version < CONFIG_VERSION {
             self.version = CONFIG_VERSION;
         }
+    }
+
+    /// The trigger phrase to detect, or `None` when voice rewrite is off (toggle off or empty
+    /// phrase). Whether the phrase is usable (two or more words) is `rewrite::Trigger::new`'s call.
+    #[allow(dead_code)] // read by the pipeline and the Cleanup page once they land
+    pub fn rewrite_trigger_effective(&self) -> Option<&str> {
+        let t = self.rewrite_trigger.trim();
+        (self.ai_cleanup.rewrite_enabled && !t.is_empty()).then_some(t)
     }
 
     /// Model for the active STT provider (falls back to the registry default).
@@ -334,6 +358,34 @@ mod tests {
         assert!(!off.mute_system_audio);
         let back: Config = serde_json::from_str(&serde_json::to_string(&off).unwrap()).unwrap();
         assert!(!back.mute_system_audio);
+    }
+    #[test]
+    fn rewrite_settings_default_for_old_files() {
+        // A config written before voice rewrite existed gets it on, with the stock phrase.
+        let old: Config = serde_json::from_str(r#"{"version":1,"hotkey":"F8","ai_cleanup":{"enabled":true,"timeout_ms":2000}}"#).unwrap();
+        assert_eq!(old.rewrite_trigger, "rewrite this concisely");
+        assert!(old.ai_cleanup.rewrite_enabled);
+        assert_eq!(old.ai_cleanup.rewrite_timeout_ms, 10_000);
+        assert!(old.ai_cleanup.enabled && old.ai_cleanup.timeout_ms == 2000, "other fields untouched");
+        assert_eq!(old.rewrite_trigger_effective(), Some("rewrite this concisely"));
+        let d = Config::default();
+        assert_eq!(d.rewrite_trigger, DEFAULT_REWRITE_TRIGGER);
+        assert!(d.ai_cleanup.rewrite_enabled);
+        assert_eq!(d.ai_cleanup.rewrite_timeout_ms, DEFAULT_REWRITE_TIMEOUT_MS);
+    }
+    #[test]
+    fn rewrite_settings_explicit_values_stick() {
+        let c: Config = serde_json::from_str(r#"{"rewrite_trigger":"  ","ai_cleanup":{"rewrite_enabled":false,"rewrite_timeout_ms":3000}}"#).unwrap();
+        assert!(!c.ai_cleanup.rewrite_enabled);
+        assert_eq!(c.ai_cleanup.rewrite_timeout_ms, 3000);
+        assert_eq!(c.rewrite_trigger_effective(), None, "off and blank");
+        let empty: Config = serde_json::from_str(r#"{"rewrite_trigger":""}"#).unwrap();
+        assert_eq!(empty.rewrite_trigger, "", "an explicit empty phrase is kept, not reset");
+        assert_eq!(empty.rewrite_trigger_effective(), None);
+        let custom: Config = serde_json::from_str(r#"{"rewrite_trigger":" make it short "}"#).unwrap();
+        assert_eq!(custom.rewrite_trigger_effective(), Some("make it short"));
+        let back: Config = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
+        assert_eq!(back, c);
     }
     #[test]
     fn roundtrip() {

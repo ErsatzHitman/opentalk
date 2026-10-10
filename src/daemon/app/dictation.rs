@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use super::host::{App, TIMER_CAP, WM_NOTE, post};
 use super::latency::{self, Sample};
 use super::machine::{Input, MAX_RECORDING_MS, Phase};
-use super::pipeline;
+use super::pipeline::{self, Cleaned, RewriteState};
 use crate::core::config::Config;
 use crate::core::history::{self, Entry, Status};
 use crate::core::timing::{now_ms, unix_ms};
@@ -75,8 +75,9 @@ pub struct Failed {
 }
 
 pub enum Outcome {
-    /// Text delivered. `note` explains a degraded delivery (copied, not pasted).
-    Done { note: Option<String> },
+    /// Text delivered. `note` explains a degraded delivery (copied, not pasted); `warn` is the
+    /// (title, description) pill card for a voice rewrite that fell back to the text as dictated.
+    Done { note: Option<String>, warn: Option<(String, String)> },
     /// Nothing usable was said (silence, only fillers, hallucination).
     Nothing,
     Failed { title: String, message: String, retry: Option<Failed> },
@@ -678,16 +679,10 @@ impl App {
         self.set_idle();
         let capped = std::mem::take(&mut self.capped);
         match outcome {
-            Outcome::Done { note } => {
+            Outcome::Done { note, warn } => {
                 self.last_failed = None;
-                match note {
-                    Some(reason) => self.pill.show_error("Couldn't paste", &reason, false),
-                    None if capped => self.pill.show_error(
-                        "Recording limit reached",
-                        &format!("OpenTalk stops a recording after {} minutes; everything up to then was transcribed.", MAX_RECORDING_MS / 60_000),
-                        false,
-                    ),
-                    None => {}
+                if let Some((title, desc)) = done_card(note, warn, capped) {
+                    self.pill.show_error(&title, &desc, false);
                 }
             }
             Outcome::Nothing => self.pill.show_error(NO_SPEECH_TITLE, NO_SPEECH_BODY, false),
@@ -745,6 +740,58 @@ impl App {
         self.release_mute_within(muteaudio::QUIT_WAIT);
         self.cancel_recording();
         self.cancel_job();
+    }
+}
+
+/// The pill card to show after a delivered dictation. Precedence: a paste problem, then the voice
+/// rewrite fallback, then the recording-limit notice.
+fn done_card(note: Option<String>, warn: Option<(String, String)>, capped: bool) -> Option<(String, String)> {
+    match (note, warn) {
+        (Some(reason), _) => Some(("Couldn't paste".into(), reason)),
+        (None, Some(card)) => Some(card),
+        (None, None) if capped => Some((
+            "Recording limit reached".into(),
+            format!("OpenTalk stops a recording after {} minutes; everything up to then was transcribed.", MAX_RECORDING_MS / 60_000),
+        )),
+        (None, None) => None,
+    }
+}
+
+/// The rewrite-fallback card for `state`, if the rewrite failed.
+fn rewrite_warn(state: &RewriteState) -> Option<(String, String)> {
+    match state {
+        RewriteState::Failed(e) => {
+            let (title, desc) = pipeline::rewrite_card(e);
+            Some((title.to_string(), desc))
+        }
+        _ => None,
+    }
+}
+
+/// Outcome of a dictation whose cleaned text is empty: a bare rewrite phrase gets its own card
+/// (nothing is pasted), everything else is "nothing usable was said".
+fn empty_outcome(cfg: &Config, cleaned: &Cleaned) -> Outcome {
+    if cleaned.rewrite == RewriteState::NothingToRewrite {
+        let (title, message) = pipeline::nothing_to_rewrite_card(cfg);
+        return Outcome::Failed { title: title.into(), message, retry: None };
+    }
+    Outcome::Nothing
+}
+
+/// The history line of a delivered dictation: `text` is what was pasted (the concise rewrite for a
+/// rewritten one), `raw` the full recognizer text including the phrase, `original` the text the
+/// rewrite started from.
+fn delivered_entry(cfg: &Config, app: &AppInfo, cleaned: &Cleaned, speech_ms: u64, latency_ms: u64) -> Entry {
+    Entry {
+        text: cleaned.text.clone(),
+        raw: cleaned.raw.clone(),
+        status: Status::Ok,
+        duration_ms: speech_ms,
+        latency_ms,
+        ai_cleaned: cleaned.ai_cleaned,
+        rewritten: cleaned.rewrite == RewriteState::Done,
+        original: cleaned.original.clone(),
+        ..base_entry(cfg, app)
     }
 }
 
@@ -833,8 +880,13 @@ fn run_job(job: Job) -> Outcome {
         if cfg.save_discarded {
             log_history(&cfg, Entry { raw: cleaned.raw.clone(), ..discarded_entry(&cfg, &app, speech_ms) });
         }
-        return Outcome::Nothing;
+        if cancelled() {
+            return Outcome::Cancelled;
+        }
+        return empty_outcome(&cfg, &cleaned);
     }
+    // Esc during the cleanup / rewrite call: the worker returns when the call does, but nothing is
+    // pasted and no history entry is written (the result is dropped by `on_job_done` anyway).
     if cancelled() {
         return Outcome::Cancelled;
     }
@@ -856,18 +908,7 @@ fn run_job(job: Job) -> Outcome {
     let done = now_ms();
     let (paste_ms, total) = (done - t_paste, done - t_stop);
 
-    log_history(
-        &cfg,
-        Entry {
-            text: cleaned.text.clone(),
-            raw: cleaned.raw.clone(),
-            status: Status::Ok,
-            duration_ms: speech_ms,
-            latency_ms: total as u64,
-            ai_cleaned: cleaned.ai_cleaned,
-            ..base_entry(&cfg, &app)
-        },
-    );
+    log_history(&cfg, delivered_entry(&cfg, &app, &cleaned, speech_ms, total as u64));
     latency::record(Sample {
         seq: id,
         hotkey_pill,
@@ -883,7 +924,8 @@ fn run_job(job: Job) -> Outcome {
         provider: provider_name(&cfg),
         model: cfg.stt_model(),
     });
-    Outcome::Done { note }
+    let warn = rewrite_warn(&cleaned.rewrite);
+    Outcome::Done { note, warn }
 }
 
 fn failure(cfg: &Config, app: &AppInfo, e: SttError, audio: Audio, speech_ms: u64) -> Outcome {
@@ -1047,5 +1089,68 @@ mod tests {
             Ok(Some(r)) => assert_eq!(r, "r"),
             _ => panic!("expected the copied-only note"),
         }
+    }
+    // ---- voice rewrite -----------------------------------------------------------------------
+
+    fn cleaned(rewrite: RewriteState) -> Cleaned {
+        Cleaned { raw: "send it friday rewrite this concisely".into(), text: "Send it Friday.".into(), rewrite, ..Cleaned::default() }
+    }
+
+    #[test]
+    fn done_card_precedence_is_paste_note_then_rewrite_warning_then_cap() {
+        let warn = Some(("Rewrite timed out".to_string(), "Pasted your text as dictated.".to_string()));
+        let note = Some("blocked".to_string());
+        assert_eq!(done_card(note.clone(), warn.clone(), true), Some(("Couldn't paste".into(), "blocked".into())));
+        assert_eq!(done_card(None, warn.clone(), true), warn, "the rewrite card wins over the recording limit");
+        assert_eq!(done_card(None, warn.clone(), false), warn);
+        let cap = done_card(None, None, true).expect("cap card");
+        assert_eq!(cap.0, "Recording limit reached");
+        assert_eq!(done_card(None, None, false), None);
+    }
+
+    #[test]
+    fn a_failed_rewrite_maps_to_an_informational_card_only_when_it_failed() {
+        let (title, desc) = rewrite_warn(&RewriteState::Failed(crate::llm::LlmError::Timeout)).expect("card");
+        assert_eq!((title.as_str(), desc.as_str()), ("Rewrite timed out", "Pasted your text as dictated."));
+        for ok in [RewriteState::None, RewriteState::Done, RewriteState::Skipped, RewriteState::NothingToRewrite] {
+            assert_eq!(rewrite_warn(&ok), None, "{ok:?}");
+        }
+    }
+
+    #[test]
+    fn a_bare_phrase_is_a_nothing_to_rewrite_card_without_retry() {
+        let cfg = Config::default();
+        match empty_outcome(&cfg, &Cleaned { text: String::new(), rewrite: RewriteState::NothingToRewrite, ..Cleaned::default() }) {
+            Outcome::Failed { title, message, retry } => {
+                assert_eq!(title, "Nothing to rewrite");
+                assert!(message.contains("rewrite this concisely"), "{message}");
+                assert!(retry.is_none());
+            }
+            _ => panic!("expected the informational card"),
+        }
+        // Silence / fillers keep the usual "didn't catch that" outcome.
+        assert!(matches!(empty_outcome(&cfg, &Cleaned::default()), Outcome::Nothing));
+    }
+
+    #[test]
+    fn history_keeps_the_concise_text_the_full_speech_and_the_original() {
+        let cfg = Config::default();
+        let app = AppInfo::default();
+        let mut c = cleaned(RewriteState::Done);
+        c.text = "Send it Friday.".into();
+        c.original = Some("Please could you send it over on Friday if possible.".into());
+        let e = delivered_entry(&cfg, &app, &c, 1200, 800);
+        assert_eq!(e.text, "Send it Friday.");
+        assert_eq!(e.raw, "send it friday rewrite this concisely");
+        assert!(e.rewritten && !e.ai_cleaned);
+        assert_eq!(e.original.as_deref(), Some("Please could you send it over on Friday if possible."));
+        assert_eq!((e.status, e.duration_ms, e.latency_ms), (Status::Ok, 1200, 800));
+        // A fallback (or skipped) rewrite is stored as an ordinary dictation.
+        for state in [RewriteState::Failed(crate::llm::LlmError::Timeout), RewriteState::Skipped, RewriteState::None] {
+            let e = delivered_entry(&cfg, &app, &cleaned(state), 1200, 800);
+            assert!(!e.rewritten && e.original.is_none());
+        }
+        let ai = Cleaned { ai_cleaned: true, ..cleaned(RewriteState::None) };
+        assert!(delivered_entry(&cfg, &app, &ai, 1, 1).ai_cleaned);
     }
 }

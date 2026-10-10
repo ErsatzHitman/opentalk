@@ -312,6 +312,16 @@ STT correctness therefore rests on the mock contract tests; getting a real trans
 - Latencies come from the daemon's own QPC-stamped log lines (`latency seq=...`), read back with `--bench latency`.
 - Per-thread CPU uses `ProcessThread.TotalProcessorTime` and the thread names Rust sets (`SetThreadDescription`).
 
+## Voice rewrite (cost note)
+
+The rewrite adds exactly one LLM round trip (default budget 10 s, no retries) after the transcript is final, and only
+for a dictation that ends with the rewrite phrase; it replaces the cleanup call for that dictation, so such a dictation
+makes one LLM call, not two. Nothing runs while recording or idle (no timer, no polling), the detection is a single token
+pass over the text (a unit test pins it linear on a 100k-word input), and the mute is already released before the Thinking state, so a slow rewrite never keeps the speakers muted.
+Live AI rewrite is UNVERIFIED here (network to openrouter.ai is blocked in this environment): `live_openrouter_rewrite`
+and `live_rewrite_openrouter_free` (OpenRouter `:free` text models only) report UNVERIFIED without a key or network and
+need a run with `OPENTALK_SECRET_OPENROUTER` set. The contract tests use in-process mock servers.
+
 ## Notes
 
 - **opengl32.dll is delay-loaded** (`build.rs`). Only the Settings window draws with OpenGL, but a load-time import put

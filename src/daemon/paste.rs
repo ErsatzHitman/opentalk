@@ -724,8 +724,8 @@ fn add_exclusion_markers(cb: &Clipboard, already: &[u32]) {
 }
 
 /// Read CF_UNICODETEXT (None if absent).
-#[cfg(test)]
-pub(crate) fn read_clipboard_text() -> Option<String> {
+#[allow(dead_code)] // used by the tray text editor (paste into a popup field) once it lands
+pub fn read_clipboard_text() -> Option<String> {
     let owner = Owner::new()?;
     let _cb = Clipboard::open(&owner)?;
     // SAFETY: clipboard open; handle read-only locked and copied.

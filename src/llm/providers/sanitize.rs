@@ -341,6 +341,70 @@ pub fn validate(raw: &str, output: &str) -> Result<String, LlmError> {
     Ok(cleaned)
 }
 
+/// Openers of a model declining or answering instead of rewriting.
+const REFUSAL_PREFIXES: &[&str] = &[
+    "i'm sorry", "i\u{2019}m sorry", "i am sorry", "sorry,", "sorry.", "i can't", "i can\u{2019}t", "i cannot", "i'm unable", "i\u{2019}m unable",
+    "i am unable", "as an ai", "as a language model", "i won't", "i won\u{2019}t", "i apologize", "unfortunately, i",
+];
+
+/// The output may be at most this much longer than the input (1.05 x + 1 word): "gonna" ->
+/// "going to" adds a token, a rewrite must not grow otherwise.
+const REWRITE_GROWTH: f64 = 1.05;
+/// For inputs of [`REWRITE_COLLAPSE_MIN_INPUT`] or more words the output keeps at least this
+/// share of the words (a "rewrite" that is one word is a collapse, not a summary).
+const REWRITE_FLOOR: f64 = 0.08;
+const REWRITE_COLLAPSE_MIN_INPUT: usize = 8;
+/// Answer-instead-of-rewrite guard: this share of the output's content words (4+ letters) must
+/// come from the input (sharing a 4-letter stem), checked for outputs of 6+ words.
+const REWRITE_MIN_OVERLAP: f64 = 0.2;
+const REWRITE_OVERLAP_MIN_OUTPUT: usize = 6;
+
+/// Validate the model's concise rewrite of `input`. Unlike [`validate`], shrinking by any amount
+/// is fine, an empty output is never fine, and growing is not. Returns the sanitized rewrite, or
+/// `InvalidOutput` for: empty, a refusal, the transcript said twice, longer than the input,
+/// collapsed to (almost) nothing, or sharing too little content with the input (an answer to a
+/// question in the dictation instead of a rewrite of it).
+pub fn validate_rewrite(input: &str, output: &str) -> Result<String, LlmError> {
+    let s = sanitize(output, input);
+    if s.trim().is_empty() {
+        return Err(LlmError::InvalidOutput("empty rewrite".into()));
+    }
+    let low = s.trim_start().to_lowercase();
+    let input_low = input.trim_start().to_lowercase();
+    if let Some(p) = REFUSAL_PREFIXES.iter().find(|p| low.starts_with(**p))
+        && !input_low.starts_with(*p)
+    {
+        return Err(LlmError::InvalidOutput("the model declined to rewrite".into()));
+    }
+    if is_duplicated_transcript(input, &s) {
+        return Err(LlmError::InvalidOutput("AI rewrite repeated the transcript".into()));
+    }
+    let (inp, out) = (comparison_tokens(input), comparison_tokens(&s));
+    let (i, o) = (inp.len(), out.len());
+    if o as f64 > (i as f64 * REWRITE_GROWTH).ceil() + 1.0 {
+        return Err(LlmError::InvalidOutput(format!("rewrite has {o} words, more than the {i} it started from")));
+    }
+    if i >= REWRITE_COLLAPSE_MIN_INPUT && (o as f64) < (i as f64 * REWRITE_FLOOR).ceil() {
+        return Err(LlmError::InvalidOutput(format!("rewrite collapsed from {i} words to {o}")));
+    }
+    if o >= REWRITE_OVERLAP_MIN_OUTPUT && !out.iter().any(|t| t.chars().next().is_some_and(is_cjk)) {
+        let stems: std::collections::HashSet<String> = inp.iter().filter(|t| t.chars().count() >= 4).map(|t| stem(t)).collect();
+        let content: Vec<&String> = out.iter().filter(|t| t.chars().count() >= 4).collect();
+        if content.len() >= 3 {
+            let shared = content.iter().filter(|t| stems.contains(&stem(t))).count();
+            if (shared as f64) < content.len() as f64 * REWRITE_MIN_OVERLAP {
+                return Err(LlmError::InvalidOutput("the output does not look like a rewrite of the dictation".into()));
+            }
+        }
+    }
+    Ok(s)
+}
+
+/// First four characters of a lowercase token ("shipping" and "shipped" share "ship").
+fn stem(token: &str) -> String {
+    token.chars().take(4).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -492,6 +556,111 @@ mod tests {
         assert_eq!(validate("um like you know", "  ").unwrap(), "");
         assert_eq!(validate("ok", "OK.").unwrap(), "OK.");
         assert_eq!(validate(LONG_RAW, LONG_CLEAN).unwrap(), LONG_CLEAN);
+    }
+
+    // --- validate_rewrite ---
+
+    const WORDY: &str = "so I was thinking that maybe we could possibly move the meeting from Thursday to Friday afternoon if that works for everyone because the client is out on Thursday";
+    const CONCISE: &str = "Can we move the meeting from Thursday to Friday afternoon? The client is out on Thursday.";
+
+    #[test]
+    fn rewrite_accepts_a_shorter_text_that_the_cleanup_ratio_would_reject() {
+        assert_eq!(validate_rewrite(WORDY, CONCISE).unwrap(), CONCISE);
+        // 0.2 of the words: the cleanup validator refuses it, the rewrite validator allows it.
+        let ten = "the team wants to ship the release next week but the team also wants the tests to pass first so the release might slip";
+        assert_eq!(validate_rewrite(ten, "The release may slip.").unwrap(), "The release may slip.");
+        assert!(validate(ten, "The release may slip.").is_err());
+    }
+
+    #[test]
+    fn rewrite_strips_preamble_quotes_fences_and_thinking() {
+        let want = CONCISE.to_string();
+        for out in [
+            format!("Here is the concise version:\n{CONCISE}"),
+            format!("\"{CONCISE}\""),
+            format!("<think>shorten it</think>{CONCISE}"),
+            format!("```\n{CONCISE}\n```"),
+            format!("<transcript>\n{CONCISE}\n</transcript>"),
+            format!("  {CONCISE}\n\n"),
+        ] {
+            assert_eq!(validate_rewrite(WORDY, &out).unwrap(), want, "{out:?}");
+        }
+    }
+
+    #[test]
+    fn rewrite_rejects_empty_output_even_for_short_input() {
+        for out in ["", "   ", "<think>x</think>", "\"\"", "```\n```"] {
+            assert!(invalid(validate_rewrite(WORDY, out)).contains("empty"), "{out:?}");
+        }
+        assert!(invalid(validate_rewrite("ok then", "")).contains("empty"));
+    }
+
+    #[test]
+    fn rewrite_rejects_refusals_unless_the_speaker_said_them() {
+        for out in [
+            "I'm sorry, but I can't help with that.",
+            "I\u{2019}m sorry, I cannot rewrite this.",
+            "Sorry, I am unable to do that.",
+            "As an AI language model, I cannot.",
+            "I cannot rewrite messages like this one.",
+            "I apologize, here is a shorter version: move the meeting.",
+        ] {
+            assert!(invalid(validate_rewrite(WORDY, out)).contains("declined"), "{out:?}");
+        }
+        // The dictation itself starts with that phrase: keep it.
+        let said = "I'm sorry but I cannot make the meeting on Thursday because the client is out and I have to travel to see them";
+        assert!(validate_rewrite(said, "I'm sorry, I cannot make Thursday: the client is out and I travel.").is_ok());
+    }
+
+    #[test]
+    fn rewrite_rejects_the_transcript_said_twice() {
+        let twice = format!("{CONCISE} {CONCISE}");
+        assert!(validate_rewrite(CONCISE, &twice).is_err());
+        let r = validate_rewrite(WORDY, &format!("{WORDY} {WORDY}"));
+        assert!(r.is_err(), "{r:?}");
+    }
+
+    #[test]
+    fn rewrite_rejects_output_longer_than_the_input() {
+        let growth = format!("{WORDY} and that is all I wanted to say about the meeting today and tomorrow");
+        assert!(invalid(validate_rewrite(WORDY, &growth)).contains("more than"));
+        // Small slack for contractions: 4 words in, 6 out is fine, 7 is not.
+        assert!(validate_rewrite("gonna ship it friday", "I'm going to ship it Friday.").is_ok());
+        assert!(validate_rewrite("gonna ship it friday", "I am going to ship it on Friday for sure.").is_err());
+    }
+
+    #[test]
+    fn rewrite_rejects_a_collapse_of_a_long_input() {
+        let forty = "so basically what I wanted to say is that the quarterly numbers are looking better than we expected and the board is happy about the new product launch and the hiring plan";
+        assert_eq!(comparison_tokens(forty).len(), 32);
+        assert!(invalid(validate_rewrite(forty, "Fine.")).contains("collapsed"));
+        assert!(validate_rewrite(forty, "Quarterly numbers beat expectations; the board likes the launch and hiring plan.").is_ok());
+        // Short inputs may shrink to one word.
+        assert_eq!(validate_rewrite("yes yes absolutely I agree", "Agreed.").unwrap(), "Agreed.");
+    }
+
+    #[test]
+    fn rewrite_rejects_an_answer_to_a_question_in_the_dictation() {
+        let q = "what time does the pharmacy close tonight and also do they deliver";
+        assert!(validate_rewrite(q, "What time does the pharmacy close tonight, and do they deliver?").is_ok());
+        // A poem or an unrelated answer shares (almost) no content words with the dictation.
+        let poem = "Ocean waves crash upon the shore, whispering ancient secrets to the sand.";
+        assert!(invalid(validate_rewrite(q, poem)).contains("does not look like"));
+    }
+
+    #[test]
+    fn rewrite_accepts_text_that_is_already_concise() {
+        assert_eq!(validate_rewrite("Send it Friday.", "Send it Friday.").unwrap(), "Send it Friday.");
+        assert_eq!(validate_rewrite("send it friday", "Send it Friday.").unwrap(), "Send it Friday.");
+        assert_eq!(validate_rewrite(CONCISE, CONCISE).unwrap(), CONCISE);
+    }
+
+    #[test]
+    fn rewrite_overlap_guard_skips_cjk_and_tolerates_stems() {
+        let zh = "我想说的是明天的会议可能需要推迟到下周因为客户那边临时有安排所以我们需要重新确认时间";
+        assert!(validate_rewrite(zh, "明天的会议推迟到下周，需重新确认时间。").is_ok());
+        let en = "we were shipping the releases yesterday and the testing finished quickly afterwards without problems";
+        assert!(validate_rewrite(en, "We shipped the release; testing finished without problems.").is_ok());
     }
 
     fn invalid(r: Result<String, LlmError>) -> String {

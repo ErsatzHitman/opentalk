@@ -1,6 +1,7 @@
 //! End-to-end tests that drive the real executable.
 //!
-//! - `transcribe_file_*`: headless pipeline against the in-repo mock STT server (no network).
+//! - `transcribe_file_*`: headless pipeline against the in-repo mock STT server (no network). The
+//!   same mock answers `/chat/completions`, so the voice rewrite runs end to end without a provider.
 //! - `live_*` (ignored): OpenRouter, `:free` models only, key via `OPENTALK_SECRET_OPENROUTER`.
 //!   They print VERIFIED / UNVERIFIED / FAILED; `OPENTALK_LIVE_REQUIRE=1` turns UNVERIFIED into a failure.
 //! - `desktop_e2e_notepad` (ignored): `tests/e2e.ps1` - daemon + injected WAV + paste into Notepad.
@@ -28,6 +29,11 @@ impl Home {
         std::fs::create_dir_all(&dir).expect("temp home");
         Home(dir)
     }
+
+    /// Write a (partial) config.json; unspecified settings keep their defaults.
+    fn config(&self, json: &str) {
+        std::fs::write(self.0.join("config.json"), json).expect("write config");
+    }
 }
 
 impl Drop for Home {
@@ -44,8 +50,14 @@ struct Mock {
 
 impl Mock {
     fn start() -> Mock {
+        Mock::start_with(&[])
+    }
+
+    /// `extra`: more `--bench mock-stt` flags (`--text`, `--llm-text`, `--llm-status`, `--delay-ms`).
+    fn start_with(extra: &[&str]) -> Mock {
         let mut child = Command::new(EXE)
             .args(["--bench", "mock-stt", "--port", "0"])
+            .args(extra)
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
@@ -133,6 +145,238 @@ fn bench_summary_of_an_empty_log_is_valid_json() {
     let out = Command::new(EXE).args(["--bench", "latency"]).env("OPENTALK_HOME", &home.0).output().expect("run");
     let v: serde_json::Value = serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).expect("json");
     assert_eq!(v["count"], 0);
+}
+
+// ---- voice rewrite, end to end against the mock ---------------------------------------------
+
+const WORDY: &str = "So I was thinking that maybe we could possibly move the meeting from Thursday to Friday afternoon if that works for everyone because the client is out on Thursday.";
+
+/// `--transcribe-file` on tts_fillers.wav with the STT and the LLM both served by `mock`.
+fn rewrite_run(home: &Home, mock: &Mock, extra: &[&str]) -> (i32, serde_json::Value) {
+    let wav = fixture("tts_fillers.wav");
+    let mut args = vec![wav.to_str().unwrap(), "--provider", "openai", "--model", "whisper-1", "--no-llm"];
+    args.extend_from_slice(extra);
+    transcribe(
+        home,
+        &args,
+        &[
+            ("OPENTALK_STT_BASE_URL", &mock.url),
+            ("OPENTALK_LLM_BASE_URL", &mock.url),
+            ("OPENTALK_SECRET_OPENAI", "e2e-dummy-key-123456"),
+            ("OPENTALK_SECRET_OPENROUTER", "e2e-dummy-key-123456"),
+        ],
+    )
+}
+
+#[test]
+fn transcribe_file_rewrites_when_the_phrase_ends_the_dictation() {
+    let said = format!("{WORDY} Rewrite this concisely.");
+    let mock = Mock::start_with(&["--text", &said]);
+    let home = Home::new("rw-ok");
+    let (code, v) = rewrite_run(&home, &mock, &[]);
+    assert_eq!(code, 0, "{v}");
+    let (raw, text) = (v["raw"].as_str().unwrap(), v["text"].as_str().unwrap());
+    assert!(raw.ends_with("Rewrite this concisely."), "raw keeps the phrase: {raw}");
+    assert_eq!((v["rewritten"].clone(), v["rewrite"].clone()), (true.into(), "done".into()), "{v}");
+    assert!(v["rewrite_error"].is_null());
+    assert!(!text.to_lowercase().contains("rewrite") && !text.to_lowercase().contains("concisely"), "{text}");
+    // The mock's deterministic rewrite keeps the first 60% of the BODY, so it is clearly shorter.
+    assert!(text.split_whitespace().count() < WORDY.split_whitespace().count() * 7 / 10, "{text}");
+    assert!(text.starts_with("So I was thinking"), "{text}");
+    assert!(v["original"].as_str().unwrap().ends_with("Thursday."), "original is the deterministic body: {v}");
+    assert_eq!(v["ai_cleaned"], false, "a rewrite is not an AI cleanup");
+}
+
+#[test]
+fn transcribe_file_uses_the_fixed_llm_reply_and_ignores_the_cleanup_toggle() {
+    let said = format!("{WORDY} Rewrite this concisely.");
+    let mock = Mock::start_with(&["--text", &said, "--llm-text", "Can we move the meeting from Thursday to Friday afternoon? The client is out on Thursday."]);
+    let home = Home::new("rw-fixed");
+    // `--no-llm` (AI cleanup off) is in rewrite_run's args: the rewrite still goes out.
+    let (code, v) = rewrite_run(&home, &mock, &[]);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["text"], "Can we move the meeting from Thursday to Friday afternoon? The client is out on Thursday.");
+    assert_eq!(v["rewritten"], true);
+}
+
+#[test]
+fn transcribe_file_pastes_the_text_as_dictated_when_the_rewrite_fails() {
+    let said = format!("{WORDY} Rewrite this concisely.");
+    let mock = Mock::start_with(&["--text", &said, "--llm-status", "500"]);
+    let home = Home::new("rw-500");
+    let (code, v) = rewrite_run(&home, &mock, &[]);
+    assert_eq!(code, 0, "a failed rewrite never fails the dictation: {v}");
+    assert_eq!(v["text"], WORDY.trim_end_matches('.').to_string() + ".", "the body, phrase removed: {v}");
+    assert_eq!((v["rewritten"].clone(), v["rewrite"].clone()), (false.into(), "failed".into()));
+    assert!(v["rewrite_error"].as_str().unwrap().contains("500"), "{v}");
+}
+
+#[test]
+fn transcribe_file_falls_back_on_a_refusal_or_a_longer_answer() {
+    let said = format!("{WORDY} Rewrite this concisely.");
+    for reply in ["I'm sorry, but I can't help with that.", "Sure."] {
+        let mock = Mock::start_with(&["--text", &said, "--llm-text", reply]);
+        let home = Home::new("rw-bad");
+        let (code, v) = rewrite_run(&home, &mock, &[]);
+        assert_eq!(code, 0, "{v}");
+        assert_eq!((v["rewritten"].clone(), v["rewrite"].clone()), (false.into(), "failed".into()), "{reply}: {v}");
+        assert!(v["rewrite_error"].as_str().unwrap().contains("InvalidOutput"), "{v}");
+        assert!(v["text"].as_str().unwrap().starts_with("So I was thinking"), "{v}");
+    }
+}
+
+#[test]
+fn transcribe_file_times_out_a_slow_rewrite_and_pastes_the_original() {
+    let said = format!("{WORDY} Rewrite this concisely.");
+    let mock = Mock::start_with(&["--text", &said, "--delay-ms", "2000"]);
+    let home = Home::new("rw-slow");
+    home.config(r#"{"ai_cleanup":{"rewrite_timeout_ms":300}}"#);
+    let started = std::time::Instant::now();
+    let (code, v) = rewrite_run(&home, &mock, &[]);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!((v["rewritten"].clone(), v["rewrite"].clone()), (false.into(), "failed".into()), "{v}");
+    assert!(v["rewrite_error"].as_str().unwrap().contains("Timeout"), "{v}");
+    assert!(v["text"].as_str().unwrap().starts_with("So I was thinking"), "{v}");
+    // STT took 2 s; the rewrite gave up after ~0.3 s instead of waiting the 2 s for the mock.
+    assert!(started.elapsed().as_millis() < 4_500, "{} ms", started.elapsed().as_millis());
+}
+
+#[test]
+fn transcribe_file_without_the_phrase_is_unchanged() {
+    let mock = Mock::start();
+    let home = Home::new("rw-none");
+    let (code, v) = rewrite_run(&home, &mock, &[]);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!((v["rewritten"].clone(), v["rewrite"].clone()), (false.into(), "none".into()));
+    assert!(v["text"].as_str().unwrap().contains("ship the new release on Friday"), "{v}");
+}
+
+#[test]
+fn transcribe_file_no_rewrite_keeps_the_phrase_in_the_text() {
+    let said = format!("{WORDY} Rewrite this concisely.");
+    let mock = Mock::start_with(&["--text", &said]);
+    let home = Home::new("rw-off");
+    let (code, v) = rewrite_run(&home, &mock, &["--no-rewrite"]);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["rewrite"], "none");
+    assert!(v["text"].as_str().unwrap().ends_with("Rewrite this concisely."), "{v}");
+    // The same switch lives in config.json.
+    let home = Home::new("rw-off-cfg");
+    home.config(r#"{"ai_cleanup":{"rewrite_enabled":false}}"#);
+    let (_, v) = rewrite_run(&home, &mock, &[]);
+    assert_eq!(v["rewrite"], "none");
+    // An explicitly empty phrase turns it off as well.
+    let home = Home::new("rw-empty");
+    home.config(r#"{"rewrite_trigger":""}"#);
+    let (_, v) = rewrite_run(&home, &mock, &[]);
+    assert_eq!(v["rewrite"], "none");
+}
+
+#[test]
+fn transcribe_file_custom_phrase() {
+    let said = format!("{WORDY} Make it short.");
+    let mock = Mock::start_with(&["--text", &said]);
+    let home = Home::new("rw-custom");
+    let (_, v) = rewrite_run(&home, &mock, &["--rewrite-trigger", "make it short"]);
+    assert_eq!(v["rewritten"], true, "{v}");
+    assert!(!v["text"].as_str().unwrap().to_lowercase().contains("make it short"), "{v}");
+    // The stock phrase no longer fires when another one is configured.
+    let said = format!("{WORDY} Rewrite this concisely.");
+    let mock = Mock::start_with(&["--text", &said]);
+    let (_, v) = rewrite_run(&home, &mock, &["--rewrite-trigger", "make it short"]);
+    assert_eq!(v["rewrite"], "none", "{v}");
+}
+
+#[test]
+fn transcribe_file_only_the_phrase_pastes_nothing() {
+    let mock = Mock::start_with(&["--text", "Rewrite this concisely."]);
+    let home = Home::new("rw-only");
+    let (code, v) = rewrite_run(&home, &mock, &[]);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!((v["text"].clone(), v["rewrite"].clone(), v["rewritten"].clone()), ("".into(), "nothing".into(), false.into()), "{v}");
+}
+
+#[test]
+fn transcribe_file_short_body_needs_no_llm() {
+    // No LLM base override and no key: reaching the network would show up as a failed rewrite.
+    let mock = Mock::start_with(&["--text", "Send it Friday. Rewrite this concisely."]);
+    let home = Home::new("rw-short");
+    let wav = fixture("tts_fillers.wav");
+    let (code, v) = transcribe(
+        &home,
+        &[wav.to_str().unwrap(), "--provider", "openai", "--model", "whisper-1", "--no-llm"],
+        &[("OPENTALK_STT_BASE_URL", &mock.url), ("OPENTALK_SECRET_OPENAI", "e2e-dummy-key-123456"), ("OPENTALK_LLM_BASE_URL", "http://127.0.0.1:9")],
+    );
+    assert_eq!(code, 0, "{v}");
+    assert_eq!((v["text"].clone(), v["rewrite"].clone()), ("Send it Friday.".into(), "skipped".into()), "{v}");
+}
+
+#[test]
+fn transcribe_file_without_a_key_reports_not_configured_and_keeps_the_text() {
+    let said = format!("{WORDY} Rewrite this concisely.");
+    let mock = Mock::start_with(&["--text", &said]);
+    let home = Home::new("rw-nokey");
+    let wav = fixture("tts_fillers.wav");
+    let (code, v) = transcribe(
+        &home,
+        &[wav.to_str().unwrap(), "--provider", "openai", "--model", "whisper-1"],
+        &[("OPENTALK_STT_BASE_URL", &mock.url), ("OPENTALK_SECRET_OPENAI", "e2e-dummy-key-123456"), ("OPENTALK_LLM_BASE_URL", &mock.url)],
+    );
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["rewrite"], "failed", "{v}");
+    assert!(v["rewrite_error"].as_str().unwrap().contains("NotConfigured"), "{v}");
+    assert!(v["text"].as_str().unwrap().starts_with("So I was thinking"), "{v}");
+}
+
+/// Live rewrite through the real executable: the STT is the mock, the LLM is OpenRouter with a
+/// `:free` text model (never Groq, never a paid model). Without `OPENTALK_SECRET_OPENROUTER` or
+/// network it is UNVERIFIED; `OPENTALK_LIVE_REQUIRE=1` turns that into a failure.
+#[test]
+#[ignore = "live: OpenRouter free text model (needs OPENTALK_SECRET_OPENROUTER)"]
+fn live_rewrite_openrouter_free() {
+    const TEST: &str = "live_rewrite_openrouter_free";
+    let Ok(key) = std::env::var("OPENTALK_SECRET_OPENROUTER") else {
+        return report_live(TEST, Live::Unverified("OPENTALK_SECRET_OPENROUTER not set".into()));
+    };
+    let models = std::env::var("OPENTALK_LIVE_MODEL")
+        .unwrap_or_else(|_| "nvidia/nemotron-3-super-120b-a12b:free,google/gemma-4-31b-it:free,nvidia/nemotron-3.5-lightning:free".into());
+    let said = format!("{WORDY} Rewrite this concisely.");
+    let mock = Mock::start_with(&["--text", &said]);
+    let wav = fixture("tts_fillers.wav");
+    let mut notes = Vec::new();
+    for model in models.split(',').map(str::trim).filter(|m| !m.is_empty()) {
+        assert!(model.ends_with(":free"), "live tests may only use :free models");
+        let home = Home::new("rw-live");
+        home.config(&format!(r#"{{"ai_cleanup":{{"provider":"openrouter","models":{{"openrouter":"{model}"}},"rewrite_timeout_ms":30000}}}}"#));
+        for attempt in 0..3u64 {
+            let (code, v) = transcribe(
+                &home,
+                &[wav.to_str().unwrap(), "--provider", "openai", "--model", "whisper-1", "--no-llm"],
+                &[("OPENTALK_STT_BASE_URL", &mock.url), ("OPENTALK_SECRET_OPENAI", "e2e-dummy-key-123456"), ("OPENTALK_SECRET_OPENROUTER", &key)],
+            );
+            assert_eq!(code, 0, "{v}");
+            if v["rewritten"] == true {
+                let text = v["text"].as_str().unwrap_or_default();
+                let ok = text.split_whitespace().count() < WORDY.split_whitespace().count() && text.contains("Thursday") && text.contains("Friday");
+                if ok {
+                    return report_live(TEST, Live::Verified(format!("{model}: {text}")));
+                }
+                notes.push(format!("{model}: unexpected rewrite {text:?}"));
+                break;
+            }
+            let err = v["rewrite_error"].as_str().unwrap_or("no error").to_string();
+            if err.contains("401") || err.contains("403") || err.contains("NotConfigured") {
+                return report_live(TEST, Live::Failed(format!("{model}: {err}")));
+            }
+            if err.contains("429") || err.contains("Timeout") {
+                std::thread::sleep(std::time::Duration::from_secs(2 << attempt));
+                continue;
+            }
+            notes.push(format!("{model}: {err}"));
+            break;
+        }
+    }
+    report_live(TEST, Live::Unverified(notes.join("; ")));
 }
 
 /// Live OpenRouter smoke test (`:free` models only; `OPENTALK_LIVE_MODEL` may list several,
@@ -436,6 +680,60 @@ fn desktop_cancel_while_the_mic_starts_drops_the_dictation() {
     assert!(log.contains("recording #1 cancelled"), "the pending recording was not cancelled:\n{log}");
     assert!(!log.contains("recording #1 stopped"), "a cancelled recording reached the worker:\n{log}");
     assert!(history.trim().is_empty(), "a cancelled dictation wrote history: {history}");
+}
+
+/// Esc while the rewrite call is in flight (the pill is in Thinking): nothing is pasted or
+/// stored, even after the slow mock LLM finally answers.
+#[test]
+#[ignore = "desktop: starts the real daemon (single-instance lock), injected WAV, local mock STT + slow mock LLM"]
+fn desktop_cancel_during_rewrite() {
+    const WM_OT_TOGGLE: u32 = 0x8000 + 4;
+    const WM_OT_CANCEL: u32 = 0x8000 + 5;
+    let said = format!("{WORDY} Rewrite this concisely.");
+    let mock = Mock::start_with(&["--text", &said, "--llm-delay-ms", "5000"]);
+    let home = Home::new("cancel-rewrite");
+    let cfg = serde_json::json!({
+        "audio_cues": false, "auto_paste": false, "keep_in_clipboard": true, "history_enabled": true,
+        "save_discarded": true, "show_app_bubble": false, "start_minimized": true, "stt": { "provider": "openai" }
+    });
+    std::fs::write(home.0.join("config.json"), cfg.to_string()).expect("config");
+    let mut daemon = Command::new(EXE)
+        .arg("--hidden")
+        .env("OPENTALK_HOME", &home.0)
+        .env("OPENTALK_INJECT_WAV", fixture("tts_fillers.wav"))
+        .env("OPENTALK_STT_BASE_URL", &mock.url)
+        .env("OPENTALK_LLM_BASE_URL", &mock.url)
+        .env("OPENTALK_SECRET_OPENAI", "e2e-dummy-key-123456")
+        .env("OPENTALK_SECRET_OPENROUTER", "e2e-dummy-key-123456")
+        .spawn()
+        .expect("start daemon");
+    let log_path = home.0.join("logs").join("daemon.log");
+    let read_log = || std::fs::read_to_string(&log_path).unwrap_or_default();
+    let ready = (0..300).any(|_| {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        unsafe { windows::Win32::UI::WindowsAndMessaging::FindWindowW(windows::core::w!("OpenTalkDaemon"), None) }.is_ok()
+    });
+    let mut posted = ready && post_to_daemon(WM_OT_TOGGLE);
+    std::thread::sleep(std::time::Duration::from_secs(5)); // the injected WAV plays
+    posted = posted && post_to_daemon(WM_OT_TOGGLE);
+    // Wait until the worker is inside the rewrite call, then press Esc.
+    let in_rewrite = (0..200).any(|_| {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        read_log().contains("rewrite matched")
+    });
+    let cancelled = in_rewrite && post_to_daemon(WM_OT_CANCEL);
+    std::thread::sleep(std::time::Duration::from_secs(8)); // past the mock's 5 s answer
+    let history = std::fs::read_to_string(home.0.join("history.jsonl")).unwrap_or_default();
+    let log = read_log();
+    let _ = Command::new(EXE).args(["--bench", "quit"]).env("OPENTALK_HOME", &home.0).status();
+    if daemon.wait_timeout_ms(5000).is_none() {
+        let _ = daemon.kill();
+        let _ = daemon.wait();
+    }
+    assert!(ready && posted, "daemon window never appeared (another daemon running?)");
+    assert!(in_rewrite && cancelled, "the dictation never reached the rewrite call:\n{log}");
+    assert!(log.contains("dictation #1 cancelled"), "Esc did not cancel the job:\n{log}");
+    assert!(history.trim().is_empty(), "a cancelled rewrite wrote history: {history}");
 }
 
 trait WaitTimeout {
