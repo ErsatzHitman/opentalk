@@ -378,24 +378,33 @@ impl<'a> Canvas<'a> {
         let (x0, y0, x1, y1) = self.dev_range(r.inflate(reach));
         let s = self.scale;
         let inv = 1.0 / s;
-        let k = std::f32::consts::FRAC_1_SQRT_2 / sigma;
+        let inv_sigma = 1.0 / sigma;
+        // separable box profile: 0.5 * (erf((p - lo) k) - erf((p - hi) k)) == cdf((p - lo) / sigma) -
+        // cdf((p - hi) / sigma); the column factors are computed once, not once per pixel
+        let profile = |p: f32, lo: f32, hi: f32| norm_cdf_fast((p - lo) * inv_sigma) - norm_cdf_fast((p - hi) * inv_sigma);
+        // the column factors live in a reused per-thread buffer, so a frame allocates nothing
+        thread_local! {
+            static COLS: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        let mut cols = COLS.with(|c| std::mem::take(&mut *c.borrow_mut()));
+        cols.clear();
+        cols.extend((x0..x1).map(|x| profile((x as f32 + 0.5) * inv, r.l, r.r)));
         for y in y0..y1 {
             let ly = (y as f32 + 0.5) * inv;
-            let fy = 0.5 * (erf((ly - r.t) * k) - erf((ly - r.b) * k));
+            let fy = profile(ly, r.t, r.b);
             if fy <= 0.0005 {
                 continue;
             }
             for x in x0..x1 {
                 let lx = (x as f32 + 0.5) * inv;
-                let fx = 0.5 * (erf((lx - r.l) * k) - erf((lx - r.r) * k));
-                let mut f = fx * fy;
+                let mut f = cols[(x - x0) as usize] * fy;
                 if rad > 0.5 {
                     // fade the four corners toward the rounded outline
                     let d = sd_round_box(lx, ly, r.cx(), r.cy(), r.w() * 0.5, r.h() * 0.5, rad);
                     if d > 0.0 {
                         // outside the rounded outline the box product over-estimates; blend with
                         // the 1-D SDF profile
-                        let g = norm_cdf(-d / sigma);
+                        let g = norm_cdf_fast(-d * inv_sigma);
                         f = f.min(g.max(0.0));
                     }
                 }
@@ -405,6 +414,7 @@ impl<'a> Canvas<'a> {
                 }
             }
         }
+        COLS.with(|c| *c.borrow_mut() = cols);
     }
 }
 

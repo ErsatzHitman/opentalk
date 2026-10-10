@@ -176,10 +176,10 @@ impl<S, M> Gate<S, M> {
     fn run(&self, f: impl FnOnce(&mut S), replay: &mut dyn FnMut(M)) -> bool {
         let ran = match self.state.try_borrow_mut() {
             Ok(mut guard) => {
-                if let Some(state) = guard.as_mut() {
-                    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(state))).is_err() {
-                        log_err!("panic while handling a window message (recovered)");
-                    }
+                if let Some(state) = guard.as_mut()
+                    && std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(state))).is_err()
+                {
+                    log_err!("panic while handling a window message (recovered)");
                 }
                 true
             }
@@ -865,10 +865,10 @@ pub fn run(hidden: bool) -> i32 {
         }
         // An isolated instance (tests, benchmarks: OPENTALK_HOME set) must never re-point the
         // user's real launch-at-login entry at its own executable.
-        if !isolated_home() {
-            if let Err(e) = autostart::sync() {
-                log_warn!("autostart sync failed: {e}");
-            }
+        if !isolated_home()
+            && let Err(e) = autostart::sync()
+        {
+            log_warn!("autostart sync failed: {e}");
         }
         prune_history_now(retention);
     });

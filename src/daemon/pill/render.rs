@@ -876,7 +876,9 @@ mod tests {
             t += 1000.0 / 60.0;
         }
         let mut pm = Pixmap::new(208, 120).unwrap();
-        render_into(&s, 1000.0, &mut pm); // warm
+        // warm: the first paint of a shape evaluates the field inline, the second bakes its map
+        render_into(&s, 1000.0, &mut pm);
+        render_into(&s, 1000.0, &mut pm);
         let n = 50;
         let t0 = std::time::Instant::now();
         for _ in 0..n {
@@ -1551,6 +1553,60 @@ mod tests {
             let p95 = all[all.len() * 95 / 100];
             println!("transition frames {scale}x: expand median {e:.3} ms, hold {h:.3} ms, shrink median {k:.3} ms, p95 {p95:.3} ms, worst {worst:.3} ms");
             assert!(e < 60.0 && k < 60.0, "{scale}x: expand {e:.1} ms, shrink {k:.1} ms");
+        }
+    }
+
+    /// The detached cancel button grows and slides out over its 280 ms emerge: its glass uses the same
+    /// table-driven field as the pill's resize, so no emerge or retract frame bakes a displacement map
+    /// (or evicts the pill's and the bubble's), and only the settled button is baked.
+    #[test]
+    fn cancel_emerge_frames_use_the_table_field_and_bake_nothing() {
+        let median = |mut v: Vec<f64>| {
+            v.sort_by(|a, b| a.total_cmp(b));
+            v[v.len() / 2]
+        };
+        for scale in [1.0f32, 2.0] {
+            let bd = busy_backdrop(scale, 1);
+            let mut s = RenderState::new(Palette::DARK, scale, PanelPosition::BottomRight);
+            s.set_backdrop(Some(bd));
+            s.set_app(Some(AppBubble::new("Notepad", &vec![200u8; 32 * 32 * 4], 32, scale).unwrap()), 0.0);
+            s.set_mode(PillMode::Recording, 0.0);
+            let mut pm = new_pm(&s);
+            let mut cache = FrameCache::new();
+            let mut t = 0.0;
+            while t < 1500.0 {
+                s.tick(t, speech(t));
+                cache.render(&s, t, &mut pm);
+                t += FRAME;
+            }
+            let held = glass::disp_cache_len();
+            let mut frames = Vec::new();
+            let mut bakes = 0;
+            for over in [true, false] {
+                s.set_pointer(Pointer { group: over, pill: over, bubble: false, cancel: false }, t);
+                let t_end = t + CANCEL_EMERGE_MS - 20.0;
+                while t < t_end {
+                    s.tick(t, speech(t));
+                    let before = glass::bake_count();
+                    let t0 = std::time::Instant::now();
+                    cache.render(&s, t, &mut pm);
+                    frames.push(t0.elapsed().as_secs_f64() * 1000.0);
+                    if t > t_end - CANCEL_EMERGE_MS + 40.0 {
+                        bakes += glass::bake_count() - before;
+                    }
+                    t += FRAME;
+                }
+                for _ in 0..6 {
+                    s.tick(t, speech(t));
+                    cache.render(&s, t, &mut pm);
+                    t += FRAME;
+                }
+            }
+            assert_eq!(bakes, 0, "{scale}x: an emerge / retract frame baked a displacement map");
+            assert!(glass::disp_cache_len() >= held, "{scale}x: the emerge evicted a steady map");
+            let worst = frames.iter().cloned().fold(0.0, f64::max);
+            println!("cancel emerge frames {scale}x: median {:.3} ms, worst {worst:.3} ms", median(frames.clone()));
+            assert!(median(frames) < 60.0);
         }
     }
 

@@ -298,12 +298,11 @@ impl App {
                 if first.load(Ordering::Relaxed) == 0 {
                     first.store(now_ms().to_bits(), Ordering::Relaxed);
                 }
-                if let Some(feed) = &feed {
-                    if let Ok(mut slot) = feed.lock() {
-                        if let Some(session) = slot.as_mut() {
-                            session.push(pcm);
-                        }
-                    }
+                if let Some(feed) = &feed
+                    && let Ok(mut slot) = feed.lock()
+                    && let Some(session) = slot.as_mut()
+                {
+                    session.push(pcm);
                 }
             })
         };
@@ -769,10 +768,10 @@ fn discarded_entry(cfg: &Config, app: &AppInfo, speech_ms: u64) -> Entry {
 }
 
 fn log_history(cfg: &Config, entry: Entry) {
-    if cfg.history_enabled {
-        if let Err(e) = history::append_new(entry) {
-            log_warn!("history: {e}");
-        }
+    if cfg.history_enabled
+        && let Err(e) = history::append_new(entry)
+    {
+        log_warn!("history: {e}");
     }
 }
 
@@ -939,8 +938,7 @@ mod tests {
 
     #[test]
     fn failure_keeps_audio_only_when_asked() {
-        let mut cfg = Config::default();
-        cfg.history_enabled = false;
+        let mut cfg = Config { history_enabled: false, ..Config::default() };
         let audio = Audio { samples: vec![1, 2, 3], sample_rate: 16000 };
         let e = SttError::new(SttErrorCode::Timeout, "slow");
         match failure(&cfg, &AppInfo::default(), e.clone(), audio.clone(), 500) {
@@ -1028,7 +1026,7 @@ mod tests {
                 drop(late);
             },
         );
-        let probe = r.ok().expect("delivered");
+        let Ok(probe) = r else { panic!("delivered") };
         assert_eq!(dropped.load(Ordering::SeqCst), 0, "the caller owns it");
         drop(probe);
         assert_eq!(dropped.load(Ordering::SeqCst), 1);

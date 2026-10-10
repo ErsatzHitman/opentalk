@@ -704,11 +704,14 @@ impl DispMap {
 
 thread_local! {
     static DISP: RefCell<Vec<(DispKey, Rc<DispMap>)>> = const { RefCell::new(Vec::new()) };
-    /// The last box asked for that was not in the cache. A box seen once is a frame of an animation
-    /// (the capsule has a new size every frame of the expand / shrink): it is evaluated inline, not
-    /// baked and not allowed to evict the maps of the boxes that stay. Seen twice in a row it is a
-    /// steady shape, and is baked.
-    static SEEN: std::cell::Cell<Option<DispKey>> = const { std::cell::Cell::new(None) };
+    /// Where each recently painted, not yet baked shape (size, radius, page, scale) was last seen:
+    /// its device origin and sub-pixel phase. A shape seen somewhere else than at its last sighting
+    /// is animating (the capsule or the cancel button grows, or the group slides by a fraction of
+    /// a pixel every frame of an expand / shrink / emerge): it is evaluated inline, not baked and not
+    /// allowed to evict the maps of the shapes that stay. Seen again at the same spot it is steady,
+    /// and is baked. Tracked per shape, so the pill, the bubble and the cancel button painted in
+    /// one frame never mask each other.
+    static SEEN: RefCell<[Option<(DispKey, i32, i32)>; SEEN_SLOTS]> = const { RefCell::new([None; SEEN_SLOTS]) };
 }
 #[cfg(test)]
 thread_local! {
@@ -731,6 +734,24 @@ pub fn disp_cache_len() -> usize {
 #[cfg(test)]
 pub fn bake_count() -> u32 {
     BAKES.with(|b| b.get())
+}
+
+/// Shapes remembered by `SEEN`, least recently painted dropped first.
+const SEEN_SLOTS: usize = 8;
+
+/// Was this shape last seen at exactly this spot (device origin `(gx, gy)` plus the sub-pixel phase
+/// in `key`), so it is not animating? Records the sighting either way.
+fn seen_before(key: DispKey, gx: i32, gy: i32) -> bool {
+    let shape = |k: &DispKey| DispKey { phase_x: 0, phase_y: 0, ..*k };
+    SEEN.with(|s| {
+        // a fixed array (moved to the front on every sighting): painting never allocates
+        let mut s = s.borrow_mut();
+        let at = s.iter().position(|e| e.is_some_and(|(k, _, _)| shape(&k) == shape(&key)));
+        let prev = at.and_then(|i| s[i]);
+        s[..=at.unwrap_or(SEEN_SLOTS - 1)].rotate_right(1);
+        s[0] = Some((key, gx, gy));
+        prev == Some((key, gx, gy))
+    })
 }
 
 /// Fetch (or bake) the map for a rounded box; returns it with the device origin `(gx0, gy0)` of its
@@ -772,7 +793,7 @@ fn disp_map(field: Rect, radius: f32, page: (f32, f32), scale: f32) -> Option<(R
             c.insert(0, hit);
             return Some(m);
         }
-        if SEEN.with(|s| s.replace(Some(key))) != Some(key) {
+        if !seen_before(key, fx as i32, fy as i32) {
             return None; // first sighting: an animation frame
         }
         let m = Rc::new(DispMap::bake(&key, scale));
@@ -1188,6 +1209,26 @@ mod tests {
         let _ = paint_capsule(&other, false, 1.0);
         let _ = paint_capsule(&other, false, 1.0);
         assert_eq!(bake_count(), before + 3, "a new monitor size bakes again");
+    }
+
+    #[test]
+    fn three_new_steady_shapes_in_one_frame_are_all_baked_on_the_next() {
+        // after a DPI or monitor change the pill, the app bubble and the cancel button are all new
+        // shapes in the same frame: they must not keep evicting each other from the miss list
+        let b = flat_backdrop([128, 128, 128]);
+        let shapes = [(97.0, 35.0), (35.0, 35.0), (27.0, 27.0)];
+        let frame = || {
+            for (w, h) in shapes {
+                paint_box(&b, w, h, 1.75, (264.0, 120.0));
+            }
+        };
+        let before = bake_count();
+        frame();
+        assert_eq!(bake_count(), before, "first frame: evaluated inline");
+        frame();
+        assert_eq!(bake_count(), before + 3, "second frame: each steady shape baked once");
+        frame();
+        assert_eq!(bake_count(), before + 3, "then reused");
     }
 
     /// Paint a rounded box `w` x `h` (logical px) at `scale` into a window-sized pixmap.

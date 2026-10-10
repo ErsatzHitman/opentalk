@@ -145,7 +145,7 @@ pub fn button(ui: &mut Ui, p: &Palette, b: Btn) -> Response {
         painter.rect_stroke(rect, cr(h / 2.0), stroke, StrokeKind::Inside);
     }
     if b.variant == Variant::Primary {
-        // Soft top highlight, a nod to the "brand glass" capsule.
+        // Soft top highlight on the primary capsule.
         let hl = Rect::from_min_max(rect.min + vec2(h / 2.0, 1.0), pos2(rect.max.x - h / 2.0, rect.min.y + 2.0));
         painter.rect_filled(hl, cr(1.0), with_alpha(Color32::WHITE, 28));
     }
