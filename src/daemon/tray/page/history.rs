@@ -99,18 +99,29 @@ fn global_tombstones() -> Arc<Mutex<Tombstones>> {
     T.get_or_init(Default::default).clone()
 }
 
+/// The entry the list is opening in the detail page. The list already holds it (it may have found
+/// it through a whole-file search, far from the end of the file), so the detail page takes it from
+/// here instead of reading the file again on the UI thread.
+type Handoff = Arc<Mutex<Option<Entry>>>;
+
+fn global_handoff() -> Handoff {
+    static H: OnceLock<Handoff> = OnceLock::new();
+    H.get_or_init(Default::default).clone()
+}
+
 #[derive(Clone)]
 struct Env {
     store: Arc<dyn Store>,
     spawn: Spawn,
     tomb: Arc<Mutex<Tombstones>>,
+    handoff: Handoff,
     /// Seconds to add to UTC for local time at a timestamp.
     offset_of: fn(i64) -> i64,
 }
 
 impl Env {
     fn disk() -> Env {
-        Env { store: Arc::new(DiskStore), spawn: spawn_thread, tomb: global_tombstones(), offset_of: timefmt::local_offset_secs }
+        Env { store: Arc::new(DiskStore), spawn: spawn_thread, tomb: global_tombstones(), handoff: global_handoff(), offset_of: timefmt::local_offset_secs }
     }
 
     fn alive(&self, mut v: Vec<Entry>) -> Vec<Entry> {
@@ -286,7 +297,7 @@ impl HistoryPage {
         Some(match (&self.summary, self.more) {
             (Some(s), true) => histview::stats_line(s),
             (_, false) => histview::stats_line(&histview::stats(&self.pool)),
-            (None, true) => format!("Latest {}: {}", histview::thousands(self.pool.len()), histview::stats_line(&histview::stats(&self.pool))),
+            (None, true) => format!("Newest {} entries \u{b7} {}", histview::thousands(self.pool.len()), histview::stats_line(&histview::stats(&self.pool))),
         })
     }
 
@@ -319,7 +330,11 @@ impl HistoryPage {
                 if text.is_empty() { "(empty)".into() } else { truncate(&text, ROW_TEXT_CHARS) }
             }
         };
-        r.meta = histview::meta_line(e);
+        // Only the latency: provider and model are on the detail page, and a longer meta crowds the
+        // time and app name out of the first line (the renderer shares it with the chips).
+        if e.status == Status::Ok && e.latency_ms > 0 {
+            r.meta = histview::format_latency(e.latency_ms);
+        }
         match e.status {
             Status::Failed => r.chips.push(("Failed".into(), Tone::Err)),
             Status::Discarded => r.chips.push(("Discarded".into(), Tone::Warn)),
@@ -445,7 +460,10 @@ impl PageModel for HistoryPage {
     fn row_event(&mut self, index: usize, ev: Event, _cx: &mut Cx) -> Vec<Effect> {
         let Some(e) = self.entry_at(index) else { return Vec::new() };
         match ev {
-            Event::Activated => vec![Effect::Navigate(Route::HistoryEntry(e.id))],
+            Event::Activated => {
+                *self.env.handoff.lock().unwrap_or_else(|p| p.into_inner()) = Some(e.clone());
+                vec![Effect::Navigate(Route::HistoryEntry(e.id))]
+            }
             Event::Copy => vec![Effect::CopyText(e.text.clone()), clipboard_toast()],
             _ => Vec::new(),
         }
@@ -574,7 +592,8 @@ impl PageModel for EntryPage {
     }
 
     fn enter(&mut self, _cx: &mut Cx) {
-        self.entry = self.env.store.find(self.id).filter(|e| !self.env.hidden(e));
+        let handed = self.env.handoff.lock().unwrap_or_else(|p| p.into_inner()).take().filter(|e| e.id == self.id);
+        self.entry = handed.or_else(|| self.env.store.find(self.id)).filter(|e| !self.env.hidden(e));
         self.newest = self.env.store.load_recent(1).entries.first().is_some_and(|e| e.id == self.id);
     }
 
@@ -736,7 +755,7 @@ mod tests {
     }
 
     fn env(store: Arc<Fake>) -> Env {
-        Env { store, spawn: inline, tomb: Arc::default(), offset_of: utc }
+        Env { store, spawn: inline, tomb: Arc::default(), handoff: Arc::default(), offset_of: utc }
     }
 
     fn e(id: i64, ts: i64, text: &str) -> Entry {
@@ -786,10 +805,10 @@ mod tests {
             "#1 field Search [text] value=\"\" hint=\"Words from the text, app or provider\" max=200",
             "#2 toggle Show discarded [off] (Recordings too short or silent to paste)",
             "[virtual rows: 4 x 64px]",
-            "#100 row h=64 | 11:30 \u{b7} Slack | Ship it on Friday. | Groq \u{b7} whisper-large-v3-turbo \u{b7} 840 ms | chips=[\"AI cleaned/Info\"] | copy",
-            "#101 row h=64 | 09:05 | Groq rejected the key (401). | Groq \u{b7} whisper-large-v3-turbo \u{b7} 840 ms | chips=[\"Failed/Err\"] | >",
-            "#102 row h=64 | Oct 2, 08:00 \u{b7} Outlook | Send the report tomorrow. | Groq \u{b7} whisper-large-v3-turbo \u{b7} 840 ms | chips=[\"Rewritten/Info\"] | copy",
-            "#103 row h=64 | Dec 31, 2025, 23:00 | Happy new year | Groq \u{b7} whisper-large-v3-turbo \u{b7} 840 ms | chips=[] | copy",
+            "#100 row h=64 | 11:30 \u{b7} Slack | Ship it on Friday. | 840 ms | chips=[\"AI cleaned/Info\"] | copy",
+            "#101 row h=64 | 09:05 | Groq rejected the key (401). |  | chips=[\"Failed/Err\"] | >",
+            "#102 row h=64 | Oct 2, 08:00 \u{b7} Outlook | Send the report tomorrow. | 840 ms | chips=[\"Rewritten/Info\"] | copy",
+            "#103 row h=64 | Dec 31, 2025, 23:00 | Happy new year | 840 ms | chips=[] | copy",
             "space 4",
             "#4 button Clear all [Destructive]",
         ]
@@ -928,7 +947,7 @@ mod tests {
         let mut p = new_page(Fake::new(many(300)));
         p.env.spawn = |_job| {}; // the totals worker never finishes
         p.enter(&mut Cx::new(&mut cfg, false, now()));
-        assert_eq!(p.stats_note().unwrap(), "Latest 200: 200 dictations \u{b7} 400 words \u{b7} avg 840 ms");
+        assert_eq!(p.stats_note().unwrap(), "Newest 200 entries \u{b7} 200 dictations \u{b7} 400 words \u{b7} avg 840 ms");
     }
 
     #[test]
@@ -1003,6 +1022,25 @@ mod tests {
         assert_eq!(p.row_event(0, Event::Copy, &mut cx), vec![Effect::CopyText("Ship it on Friday.".into()), Effect::Toast("Copied to clipboard".into())]);
         assert_eq!(p.row_event(2, Event::Activated, &mut cx), vec![Effect::Navigate(Route::HistoryEntry(2))], "index is into the visible rows");
         assert!(p.row_event(99, Event::Activated, &mut cx).is_empty());
+    }
+
+    #[test]
+    fn the_detail_page_takes_the_entry_from_the_list_instead_of_reading_the_file() {
+        let mut cfg = Config::default();
+        let store = Fake::new(sample());
+        let e = env(store.clone());
+        let mut list = HistoryPage::new(e.clone());
+        list.enter(&mut Cx::new(&mut cfg, false, now()));
+        list.row_event(0, Event::Activated, &mut Cx::new(&mut cfg, false, now()));
+        // The file no longer has it (e.g. it was far back and the store would have to scan for it).
+        store.entries.lock().unwrap().clear();
+        let mut p = EntryPage::new(e.clone(), 5);
+        open(&mut p, &mut cfg);
+        assert_eq!(p.entry.as_ref().map(|x| x.id), Some(5));
+        // A handed-over entry of another page is ignored and consumed once.
+        let mut other = EntryPage::new(e, 4);
+        open(&mut other, &mut cfg);
+        assert!(other.entry.is_none());
     }
 
     #[test]
@@ -1183,7 +1221,7 @@ mod tests {
         let mut cfg = Config::default();
         let fake = Fake::new(sample());
         let tomb: Arc<Mutex<Tombstones>> = Arc::default();
-        let mk = |tomb: &Arc<Mutex<Tombstones>>| Env { store: fake.clone(), spawn: inline, tomb: tomb.clone(), offset_of: utc };
+        let mk = |tomb: &Arc<Mutex<Tombstones>>| Env { store: fake.clone(), spawn: inline, tomb: tomb.clone(), handoff: Arc::default(), offset_of: utc };
         let mut list = HistoryPage::new(mk(&tomb));
         list.enter(&mut Cx::new(&mut cfg, false, now()));
         let mut d = EntryPage::new(mk(&tomb), 2);
