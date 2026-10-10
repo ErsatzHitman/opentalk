@@ -62,6 +62,8 @@ $wavMs = Get-WavMs $wav
 $outDir = Join-Path $PSScriptRoot 'out'
 New-Item -ItemType Directory -Force -Path $outDir | Out-Null
 $R = @{}
+# Optional scenarios leave their key null (the report reads them under strict mode).
+foreach ($k in 'recording_mic', 'settings', 'settings_open_ms', 'daemon_with_settings', 'daemon_after_settings') { $R[$k] = $null }
 
 function Section([string]$t) { Write-Host ("`n== {0}" -f $t) -ForegroundColor Cyan }
 
@@ -335,7 +337,7 @@ if (-not $SkipE2E) {
             $raw = & powershell -NoProfile -ExecutionPolicy Bypass -File $script -Exe $Exe -Stt $mode -Target form -Mode paste 2>&1 | Out-String
             $json = $null
             if ($raw -match '(?s)(\{.*\})') { try { $json = $Matches[1] | ConvertFrom-Json } catch {} }
-            $row = [ordered]@{ stt = $mode; pass = [bool]($json -and $json.pass); clipboard_restored = $(if ($json -and $json.PSObject.Properties['clipboard_restored']) { $json.clipboard_restored } else { $null }); error = if ($json -and $json.PSObject.Properties['error']) { $json.error } elseif ($json) { $null } else { 'no JSON from tests\e2e.ps1' } }
+            $row = [ordered]@{ stt = $mode; latency = $null; pass = [bool]($json -and $json.pass); clipboard_restored = $(if ($json -and $json.PSObject.Properties['clipboard_restored']) { $json.clipboard_restored } else { $null }); error = if ($json -and $json.PSObject.Properties['error']) { $json.error } elseif ($json) { $null } else { 'no JSON from tests\e2e.ps1' } }
             if ($json -and $json.PSObject.Properties['latency_line'] -and $json.latency_line) { $row.latency = ConvertFrom-LatencyLine $json.latency_line }
             $R['e2e'] += [pscustomobject]$row
             Write-Host ("e2e {0}: pass={1} {2}" -f $mode, $row.pass, $(if ($row.latency) { "paste {0} ms, total {1} ms" -f $row.latency.paste, $row.latency.total } else { $row.error }))
@@ -444,8 +446,8 @@ the one-core figure (100% = one fully busy core) is given in brackets.
 | Recording CPU ($recLabel, $RecordSec s) | $($rec.CpuPctAll)% ($($rec.CpuPctCore)% of one core) | <= 1.5% | ~3% | $(Verdict ($rec.CpuPctAll -le 1.5)) |
 | Recording CPU, projected on a 4-core laptop (one-core % / 4) | $([math]::Round($rec.CpuPctCore / 4, 2))% | <= 1.5% | ~3% | $(Verdict ($rec.CpuPctCore / 4 -le 1.5)) |
 | Busiest daemon threads while recording (injected, % of one core) | $(if ($R.recording_injected.top_threads) { $R.recording_injected.top_threads -join ', ' } else { 'n/a' }) | - | - | - |
-$(if ($null -ne $R.recording_mic.main_thread_pct) { "| Main thread while recording (real mic, % of one core; message loop + pill) | $($R.recording_mic.main_thread_pct)% (projected on 4 cores: $([math]::Round($R.recording_mic.main_thread_pct / 4, 2))%) | <= 6% (<= 1.5% on 4 cores) | - | $(Verdict ($R.recording_mic.main_thread_pct -le 6)) |" })
-$(if ($R.recording_mic.top_threads) { "| Busiest daemon threads while recording (real mic, % of one core) | $($R.recording_mic.top_threads -join ', ') | - | - | - |" })
+$(if ($R.recording_mic -and $null -ne $R.recording_mic.main_thread_pct) { "| Main thread while recording (real mic, % of one core; message loop + pill) | $($R.recording_mic.main_thread_pct)% (projected on 4 cores: $([math]::Round($R.recording_mic.main_thread_pct / 4, 2))%) | <= 6% (<= 1.5% on 4 cores) | - | $(Verdict ($R.recording_mic.main_thread_pct -le 6)) |" })
+$(if ($R.recording_mic -and $R.recording_mic.top_threads) { "| Busiest daemon threads while recording (real mic, % of one core) | $($R.recording_mic.top_threads -join ', ') | - | - | - |" })
 | Daemon working set, idle (mean / peak) | $($R.idle.WsMeanMB) / $($R.idle.WsPeakMB) MB | <= 25 MB | ~110 MB | $(Verdict ($R.idle.WsPeakMB -le 25)) |
 | Daemon private bytes, idle (mean / peak) | $($R.idle.PrivMeanMB) / $($R.idle.PrivPeakMB) MB | <= 15 MB | n/a | $(Verdict ($R.idle.PrivPeakMB -le 15)) |
 | Daemon private working set, idle (Task Manager "Memory") | $(Fmt $R.idle.private_ws_mb ' MB') | n/a | ~110 MB | - |
