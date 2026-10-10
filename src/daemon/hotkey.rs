@@ -714,7 +714,11 @@ impl<K: KeyState> Matcher<K> {
         }
 
         // A Win (or Alt) key goes up after a combo fired: cancel the Start menu (menu bar).
-        if !down && self.mask_enabled && (bit & WIN_MASK != 0 && self.win_used || bit & ALT_MASK != 0 && self.alt_used) {
+        // The Alt mask is not optional: it undoes a side effect of swallowing the main key, so
+        // `suppress_start_menu = false` (which only governs the Win key) does not turn it off.
+        if !down
+            && ((self.mask_enabled && bit & WIN_MASK != 0 && self.win_used) || (bit & ALT_MASK != 0 && self.alt_used))
+        {
             out.mask = true;
         }
         if self.mods & WIN_MASK == 0 {
@@ -1435,13 +1439,23 @@ mod tests {
     }
 
     #[test]
-    fn mask_disabled_covers_alt_too() {
+    fn start_menu_toggle_off_still_masks_alt() {
         let mut h = harness("Alt+F9");
         h.m.set_start_menu_mask(false);
         h.step_full(VK_LMENU, true);
         h.step_full(0x78, true);
         h.step_full(0x78, false);
-        assert!(!h.step_full(VK_LMENU, false).mask);
+        assert!(h.step_full(VK_LMENU, false).mask);
+    }
+
+    #[test]
+    fn start_menu_toggle_off_still_skips_win_mask() {
+        let mut h = harness("F8");
+        h.m.set_start_menu_mask(false);
+        h.step_full(VK_LWIN, true);
+        h.step_full(0x77, true);
+        h.step_full(0x77, false);
+        assert!(!h.step_full(VK_LWIN, false).mask);
     }
 
     #[test]
