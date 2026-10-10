@@ -3,8 +3,9 @@
 //! `bench/bench.ps1` read back (`parse_line`).
 //!
 //! Definitions (all in ms, QPC based):
-//! - `hotkey_pill`: hotkey event received -> pill repainted in its "preparing" state
-//! - `hotkey_audio`: hotkey event received -> first microphone packet delivered
+//! - `hotkey_pill`: hotkey event seen by the low-level hook (stamped on its thread, so the time
+//!   the event waits for the message loop counts) -> pill repainted in its "preparing" state
+//! - `hotkey_audio`: hotkey event seen by the hook -> first microphone packet delivered
 //! - `prep`: stop requested -> worker about to send the request (stop recorder, VAD, trim)
 //! - `stt`: request sent -> transcript back (batch round trip, or the streaming finalise)
 //! - `cleanup`: deterministic cleanup + optional AI cleanup + snippets
@@ -18,8 +19,9 @@ const RING_CAP: usize = 64;
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Sample {
     pub seq: u64,
+    /// Hook event -> pill repainted.
     pub hotkey_pill: f64,
-    /// Negative when no audio packet was seen.
+    /// Hook event -> first audio packet. Negative when no audio packet was seen.
     pub hotkey_audio: f64,
     pub prep: f64,
     pub stt: f64,
@@ -48,6 +50,7 @@ pub fn record(s: Sample) {
 }
 
 /// The most recent samples, oldest first.
+#[cfg(test)]
 pub fn recent() -> Vec<Sample> {
     RING.lock().unwrap_or_else(|e| e.into_inner()).iter().cloned().collect()
 }
