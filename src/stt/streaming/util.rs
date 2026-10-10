@@ -6,9 +6,11 @@ pub fn err(code: SttErrorCode, message: impl Into<String>, detail: impl Into<Str
     SttError { code, message: message.into(), detail: detail.into(), status: None }
 }
 
-/// Remove `secret` from `text` and bound its length, so it is safe for `SttError::detail`.
+/// Remove `secret` (and its percent-encoded form) plus pattern-shaped keys from `text`, then
+/// bound its length, so it is safe for `SttError::detail`. Redaction runs first, so a key
+/// straddling the length bound cannot survive as a prefix.
 pub fn scrub(text: &str, secret: &str) -> String {
-    let mut out = if secret.is_empty() { text.to_string() } else { text.replace(secret, "***") };
+    let mut out = crate::stt::errors::redact_with(text, &[secret]);
     if out.len() > 300 {
         let mut cut = 300;
         while !out.is_char_boundary(cut) {
@@ -43,7 +45,7 @@ pub fn ws_error(provider: &str, e: &tungstenite::Error, secret: &str) -> SttErro
             let body = resp.body().as_deref().map(String::from_utf8_lossy).unwrap_or_default();
             status_error(provider, resp.status().as_u16(), &body, secret)
         }
-        E::Io(io) if is_timeout(io) => err(SttErrorCode::Timeout, format!("{provider} did not respond in time."), io.to_string()),
+        E::Io(io) if is_timeout(io) => err(SttErrorCode::Timeout, format!("{provider} did not respond in time."), scrub(&io.to_string(), secret)),
         E::Io(io) => err(SttErrorCode::Unreachable, format!("Could not reach {provider}."), scrub(&io.to_string(), secret)),
         E::Tls(t) => err(SttErrorCode::Unreachable, format!("Secure connection to {provider} failed."), scrub(&t.to_string(), secret)),
         E::ConnectionClosed | E::AlreadyClosed | E::Protocol(tungstenite::error::ProtocolError::ResetWithoutClosingHandshake) => {
@@ -75,6 +77,27 @@ pub fn percent_encode(s: &str) -> String {
         }
     }
     out
+}
+
+/// Inverse of [`percent_encode`]; malformed escapes pass through unchanged.
+pub fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let hex = |c: u8| (c as char).to_digit(16);
+        match (b[i], b.get(i + 1).and_then(|c| hex(*c)), b.get(i + 2).and_then(|c| hex(*c))) {
+            (b'%', Some(h), Some(l)) => {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+            }
+            (c, ..) => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// `None` for unset/"auto"/blank, otherwise the trimmed code.
@@ -171,6 +194,68 @@ mod tests {
     fn scrub_hides_secret_and_truncates() {
         let s = scrub(&format!("bad key sk-secret {}", "x".repeat(400)), "sk-secret");
         assert!(!s.contains("sk-secret") && s.len() <= 300);
+    }
+
+    const KEY: &str = "dg3f9a1c77b25e0d84aa6c1e"; // no known prefix: only the configured-key match can see it
+
+    fn assert_clean(e: &SttError) {
+        for text in [e.message.as_str(), e.detail.as_str(), &e.to_string(), &format!("{e:?}")] {
+            assert!(!text.contains(KEY), "key leaked: {text}");
+        }
+    }
+
+    #[test]
+    fn scrub_catches_prefixless_and_encoded_keys_and_cut_keys() {
+        let enc_key = "key with/odd+chars=1";
+        assert!(!scrub(&format!("GET /?token={}", percent_encode(enc_key)), enc_key).contains("odd"));
+        assert!(!scrub(&format!("{}{KEY}", "x".repeat(297)), KEY).contains("dg3f"), "redacted before the cut");
+        assert!(!scrub(&format!("Bearer {KEY} sk-abcdefgh1234"), "").contains("abcdefgh1234"));
+    }
+
+    #[test]
+    fn upgrade_refusal_echoing_the_key_is_clean() {
+        let body = format!(r#"{{"err_code":"INVALID_AUTH","err_msg":"Invalid credentials. Token {KEY}"}}"#);
+        let e = status_error("Deepgram", 401, &body, KEY);
+        assert_eq!(e.code, SttErrorCode::AuthFailed);
+        assert_clean(&e);
+        // the same through a tungstenite HTTP refusal
+        let resp = tungstenite::http::Response::builder().status(401).body(Some(body.into_bytes())).unwrap();
+        assert_clean(&ws_error("Deepgram", &tungstenite::Error::Http(Box::new(resp)), KEY));
+        assert_clean(&ws_error("Deepgram", &tungstenite::Error::Io(std::io::Error::other(format!("connect {KEY}"))), KEY));
+    }
+
+    #[test]
+    fn ws_error_frame_echoing_the_key_is_clean() {
+        use super::super::test_support::{Options, serve};
+        use crate::stt::{Credentials, SttOptions, StreamingProvider};
+        use std::time::Duration;
+        use tungstenite::Message;
+
+        let mock = serve(Options::default(), |c| {
+            while let Some(m) = c.recv(Duration::from_secs(5)) {
+                if matches!(m, Message::Binary(_)) {
+                    c.send(&format!(r#"{{"type":"Error","description":"Invalid credentials. Token {KEY}"}}"#));
+                }
+            }
+        });
+        let creds = Credentials { api_key: Some(KEY.into()), base_url: Some(mock.ws_url()), extra: Vec::new() };
+        let opts = SttOptions { model: "nova-3".into(), language: None, hints: Vec::new(), timeout_ms: 5000 };
+        let mut s = super::super::deepgram::Deepgram.start(&opts, &creds).expect("starts");
+        for _ in 0..10 {
+            s.push(&[200i16; 800]);
+        }
+        let e = s.finish().expect_err("provider error frame");
+        assert_eq!(e.code, SttErrorCode::Other);
+        assert!(e.detail.contains("[redacted]"), "{}", e.detail);
+        assert_clean(&e);
+    }
+
+    #[test]
+    fn percent_decode_round_trips() {
+        for s in ["tok+/=abc", "ünï cödé", "plain-_.~", "100%"] {
+            assert_eq!(percent_decode(&percent_encode(s)), s);
+        }
+        assert_eq!(percent_decode("%zz%4"), "%zz%4");
     }
 
     #[test]

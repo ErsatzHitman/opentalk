@@ -334,4 +334,19 @@ mod tests {
         let e = Custom.transcribe(&audio(), &opts(""), &creds(&mock, "k")).unwrap_err();
         assert_eq!((e.code, e.message.as_str()), (SttErrorCode::Other, "Your server returned an unexpected error."));
     }
+
+    #[test]
+    fn configured_key_echoed_by_the_server_is_redacted_for_bearer_and_azure() {
+        use crate::core::config::SttProviderId;
+        const KEY: &str = "cu4Rg7Ty1Vn5Xb9Lm3Qd8Hs2";
+        let provider = crate::stt::providers::get(SttProviderId::Custom);
+        let mock = serve(vec![Resp::json(401, &format!(r#"{{"error":"invalid key {KEY}"}}"#))]);
+        let e = provider.transcribe(&audio(), &opts(""), &creds(&mock, KEY)).unwrap_err();
+        assert_eq!(e.code, SttErrorCode::AuthFailed);
+        assert!(e.detail.starts_with("HTTP 401: "), "{}", e.detail);
+        assert_no_leak(&e, KEY);
+        // a transport-level failure naming the key (e.g. in a URL) is covered as well
+        let mock = serve(vec![Resp::json(200, &format!(r#"{{"unexpected":"{KEY}"}}"#))]);
+        assert_no_leak(&provider.transcribe(&audio(), &opts(""), &creds(&mock, KEY)).unwrap_err(), KEY);
+    }
 }
