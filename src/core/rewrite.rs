@@ -92,6 +92,11 @@ impl TriggerProblem {
     }
 }
 
+/// Number of word tokens in `text` (a CJK character counts as one word).
+pub fn word_count(text: &str) -> usize {
+    tokens(text).len()
+}
+
 /// Result of [`detect`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Detect {
@@ -605,7 +610,7 @@ mod tests {
         let mut s = String::new();
         for _ in 0..n {
             s.push_str(rng.pick(PIECES));
-            if rng.next() % 3 != 0 {
+            if !rng.next().is_multiple_of(3) {
                 s.push(' ');
             }
         }
@@ -619,7 +624,7 @@ mod tests {
         let mut matches = 0;
         for _ in 0..20_000 {
             let mut text = random_text(&mut rng);
-            if rng.next() % 2 == 0 {
+            if rng.next().is_multiple_of(2) {
                 // Bias toward the interesting case: end with (a variation of) a trigger.
                 text.push_str(rng.pick(&["Rewrite this concisely", "rewrite, this concisely!", "re-write this concisely please", "请简化。", "Don't ramble", "make it short please"]));
                 text.push_str(rng.pick(&["", ".", " thanks", ", thank you", " please", "!!", " 🙂"]));
@@ -696,6 +701,14 @@ mod tests {
         assert_eq!(toks[1].sq, "stop");
         // An apostrophe opening a word does not move the span.
         assert_eq!(tokens("'hi").first().map(|t| (t.start, t.end)), Some((1, 3)));
+    }
+
+    #[test]
+    fn word_count_counts_tokens() {
+        assert_eq!(word_count("Send it Friday."), 3);
+        assert_eq!(word_count("don't re-write"), 3);
+        assert_eq!(word_count("明天开会"), 4);
+        assert_eq!(word_count(" ... "), 0);
     }
 
     #[test]

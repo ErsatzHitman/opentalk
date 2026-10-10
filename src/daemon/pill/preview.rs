@@ -41,6 +41,9 @@ pub const STATES: &[&str] = &[
     "error",
     "error-noretry",
     "error-long",
+    "rewrite-nothing",
+    "rewrite-failed",
+    "rewrite-nokey",
 ];
 
 #[derive(Clone, Debug)]
@@ -207,6 +210,16 @@ pub fn build(scene: &Scene) -> Result<(RenderState, f64), String> {
                 true,
                 0.0,
             ))
+        }
+        // The voice-rewrite cards, built from the same text the daemon shows.
+        "rewrite-nothing" => {
+            let (title, desc) = crate::daemon::app::pipeline::nothing_to_rewrite_card(&crate::core::config::Config::default());
+            st.error = Some(super::card::ErrorCard::new(title, &desc, false, 0.0));
+        }
+        "rewrite-failed" | "rewrite-nokey" => {
+            let err = if scene.state == "rewrite-failed" { crate::llm::LlmError::Timeout } else { crate::llm::LlmError::NotConfigured };
+            let (title, desc) = crate::daemon::app::pipeline::rewrite_card(&err);
+            st.error = Some(super::card::ErrorCard::new(title, &desc, false, 0.0));
         }
         other => return Err(format!("unknown state '{other}' (expected one of: {})", STATES.join(", "))),
     }
@@ -764,6 +777,21 @@ mod golden {
                     std::fs::create_dir_all(dir).unwrap();
                     sheet.save_png(dir.join(format!("transition_{}_{}.png", if dark { "dark" } else { "light" }, bd))).unwrap();
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn rewrite_cards_render_with_their_text_and_no_retry_button() {
+        for (state, title) in [("rewrite-nothing", "Nothing to rewrite"), ("rewrite-failed", "Rewrite timed out"), ("rewrite-nokey", "Add an AI key to rewrite")] {
+            for dark in [false, true] {
+                let mut scene = Scene::new(state, 400.0);
+                scene.dark = dark;
+                let (st, _) = build(&scene).expect(state);
+                let card = st.error.as_ref().expect("card");
+                assert_eq!(card.title, title);
+                assert!(!card.retry, "informational: no Retry");
+                assert!(render_scene(&scene).is_ok());
             }
         }
     }

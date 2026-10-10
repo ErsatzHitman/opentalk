@@ -3,6 +3,7 @@
 //!
 //! ```text
 //! --transcribe-file <wav> [--provider id] [--model m] [--llm | --no-llm]
+//!                                  [--rewrite-trigger <phrase> | --no-rewrite]
 //! --bench dictate <n> <wav> [secs] per round: check the daemon is idle, start, play the file, stop,
 //!                                  wait (default 45 s) for history; one JSON line per round
 //! --bench latency [n]              print the daemon log's latency lines + median/p95 summary
@@ -10,8 +11,11 @@
 //! --bench phase                    print the daemon's phase (idle | arming | recording | thinking)
 //! --bench toggle | cancel | quit | settings   one IPC message to the running daemon
 //! --bench wait-ready [secs]        block until the daemon window exists
-//! --bench mock-stt [--port P] [--delay-ms D] [--text T]   local STT server: OpenAI/Deepgram REST
-//!                                  replies over HTTP, Deepgram live protocol over ws:// (same port)
+//! --bench mock-stt [--port P] [--delay-ms D] [--text T] [--llm-text L] [--llm-status S]
+//!                                  [--llm-delay-ms D]
+//!                                  local STT server: OpenAI/Deepgram REST replies over HTTP,
+//!                                  Deepgram live protocol over ws:// (same port), and a
+//!                                  `/chat/completions` route standing in for the cleanup/rewrite LLM
 //! ```
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -53,6 +57,14 @@ pub struct FileResult {
     pub cleanup_ms: f64,
     pub total_ms: f64,
     pub ai_cleaned: bool,
+    /// What the voice rewrite did: `none`, `done`, `skipped`, `failed` or `nothing` (only the phrase).
+    pub rewrite: String,
+    /// The text was replaced by the AI provider's concise rewrite.
+    pub rewritten: bool,
+    /// Why the rewrite fell back to the text as dictated.
+    pub rewrite_error: Option<String>,
+    /// For a rewritten text: the deterministic text (phrase removed) it started from.
+    pub original: Option<String>,
 }
 
 impl FileResult {
@@ -61,6 +73,7 @@ impl FileResult {
             "raw": self.raw, "text": self.text, "provider": self.provider, "model": self.model,
             "stt_ms": round1(self.stt_ms), "cleanup_ms": round1(self.cleanup_ms), "total_ms": round1(self.total_ms),
             "ai_cleaned": self.ai_cleaned,
+            "rewrite": self.rewrite, "rewritten": self.rewritten, "rewrite_error": self.rewrite_error, "original": self.original,
         })
     }
 }
@@ -92,12 +105,19 @@ pub fn transcribe_audio(cfg: &Config, audio: &Audio, opts: &SttOptions, creds: &
         cleanup_ms: t3 - t2,
         total_ms: t3 - t0,
         ai_cleaned: cleaned.ai_cleaned,
+        rewrite: cleaned.rewrite.label().to_string(),
+        rewritten: cleaned.rewrite == pipeline::RewriteState::Done,
+        rewrite_error: match &cleaned.rewrite {
+            pipeline::RewriteState::Failed(e) => Some(e.to_string()),
+            _ => None,
+        },
+        original: cleaned.original,
     })
 }
 
 pub fn transcribe_file(args: &[String]) -> i32 {
     let Some(path) = args.first().filter(|a| !a.starts_with("--")) else {
-        eprintln!("usage: opentalk --transcribe-file <wav> [--provider id] [--model m] [--llm | --no-llm]");
+        eprintln!("usage: opentalk --transcribe-file <wav> [--provider id] [--model m] [--llm | --no-llm] [--rewrite-trigger <phrase> | --no-rewrite]");
         return 2;
     };
     let fail = |msg: String| {
@@ -124,6 +144,13 @@ pub fn transcribe_file(args: &[String]) -> i32 {
     }
     if args.iter().any(|a| a == "--llm") {
         cfg.ai_cleanup.enabled = true;
+    }
+    if let Some(phrase) = flag_value(args, "--rewrite-trigger") {
+        cfg.rewrite_trigger = phrase.to_string();
+        cfg.ai_cleanup.rewrite_enabled = true;
+    }
+    if args.iter().any(|a| a == "--no-rewrite") {
+        cfg.ai_cleanup.rewrite_enabled = false;
     }
     let bytes = match std::fs::read(path) {
         Ok(b) => b,
@@ -477,6 +504,10 @@ fn bench_mock(args: &[String]) -> i32 {
     let port: u16 = flag_value(args, "--port").and_then(|s| s.parse().ok()).unwrap_or(0);
     let delay = Duration::from_millis(flag_value(args, "--delay-ms").and_then(|s| s.parse().ok()).unwrap_or(0));
     let text = flag_value(args, "--text").unwrap_or(FILLER_SENTENCE).to_string();
+    let mut mock = Mock::new(delay, text);
+    mock.llm_text = flag_value(args, "--llm-text").map(str::to_string);
+    mock.llm_delay = Duration::from_millis(flag_value(args, "--llm-delay-ms").and_then(|s| s.parse().ok()).unwrap_or(0));
+    mock.llm_status = flag_value(args, "--llm-status").and_then(|s| s.parse().ok()).unwrap_or(200);
     let listener = match TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], port))) {
         Ok(l) => l,
         Err(e) => {
@@ -487,20 +518,50 @@ fn bench_mock(args: &[String]) -> i32 {
     let addr = listener.local_addr().map(|a| a.to_string()).unwrap_or_default();
     println!("listening http://{addr}");
     let _ = std::io::stdout().flush();
-    serve_forever(listener, delay, Arc::new(text));
+    serve_with(listener, Arc::new(mock));
     0
+}
+
+/// What the mock server answers.
+#[derive(Debug)]
+pub struct Mock {
+    /// Added to every STT reply, to the Deepgram finalize and to chat replies.
+    pub delay: Duration,
+    /// The transcript every STT request returns.
+    pub text: String,
+    /// The chat-completions reply content; `None` = a deterministic concise version of the
+    /// `<transcript>` in the request (its first 60% of the words).
+    pub llm_text: Option<String>,
+    /// Extra wait before chat-completions replies, on top of `delay` (`--llm-delay-ms`).
+    pub llm_delay: Duration,
+    /// HTTP status of chat-completions replies (anything but 200 returns an error body).
+    pub llm_status: u16,
+    /// Every chat-completions request body received (tests assert the request shape).
+    pub llm_requests: std::sync::Mutex<Vec<String>>,
+}
+
+impl Mock {
+    pub fn new(delay: Duration, text: String) -> Mock {
+        Mock { delay, text, llm_text: None, llm_delay: Duration::ZERO, llm_status: 200, llm_requests: Default::default() }
+    }
 }
 
 /// Accept connections forever; one thread per connection (keep-alive aware). A WebSocket
 /// upgrade gets the Deepgram live protocol, anything else plain HTTP.
+#[cfg(test)]
 pub fn serve_forever(listener: TcpListener, delay: Duration, text: Arc<String>) {
+    serve_with(listener, Arc::new(Mock::new(delay, text.to_string())));
+}
+
+/// [`serve_forever`] with the full mock configuration.
+pub fn serve_with(listener: TcpListener, mock: Arc<Mock>) {
     for conn in listener.incoming().flatten() {
-        let text = text.clone();
+        let mock = mock.clone();
         std::thread::spawn(move || {
             if is_websocket_upgrade(&conn) {
-                serve_ws(conn, delay, &text);
+                serve_ws(conn, mock.delay, &mock.text);
             } else {
-                let _ = serve_connection(conn, delay, &text);
+                let _ = serve_connection(conn, &mock);
             }
         });
     }
@@ -563,8 +624,39 @@ fn serve_ws(stream: TcpStream, delay: Duration, text: &str) {
     }
 }
 
-/// Minimal HTTP/1.1 server loop: POSTs get `{"text": ...}` after `delay`, anything else an empty 200.
-fn serve_connection(stream: TcpStream, delay: Duration, text: &str) -> std::io::Result<()> {
+/// The user message's `<transcript>` text of a chat-completions request body, if present.
+fn transcript_in(request: &str) -> Option<String> {
+    let v: Value = serde_json::from_str(request).ok()?;
+    let user = v.get("messages")?.as_array()?.iter().rev().find(|m| m["role"] == "user")?["content"].as_str()?;
+    let start = user.find("<transcript>")? + "<transcript>".len();
+    let end = user.rfind("</transcript>")?;
+    Some(user[start..end.max(start)].trim().to_string())
+}
+
+/// A deterministic "concise rewrite": the first 60% of the words, closed with a full stop.
+fn concise(text: &str) -> String {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    let keep = (words.len() * 3).div_ceil(5).max(1);
+    let mut out = words[..keep.min(words.len())].join(" ");
+    out = out.trim_end_matches(['.', ',', ';', ':', '!', '?']).to_string();
+    out.push('.');
+    out
+}
+
+/// The chat-completions answer (status, body) for a request body.
+fn chat_reply(mock: &Mock, request: &str) -> (u16, String) {
+    if mock.llm_status != 200 {
+        let body = json!({ "error": { "message": "mock llm error", "code": mock.llm_status } });
+        return (mock.llm_status, body.to_string());
+    }
+    let content = mock.llm_text.clone().unwrap_or_else(|| concise(&transcript_in(request).unwrap_or_default()));
+    let body = json!({ "choices": [{ "message": { "role": "assistant", "content": content }, "finish_reason": "stop" }] });
+    (200, body.to_string())
+}
+
+/// Minimal HTTP/1.1 server loop: POSTs to `.../chat/completions` get a chat reply (the LLM
+/// stand-in), other POSTs get `{"text": ...}`, all after `delay`; anything else an empty 200.
+fn serve_connection(stream: TcpStream, mock: &Mock) -> std::io::Result<()> {
     stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(Duration::from_secs(60)))?;
     let mut out = stream.try_clone()?;
@@ -575,6 +667,7 @@ fn serve_connection(stream: TcpStream, delay: Duration, text: &str) -> std::io::
             return Ok(());
         }
         let method = request_line.split_whitespace().next().unwrap_or("").to_string();
+        let path = request_line.split_whitespace().nth(1).unwrap_or("").to_string();
         let (mut len, mut chunked, mut close) = (0usize, false, false);
         loop {
             let mut h = String::new();
@@ -594,27 +687,40 @@ fn serve_connection(stream: TcpStream, delay: Duration, text: &str) -> std::io::
                 close = true;
             }
         }
+        let is_chat = method == "POST" && path.split('?').next().unwrap_or("").ends_with("/chat/completions");
+        // Request bodies are read in full (the STT ones are audio: only chat bodies are kept).
+        let mut request = Vec::new();
+        let sink: &mut dyn Write = &mut request;
+        let mut discard = std::io::sink();
+        let dest: &mut dyn Write = if is_chat { sink } else { &mut discard };
         if chunked {
             loop {
                 let mut size = String::new();
                 reader.read_line(&mut size)?;
                 let n = usize::from_str_radix(size.trim().split(';').next().unwrap_or("0"), 16).unwrap_or(0);
-                std::io::copy(&mut reader.by_ref().take(n as u64 + 2), &mut std::io::sink())?;
+                std::io::copy(&mut reader.by_ref().take(n as u64 + 2), dest)?;
                 if n == 0 {
                     break;
                 }
             }
         } else {
-            std::io::copy(&mut reader.by_ref().take(len as u64), &mut std::io::sink())?;
+            std::io::copy(&mut reader.by_ref().take(len as u64), dest)?;
         }
-        let body = if method == "POST" {
-            std::thread::sleep(delay);
-            batch_body(text)
+        let (status, body) = if is_chat {
+            let request = String::from_utf8_lossy(&request).into_owned();
+            let reply = chat_reply(mock, &request);
+            mock.llm_requests.lock().unwrap_or_else(|e| e.into_inner()).push(request);
+            std::thread::sleep(mock.delay + mock.llm_delay);
+            reply
+        } else if method == "POST" {
+            std::thread::sleep(mock.delay);
+            (200, batch_body(&mock.text))
         } else {
-            String::new()
+            (200, String::new())
         };
         let head = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: {}\r\n\r\n",
+            "HTTP/1.1 {status} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: {}\r\n\r\n",
+            if status == 200 { "OK" } else { "Error" },
             body.len(),
             if close { "close" } else { "keep-alive" }
         );
@@ -706,6 +812,136 @@ mod tests {
         let creds = Credentials { api_key: Some("dg-test-key-123456".into()), base_url: Some(base), extra: vec![] };
         let batch = stt::transcribe_with(SttProviderId::Deepgram, &audio, &opts, &creds).expect("batch");
         assert_eq!(batch.text, FILLER_SENTENCE);
+    }
+
+    /// A mock with its own settings; returns the base URL and the shared mock (to read the requests).
+    fn start_mock_with(configure: impl FnOnce(&mut Mock)) -> (String, Arc<Mock>) {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        let mut mock = Mock::new(Duration::ZERO, FILLER_SENTENCE.to_string());
+        configure(&mut mock);
+        let mock = Arc::new(mock);
+        let m = mock.clone();
+        std::thread::spawn(move || serve_with(l, m));
+        (url, mock)
+    }
+
+    fn chat_request(transcript: &str) -> Value {
+        json!({
+            "model": "m", "temperature": 0,
+            "messages": [
+                { "role": "system", "content": "sys" },
+                { "role": "user", "content": format!("<transcript>\n{transcript}\n</transcript>\n\nOutput only the concise rewrite.") },
+            ],
+        })
+    }
+
+    #[test]
+    fn mock_chat_route_returns_a_shorter_choices_reply() {
+        let (base, mock) = start_mock_with(|_| {});
+        let agent = crate::core::http::agent();
+        let sent = "one two three four five six seven eight nine ten.";
+        let r = agent.post(&format!("{base}/chat/completions")).send_json(chat_request(sent)).unwrap();
+        let v: Value = serde_json::from_str(&r.into_string().unwrap()).unwrap();
+        assert_eq!(v["choices"][0]["message"]["content"], "one two three four five six.", "first 60% of the words");
+        assert_eq!(v["choices"][0]["finish_reason"], "stop");
+        let seen = mock.llm_requests.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert!(seen[0].contains("one two three"), "the request body is recorded");
+        // The nested (`/v1/...`) path and a query string are the same route.
+        drop(seen);
+        let r = agent.post(&format!("{base}/api/v1/chat/completions?x=1")).send_json(chat_request("alpha beta gamma delta epsilon")).unwrap();
+        let v: Value = serde_json::from_str(&r.into_string().unwrap()).unwrap();
+        assert_eq!(v["choices"][0]["message"]["content"], "alpha beta gamma.");
+    }
+
+    #[test]
+    fn mock_chat_text_and_status_flags() {
+        let (base, _) = start_mock_with(|m| m.llm_text = Some("Fixed answer.".into()));
+        let agent = crate::core::http::agent();
+        let r = agent.post(&format!("{base}/chat/completions")).send_json(chat_request("whatever words here")).unwrap();
+        let v: Value = serde_json::from_str(&r.into_string().unwrap()).unwrap();
+        assert_eq!(v["choices"][0]["message"]["content"], "Fixed answer.");
+
+        let (base, _) = start_mock_with(|m| m.llm_status = 500);
+        let e = agent.post(&format!("{base}/chat/completions")).send_json(chat_request("x y z")).unwrap_err();
+        match e {
+            ureq::Error::Status(code, resp) => {
+                assert_eq!(code, 500);
+                assert!(resp.into_string().unwrap().contains("mock llm error"));
+            }
+            other => panic!("expected an HTTP status error, got {other:?}"),
+        }
+        // The LLM through the real client maps to an Http error.
+        let mut cfg = Config::default();
+        cfg.ai_cleanup.rewrite_timeout_ms = 3_000;
+        let r = crate::llm::rewrite_with(&cfg, "one two three four five six", &[], Some("k-test-12345"), Some(&base));
+        assert!(matches!(r, Err(crate::llm::LlmError::Http { status: 500, .. })), "{r:?}");
+    }
+
+    #[test]
+    fn mock_stt_posts_are_unchanged_by_the_chat_route() {
+        let (base, mock) = start_mock_with(|m| m.llm_text = Some("nope".into()));
+        let agent = crate::core::http::agent();
+        let r = agent.post(&format!("{base}/audio/transcriptions")).send_string("audio").unwrap();
+        let v: Value = serde_json::from_str(&r.into_string().unwrap()).unwrap();
+        assert_eq!(v["text"], FILLER_SENTENCE);
+        assert!(mock.llm_requests.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn concise_helper_edge_cases() {
+        assert_eq!(concise("one"), "one.");
+        assert_eq!(concise(""), ".");
+        assert_eq!(concise("a b c d e"), "a b c.");
+        assert_eq!(concise("Hello there, friend!"), "Hello there.");
+        assert_eq!(transcript_in("not json"), None);
+        assert_eq!(transcript_in(&chat_request("hi there").to_string()).as_deref(), Some("hi there"));
+    }
+
+    #[test]
+    fn file_pipeline_rewrites_when_the_dictation_ends_with_the_phrase() {
+        let sentence = "So I was thinking that maybe we could possibly move the meeting from Thursday to Friday afternoon if that works for everyone. Rewrite this concisely.";
+        let (base, mock) = start_mock_with(|m| m.text = sentence.to_string());
+        let mut cfg = Config::default();
+        cfg.stt.provider = SttProviderId::Openai;
+        cfg.ai_cleanup.rewrite_timeout_ms = 3_000;
+        let opts = SttOptions { model: "whisper-1".into(), timeout_ms: 5_000, ..SttOptions::default() };
+        let creds = Credentials { api_key: Some("test-key-123456".into()), base_url: Some(base.clone()), extra: vec![] };
+        let audio = fixture("tts_fillers.wav");
+        let info = vad::analyze(&audio);
+        let transcript = stt::transcribe_with(cfg.stt.provider, &vad::trim(&audio, 150), &opts, &creds).unwrap();
+        assert_eq!(transcript.text, sentence);
+        let calls = pipeline::LlmCalls {
+            cleanup: &|t| crate::llm::cleanup_with(&cfg, t, &[], Some("llm-key-12345"), Some(&base)),
+            rewrite: &|t| crate::llm::rewrite_with(&cfg, t, &[], Some("llm-key-12345"), Some(&base)),
+        };
+        let cleaned = pipeline::clean_with_calls(&cfg, &transcript, info.speech_ms, &calls);
+        assert_eq!(cleaned.rewrite, pipeline::RewriteState::Done, "{cleaned:?}");
+        assert!(cleaned.text.split_whitespace().count() < 20 && !cleaned.text.to_lowercase().contains("rewrite"), "{}", cleaned.text);
+        assert!(cleaned.raw.contains("Rewrite this concisely"));
+        let seen = mock.llm_requests.lock().unwrap();
+        assert_eq!(seen.len(), 1, "exactly one LLM request");
+        let sent = transcript_in(&seen[0]).unwrap();
+        assert!(sent.starts_with("So I was thinking") && sent.ends_with("everyone.") && !sent.to_lowercase().contains("concisely"), "{sent}");
+        // The file result carries the new fields.
+        let r = FileResult {
+            raw: cleaned.raw,
+            text: cleaned.text,
+            provider: "openai".into(),
+            model: "whisper-1".into(),
+            stt_ms: 1.0,
+            cleanup_ms: 2.0,
+            total_ms: 3.0,
+            ai_cleaned: false,
+            rewrite: cleaned.rewrite.label().into(),
+            rewritten: true,
+            rewrite_error: None,
+            original: cleaned.original,
+        };
+        let j = r.to_json();
+        assert_eq!((j["rewritten"].clone(), j["rewrite"].clone(), j["rewrite_error"].clone()), (json!(true), json!("done"), Value::Null));
+        assert_eq!(j["original"], sent);
     }
 
     #[test]
