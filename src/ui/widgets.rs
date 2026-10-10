@@ -1,19 +1,13 @@
-//! Custom-painted widgets in the liquid-glass look (buttons, toggle, segmented control, pill
-//! tabs, inputs, selects, settings panels, chips, menus, dialogs). See `glass.rs` and
-//! docs/GLASS.md for the tiers and the four rules these implement.
+//! Custom-painted widgets that reproduce OpenWhispr's component look (buttons, toggle,
+//! segmented control, pill tabs, inputs, selects, settings panels, chips, dialogs).
 //!
 //! Everything takes the [`Palette`] explicitly and animates hover/press through
 //! `Context::animate_bool_with_time`, which only requests repaints while a transition runs.
-//!
-//! Rule 3 (a child of glass paints no surface of its own) is enforced here: `panel`,
-//! `menu_surface` and `glass_modal` mark their content as "inside glass", and every widget below
-//! then draws a soft wash instead of its own chip / border.
 use super::fonts;
-use super::glass::{self, Gl};
 use super::icons;
 use super::theme::{Palette, mix, with_alpha};
 use eframe::egui::{
-    self, Align, Align2, Color32, CornerRadius, CursorIcon, FontId, Id, Layout, Margin, Rect, Response, RichText, Sense, Shape,
+    self, Align, Align2, Color32, CornerRadius, CursorIcon, FontId, Id, Layout, Margin, Rect, Response, RichText, Sense,
     Stroke, StrokeKind, Ui, UiBuilder, Vec2, pos2, vec2,
 };
 
@@ -30,40 +24,6 @@ pub fn pointer(resp: &Response) {
     if resp.hovered() {
         resp.ctx.set_cursor_icon(CursorIcon::PointingHand);
     }
-}
-
-// ---------------------------------------------------------------- glass context
-
-fn glass_flag() -> Id {
-    Id::new("opentalk-inside-glass")
-}
-
-/// True while drawing the content of a glass surface (rule 3: no nested surfaces).
-pub fn in_glass(ctx: &egui::Context) -> bool {
-    ctx.data(|d| d.get_temp::<bool>(glass_flag())).unwrap_or(false)
-}
-
-/// Mark the content being drawn as inside (or outside) a glass surface; returns the previous value.
-pub fn set_in_glass(ctx: &egui::Context, on: bool) -> bool {
-    let prev = in_glass(ctx);
-    ctx.data_mut(|d| d.insert_temp(glass_flag(), on));
-    prev
-}
-
-/// The glass painting context (theme + window size) for this frame.
-pub fn gl(ui: &Ui, p: &Palette) -> Gl {
-    Gl::new(ui.ctx(), p.dark)
-}
-
-/// Wash fading from level `from` to level `to` as `t` goes 0 -> 1.
-fn wash_to(p: &Palette, from: u8, to: u8, t: f32) -> Color32 {
-    mix(p.wash(from), p.wash(to), t)
-}
-
-/// Draw `shapes` behind content that is laid out afterwards: reserve a slot now, fill it once the
-/// content's rect is known.
-fn reserve(ui: &Ui) -> egui::layers::ShapeIdx {
-    ui.painter().add(Shape::Noop)
 }
 
 /// Plain text label with an explicit size/colour (wraps like `ui.label`).
@@ -93,17 +53,16 @@ pub fn paint_icon(ui: &Ui, rect: Rect, glyph: char, size: f32, color: Color32) {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Variant {
-    /// Brand coloured glass.
+    /// Brand capsule.
     Primary,
-    /// `outline`: a chip on the page, a wash inside a panel.
+    /// `outline`: muted fill + border.
     Outline,
-    /// `outline-flat`: the lighter chip.
+    /// `outline-flat`: transparent + hairline border.
     Flat,
-    /// No chrome, hover wash.
+    /// No chrome, hover tint.
     Ghost,
-    /// Destructive coloured glass.
     Destructive,
-    /// Destructive text on a destructive wash.
+    /// Outline in destructive colour (`text-destructive border-destructive/25`).
     DestructiveOutline,
 }
 
@@ -152,62 +111,52 @@ pub fn button(ui: &mut Ui, p: &Palette, b: Btn) -> Response {
     if b.enabled {
         pointer(&resp);
     }
-    let hv = if down { 1.0 } else { hov };
-    let g = gl(ui, p);
-    let inside = in_glass(ui.ctx());
-    let mut painter = ui.painter().clone();
-    if !b.enabled {
-        painter.set_opacity(0.5);
-    }
-    let r = h / 2.0;
-    let fg = match b.variant {
-        // Coloured glass: only the tint is replaced, rim and border stay (recipes.md).
-        Variant::Primary => {
-            glass::colored(&painter, &g, rect, r, p.primary, hv, !inside);
-            p.primary_fg
-        }
-        Variant::Destructive => {
-            glass::colored(&painter, &g, rect, r, p.destructive, hv, !inside);
-            Color32::WHITE
-        }
-        Variant::Outline => {
-            if inside {
-                painter.rect_filled(rect, cr(r), wash_to(p, 1, 2, hv));
-            } else {
-                glass::chip(&painter, &g, rect, r, hv);
-            }
-            p.foreground
-        }
-        Variant::Flat => {
-            if inside {
-                painter.rect_filled(rect, cr(r), wash_to(p, 0, 1, hv));
-            } else {
-                glass::chip(&painter, &g, rect, r, hv * 0.6);
-            }
-            mix(p.muted_a(80), p.fg_a(90), hov)
-        }
-        Variant::Ghost => {
-            painter.rect_filled(rect, cr(r), with_alpha_mul(p.wash(1), hv));
-            mix(p.muted_a(80), p.foreground, hov)
-        }
-        Variant::DestructiveOutline => {
-            if !inside {
-                glass::chip(&painter, &g, rect, r, hv);
-            }
-            painter.rect_filled(rect, cr(r), mix(p.destructive_a(8), p.destructive_a(18), hv));
-            p.destructive
-        }
+    let (mut fill, mut stroke, fg) = match b.variant {
+        Variant::Primary => (mix(p.primary, Color32::WHITE, 0.08 * hov), Stroke::new(1.0, mix(p.primary, Color32::BLACK, 0.12)), p.primary_fg),
+        Variant::Outline => (
+            mix(if p.dark { p.raised } else { with_alpha(p.muted, 70) }, if p.dark { p.raised } else { p.muted }, hov),
+            Stroke::new(1.0, mix(if p.dark { p.border_hover } else { p.border_a(70) }, p.border_hover, hov)),
+            p.foreground,
+        ),
+        Variant::Flat => (
+            mix(Color32::TRANSPARENT, p.fg_a(if p.dark { 5 } else { 3 }), hov),
+            Stroke::new(1.0, mix(if p.dark { with_alpha(Color32::WHITE, 10) } else { p.border_a(70) }, p.border, hov)),
+            mix(p.muted_a(70), p.fg_a(80), hov),
+        ),
+        Variant::Ghost => (mix(Color32::TRANSPARENT, p.overlay(6), hov), Stroke::NONE, mix(p.muted_a(80), p.foreground, hov)),
+        Variant::Destructive => (mix(p.destructive, Color32::WHITE, 0.06 * hov), Stroke::new(1.0, with_alpha(p.destructive, 70)), Color32::WHITE),
+        Variant::DestructiveOutline => (
+            mix(Color32::TRANSPARENT, p.destructive_a(8), hov),
+            Stroke::new(1.0, p.destructive_a(25 + (hov * 20.0) as u8)),
+            p.destructive,
+        ),
     };
-    let fg = if b.enabled { fg } else { with_alpha_mul(fg, 0.7) };
+    if down {
+        fill = mix(fill, Color32::BLACK, 0.06);
+    }
+    if !b.enabled {
+        fill = with_alpha_mul(fill, 0.5);
+        stroke.color = with_alpha_mul(stroke.color, 0.5);
+    }
+    let fg = if b.enabled { fg } else { with_alpha_mul(fg, 0.5) };
+    let painter = ui.painter();
+    painter.rect_filled(rect, cr(h / 2.0), fill);
+    if stroke.width > 0.0 {
+        painter.rect_stroke(rect, cr(h / 2.0), stroke, StrokeKind::Inside);
+    }
+    if b.variant == Variant::Primary {
+        // Soft top highlight, a nod to the "brand glass" capsule.
+        let hl = Rect::from_min_max(rect.min + vec2(h / 2.0, 1.0), pos2(rect.max.x - h / 2.0, rect.min.y + 2.0));
+        painter.rect_filled(hl, cr(1.0), with_alpha(Color32::WHITE, 28));
+    }
     let content_w = tw + iw;
     let mut x = rect.center().x - content_w / 2.0;
-    let text_y = rect.center().y + if down { 0.5 } else { 0.0 };
-    if let Some(glyph) = b.icon {
-        painter.text(pos2(x + ics / 2.0, text_y), Align2::CENTER_CENTER, glyph.to_string(), fonts::icon(ics), fg);
+    if let Some(g) = b.icon {
+        painter.text(pos2(x + ics / 2.0, rect.center().y), Align2::CENTER_CENTER, g.to_string(), fonts::icon(ics), fg);
         x += ics + if b.label.is_empty() { 0.0 } else { 6.0 };
     }
     if !b.label.is_empty() {
-        painter.text(pos2(x, text_y), Align2::LEFT_CENTER, b.label, font, fg);
+        painter.text(pos2(x, rect.center().y), Align2::LEFT_CENTER, b.label, font, fg);
     }
     resp
 }
@@ -216,29 +165,24 @@ pub fn with_alpha_mul(c: Color32, k: f32) -> Color32 {
     Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), (c.a() as f32 * k) as u8)
 }
 
-/// Square/circle icon button (history row actions, window chrome, etc.): a wash on hover, never a
-/// surface of its own.
+/// Square/circle icon button (history row actions, window chrome, etc.).
 pub fn icon_button(ui: &mut Ui, p: &Palette, glyph: char, size: f32, icon_size: f32, hover_fg: Color32, hover_bg: Color32) -> Response {
     let (rect, resp) = ui.allocate_exact_size(vec2(size, size), Sense::click());
     let hov = hover_anim(ui, resp.id.with("h"), resp.hovered());
     pointer(&resp);
-    // Callers still pass the old flat-design tint; the default one becomes the glass wash, a
-    // deliberate colour (e.g. destructive) is kept.
-    let bg = if hover_bg == p.fg_a(6) || hover_bg.a() == 0 { p.wash(1) } else { hover_bg };
-    ui.painter().rect_filled(rect, cr(size / 2.0), mix(Color32::TRANSPARENT, bg, hov));
-    paint_icon(ui, rect, glyph, icon_size, mix(p.muted_a(75), hover_fg, hov));
+    ui.painter().rect_filled(rect, cr(size / 2.0), mix(Color32::TRANSPARENT, hover_bg, hov));
+    paint_icon(ui, rect, glyph, icon_size, mix(p.muted_a(70), hover_fg, hov));
     resp
 }
 
-/// Ghost icon button using the default hover wash.
+/// Ghost icon button using the default hover tint.
 pub fn ghost_icon(ui: &mut Ui, p: &Palette, glyph: char) -> Response {
     icon_button(ui, p, glyph, 28.0, 13.0, p.foreground, p.fg_a(6))
 }
 
 // ---------------------------------------------------------------- toggle
 
-/// 44x24 switch with a 16 px thumb (`ui/toggle.tsx`). Returns true when changed. On is coloured
-/// glass in the brand hue, off a wash with a hairline.
+/// 44x24 switch with a 16 px thumb (`ui/toggle.tsx`). Returns true when changed.
 pub fn toggle(ui: &mut Ui, p: &Palette, value: &mut bool) -> bool {
     let (rect, resp) = ui.allocate_exact_size(vec2(44.0, 24.0), Sense::click());
     pointer(&resp);
@@ -249,38 +193,30 @@ pub fn toggle(ui: &mut Ui, p: &Palette, value: &mut bool) -> bool {
     }
     let t = ui.ctx().animate_bool_with_time(resp.id.with("on"), *value, 0.15);
     let hov = hover_anim(ui, resp.id.with("h"), resp.hovered());
-    let g = gl(ui, p);
+    let off = if p.dark { mix(p.raised, p.surface3, hov) } else { with_alpha(p.muted_fg, 30 + (hov * 10.0) as u8) };
+    let off = if p.dark { off } else { mix(p.background, off, 1.0) };
+    let on = mix(p.primary, Color32::WHITE, 0.06 * hov);
+    let track = mix(off, on, t);
     let painter = ui.painter();
-    painter.rect_filled(rect, cr(12.0), wash_to(p, 1, 2, hov));
-    painter.rect_stroke(rect, cr(12.0), Stroke::new(1.0, p.glass().border.color()), StrokeKind::Inside);
-    if t > 0.0 {
-        let mut on = painter.clone();
-        on.set_opacity(t);
-        glass::colored(&on, &g, rect, 12.0, p.primary, hov, false);
-    }
+    painter.rect_filled(rect, cr(12.0), track);
     let x = rect.min.x + 4.0 + 8.0 + t * 20.0;
     let c = pos2(x, rect.center().y);
-    painter.circle_filled(c + vec2(0.0, 1.0), 8.5, Color32::from_black_alpha(if p.dark { 70 } else { 34 }));
-    painter.circle_filled(c, 8.0, if p.dark { Color32::from_rgb(0xee, 0xee, 0xf2) } else { Color32::WHITE });
-    painter.circle_stroke(c, 8.0, Stroke::new(1.0, Color32::from_white_alpha(if p.dark { 90 } else { 200 })));
+    painter.circle_filled(c + vec2(0.0, 0.5), 8.0, Color32::from_black_alpha(25));
+    painter.circle_filled(c, 8.0, if p.dark { mix(p.foreground, p.background, 0.0) } else { Color32::WHITE });
     changed
 }
 
 // ---------------------------------------------------------------- segmented / tabs
 
 /// Segmented control (e.g. Light | Dark | Auto). Returns true when the selection changed.
-/// A chip when it sits on the page, a wash inside a panel; the selected segment is a primary wash.
 pub fn segmented(ui: &mut Ui, p: &Palette, selected: &mut usize, labels: &[&str]) -> bool {
     let font = fonts::semibold(12.0);
     let widths: Vec<f32> = labels.iter().map(|l| measure(ui, l, font.clone()).x + 28.0).collect();
     let total: f32 = widths.iter().sum::<f32>() + 6.0;
     let (rect, _) = ui.allocate_exact_size(vec2(total, 32.0), Sense::hover());
     let painter = ui.painter().clone();
-    if in_glass(ui.ctx()) {
-        painter.rect_filled(rect, cr(16.0), p.wash(1));
-    } else {
-        glass::chip(&painter, &gl(ui, p), rect, 16.0, 0.0);
-    }
+    painter.rect_filled(rect, cr(8.0), if p.dark { p.surface3 } else { p.muted });
+    painter.rect_stroke(rect, cr(8.0), Stroke::new(1.0, p.panel_border()), StrokeKind::Inside);
     let mut x = rect.min.x + 3.0;
     let mut changed = false;
     for (i, l) in labels.iter().enumerate() {
@@ -289,13 +225,13 @@ pub fn segmented(ui: &mut Ui, p: &Palette, selected: &mut usize, labels: &[&str]
         pointer(&resp);
         let sel = *selected == i;
         let t = ui.ctx().animate_bool_with_time(resp.id.with("s"), sel, 0.12);
-        let hov = hover_anim(ui, resp.id.with("h"), resp.hovered() && !sel);
-        if hov > 0.0 {
-            painter.rect_filled(r, cr(13.0), with_alpha_mul(p.wash(1), hov));
-        }
         if t > 0.0 {
-            painter.rect_filled(r, cr(13.0), with_alpha_mul(p.primary_wash(1), t));
+            painter.rect_filled(r, cr(6.0), with_alpha_mul(if p.dark { p.raised } else { Color32::WHITE }, t));
+            if !p.dark {
+                painter.rect_stroke(r, cr(6.0), Stroke::new(1.0, with_alpha_mul(p.border, t)), StrokeKind::Inside);
+            }
         }
+        let hov = hover_anim(ui, resp.id.with("h"), resp.hovered() && !sel);
         let col = mix(mix(p.muted_fg, p.foreground, hov), p.foreground, t);
         painter.text(r.center(), Align2::CENTER_CENTER, *l, font.clone(), col);
         if resp.clicked() && !sel {
@@ -319,8 +255,6 @@ pub fn pill_tabs(ui: &mut Ui, p: &Palette, selected: usize, labels: &[(&str, &st
     let origin = ui.cursor().min;
     let mut clicked = None;
     let mut max_x = 0.0f32;
-    let g = gl(ui, p);
-    let inside = in_glass(ui.ctx());
     for (i, (label, badge)) in labels.iter().enumerate() {
         let tw = measure(ui, label, font.clone()).x;
         let bw = if badge.is_empty() { 0.0 } else { measure(ui, badge, small.clone()).x + 4.0 };
@@ -336,14 +270,10 @@ pub fn pill_tabs(ui: &mut Ui, p: &Palette, selected: usize, labels: &[(&str, &st
         let t = ui.ctx().animate_bool_with_time(resp.id.with("s"), sel, 0.15);
         let hov = hover_anim(ui, resp.id.with("h"), resp.hovered() && !sel);
         let painter = ui.painter();
-        if inside {
-            painter.rect_filled(r, cr(h / 2.0), mix(Color32::TRANSPARENT, p.wash(1), hov));
-        } else {
-            glass::chip(painter, &g, r, h / 2.0, hov);
-        }
-        if t > 0.0 {
-            painter.rect_filled(r, cr(h / 2.0), with_alpha_mul(p.primary_wash(2), t));
-        }
+        let ring_idle = if p.dark { with_alpha(Color32::WHITE, 10) } else { p.border_a(60) };
+        let ring = mix(ring_idle, p.primary_a(if p.dark { 25 } else { 30 }), t);
+        painter.rect_filled(r, cr(h / 2.0), mix(mix(Color32::TRANSPARENT, p.fg_a(5), hov), p.primary_a(if p.dark { 15 } else { 10 }), t));
+        painter.rect_stroke(r, cr(h / 2.0), Stroke::new(1.0, ring), StrokeKind::Inside);
         let col = mix(mix(p.muted_fg, p.foreground, hov), p.foreground, t);
         let tx = r.min.x + 10.0;
         painter.text(pos2(tx, r.center().y), Align2::LEFT_CENTER, label, font.clone(), col);
@@ -362,33 +292,7 @@ pub fn pill_tabs(ui: &mut Ui, p: &Palette, selected: usize, labels: &[(&str, &st
 
 // ---------------------------------------------------------------- inputs
 
-/// The input chrome. Inside glass (rule 3) there is no box: a hairline along the bottom, a soft wash
-/// on hover and, when focused, the hairline in the brand colour plus a low-alpha primary focus ring.
-/// On the bare page an input has nothing to sit on, so it is a chip-tier glass box (tint, border, top
-/// rim) with the same focus ring. `round` is the search-field variant, a pill.
-pub fn input_chrome(ui: &Ui, p: &Palette, rect: Rect, focus_t: f32, hover_t: f32, round: bool) {
-    let painter = ui.painter();
-    let radius = if round { rect.height() / 2.0 } else { 8.0 };
-    let inside = in_glass(ui.ctx());
-    if !inside {
-        glass::chip(painter, &gl(ui, p), rect, radius, hover_t.max(focus_t));
-    } else if round {
-        painter.rect_filled(rect, cr(radius), wash_to(p, 0, 1, hover_t));
-    } else if hover_t > 0.0 {
-        painter.rect_filled(rect, cr(radius), with_alpha_mul(p.wash(0), hover_t));
-    }
-    if focus_t > 0.0 {
-        painter.rect_filled(rect, cr(radius), with_alpha_mul(p.primary_a(6), focus_t));
-        painter.rect_stroke(rect.expand(1.0), cr(radius + 1.0), Stroke::new(2.0, p.primary_a(if p.dark { 38 } else { 32 }).gamma_multiply(focus_t)), StrokeKind::Outside);
-    }
-    if inside && !round {
-        let y = rect.max.y - 0.5;
-        let line = mix(mix(p.input_border(), p.fg_a(if p.dark { 40 } else { 45 }), hover_t), p.primary, focus_t);
-        painter.line_segment([pos2(rect.min.x + 1.0, y), pos2(rect.max.x - 1.0, y)], Stroke::new(1.0, line));
-    }
-}
-
-/// Single-line text input in the glass chrome. `password` masks the content.
+/// Single-line text input in OpenWhispr's input chrome. `password` masks the content.
 pub fn text_input(ui: &mut Ui, p: &Palette, value: &mut String, hint: &str, width: f32, password: bool) -> Response {
     text_input_h(ui, p, value, hint, width, 32.0, password, false)
 }
@@ -401,8 +305,14 @@ pub fn text_input_h(ui: &mut Ui, p: &Palette, value: &mut String, hint: &str, wi
     let focused = ui.memory(|m| m.has_focus(id));
     let hov = ui.rect_contains_pointer(rect);
     let t = ui.ctx().animate_bool_with_time(id.with("f"), focused, 0.12);
-    let ht = ui.ctx().animate_bool_with_time(id.with("h"), hov && !focused, 0.12);
-    input_chrome(ui, p, rect, t, ht, round);
+    let radius = if round { height / 2.0 } else { 6.0 };
+    let painter = ui.painter();
+    painter.rect_filled(rect, cr(radius), p.input_fill());
+    if t > 0.0 {
+        painter.rect_stroke(rect.expand(1.5 * t), cr(radius + 1.5), Stroke::new(2.0, p.primary_a(12)), StrokeKind::Outside);
+    }
+    let base = if hov { p.border_hover } else { p.input_border() };
+    painter.rect_stroke(rect, cr(radius), Stroke::new(1.0, mix(base, p.primary, t)), StrokeKind::Inside);
     let inner = rect.shrink2(vec2(if round { 14.0 } else { 10.0 }, 0.0));
     let edit = egui::TextEdit::singleline(value)
         .id(id)
@@ -424,10 +334,10 @@ pub fn text_area(ui: &mut Ui, p: &Palette, value: &mut String, hint: &str, rows:
     let (rect, _) = ui.allocate_exact_size(vec2(width, h), Sense::hover());
     let id = ui.id().with(("area", rect.min.x as i32, rect.min.y as i32, hint));
     let focused = ui.memory(|m| m.has_focus(id));
-    let hov = ui.rect_contains_pointer(rect);
     let t = ui.ctx().animate_bool_with_time(id.with("f"), focused, 0.12);
-    let ht = ui.ctx().animate_bool_with_time(id.with("h"), hov && !focused, 0.12);
-    input_chrome(ui, p, rect, t, ht, false);
+    let painter = ui.painter();
+    painter.rect_filled(rect, cr(6.0), p.input_fill());
+    painter.rect_stroke(rect, cr(6.0), Stroke::new(1.0, mix(p.input_border(), p.primary, t)), StrokeKind::Inside);
     let inner = rect.shrink2(vec2(10.0, 8.0));
     let font = if mono { FontId::monospace(12.0) } else { fonts::regular(12.5) };
     let mut child = ui.new_child(UiBuilder::new().max_rect(inner).layout(Layout::top_down(Align::Min)));
@@ -467,14 +377,10 @@ pub fn select(
     let (rect, resp) = ui.allocate_exact_size(vec2(width, 32.0), Sense::click());
     pointer(&resp);
     let open = egui::Popup::is_id_open(ui.ctx(), egui::Popup::default_response_id(&resp));
-    let hov = hover_anim(ui, resp.id.with("h"), resp.hovered() && !open);
-    let ot = hover_anim(ui, resp.id.with("o"), open);
-    // Closed state is an input, so it follows rule 3: hairline, wash on hover, brand line when open.
-    input_chrome(ui, p, rect, 0.0, hov, false);
-    if ot > 0.0 {
-        let y = rect.max.y - 0.5;
-        ui.painter().line_segment([pos2(rect.min.x + 1.0, y), pos2(rect.max.x - 1.0, y)], Stroke::new(1.0, p.primary.gamma_multiply(ot)));
-    }
+    let hov = hover_anim(ui, resp.id.with("h"), resp.hovered() || open);
+    let painter = ui.painter();
+    painter.rect_filled(rect, cr(6.0), p.input_fill());
+    painter.rect_stroke(rect, cr(6.0), Stroke::new(1.0, mix(p.input_border(), if open { p.primary } else { p.border_hover }, hov)), StrokeKind::Inside);
     let clip = Rect::from_min_max(rect.min, pos2(rect.max.x - 28.0, rect.max.y));
     ui.painter().with_clip_rect(clip).text(
         pos2(rect.min.x + 10.0, rect.center().y),
@@ -493,30 +399,29 @@ pub fn select(
         .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
         .gap(4.0)
         .width(list_w)
-        .frame(egui::Frame::NONE)
+        .frame(popup_frame(p))
         .show(|ui| {
-            menu_surface(ui, p, list_w - 8.0, |ui| {
-                ui.spacing_mut().item_spacing = vec2(0.0, 1.0);
-                let mut filter = ui.memory_mut(|m| m.data.get_temp::<String>(filter_id).unwrap_or_default());
-                if searchable {
-                    ui.add_space(2.0);
-                    let w = ui.available_width();
-                    text_input_h(ui, p, &mut filter, "Search...", w, 28.0, false, false);
-                    ui.add_space(4.0);
-                    ui.memory_mut(|m| m.data.insert_temp(filter_id, filter.clone()));
-                }
-                let needle = filter.to_lowercase();
-                egui::ScrollArea::vertical().max_height(280.0).auto_shrink([false, true]).show(ui, |ui| {
-                    for (i, label) in options.iter().enumerate() {
-                        if !needle.is_empty() && !label.to_lowercase().contains(&needle) {
-                            continue;
-                        }
-                        if menu_item(ui, p, label, selected == Some(i), false, None).clicked() {
-                            chosen = Some(i);
-                            egui::Popup::close_all(ui.ctx());
-                        }
+            ui.set_min_width(list_w - 8.0);
+            ui.spacing_mut().item_spacing = vec2(0.0, 1.0);
+            let mut filter = ui.memory_mut(|m| m.data.get_temp::<String>(filter_id).unwrap_or_default());
+            if searchable {
+                ui.add_space(2.0);
+                let w = ui.available_width();
+                text_input_h(ui, p, &mut filter, "Search...", w, 28.0, false, false);
+                ui.add_space(4.0);
+                ui.memory_mut(|m| m.data.insert_temp(filter_id, filter.clone()));
+            }
+            let needle = filter.to_lowercase();
+            egui::ScrollArea::vertical().max_height(280.0).auto_shrink([false, true]).show(ui, |ui| {
+                for (i, label) in options.iter().enumerate() {
+                    if !needle.is_empty() && !label.to_lowercase().contains(&needle) {
+                        continue;
                     }
-                });
+                    if menu_item(ui, p, label, selected == Some(i), false, None).clicked() {
+                        chosen = Some(i);
+                        egui::Popup::close_all(ui.ctx());
+                    }
+                }
             });
         });
     if chosen.is_some() {
@@ -525,39 +430,31 @@ pub fn select(
     SelectOut { chosen }
 }
 
-/// Menu tier surface behind `add` (dropdowns, popovers, context menus): a 55 % wash of the menu
-/// surface with border, shadows and top rim, `width` points of content wide. Use it as the only
-/// content of a `Popup` shown with `.frame(Frame::NONE)`.
-pub fn menu_surface<R>(ui: &mut Ui, p: &Palette, width: f32, add: impl FnOnce(&mut Ui) -> R) -> R {
-    let g = gl(ui, p);
-    let slot = reserve(ui);
-    let prev = set_in_glass(ui.ctx(), true);
-    let out = egui::Frame::new().inner_margin(Margin::same(4)).show(ui, |ui| {
-        ui.set_width(width);
-        add(ui)
-    });
-    set_in_glass(ui.ctx(), prev);
-    ui.painter().set(slot, Shape::Vec(glass::menu_shapes(&g, out.response.rect, glass::RADIUS)));
-    out.inner
+pub fn popup_frame(p: &Palette) -> egui::Frame {
+    egui::Frame::new()
+        .fill(if p.dark { p.surface2 } else { Color32::WHITE })
+        .stroke(Stroke::new(1.0, if p.dark { with_alpha(Color32::WHITE, 12) } else { p.border }))
+        .corner_radius(cr(8.0))
+        .inner_margin(Margin::same(4))
+        .shadow(egui::Shadow { offset: [0, 6], blur: 20, spread: 0, color: Color32::from_black_alpha(if p.dark { 120 } else { 40 }) })
 }
 
-/// A dropdown-menu row: optional leading icon, check mark when selected, destructive tint. Hover is
-/// a wash with no border (rule 3).
+/// A dropdown-menu row: optional leading icon, check mark when selected, destructive tint.
 pub fn menu_item(ui: &mut Ui, p: &Palette, label: &str, selected: bool, destructive: bool, icon: Option<char>) -> Response {
     let w = ui.available_width();
     let (rect, resp) = ui.allocate_exact_size(vec2(w, 30.0), Sense::click());
     pointer(&resp);
     let hov = hover_anim(ui, resp.id.with("h"), resp.hovered());
     let painter = ui.painter();
-    let tint = if destructive { p.destructive_a(12) } else { p.wash(1) };
-    painter.rect_filled(rect, cr(8.0), mix(Color32::TRANSPARENT, tint, hov));
+    let tint = if destructive { p.destructive_a(10) } else { p.overlay(6) };
+    painter.rect_filled(rect, cr(6.0), mix(Color32::TRANSPARENT, tint, hov));
     let col = if destructive { p.destructive } else { p.foreground };
     let mut x = rect.min.x + 10.0;
     if let Some(g) = icon {
         painter.text(pos2(x + 6.5, rect.center().y), Align2::CENTER_CENTER, g.to_string(), fonts::icon(13.0), if destructive { col } else { p.muted_a(90) });
         x += 22.0;
     }
-    painter.text(pos2(x, rect.center().y), Align2::LEFT_CENTER, label, if selected { fonts::semibold(13.0) } else { fonts::regular(13.0) }, col);
+    painter.text(pos2(x, rect.center().y), Align2::LEFT_CENTER, label, fonts::regular(13.0), col);
     if selected {
         painter.text(pos2(rect.max.x - 14.0, rect.center().y), Align2::CENTER_CENTER, icons::CHECK.to_string(), fonts::icon(11.0), p.primary);
     }
@@ -566,66 +463,22 @@ pub fn menu_item(ui: &mut Ui, p: &Palette, label: &str, selected: bool, destruct
 
 // ---------------------------------------------------------------- panels and rows
 
-/// Settings panel: one glass panel (refraction band, tint, rim, shadow) containing transparent
-/// rows. Content is drawn "inside glass": rows, chips and buttons paint washes, not surfaces.
+/// Settings panel: `rounded-lg border bg-card/50` containing divided rows.
 pub fn panel<R>(ui: &mut Ui, p: &Palette, add: impl FnOnce(&mut Ui) -> R) -> R {
-    let g = gl(ui, p);
-    let slot = reserve(ui);
-    // Rule 3 / "no glass nested in glass": a panel inside a modal (or any other glass) is only a soft
-    // grouping wash; its rows are separated by spacing and dividers.
-    let nested = in_glass(ui.ctx());
-    let prev = set_in_glass(ui.ctx(), true);
-    let out = egui::Frame::new().show(ui, |ui| {
-        ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
-        ui.set_width(ui.available_width());
-        add(ui)
-    });
-    set_in_glass(ui.ctx(), prev);
-    let rect = out.response.rect;
-    if nested {
-        ui.painter().set(slot, Shape::rect_filled(rect, cr(glass::RADIUS), p.wash(0)));
-    } else {
-        ui.painter().set(slot, Shape::Vec(glass::panel_shapes(&g, rect, glass::RADIUS, 0.0)));
-    }
-    out.inner
+    let frame = egui::Frame::new().fill(p.panel_fill()).stroke(Stroke::new(1.0, p.panel_border())).corner_radius(cr(8.0));
+    frame
+        .show(ui, |ui| {
+            ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
+            ui.set_width(ui.available_width());
+            add(ui)
+        })
+        .inner
 }
 
-/// Row divider inside a panel: the glass border at 60 %, inset from the rim so it reads as spacing.
 pub fn divider(ui: &mut Ui, p: &Palette) {
     let w = ui.available_width();
     let (r, _) = ui.allocate_exact_size(vec2(w, 1.0), Sense::hover());
-    ui.painter().rect_filled(Rect::from_min_max(pos2(r.min.x + 16.0, r.min.y), pos2(r.max.x - 16.0, r.max.y)), 0.0, p.divider());
-}
-
-/// Corner rounding for a row wash that touches a panel's rim: the panel's radius (less its border)
-/// on the outer corners of the first and last row, square in between.
-pub fn edge_rounding(first: bool, last: bool) -> CornerRadius {
-    let r = (glass::RADIUS - 1.0) as u8;
-    CornerRadius { nw: if first { r } else { 0 }, ne: if first { r } else { 0 }, sw: if last { r } else { 0 }, se: if last { r } else { 0 } }
-}
-
-/// A status notice (warning banner, test result): a glass panel carrying `tone` as coloured glass
-/// (rule 2: the tint is overridden, rim and refraction stay). Inside another glass surface it is only
-/// a tone wash, never a second panel.
-pub fn notice<R>(ui: &mut Ui, p: &Palette, tone: Color32, add: impl FnOnce(&mut Ui) -> R) -> R {
-    let g = gl(ui, p);
-    let slot = reserve(ui);
-    let nested = in_glass(ui.ctx());
-    let prev = set_in_glass(ui.ctx(), true);
-    let out = egui::Frame::new().inner_margin(Margin::symmetric(14, 10)).show(ui, |ui| {
-        ui.set_width(ui.available_width());
-        add(ui)
-    });
-    set_in_glass(ui.ctx(), prev);
-    let rect = out.response.rect;
-    let strength = if p.dark { 0.13 } else { 0.10 };
-    if nested {
-        let r = cr(10.0);
-        ui.painter().set(slot, Shape::Vec(vec![Shape::rect_filled(rect, r, p.wash(0)), Shape::rect_filled(rect, r, with_alpha_mul(tone, strength * 1.2))]));
-    } else {
-        ui.painter().set(slot, Shape::Vec(glass::tinted_shapes(&g, rect, glass::RADIUS, tone, strength)));
-    }
-    out.inner
+    ui.painter().rect_filled(r, 0.0, p.divider());
 }
 
 /// Label + description on the left and a control of width `ctrl_w` on the right.
@@ -698,56 +551,21 @@ pub enum ChipKind {
     Destructive,
 }
 
-/// Small tag. Chip tier on the page; inside a panel a tinted wash (rule 3). Returns its response
-/// (for tooltips).
+/// Small rounded tag. Returns its response (for tooltips).
 pub fn chip(ui: &mut Ui, p: &Palette, label: &str, kind: ChipKind) -> Response {
     let font = fonts::semibold(11.0);
     let tw = measure(ui, label, font.clone()).x;
-    let (rect, resp) = ui.allocate_exact_size(vec2(tw + 14.0, 20.0), Sense::hover());
-    paint_chip(ui, p, rect, label, kind);
-    resp
-}
-
-/// [`chip`] drawn into a rect of the caller's layout (model cards line their tags up themselves).
-pub fn paint_chip(ui: &Ui, p: &Palette, rect: Rect, label: &str, kind: ChipKind) {
+    let (rect, resp) = ui.allocate_exact_size(vec2(tw + 12.0, 20.0), Sense::hover());
     let (bg, fg) = match kind {
-        ChipKind::Neutral => (p.wash(1), p.muted_fg),
-        ChipKind::Primary => (p.primary_a(if p.dark { 18 } else { 13 }), p.primary),
-        ChipKind::Success => (p.success_a(if p.dark { 18 } else { 13 }), p.success),
-        ChipKind::Warning => (p.warning_a(if p.dark { 20 } else { 15 }), p.warning),
-        ChipKind::Destructive => (p.destructive_a(if p.dark { 18 } else { 12 }), p.destructive),
+        ChipKind::Neutral => (if p.dark { p.surface3 } else { with_alpha(p.muted, 100) }, p.muted_fg),
+        ChipKind::Primary => (p.primary_a(10), p.primary),
+        ChipKind::Success => (p.success_a(12), p.success),
+        ChipKind::Warning => (p.warning_a(14), p.warning),
+        ChipKind::Destructive => (p.destructive_a(10), p.destructive),
     };
-    if !in_glass(ui.ctx()) {
-        glass::chip(ui.painter(), &gl(ui, p), rect, rect.height() / 2.0, 0.0);
-    }
-    ui.painter().rect_filled(rect, cr(rect.height() / 2.0), bg);
-    ui.painter().text(rect.center(), Align2::CENTER_CENTER, label, fonts::semibold(11.0), fg);
-}
-
-/// Width of a chip with `label`.
-pub fn chip_width(ui: &Ui, label: &str) -> f32 {
-    measure(ui, label, fonts::semibold(11.0)).x + 14.0
-}
-
-/// A keyboard key cap (`Ctrl`, `Esc`). A chip on the page; inside glass a wash with a hairline under
-/// it, so it reads as a key without becoming a second surface.
-pub fn keycap(ui: &mut Ui, p: &Palette, label: &str) {
-    let font = fonts::semibold(11.5);
-    let tw = measure(ui, label, font.clone()).x;
-    let (rect, _) = ui.allocate_exact_size(vec2(tw + 16.0, 24.0), Sense::hover());
-    paint_keycap(ui, p, rect, label, font);
-}
-
-/// [`keycap`] into a rect of the caller's layout.
-pub fn paint_keycap(ui: &Ui, p: &Palette, rect: Rect, label: &str, font: FontId) {
-    if in_glass(ui.ctx()) {
-        ui.painter().rect_filled(rect, cr(6.0), p.wash(2));
-        let y = rect.max.y - 0.5;
-        ui.painter().line_segment([pos2(rect.min.x + 3.0, y), pos2(rect.max.x - 3.0, y)], Stroke::new(1.0, p.input_border()));
-    } else {
-        glass::chip(ui.painter(), &gl(ui, p), rect, 6.0, 0.0);
-    }
-    ui.painter().text(rect.center(), Align2::CENTER_CENTER, label, font, p.foreground);
+    ui.painter().rect_filled(rect, cr(4.0), bg);
+    ui.painter().text(rect.center(), Align2::CENTER_CENTER, label, font, fg);
+    resp
 }
 
 /// Coloured circle with an initial: stand-in for the target application's icon.
@@ -785,57 +603,36 @@ pub enum DialogResult {
     Cancel,
 }
 
-/// Modal tier: `egui::Modal` over `--glass-scrim`, the surface a glass panel with the frost layer
-/// at `--glass-radius-lg`. `margin` is the padding inside the surface. The content is drawn inside
-/// glass (rule 3). Esc and a click on the scrim close it (`should_close`).
-pub fn glass_modal<R>(ctx: &egui::Context, p: &Palette, id: Id, margin: i8, add: impl FnOnce(&mut Ui) -> R) -> egui::ModalResponse<R> {
-    glass_modal_at(ctx, p, id, margin, None, add)
-}
-
-/// [`glass_modal`] placed by a custom `Area` (e.g. anchored near the top, like the Ctrl+K palette).
-pub fn glass_modal_at<R>(
-    ctx: &egui::Context,
-    p: &Palette,
-    id: Id,
-    margin: i8,
-    area: Option<egui::Area>,
-    add: impl FnOnce(&mut Ui) -> R,
-) -> egui::ModalResponse<R> {
-    let g = Gl::new(ctx, p.dark);
-    let mut modal = egui::Modal::new(id).backdrop_color(glass::scrim_color(p.dark)).frame(egui::Frame::NONE);
-    if let Some(a) = area {
-        modal = modal.area(a);
-    }
-    modal.show(ctx, |ui| {
-        let slot = reserve(ui);
-        let prev = set_in_glass(ui.ctx(), true);
-        let out = egui::Frame::new().inner_margin(Margin::same(margin)).show(ui, add);
-        set_in_glass(ui.ctx(), prev);
-        ui.painter().set(slot, Shape::Vec(glass::modal_shapes(&g, out.response.rect, glass::RADIUS_LG)));
-        out.inner
-    })
-}
-
 /// Modal confirmation dialog (`Delete`, `Clear all`, `Reset`). `destructive` colours the action.
 pub fn confirm_dialog(ctx: &egui::Context, p: &Palette, id: &str, title: &str, body: &str, action: &str, destructive: bool) -> DialogResult {
     let mut result = DialogResult::Open;
-    let modal = glass_modal(ctx, p, Id::new(id), 24, |ui| {
-        ui.set_width(380.0);
-        ui.spacing_mut().item_spacing = vec2(0.0, 6.0);
-        text_semi(ui, title, 15.0, p.foreground);
-        text(ui, body, 13.0, p.muted_a(90));
-        ui.add_space(12.0);
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            ui.spacing_mut().item_spacing = vec2(8.0, 0.0);
-            let v = if destructive { Variant::Destructive } else { Variant::Primary };
-            if button(ui, p, Btn::new(action, v).min_width(84.0)).clicked() {
-                result = DialogResult::Confirm;
-            }
-            if button(ui, p, Btn::new("Cancel", Variant::Outline).min_width(84.0)).clicked() {
-                result = DialogResult::Cancel;
-            }
+    let modal = egui::Modal::new(Id::new(id))
+        .backdrop_color(Color32::from_black_alpha(if p.dark { 150 } else { 90 }))
+        .frame(
+            egui::Frame::new()
+                .fill(if p.dark { p.surface1 } else { Color32::WHITE })
+                .stroke(Stroke::new(1.0, if p.dark { with_alpha(Color32::WHITE, 12) } else { p.border }))
+                .corner_radius(cr(12.0))
+                .inner_margin(Margin::same(20))
+                .shadow(egui::Shadow { offset: [0, 20], blur: 50, spread: 0, color: Color32::from_black_alpha(80) }),
+        )
+        .show(ctx, |ui| {
+            ui.set_width(380.0);
+            ui.spacing_mut().item_spacing = vec2(0.0, 6.0);
+            text_semi(ui, title, 15.0, p.foreground);
+            text(ui, body, 13.0, p.muted_a(90));
+            ui.add_space(12.0);
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.spacing_mut().item_spacing = vec2(8.0, 0.0);
+                let v = if destructive { Variant::Destructive } else { Variant::Primary };
+                if button(ui, p, Btn::new(action, v).min_width(84.0)).clicked() {
+                    result = DialogResult::Confirm;
+                }
+                if button(ui, p, Btn::new("Cancel", Variant::Outline).min_width(84.0)).clicked() {
+                    result = DialogResult::Cancel;
+                }
+            });
         });
-    });
     if modal.should_close() && matches!(result, DialogResult::Open) {
         result = DialogResult::Cancel;
     }
@@ -868,19 +665,5 @@ mod tests {
     #[test]
     fn alpha_mul() {
         assert_eq!(with_alpha_mul(Color32::from_rgba_unmultiplied(1, 2, 3, 200), 0.5).a(), 100);
-    }
-
-    #[test]
-    fn the_inside_glass_flag_nests_and_restores() {
-        let ctx = egui::Context::default();
-        assert!(!in_glass(&ctx));
-        let outer = set_in_glass(&ctx, true);
-        assert!(!outer && in_glass(&ctx));
-        let inner = set_in_glass(&ctx, true);
-        assert!(inner, "a nested surface sees that it is already inside glass");
-        set_in_glass(&ctx, inner);
-        assert!(in_glass(&ctx));
-        set_in_glass(&ctx, outer);
-        assert!(!in_glass(&ctx));
     }
 }

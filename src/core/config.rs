@@ -150,8 +150,6 @@ pub struct Config {
     pub version: u32,
     // ---- Preferences ----
     pub theme: Theme,
-    /// Paint an opaque window background instead of the translucent Windows backdrop (Settings).
-    pub reduce_transparency: bool,
     pub audio_cues: bool,
     pub pause_media: bool,
     pub auto_paste: bool,
@@ -197,7 +195,6 @@ impl Default for Config {
         Self {
             version: CONFIG_VERSION,
             theme: Theme::Auto,
-            reduce_transparency: false,
             audio_cues: true,
             pause_media: false,
             auto_paste: true,
@@ -312,18 +309,16 @@ mod tests {
         assert_eq!(back.ai_cleanup.azure_model, "gpt-5");
     }
     #[test]
-    fn reduce_transparency_defaults_off_for_old_files() {
-        // A config written before the glass Settings UI (no `reduce_transparency`) loads with it off,
-        // keeps every other field, and the new field round-trips once set.
-        let c: Config = serde_json::from_str(r#"{"version":1,"theme":"dark","audio_cues":false}"#).unwrap();
-        assert!(!c.reduce_transparency);
+    fn config_written_by_the_glass_build_still_loads() {
+        // The glass Settings UI wrote `reduce_transparency`; the field is gone, and a file that still
+        // carries it (or any other unknown key) loads, keeps every field it knows, and is rewritten
+        // without it.
+        let c: Config = serde_json::from_str(r#"{"version":1,"theme":"dark","reduce_transparency":true,"audio_cues":false,"future_key":{"a":1}}"#).unwrap();
         assert_eq!(c.theme, Theme::Dark);
         assert!(!c.audio_cues);
-        assert!(!Config::default().reduce_transparency);
-        let mut m = c;
-        m.reduce_transparency = true;
-        let back: Config = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
-        assert!(back.reduce_transparency);
+        let back = serde_json::to_string(&c).unwrap();
+        assert!(!back.contains("reduce_transparency"));
+        assert_eq!(serde_json::from_str::<Config>(&back).unwrap(), c);
     }
     #[test]
     fn roundtrip() {

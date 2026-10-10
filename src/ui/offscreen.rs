@@ -1,11 +1,10 @@
 //! Headless frame renderer for tests: runs the real UI through egui, tessellates it and rasterises
 //! the triangles on the CPU (Gouraud vertex colours, texture lookups, scissor, premultiplied
-//! "over"), then writes a PNG. It exists so the glass look can be checked with no window, GPU or
-//! unlocked desktop. It does not emulate DWM acrylic: the window is composited over a synthetic,
-//! deliberately busy "wallpaper" blurred to stand in for the acrylic.
+//! "over"), then writes a PNG. It exists so every screen can be checked with no window, GPU or
+//! unlocked desktop.
 //!
 //! Writes only when `OPENTALK_SHOT_DIR` is set (otherwise the test is a no-op), e.g.
-//! `OPENTALK_SHOT_DIR=docs/screenshots/glass/offscreen cargo test --bin opentalk offscreen_shots`.
+//! `OPENTALK_SHOT_DIR=docs/screenshots/ui cargo test --bin opentalk offscreen_shots`.
 use super::app::App;
 use super::{Launch, Page, Section};
 use crate::core::config::{Config, Theme};
@@ -25,16 +24,6 @@ pub struct Frame {
     pub buf: Vec<[f32; 4]>,
 }
 
-/// A bright, busy stand-in for "whatever is behind the window", already blurred (acrylic).
-fn wallpaper(x: f32, y: f32, w: f32, h: f32, dark: bool) -> [f32; 4] {
-    let (u, v) = (x / w, y / h);
-    let r = 0.55 + 0.45 * (u * 9.0 + (v * 5.0).sin() * 2.0).sin();
-    let g = 0.50 + 0.45 * (v * 7.0 - u * 3.0).cos();
-    let b = 0.60 + 0.40 * ((u + v) * 6.0).sin();
-    let k = if dark { 0.45 } else { 1.0 };
-    [r.clamp(0.0, 1.0) * k, g.clamp(0.0, 1.0) * k, b.clamp(0.0, 1.0) * k, 1.0]
-}
-
 fn c32(c: Color32) -> [f32; 4] {
     [c.r() as f32 / 255.0, c.g() as f32 / 255.0, c.b() as f32 / 255.0, c.a() as f32 / 255.0]
 }
@@ -50,17 +39,13 @@ impl Frame {
         *d = [s[0] + d[0] * k, s[1] + d[1] * k, s[2] + d[2] * k, s[3] + d[3] * k];
     }
 
-    pub fn save(&self, path: &std::path::Path, backdrop_dark: bool) {
+    /// Write the frame as an opaque PNG (the window is opaque; anything not covered shows as black).
+    pub fn save(&self, path: &std::path::Path) {
         let mut pm = tiny_skia::Pixmap::new(self.w as u32, self.h as u32).expect("pixmap");
         let data = pm.data_mut();
         for (i, p) in self.buf.iter().enumerate() {
-            // Composite over the wallpaper (acrylic stand-in) where the window is translucent.
-            let (x, y) = ((i % self.w) as f32, (i / self.w) as f32);
-            let wp = wallpaper(x, y, self.w as f32, self.h as f32, backdrop_dark);
-            let k = 1.0 - p[3];
-            let o = [p[0] + wp[0] * k, p[1] + wp[1] * k, p[2] + wp[2] * k];
             let q = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
-            data[i * 4..i * 4 + 4].copy_from_slice(&[q(o[0]), q(o[1]), q(o[2]), 255]);
+            data[i * 4..i * 4 + 4].copy_from_slice(&[q(p[0]), q(p[1]), q(p[2]), 255]);
         }
         pm.save_png(path).expect("png");
     }
@@ -312,8 +297,8 @@ fn offscreen_shots() {
         Sc { name: "history", ..base },
         Sc { name: "history-empty", empty_history: true, ..base },
         Sc { name: "history-disabled", cfg: history_off, ..base },
-        Sc { name: "history-row-menu", events: || click_at(1136.0, 510.0), ..base },
-        Sc { name: "history-hover-search", events: || hover_at(1000.0, 148.0), ..base },
+        Sc { name: "history-row-menu", events: || click_at(1136.0, 205.0), ..base },
+        Sc { name: "history-hover-search", events: || hover_at(1040.0, 116.0), ..base },
         Sc { name: "dictionary-empty", launch: dict, ..base },
         Sc { name: "dictionary-words", launch: dict, cfg: with_words, ..base },
         Sc { name: "dictionary-words-edit", launch: dict, cfg: with_words, setup: |a| a.dict_mut().edit_word(2, "kubectl"), events: || hover_at(600.0, 250.0), ..base },
@@ -353,150 +338,83 @@ fn offscreen_shots() {
             }
             let frame = render(sc.size, ppp, (sc.events)(), 7, |_ctx, ui| app.draw(ui));
             let file = out_dir.join(format!("{}-{}.png", sc.name, if dark { "dark" } else { "light" }));
-            frame.save(&file, dark);
+            frame.save(&file);
         }
     }
     let _ = std::fs::remove_dir_all(&home);
     let _ = std::fs::remove_dir_all(&empty);
 }
 
-/// The shell, rendered through the real UI code: the backdrop is uneven, the window is translucent
-/// (acrylic shows through) and the glass top bar paints over the page, in both themes.
+/// The window is a flat, fully opaque surface (no translucency, no backdrop mesh): every pixel of
+/// every page is opaque, in both themes.
 #[test]
-fn offscreen_shell_has_an_uneven_translucent_backdrop() {
+fn offscreen_window_is_opaque_and_flat() {
     for dark in [false, true] {
         let cfg = Config { theme: if dark { Theme::Dark } else { Theme::Light }, ..Config::default() };
         let mut app = App::headless(Launch { page: Page::Dictionary, settings: None }, cfg);
         // The Dictionary page needs no history file; OPENTALK_HOME is never touched by it.
         let f = render(vec2(1000.0, 700.0), 1.0, vec![], 4, |_c, ui| app.draw(ui));
-        // Gutter between the window edge and the glass surfaces (x < 8): pure backdrop.
+        assert!(f.buf.iter().all(|p| p[3] > 0.999), "dark={dark}: a pixel of the window is translucent");
+        // The window background is one flat colour: corners and the middle of the gutters agree.
         let px = |x: usize, y: usize| f.buf[y * f.w + x];
-        let samples: Vec<[f32; 4]> = (0..5).map(|i| px(3, 120 + i * 120)).collect();
-        assert!(samples.iter().all(|s| s[3] > 0.7 && s[3] < 1.0), "dark={dark}: window must be translucent over acrylic: {samples:?}");
-        let spread = |c: usize| samples.iter().map(|s| s[c]).fold(f32::MIN, f32::max) - samples.iter().map(|s| s[c]).fold(f32::MAX, f32::min);
-        assert!(spread(0).max(spread(1)).max(spread(2)).max(spread(3)) > 0.002, "dark={dark}: backdrop is flat");
-        // Inside the top bar the glass adds light on top of the backdrop (rim + tint).
-        let bar = px(500, 20);
-        let gutter = px(500, 3);
-        assert!(bar != gutter, "dark={dark}: the top bar is drawn");
+        let (a, b) = (px(3, 3), px(f.w - 4, f.h - 4));
+        assert!(a.iter().zip(b).all(|(x, y)| (x - y).abs() < 0.004), "dark={dark}: the window background is not flat: {a:?} vs {b:?}");
     }
 }
 
-/// A Settings section to scan: name, section, config tweak.
-type SectionCase = (&'static str, Section, fn(&mut Config));
-
-/// A page state to scan: name, launch, config tweak, app setup.
-type PageCase = (&'static str, Launch, fn(&mut Config), fn(&mut App));
-
-/// Large opaque fills in `shapes`: rectangles, circles and meshes (every visible vertex at least
-/// 94 % opaque) bigger than `min_area` points squared. Small opaque things (an avatar, a toggle
-/// thumb, a status dot) are fine; a big one is a surface painted over the refracted backdrop.
-fn large_opaque_fills(shapes: &[egui::epaint::ClippedShape], min_area: f32) -> Vec<Rect> {
-    fn walk(s: &egui::Shape, min_area: f32, out: &mut Vec<Rect>) {
-        let opaque = |c: Color32| c.a() >= 240;
+/// Whether any shape is a large gradient: a mesh over `min_area` points squared whose visible
+/// vertices do not all share one colour, drawn with the white texel (not glyphs).
+fn has_large_gradient(shapes: &[egui::epaint::ClippedShape], min_area: f32) -> bool {
+    fn walk(s: &egui::Shape, min_area: f32) -> bool {
         match s {
-            egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, min_area, out)),
-            egui::Shape::Rect(r) if opaque(r.fill) && r.rect.area() > min_area => out.push(r.rect),
-            egui::Shape::Circle(c) if opaque(c.fill) && std::f32::consts::PI * c.radius * c.radius > min_area => out.push(Rect::from_center_size(c.center, vec2(2.0 * c.radius, 2.0 * c.radius))),
+            egui::Shape::Vec(v) => v.iter().any(|s| walk(s, min_area)),
             egui::Shape::Mesh(m) => {
                 let visible: Vec<_> = m.vertices.iter().filter(|v| v.color.a() > 0).collect();
-                if visible.len() >= 8 && visible.iter().all(|v| opaque(v.color)) {
-                    let bounds = Rect::from_points(&visible.iter().map(|v| v.pos).collect::<Vec<_>>());
-                    if bounds.area() > min_area {
-                        out.push(bounds);
-                    }
+                if visible.len() < 4 {
+                    return false;
                 }
+                let bounds = Rect::from_points(&visible.iter().map(|v| v.pos).collect::<Vec<_>>());
+                bounds.area() > min_area && visible.iter().any(|v| v.color != visible[0].color)
             }
-            _ => {}
+            _ => false,
         }
     }
-    let mut out = Vec::new();
-    for cs in shapes {
-        walk(&cs.shape, min_area, &mut out);
-    }
-    out
+    shapes.iter().any(|cs| walk(&cs.shape, min_area))
 }
 
-/// Rule 3, checked on the real pages: nothing inside glass paints an opaque surface of its own. The
-/// pages on the bare backdrop (History, Dictionary in every state) paint none at all; with the
-/// Settings modal open the only one is the modal's own stand-in for its blurred, scrimmed backdrop
-/// (glass.rs `modal_shapes`), and a section's panels, rows, inputs, chips, notices and keycaps are
-/// washes. Both themes.
+/// A page to scan: launch state and config tweak.
+type PageCase = (Launch, fn(&mut Config));
+
+/// No page paints a large gradient (the old ambient mesh and refraction rims are gone): History,
+/// Dictionary and the Settings modal render flat, in both themes.
 #[test]
-fn pages_inside_glass_paint_no_opaque_surfaces() {
-    use crate::core::history::{Entry, Status};
-    let now = crate::core::timing::unix_ms();
-    let entries = vec![
-        Entry { id: 3, ts: now - 5_000, text: "Send the revised budget to Priya.".into(), raw: "send the revised budget to priya".into(), app_name: Some("Outlook".into()), provider: "groq".into(), model: "whisper".into(), latency_ms: 620, ai_cleaned: true, ..Default::default() },
-        Entry { id: 2, ts: now - 60_000, text: "Remind me to renew the domain.".into(), app_name: Some("Chrome".into()), ..Default::default() },
-        Entry { id: 1, ts: now - 90_000, status: Status::Failed, error: Some("Network error".into()), app_name: Some("Teams".into()), ..Default::default() },
+fn pages_paint_no_gradients() {
+    let pages: [PageCase; 4] = [
+        (Launch { page: Page::History, settings: None }, keep_cfg),
+        (Launch { page: Page::Dictionary, settings: None }, with_words),
+        (Launch { page: Page::History, settings: Some(Section::Preferences) }, keep_cfg),
+        (Launch { page: Page::History, settings: Some(Section::SpeechToText) }, keep_cfg),
     ];
-    let page = |dark: bool, launch: Launch, cfg: fn(&mut Config), setup: fn(&mut App)| {
-        let mut c = Config { theme: if dark { Theme::Dark } else { Theme::Light }, ..Config::default() };
-        cfg(&mut c);
-        let mut app = App::headless(launch, c);
-        app.hist_mut().entries = entries.clone();
-        app.hist_mut().loaded = true;
-        setup(&mut app);
-        let shapes = shapes_of(vec2(1200.0, 900.0), 1.0, vec![], 4, |_c, ui| app.draw(ui));
-        large_opaque_fills(&shapes, 1500.0)
-    };
-    let hist = Launch { page: Page::History, settings: None };
-    let dict = Launch { page: Page::Dictionary, settings: None };
     for dark in [false, true] {
-        let name = if dark { "dark" } else { "light" };
-        // Bare-backdrop pages: no opaque fill anywhere.
-        let bare: [PageCase; 6] = [
-            ("history", hist, keep_cfg, keep_app),
-            ("history banner", hist, history_off, keep_app),
-            ("dictionary empty", dict, keep_cfg, keep_app),
-            ("dictionary words", dict, with_words_corti, keep_app),
-            ("dictionary bulk", dict, with_words, |a| a.dict_mut().open_bulk("a, b")),
-            ("dictionary snippets", dict, with_snippets, |a| a.dict_mut().show_snippets()),
-        ];
-        for (what, launch, cfg, setup) in bare {
-            let fills = page(dark, launch, cfg, setup);
-            assert!(fills.is_empty(), "{what} ({name}) paints opaque surfaces: {fills:?}");
-        }
-        // The snippet edit dialog is a glass modal: its stand-in is the one opaque fill.
-        let fills = page(dark, dict, with_snippets, |a| {
-            a.dict_mut().show_snippets();
-            a.dict_mut().edit_snippet(0, "my email", "a@b.c");
-        });
-        assert_eq!(fills.len(), 1, "edit dialog ({name}): only the modal stand-in is opaque: {fills:?}");
-        // Settings sections inside the modal.
-        let sections: [SectionCase; 7] = [
-            ("preferences", Section::Preferences, keep_cfg),
-            ("hotkeys", Section::Hotkeys, keep_cfg),
-            ("stt", Section::SpeechToText, keep_cfg),
-            ("stt custom", Section::SpeechToText, stt_custom),
-            ("cleanup ai", Section::Cleanup, ai_cleanup_on),
-            ("privacy", Section::Privacy, keep_cfg),
-            ("system", Section::System, keep_cfg),
-        ];
-        for (what, sec, cfg) in sections {
-            let fills = page(dark, Launch { page: Page::History, settings: Some(sec) }, cfg, keep_app);
-            assert_eq!(fills.len(), 1, "settings {what} ({name}): only the modal stand-in is opaque: {fills:?}");
+        for (launch, cfg) in pages {
+            let mut c = Config { theme: if dark { Theme::Dark } else { Theme::Light }, ..Config::default() };
+            cfg(&mut c);
+            let mut app = App::headless(launch, c);
+            let shapes = shapes_of(vec2(1200.0, 900.0), 1.0, vec![], 4, |_c, ui| app.draw(ui));
+            assert!(!has_large_gradient(&shapes, 1500.0), "{launch:?} (dark={dark}) paints a gradient");
         }
     }
 }
 
-/// Negative control for the opaque-fill scan: it does see a big opaque rectangle, circle and mesh,
-/// and ignores small ones and translucent washes.
+/// Negative control for the gradient scan.
 #[test]
-fn the_opaque_fill_scan_sees_what_it_should() {
-    let clip = Rect::EVERYTHING;
-    let wrap = |shape: egui::Shape| egui::epaint::ClippedShape { clip_rect: clip, shape };
-    let big = Rect::from_min_size(pos2(10.0, 10.0), vec2(200.0, 100.0));
-    let small = Rect::from_min_size(pos2(10.0, 10.0), vec2(16.0, 16.0));
-    let paint = |s| large_opaque_fills(&[wrap(s)], 1500.0).len();
-    assert_eq!(paint(egui::Shape::rect_filled(big, 4.0, Color32::from_rgb(20, 20, 20))), 1);
-    assert_eq!(paint(egui::Shape::rect_filled(big, 4.0, Color32::from_black_alpha(20))), 0, "a wash is fine");
-    assert_eq!(paint(egui::Shape::rect_filled(small, 4.0, Color32::WHITE)), 0, "an avatar-sized fill is fine");
-    assert_eq!(paint(egui::Shape::circle_filled(pos2(100.0, 100.0), 60.0, Color32::WHITE)), 1);
+fn the_gradient_scan_sees_what_it_should() {
+    let wrap = |shape: egui::Shape| egui::epaint::ClippedShape { clip_rect: Rect::EVERYTHING, shape };
     let mut mesh = egui::epaint::Mesh::default();
-    for k in 0..8 {
-        mesh.colored_vertex(pos2(10.0 + 30.0 * k as f32, 10.0 + 12.0 * (k % 2) as f32 * 8.0), Color32::from_rgb(9, 9, 9));
+    for (k, (x, y)) in [(0.0, 0.0), (300.0, 0.0), (300.0, 300.0), (0.0, 300.0)].into_iter().enumerate() {
+        mesh.colored_vertex(pos2(x, y), Color32::from_rgb(10 * k as u8, 9, 9));
     }
-    assert_eq!(paint(egui::Shape::mesh(mesh)), 1);
+    assert!(has_large_gradient(&[wrap(egui::Shape::mesh(mesh))], 1500.0));
+    let flat = egui::Shape::rect_filled(Rect::from_min_size(pos2(0.0, 0.0), vec2(300.0, 300.0)), 4.0, Color32::from_rgb(20, 20, 20));
+    assert!(!has_large_gradient(&[wrap(flat)], 1500.0));
 }

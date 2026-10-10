@@ -1,14 +1,10 @@
-//! OpenWhispr design tokens (docs/SPEC.md) as an egui palette, light + dark, plus the egui style
-//! that makes stock widgets follow the liquid-glass look (`glass.rs`, docs/GLASS.md).
+//! OpenWhispr design tokens (docs/SPEC.md) as an egui palette, light + dark.
 //!
 //! Colours are plain sRGB; "alpha" variants (`fg_a`, `primary_a`, ...) mimic Tailwind's `/NN`
-//! opacity modifiers, which the original CSS leans on heavily. Surfaces are NOT palette colours any
-//! more: panels, chips, menus and modals are painted by `glass.rs`; what a child of glass paints is
-//! a wash (`wash`, `primary_wash`), a hairline (`divider`, `input_border`) or text.
+//! opacity modifiers, which the original CSS leans on heavily.
 use eframe::egui::{self, Color32};
 
 #[derive(Clone, Copy, Debug)]
-#[allow(dead_code)] // tokens kept complete (docs/SPEC.md); surfaces are painted by glass.rs now
 pub struct Palette {
     pub dark: bool,
     pub primary: Color32,
@@ -103,32 +99,38 @@ impl Palette {
     pub fn destructive_a(&self, pct: u8) -> Color32 {
         with_alpha(self.destructive, pct)
     }
+    pub fn border_a(&self, pct: u8) -> Color32 {
+        with_alpha(self.border, pct)
+    }
     pub fn success_a(&self, pct: u8) -> Color32 {
         with_alpha(self.success, pct)
     }
     pub fn warning_a(&self, pct: u8) -> Color32 {
         with_alpha(self.warning, pct)
     }
+    /// White overlay in dark mode / black in light, for `hover:bg-black/5 dark:hover:bg-white/5`.
+    pub fn overlay(&self, pct: u8) -> Color32 {
+        if self.dark { with_alpha(Color32::WHITE, pct) } else { with_alpha(Color32::BLACK, pct) }
+    }
 
-    /// The glass token set for this theme.
-    pub fn glass(&self) -> &'static super::glass::Tokens {
-        super::glass::tokens(self.dark)
+    /// Card fill used by list panels: `bg-card/50` (light) / `bg-surface-2/60` (dark).
+    pub fn panel_fill(&self) -> Color32 {
+        if self.dark { with_alpha(self.surface2, 60) } else { with_alpha(self.card, 50) }
     }
-    /// Soft hover / selection wash for children of glass (no border, no rim): level 0..=2.
-    pub fn wash(&self, level: u8) -> Color32 {
-        super::glass::wash_color(self.dark, level)
+    /// Panel border: `border-border/70` (light) / `border-white/10` (dark).
+    pub fn panel_border(&self) -> Color32 {
+        if self.dark { with_alpha(Color32::WHITE, 10) } else { with_alpha(self.border, 70) }
     }
-    /// Primary-hued wash for a selected item inside glass.
-    pub fn primary_wash(&self, level: u8) -> Color32 {
-        with_alpha(self.primary, [8, 14, 20][level.min(2) as usize] + if self.dark { 4 } else { 0 })
-    }
-    /// Row dividers: the glass border at 60 %, so they read as spacing rather than as a border.
+    /// Row dividers: `divide-border/60`.
     pub fn divider(&self) -> Color32 {
-        self.glass().border.scaled(0.6)
+        if self.dark { with_alpha(Color32::WHITE, 8) } else { with_alpha(self.border, 60) }
     }
-    /// Border of inputs: a hairline (rule 3, inputs inside glass have no box).
+    /// Border of inputs: `border-border/70` / `border-border-subtle/60`.
     pub fn input_border(&self) -> Color32 {
-        super::glass::hairline_color(self.dark)
+        if self.dark { with_alpha(self.border_subtle, 90) } else { with_alpha(self.border, 90) }
+    }
+    pub fn input_fill(&self) -> Color32 {
+        if self.dark { self.surface1 } else { self.input }
     }
 }
 
@@ -183,50 +185,44 @@ pub fn system_apps_use_light_theme() -> bool {
 }
 
 /// Configure egui's global style to the palette so stock widgets (TextEdit, ScrollArea,
-/// popups, tooltips) follow the glass look. Custom widgets paint themselves from `glass.rs`.
+/// popups) blend in. Custom widgets paint themselves from the `Palette` directly.
 pub fn apply(ctx: &egui::Context, p: &Palette) {
-    let t = p.glass();
     let mut style = (*ctx.global_style()).clone();
     let v = &mut style.visuals;
     *v = if p.dark { egui::Visuals::dark() } else { egui::Visuals::light() };
-    // Nothing paints an opaque panel: the backdrop is ours.
-    v.panel_fill = Color32::TRANSPARENT;
-    // Stock windows, tooltips and combo popups cannot sample our backdrop, so they get the menu
-    // tier's surface at the opacity that keeps their text readable over anything.
-    v.window_fill = t.menu_surface.scaled(0.92);
-    v.extreme_bg_color = Color32::TRANSPARENT;
-    v.text_edit_bg_color = Some(Color32::TRANSPARENT);
-    v.faint_bg_color = p.wash(0);
+    v.panel_fill = p.background;
+    v.window_fill = p.background;
+    v.extreme_bg_color = p.input_fill();
+    v.faint_bg_color = p.muted;
     v.override_text_color = Some(p.foreground);
     v.hyperlink_color = p.primary;
     v.selection.bg_fill = with_alpha(p.primary, 35);
     v.selection.stroke = egui::Stroke::new(1.0, p.primary);
-    v.window_stroke = egui::Stroke::new(1.0, t.border.color());
+    v.window_stroke = egui::Stroke::new(1.0, p.border);
     v.window_corner_radius = egui::CornerRadius::same(12);
-    v.menu_corner_radius = egui::CornerRadius::same(12);
-    // Shadows are painted by glass.rs, outside the surface only; an egui shadow would sit under
-    // translucent glass and grey it.
-    v.popup_shadow = egui::Shadow::NONE;
-    v.window_shadow = egui::Shadow::NONE;
+    v.menu_corner_radius = egui::CornerRadius::same(8);
+    v.popup_shadow = egui::Shadow {
+        offset: [0, 8],
+        blur: 24,
+        spread: 0,
+        color: Color32::from_black_alpha(if p.dark { 110 } else { 45 }),
+    };
+    v.window_shadow = v.popup_shadow;
     for w in [&mut v.widgets.noninteractive, &mut v.widgets.inactive, &mut v.widgets.hovered, &mut v.widgets.active, &mut v.widgets.open] {
-        w.corner_radius = egui::CornerRadius::same(8);
+        w.corner_radius = egui::CornerRadius::same(6);
     }
-    v.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, t.border.color());
+    v.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, p.border);
     v.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, p.foreground);
-    v.widgets.inactive.bg_fill = p.wash(1);
+    v.widgets.inactive.bg_fill = p.input_fill();
     v.widgets.inactive.weak_bg_fill = Color32::TRANSPARENT;
-    v.widgets.inactive.bg_stroke = egui::Stroke::NONE;
     v.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, p.foreground);
-    v.widgets.hovered.bg_fill = p.wash(2);
-    v.widgets.hovered.weak_bg_fill = p.wash(1);
-    v.widgets.hovered.bg_stroke = egui::Stroke::NONE;
+    v.widgets.hovered.bg_fill = p.surface3;
+    v.widgets.hovered.weak_bg_fill = p.overlay(5);
     v.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, p.foreground);
-    v.widgets.active.bg_fill = p.wash(2);
-    v.widgets.active.weak_bg_fill = p.wash(2);
-    v.widgets.active.bg_stroke = egui::Stroke::NONE;
+    v.widgets.active.bg_fill = p.raised;
+    v.widgets.active.weak_bg_fill = p.overlay(8);
     v.widgets.active.fg_stroke = egui::Stroke::new(1.0, p.foreground);
-    v.widgets.open.weak_bg_fill = p.wash(1);
-    v.widgets.open.bg_stroke = egui::Stroke::NONE;
+    v.widgets.open.weak_bg_fill = p.overlay(5);
     style.spacing.item_spacing = egui::vec2(8.0, 8.0);
     style.spacing.button_padding = egui::vec2(10.0, 4.0);
     style.spacing.scroll.bar_width = 6.0;
@@ -254,16 +250,6 @@ mod tests {
         let (a, b) = (Color32::from_rgb(0, 0, 0), Color32::from_rgb(200, 100, 50));
         assert_eq!(mix(a, b, 0.0), a);
         assert_eq!(mix(a, b, 1.0), b);
-    }
-
-    #[test]
-    fn washes_are_translucent_and_ordered() {
-        for p in [Palette::LIGHT, Palette::DARK] {
-            assert!(p.wash(2).a() < 40, "a wash must never go opaque");
-            assert!(p.divider().a() < p.glass().border.color().a() + 1);
-            assert!(p.wash(0).a() < p.wash(2).a());
-            assert!(p.input_border().a() > p.glass().border.color().a());
-        }
     }
 
     #[test]

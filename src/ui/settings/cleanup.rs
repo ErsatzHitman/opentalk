@@ -5,9 +5,10 @@ use crate::core::config::{FillerMode, LlmProviderId};
 use crate::core::secrets::SecretName;
 use crate::llm::registry::{self, PROVIDERS};
 use crate::ui::fonts;
-use crate::ui::widgets::{self as w, Btn, Variant};
+use crate::ui::theme::with_alpha;
+use crate::ui::widgets::{self as w, Btn, Variant, cr};
 use crate::ui::{Env, icons};
-use eframe::egui::{self, Ui, vec2};
+use eframe::egui::{self, Stroke, Ui, vec2};
 use std::sync::mpsc::{Receiver, channel};
 use std::time::Instant;
 
@@ -62,10 +63,11 @@ pub fn show(ui: &mut Ui, env: &mut Env, st: &mut SettingsState) -> bool {
     let p = *env.p;
     let mut changed = false;
     if let Some(rx) = &st.cleanup.rx
-        && let Ok(o) = rx.try_recv() {
-            st.cleanup.outcome = Some(o);
-            st.cleanup.rx = None;
-        }
+        && let Ok(o) = rx.try_recv()
+    {
+        st.cleanup.outcome = Some(o);
+        st.cleanup.rx = None;
+    }
 
     w::section_title(ui, &p, "Text cleanup", "Always on and instant: runs on your device before anything is pasted.");
     w::panel(ui, &p, |ui| {
@@ -95,12 +97,13 @@ pub fn show(ui: &mut Ui, env: &mut Env, st: &mut SettingsState) -> bool {
     let labels: Vec<(&str, &str)> = PROVIDERS.iter().map(|pi| (pi.name, if pi.enterprise { "Enterprise" } else { "" })).collect();
     let sel = PROVIDERS.iter().position(|pi| pi.id == provider).unwrap_or(0);
     if let Some(i) = w::pill_tabs(ui, &p, sel, &labels)
-        && PROVIDERS[i].id != provider {
-            env.cfg.ai_cleanup.provider = PROVIDERS[i].id;
-            st.key_edit = None;
-            st.cleanup.outcome = None;
-            changed = true;
-        }
+        && PROVIDERS[i].id != provider
+    {
+        env.cfg.ai_cleanup.provider = PROVIDERS[i].id;
+        st.key_edit = None;
+        st.cleanup.outcome = None;
+        changed = true;
+    }
     let provider = env.cfg.ai_cleanup.provider;
     let info = registry::provider(provider);
 
@@ -294,15 +297,21 @@ fn prompt_studio(ui: &mut Ui, env: &mut Env, st: &mut SettingsState) -> bool {
 
 fn result(ui: &mut Ui, p: &crate::ui::theme::Palette, ok: bool, badge: &str, body: &str) {
     let col = if ok { p.success } else { p.destructive };
-    w::notice(ui, p, col, |ui| {
-        ui.spacing_mut().item_spacing = vec2(0.0, 4.0);
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 8.0;
-            w::text_semi(ui, if ok { "Result" } else { "Error" }, 12.0, col);
-            w::text(ui, badge, 12.0, p.muted_a(90));
+    egui::Frame::new()
+        .fill(with_alpha(col, if p.dark { 10 } else { 6 }))
+        .stroke(Stroke::new(1.0, with_alpha(col, 30)))
+        .corner_radius(cr(8.0))
+        .inner_margin(egui::Margin::symmetric(14, 10))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing = vec2(0.0, 4.0);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                w::text_semi(ui, if ok { "Result" } else { "Error" }, 12.0, col);
+                w::text(ui, badge, 12.0, p.muted_a(80));
+            });
+            ui.label(egui::RichText::new(body).font(fonts::regular(13.0)).color(p.foreground));
         });
-        ui.label(egui::RichText::new(body).font(fonts::regular(13.0)).color(p.foreground));
-    });
 }
 
 /// Deterministic pass, then the configured LLM (what the daemon does), timed.

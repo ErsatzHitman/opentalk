@@ -5,7 +5,7 @@ use super::theme::Palette;
 use super::widgets::{self as w, cr};
 use super::{Page, fonts, history, icons, timefmt};
 use crate::core::history::{Entry, Status};
-use eframe::egui::{self, Align2, Key, Margin, Sense, vec2};
+use eframe::egui::{self, Align2, Color32, Key, Margin, Sense, Stroke, vec2};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Item {
@@ -115,7 +115,17 @@ pub fn show(ctx: &egui::Context, p: &Palette, st: &mut State, entries: &[Entry],
     let area = egui::Area::new(egui::Id::new("palette-area"))
         .anchor(Align2::CENTER_TOP, vec2(0.0, screen.height() * 0.14))
         .order(egui::Order::Foreground);
-    let modal = w::glass_modal_at(ctx, p, egui::Id::new("palette"), 0, Some(area), |ui| {
+    let modal = egui::Modal::new(egui::Id::new("palette"))
+        .area(area)
+        .backdrop_color(Color32::from_black_alpha(if p.dark { 140 } else { 60 }))
+        .frame(
+            egui::Frame::new()
+                .fill(if p.dark { p.surface1 } else { Color32::WHITE })
+                .stroke(Stroke::new(1.0, if p.dark { w::with_alpha_mul(Color32::WHITE, 0.12) } else { p.border }))
+                .corner_radius(cr(12.0))
+                .shadow(egui::Shadow { offset: [0, 20], blur: 50, spread: 0, color: Color32::from_black_alpha(90) }),
+        )
+        .show(ctx, |ui| {
             ui.set_width(width);
             ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
             // Search field
@@ -164,7 +174,7 @@ pub fn show(ctx: &egui::Context, p: &Palette, st: &mut State, entries: &[Entry],
                         st.selected = i;
                     }
                     if st.selected == i {
-                        ui.painter().rect_filled(r, cr(8.0), p.primary_wash(1));
+                        ui.painter().rect_filled(r, cr(8.0), if p.dark { p.raised } else { p.muted });
                     }
                     let glyph = match &row.item {
                         Item::Page(Page::History) => icons::HISTORY,

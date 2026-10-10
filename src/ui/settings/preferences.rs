@@ -52,8 +52,6 @@ pub fn show(ui: &mut Ui, env: &mut Env, st: &mut SettingsState) -> bool {
                 changed = true;
             }
         });
-        w::divider(ui, &p);
-        changed |= toggle_row(ui, &p, "Reduce transparency", "Use a solid window background instead of the translucent Windows backdrop.", &mut cfg.reduce_transparency);
     });
 
     // ---- Dictation

@@ -3,10 +3,10 @@
 use super::fonts;
 use super::icons;
 use super::theme::mix;
-use super::widgets::{self as w, Btn, ChipKind, Variant};
+use super::widgets::{self as w, Btn, ChipKind, Variant, cr};
 use super::{Cmd, Env};
 use crate::core::config::{Config, Snippet, SttProviderId};
-use eframe::egui::{self, Align, Color32, Layout, Margin, Sense, Ui, vec2};
+use eframe::egui::{self, Align, Color32, Layout, Margin, Sense, Stroke, Ui, vec2};
 
 // ---------------------------------------------------------------- pure logic
 
@@ -289,7 +289,7 @@ fn add_input(ui: &mut Ui, env: &mut Env, st: &mut DictState) -> bool {
     }
     let col = if add_active { mix(p.muted_a(75), p.primary, w::hover_anim(ui, add.id.with("h"), add.hovered())) } else { p.muted_a(50) };
     ui.painter().text(add_r.center(), egui::Align2::CENTER_CENTER, "Add", font, col);
-    ui.painter().rect_filled(egui::Rect::from_min_size(egui::pos2(add_r.min.x - 5.0, rect.center().y - 8.0), vec2(1.0, 16.0)), 0.0, p.divider());
+    ui.painter().rect_filled(egui::Rect::from_min_size(egui::pos2(add_r.min.x - 5.0, rect.center().y - 8.0), vec2(1.0, 16.0)), 0.0, p.fg_a(10));
     if add.clicked() && add_active {
         changed |= commit_words(env, st);
     }
@@ -315,19 +315,15 @@ fn dictionary_tab(ui: &mut Ui, env: &mut Env, st: &mut DictState) -> bool {
     let p = *env.p;
     let mut changed = false;
     if env.cfg.dictionary.is_empty() && !st.bulk_open {
-        w::panel(ui, &p, |ui| {
-            w::panel_pad(ui, 24, 22, |ui| {
-                w::text(ui, "Teach OpenTalk your words", 20.0, p.foreground);
-                ui.add_space(10.0);
-                w::text(ui, "Names, products and jargon that speech recognition tends to get wrong. They are sent to the speech provider as hints and used to fix capitalisation after transcription.", 14.0, p.muted_a(90));
-                ui.add_space(20.0);
-                ui.horizontal(|ui| {
-                    ui.set_max_width(520.0);
-                    ui.vertical(|ui| {
-                        ui.set_width(520.0f32.min(ui.available_width()));
-                        changed |= add_input(ui, env, st);
-                    });
-                });
+        w::text(ui, "Teach OpenTalk your words", 20.0, p.foreground);
+        ui.add_space(10.0);
+        w::text(ui, "Names, products and jargon that speech recognition tends to get wrong. They are sent to the speech provider as hints and used to fix capitalisation after transcription.", 14.0, p.muted_a(80));
+        ui.add_space(20.0);
+        ui.horizontal(|ui| {
+            ui.set_max_width(520.0);
+            ui.vertical(|ui| {
+                ui.set_width(520.0f32.min(ui.available_width()));
+                changed |= add_input(ui, env, st);
             });
         });
         return changed;
@@ -342,8 +338,7 @@ fn dictionary_tab(ui: &mut Ui, env: &mut Env, st: &mut DictState) -> bool {
     let total = env.cfg.dictionary.len();
     let shown = filter_words(&env.cfg.dictionary, &st.input);
     ui.horizontal(|ui| {
-        ui.set_min_height(28.0);
-        w::text_semi(ui, format!("YOUR DICTIONARY ({total})"), 11.0, p.muted_a(85));
+        w::text_semi(ui, format!("YOUR DICTIONARY ({total})"), 11.0, p.fg_a(45));
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             ui.spacing_mut().item_spacing.x = 12.0;
             let ex = w::icon_button(ui, &p, icons::DOWNLOAD, 24.0, 12.0, p.foreground, p.fg_a(6)).on_hover_text("Export dictionary");
@@ -355,85 +350,76 @@ fn dictionary_tab(ui: &mut Ui, env: &mut Env, st: &mut DictState) -> bool {
             }
         });
     });
-    ui.add_space(8.0);
+    let (line, _) = ui.allocate_exact_size(vec2(ui.available_width(), 10.0), Sense::hover());
+    dashed(ui, line.left_center(), line.right_center(), p.fg_a(10));
     if shown.is_empty() {
-        w::panel(ui, &p, |ui| {
-            w::panel_pad(ui, 16, 28, |ui| {
-                ui.vertical_centered(|ui| {
-                    w::text(ui, format!("No words match \"{}\". Press Enter to add it.", st.input.trim()), 12.5, p.muted_a(90));
-                });
-            });
+        ui.add_space(20.0);
+        ui.vertical_centered(|ui| {
+            w::text(ui, format!("No words match \"{}\". Press Enter to add it.", st.input.trim()), 12.5, p.fg_a(45));
         });
     } else {
         let mut remove: Option<usize> = None;
         let mut begin_edit: Option<usize> = None;
-        w::panel(ui, &p, |ui| {
-            for (k, &i) in shown.iter().enumerate() {
-                if k > 0 {
-                    w::divider(ui, &p);
+        for &i in &shown {
+            let editing_this = matches!(&st.editing, Some((ei, _)) if *ei == i);
+            let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 36.0), Sense::hover());
+            let hot = ui.rect_contains_pointer(rect);
+            ui.painter().rect_filled(egui::Rect::from_min_max(egui::pos2(rect.min.x, rect.max.y - 1.0), rect.max), 0.0, if p.dark { w::with_alpha_mul(Color32::WHITE, 0.1) } else { p.fg_a(4) });
+            let _ = resp;
+            if editing_this {
+                let mut done = false;
+                let mut cancel = false;
+                if let Some((_, buf)) = st.editing.as_mut() {
+                    ui.scope_builder(egui::UiBuilder::new().max_rect(egui::Rect::from_min_size(rect.min + vec2(0.0, 4.0), vec2(rect.width() - 70.0, 28.0))), |ui| {
+                        let r = w::text_input_h(ui, &p, buf, "Word", rect.width() - 70.0, 28.0, false, false);
+                        r.request_focus();
+                        if r.lost_focus() {
+                            if ui.input(|i| i.key_pressed(egui::Key::Escape)) { cancel = true } else { done = true }
+                        }
+                    });
                 }
-                let editing_this = matches!(&st.editing, Some((ei, _)) if *ei == i);
-                let (full, _resp) = ui.allocate_exact_size(vec2(ui.available_width(), 38.0), Sense::hover());
-                let rect = full.shrink2(vec2(16.0, 0.0));
-                let hot = ui.rect_contains_pointer(full);
-                if hot && !editing_this {
-                    ui.painter().rect_filled(full, w::edge_rounding(k == 0, k + 1 == shown.len()), p.wash(0));
+                let ok = egui::Rect::from_center_size(egui::pos2(rect.max.x - 46.0, rect.center().y), vec2(24.0, 24.0));
+                let okr = ui.interact(ok, ui.id().with(("dict-ok", i)), Sense::click());
+                w::pointer(&okr);
+                w::paint_icon(ui, ok, icons::CHECK, 12.0, p.success);
+                let cx = egui::Rect::from_center_size(egui::pos2(rect.max.x - 18.0, rect.center().y), vec2(24.0, 24.0));
+                let cxr = ui.interact(cx, ui.id().with(("dict-cx", i)), Sense::click());
+                w::pointer(&cxr);
+                w::paint_icon(ui, cx, icons::CLOSE, 11.0, p.muted_a(70));
+                if okr.clicked() { done = true }
+                if cxr.clicked() { cancel = true }
+                if done {
+                    if let Some((ei, buf)) = st.editing.take() {
+                        let t = buf.trim().to_string();
+                        if !t.is_empty() && env.cfg.dictionary.get(ei).map(|o| o != &t).unwrap_or(false) {
+                            env.cfg.dictionary[ei] = t;
+                            changed = true;
+                        }
+                    }
+                } else if cancel {
+                    st.editing = None;
                 }
-                if editing_this {
-                    let mut done = false;
-                    let mut cancel = false;
-                    if let Some((_, buf)) = st.editing.as_mut() {
-                        ui.scope_builder(egui::UiBuilder::new().max_rect(egui::Rect::from_min_size(rect.min + vec2(0.0, 5.0), vec2(rect.width() - 70.0, 28.0))), |ui| {
-                            let r = w::text_input_h(ui, &p, buf, "Word", rect.width() - 70.0, 28.0, false, false);
-                            r.request_focus();
-                            if r.lost_focus() {
-                                if ui.input(|i| i.key_pressed(egui::Key::Escape)) { cancel = true } else { done = true }
-                            }
-                        });
+            } else {
+                ui.painter().text(egui::pos2(rect.min.x, rect.center().y), egui::Align2::LEFT_CENTER, &env.cfg.dictionary[i], fonts::regular(13.0), p.fg_a(75));
+                let a = ui.ctx().animate_bool_with_time(ui.id().with(("dict-row", i)), hot, 0.12);
+                if a > 0.0 {
+                    let er = egui::Rect::from_center_size(egui::pos2(rect.max.x - 46.0, rect.center().y), vec2(24.0, 24.0));
+                    let dr = egui::Rect::from_center_size(egui::pos2(rect.max.x - 18.0, rect.center().y), vec2(24.0, 24.0));
+                    let e = ui.interact(er, ui.id().with(("dict-edit", i)), Sense::click());
+                    let d = ui.interact(dr, ui.id().with(("dict-del", i)), Sense::click());
+                    w::pointer(&e);
+                    w::pointer(&d);
+                    w::paint_icon(ui, er, icons::EDIT, 12.0, w::with_alpha_mul(if e.hovered() { p.foreground } else { p.muted_a(75) }, a));
+                    w::paint_icon(ui, dr, icons::DELETE, 12.0, w::with_alpha_mul(if d.hovered() { p.destructive } else { p.muted_a(75) }, a));
+                    if e.clicked() {
+                        begin_edit = Some(i);
                     }
-                    let ok = egui::Rect::from_center_size(egui::pos2(rect.max.x - 46.0, rect.center().y), vec2(24.0, 24.0));
-                    let okr = ui.interact(ok, ui.id().with(("dict-ok", i)), Sense::click());
-                    w::pointer(&okr);
-                    w::paint_icon(ui, ok, icons::CHECK, 12.0, p.success);
-                    let cx = egui::Rect::from_center_size(egui::pos2(rect.max.x - 18.0, rect.center().y), vec2(24.0, 24.0));
-                    let cxr = ui.interact(cx, ui.id().with(("dict-cx", i)), Sense::click());
-                    w::pointer(&cxr);
-                    w::paint_icon(ui, cx, icons::CLOSE, 11.0, p.muted_a(80));
-                    if okr.clicked() { done = true }
-                    if cxr.clicked() { cancel = true }
-                    if done {
-                        if let Some((ei, buf)) = st.editing.take() {
-                            let t = buf.trim().to_string();
-                            if !t.is_empty() && env.cfg.dictionary.get(ei).map(|o| o != &t).unwrap_or(false) {
-                                env.cfg.dictionary[ei] = t;
-                                changed = true;
-                            }
-                        }
-                    } else if cancel {
-                        st.editing = None;
-                    }
-                } else {
-                    ui.painter().text(egui::pos2(rect.min.x, rect.center().y), egui::Align2::LEFT_CENTER, &env.cfg.dictionary[i], fonts::regular(13.0), p.foreground);
-                    let a = ui.ctx().animate_bool_with_time(ui.id().with(("dict-row", i)), hot, 0.12);
-                    if a > 0.0 {
-                        let er = egui::Rect::from_center_size(egui::pos2(rect.max.x - 28.0, rect.center().y), vec2(24.0, 24.0));
-                        let dr = egui::Rect::from_center_size(egui::pos2(rect.max.x - 2.0, rect.center().y), vec2(24.0, 24.0));
-                        let e = ui.interact(er, ui.id().with(("dict-edit", i)), Sense::click());
-                        let d = ui.interact(dr, ui.id().with(("dict-del", i)), Sense::click());
-                        w::pointer(&e);
-                        w::pointer(&d);
-                        w::paint_icon(ui, er, icons::EDIT, 12.0, w::with_alpha_mul(if e.hovered() { p.foreground } else { p.muted_a(85) }, a));
-                        w::paint_icon(ui, dr, icons::DELETE, 12.0, w::with_alpha_mul(if d.hovered() { p.destructive } else { p.muted_a(85) }, a));
-                        if e.clicked() {
-                            begin_edit = Some(i);
-                        }
-                        if d.clicked() {
-                            remove = Some(i);
-                        }
+                    if d.clicked() {
+                        remove = Some(i);
                     }
                 }
             }
-        });
+        }
         if let Some(i) = begin_edit {
             st.editing = Some((i, env.cfg.dictionary[i].clone()));
         }
@@ -444,16 +430,22 @@ fn dictionary_tab(ui: &mut Ui, env: &mut Env, st: &mut DictState) -> bool {
     }
     ui.add_space(14.0);
     let chars = prompt_chars(&hint_words(&env.cfg.dictionary, &env.cfg.snippets));
-    w::text(ui, format!("{} characters in the speech prompt.", super::history::thousands(chars)), 12.0, p.muted_a(85));
+    w::text(ui, format!("{} characters in the speech prompt.", super::history::thousands(chars)), 12.0, p.fg_a(45));
     if let Some(msg) = budget_warning(env.cfg) {
         ui.add_space(8.0);
-        w::notice(ui, &p, p.warning, |ui| {
-            ui.horizontal_top(|ui| {
-                let (ir, _) = ui.allocate_exact_size(vec2(14.0, 16.0), Sense::hover());
-                w::paint_icon(ui, ir, icons::WARNING, 12.0, p.warning);
-                w::text(ui, msg, 12.0, if p.dark { p.warning } else { mix(p.warning, Color32::BLACK, 0.3) });
+        egui::Frame::new()
+            .fill(p.warning_a(if p.dark { 10 } else { 7 }))
+            .stroke(Stroke::new(1.0, p.warning_a(30)))
+            .corner_radius(cr(10.0))
+            .inner_margin(Margin::symmetric(14, 10))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal_top(|ui| {
+                    let (ir, _) = ui.allocate_exact_size(vec2(14.0, 16.0), Sense::hover());
+                    w::paint_icon(ui, ir, icons::WARNING, 12.0, p.warning);
+                    w::text(ui, msg, 12.0, if p.dark { p.warning } else { mix(p.warning, Color32::BLACK, 0.3) });
+                });
             });
-        });
     }
 
     if st.confirm_clear {
@@ -470,18 +462,39 @@ fn dictionary_tab(ui: &mut Ui, env: &mut Env, st: &mut DictState) -> bool {
     changed
 }
 
+fn dashed(ui: &Ui, a: egui::Pos2, b: egui::Pos2, color: Color32) {
+    let mut x = a.x;
+    while x < b.x {
+        let x2 = (x + 4.0).min(b.x);
+        ui.painter().line_segment([egui::pos2(x, a.y), egui::pos2(x2, a.y)], Stroke::new(1.0, color));
+        x += 8.0;
+    }
+}
+
 fn bulk_panel(ui: &mut Ui, env: &mut Env, st: &mut DictState) -> bool {
     let p = *env.p;
     let mut changed = false;
-    w::panel(ui, &p, |ui| {
-        w::panel_pad(ui, 12, 10, |ui| {
-            w::text_area(ui, &p, &mut st.bulk_text, "Paste words separated by commas or new lines...", 3, false);
+    egui::Frame::new()
+        .stroke(Stroke::new(1.0, p.primary_a(35)))
+        .corner_radius(cr(8.0))
+        .inner_margin(Margin::symmetric(12, 10))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            let w_ = ui.available_width();
+            ui.add(
+                egui::TextEdit::multiline(&mut st.bulk_text)
+                    .frame(egui::Frame::NONE)
+                    .desired_rows(3)
+                    .desired_width(w_)
+                    .font(fonts::regular(12.5))
+                    .text_color(p.foreground)
+                    .hint_text(egui::RichText::new("Paste words separated by commas or new lines...").color(p.muted_a(60))),
+            );
             ui.add_space(6.0);
             let pending = parse_words(&st.bulk_text).len();
             ui.horizontal(|ui| {
-                ui.set_min_height(28.0);
                 let ready = if pending > 0 { format!("{pending} words ready") } else { "Separate with commas or new lines".into() };
-                w::text(ui, ready, 12.0, if pending > 0 { p.success } else { p.muted_a(85) });
+                w::text(ui, ready, 12.0, if pending > 0 { p.success } else { p.fg_a(45) });
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = 8.0;
                     if w::button(ui, &p, Btn::new("Import", Variant::Primary).small().enabled(pending > 0)).clicked() {
@@ -496,23 +509,23 @@ fn bulk_panel(ui: &mut Ui, env: &mut Env, st: &mut DictState) -> bool {
                         st.bulk_open = false;
                     }
                     if w::button(ui, &p, Btn::new("From file...", Variant::Outline).icon(icons::FOLDER).small()).clicked()
-                        && let Some(path) = super::filedialog::open_file() {
-                            match read_import_file(&path) {
-                                Ok(txt) => {
-                                    let (words, snips) = parse_import(&txt);
-                                    let n = add_words(&mut env.cfg.dictionary, &words);
-                                    let s = merge_snippets(&mut env.cfg.snippets, snips);
-                                    st.bulk_open = false;
-                                    env.cmds.push(Cmd::Toast(if s > 0 { format!("Imported {n} words and {s} snippets") } else { format!("Imported {n} words") }));
-                                    changed |= n + s > 0;
-                                }
-                                Err(e) => env.cmds.push(Cmd::Toast(format!("Could not read the file: {e}"))),
+                        && let Some(path) = super::filedialog::open_file()
+                    {
+                        match read_import_file(&path) {
+                            Ok(txt) => {
+                                let (words, snips) = parse_import(&txt);
+                                let n = add_words(&mut env.cfg.dictionary, &words);
+                                let s = merge_snippets(&mut env.cfg.snippets, snips);
+                                st.bulk_open = false;
+                                env.cmds.push(Cmd::Toast(if s > 0 { format!("Imported {n} words and {s} snippets") } else { format!("Imported {n} words") }));
+                                changed |= n + s > 0;
                             }
+                            Err(e) => env.cmds.push(Cmd::Toast(format!("Could not read the file: {e}"))),
                         }
+                    }
                 });
             });
         });
-    });
     changed
 }
 
@@ -582,12 +595,13 @@ fn snippets_tab(ui: &mut Ui, env: &mut Env, st: &mut DictState) -> bool {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = 8.0;
                     if w::button(ui, &p, Btn::new("Export", Variant::Flat).icon(icons::DOWNLOAD).small().enabled(!env.cfg.snippets.is_empty())).clicked()
-                        && let Some(path) = super::filedialog::save_file("opentalk-snippets.json") {
-                            match std::fs::write(&path, export_snippets_json(&env.cfg.snippets)) {
-                                Ok(()) => env.cmds.push(Cmd::Toast("Snippets exported".into())),
-                                Err(e) => env.cmds.push(Cmd::Toast(format!("Export failed: {e}"))),
-                            }
+                        && let Some(path) = super::filedialog::save_file("opentalk-snippets.json")
+                    {
+                        match std::fs::write(&path, export_snippets_json(&env.cfg.snippets)) {
+                            Ok(()) => env.cmds.push(Cmd::Toast("Snippets exported".into())),
+                            Err(e) => env.cmds.push(Cmd::Toast(format!("Export failed: {e}"))),
                         }
+                    }
                 });
             });
         });
@@ -596,13 +610,12 @@ fn snippets_tab(ui: &mut Ui, env: &mut Env, st: &mut DictState) -> bool {
     if env.cfg.snippets.is_empty() {
         ui.vertical_centered(|ui| {
             ui.add_space(24.0);
-            w::text(ui, "No snippets yet", 13.5, p.muted_a(85));
+            w::text(ui, "No snippets yet", 13.5, p.fg_a(55));
         });
         return changed;
     }
     ui.horizontal(|ui| {
-        ui.set_min_height(28.0);
-        w::text_semi(ui, format!("YOUR SNIPPETS ({})", env.cfg.snippets.len()), 11.0, p.muted_a(85));
+        w::text_semi(ui, format!("YOUR SNIPPETS ({})", env.cfg.snippets.len()), 11.0, p.fg_a(45));
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             if w::button(ui, &p, Btn::new("Clear all", Variant::Ghost).small()).clicked() {
                 st.confirm_clear_snippets = true;
@@ -680,34 +693,43 @@ fn snippet_edit_dialog(ctx: &egui::Context, env: &mut Env, st: &mut DictState) -
     let Some((idx, mut trig, mut repl)) = st.edit_snip.take() else { return false };
     let mut changed = false;
     let mut keep_open = true;
-    let modal = w::glass_modal(ctx, &p, egui::Id::new("edit-snippet"), 24, |ui| {
-        ui.set_width(440.0);
-        ui.spacing_mut().item_spacing = vec2(0.0, 8.0);
-        w::text_semi(ui, "Edit snippet", 15.0, p.foreground);
-        let wd = ui.available_width();
-        w::text_input(ui, &p, &mut trig, "Trigger phrase", wd, false);
-        w::text_area(ui, &p, &mut repl, "Replacement text", 4, false);
-        if trigger_taken(&env.cfg.snippets, idx, &trig) {
-            w::text(ui, "Another snippet already uses that trigger.", 12.0, p.destructive);
-        }
-        ui.add_space(4.0);
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            ui.spacing_mut().item_spacing.x = 8.0;
-            let clash = trigger_taken(&env.cfg.snippets, idx, &trig);
-            let ok = !trig.trim().is_empty() && !repl.trim().is_empty() && !clash;
-            if w::button(ui, &p, Btn::new("Save", Variant::Primary).min_width(84.0).enabled(ok)).clicked() {
-                if let Some(s) = env.cfg.snippets.get_mut(idx) {
-                    s.trigger = trig.trim().to_string();
-                    s.replacement = repl.clone();
-                    changed = true;
+    let modal = egui::Modal::new(egui::Id::new("edit-snippet"))
+        .backdrop_color(Color32::from_black_alpha(if p.dark { 150 } else { 90 }))
+        .frame(
+            egui::Frame::new()
+                .fill(if p.dark { p.surface1 } else { Color32::WHITE })
+                .stroke(Stroke::new(1.0, if p.dark { w::with_alpha_mul(Color32::WHITE, 0.12) } else { p.border }))
+                .corner_radius(cr(12.0))
+                .inner_margin(Margin::same(20)),
+        )
+        .show(ctx, |ui| {
+            ui.set_width(440.0);
+            ui.spacing_mut().item_spacing = vec2(0.0, 8.0);
+            w::text_semi(ui, "Edit snippet", 15.0, p.foreground);
+            let wd = ui.available_width();
+            w::text_input(ui, &p, &mut trig, "Trigger phrase", wd, false);
+            w::text_area(ui, &p, &mut repl, "Replacement text", 4, false);
+            if trigger_taken(&env.cfg.snippets, idx, &trig) {
+                w::text(ui, "Another snippet already uses that trigger.", 12.0, p.destructive);
+            }
+            ui.add_space(4.0);
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                let clash = trigger_taken(&env.cfg.snippets, idx, &trig);
+                let ok = !trig.trim().is_empty() && !repl.trim().is_empty() && !clash;
+                if w::button(ui, &p, Btn::new("Save", Variant::Primary).min_width(84.0).enabled(ok)).clicked() {
+                    if let Some(s) = env.cfg.snippets.get_mut(idx) {
+                        s.trigger = trig.trim().to_string();
+                        s.replacement = repl.clone();
+                        changed = true;
+                    }
+                    keep_open = false;
                 }
-                keep_open = false;
-            }
-            if w::button(ui, &p, Btn::new("Cancel", Variant::Outline).min_width(84.0)).clicked() {
-                keep_open = false;
-            }
+                if w::button(ui, &p, Btn::new("Cancel", Variant::Outline).min_width(84.0)).clicked() {
+                    keep_open = false;
+                }
+            });
         });
-    });
     if modal.should_close() {
         keep_open = false;
     }
