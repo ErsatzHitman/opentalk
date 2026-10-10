@@ -12,6 +12,15 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE};
 
+/// `OPENTALK_NO_GLASS_CAPTURE=1` (any non-empty value other than `0`) turns the screen capture off:
+/// no display-affinity flag, no `BitBlt`, the neutral frosted glass. For A/B comparisons of waveform
+/// smoothness on a real machine (if the lag goes away with it, the capture path was the cause).
+pub const NO_GLASS_CAPTURE_ENV: &str = "OPENTALK_NO_GLASS_CAPTURE";
+
+fn capture_disabled_from(v: Option<std::ffi::OsString>) -> bool {
+    v.is_some_and(|s| !s.is_empty() && s != "0")
+}
+
 /// Exclude `hwnd` from screen capture. `false` when Windows refuses (before 10 2004 the flag is
 /// unknown): the caller must then not capture, or the pill would see itself.
 pub fn exclude_from_capture(hwnd: HWND) -> bool {
@@ -138,6 +147,7 @@ impl Drop for Capturer {
 
 // --- the host: capture, hash, frost (on a worker thread) -------------------------------------------
 
+use super::diag::Series;
 use super::glass::{self, Backdrop, Cells, Frosted};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -187,7 +197,7 @@ enum Done {
 /// The worker: owns the [`Capturer`], blocks on its channel (no polling, no CPU while idle) and does
 /// everything that waits or loops over pixels: `BitBlt` (it waits for the compositor's next frame, so
 /// it must never run on the UI thread), the cell average + hash, and the frost when the hash changed.
-fn worker(rx: Receiver<Msg>, out: Arc<Mutex<Option<Done>>>, hwnd: isize, alive: Arc<AtomicBool>) {
+fn worker(rx: Receiver<Msg>, out: Arc<Mutex<Option<Done>>>, hwnd: isize, alive: Arc<AtomicBool>, timing: Arc<Mutex<Series>>) {
     let mut cap: Option<Capturer> = None;
     // the last picture's identity: a grab with the same cell hash, region and scale changes nothing
     let mut last: Option<Identity> = None;
@@ -198,7 +208,12 @@ fn worker(rx: Receiver<Msg>, out: Arc<Mutex<Option<Done>>>, hwnd: isize, alive: 
                 cap = None;
             }
             Msg::Grab(req) => {
+                let t0 = std::time::Instant::now();
                 let done = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| grab_one(&mut cap, &mut last, &req))).unwrap_or(Done::Unavailable);
+                // wall time of the whole grab (the `BitBlt` waits for the compositor and dominates it)
+                if let Ok(mut t) = timing.lock() {
+                    t.push(t0.elapsed().as_secs_f32() * 1000.0);
+                }
                 if !req.keep {
                     cap = None;
                 }
@@ -259,12 +274,18 @@ pub struct GlassHost {
     /// Finished captures, and how many of them found the picture unchanged (diagnostics and tests).
     pub grabs: u64,
     pub unchanged: u64,
+    /// Wall time of each grab on the worker, ms (diagnostics; the worker writes, the window reads).
+    pub timing: Arc<Mutex<Series>>,
 }
 
 impl GlassHost {
     /// Exclude `hwnd` from capture. When Windows refuses (before 10 2004) the host is permanently
     /// unavailable and the pill keeps its neutral frosted glass.
     pub fn new(hwnd: HWND) -> GlassHost {
+        if capture_disabled_from(std::env::var_os(NO_GLASS_CAPTURE_ENV)) {
+            crate::log_info!("glass: screen capture disabled by {NO_GLASS_CAPTURE_ENV}");
+            return GlassHost::with_exclusion(hwnd.0 as isize, false);
+        }
         GlassHost::with_exclusion(hwnd.0 as isize, exclude_from_capture(hwnd))
     }
 
@@ -284,6 +305,7 @@ impl GlassHost {
             dirty: true,
             grabs: 0,
             unchanged: 0,
+            timing: Arc::new(Mutex::new(Series::default())),
         }
     }
 
@@ -319,8 +341,8 @@ impl GlassHost {
 
     fn spawn(&mut self) -> bool {
         let (tx, rx) = channel();
-        let (out, alive, hwnd) = (self.out.clone(), self.alive.clone(), self.hwnd);
-        match std::thread::Builder::new().name("pill-glass".into()).spawn(move || worker(rx, out, hwnd, alive)) {
+        let (out, alive, hwnd, timing) = (self.out.clone(), self.alive.clone(), self.hwnd, self.timing.clone());
+        match std::thread::Builder::new().name("pill-glass".into()).spawn(move || worker(rx, out, hwnd, alive, timing)) {
             Ok(j) => {
                 self.tx = Some(tx);
                 self.worker = Some(j);
@@ -537,6 +559,15 @@ mod tests {
         // hiding keeps the small picture for the next show and asks for a fresh capture
         h.release();
         assert!(h.dirty && h.backdrop((1708, 956), (1.0, 1.0)).is_some());
+    }
+
+    #[test]
+    fn the_capture_switch_reads_the_environment_value() {
+        assert!(!capture_disabled_from(None));
+        assert!(!capture_disabled_from(Some("".into())));
+        assert!(!capture_disabled_from(Some("0".into())));
+        assert!(capture_disabled_from(Some("1".into())));
+        assert!(capture_disabled_from(Some("true".into())));
     }
 
     #[test]

@@ -164,9 +164,9 @@ Every number below comes from `docs/SPEC.md`.
   4. On stop: shrink to 40×40 over 300 ms and fade the glow in over 220 ms.
 - **Waveform.**
   - 11 bars, each 2 px wide with 3 px gaps, height 4–22 px.
-  - The capture thread computes RMS (about 43 ms window) and publishes it through an atomic.
-  - Bar height is `4 + min(1,(rms·8)^0.75)·18`.
-  - Every 80 ms the bars shift left by one, newest on the right, and each bar eases over 75 ms.
+  - The capture thread runs a streaming meter (DC removal, 20 ms power every 10 ms, adaptive noise floor, gate with hysteresis) and publishes a 0..1 display level through an atomic, plus the peak since the pill last looked. A silent room publishes exactly 0.0.
+  - Bar height is `4 + level·18`.
+  - The bars are a delay line over one continuous envelope (12 ms attack, 120 ms release): the newest bar is the live envelope every frame, older bars scroll right to left (80 ms per slot, interpolated). Silence is a flat 4 px line and costs no frames.
 - **Signal glow.** tiny-skia has no conic gradients or blur, so it is drawn by hand:
   - Ring: computed analytically per pixel (about 2.5k pixels).
   - Halo and comet: pre-blurred once at start-up into 64 px sprites. Each frame rotates the comet and scales and breathes the halo.

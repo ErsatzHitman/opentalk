@@ -13,7 +13,8 @@
 //! - `glow`    — the Signal glow (analytic conic ring + pre-blurred halo/comet sprites)
 //! - `text`    — GDI `DrawTextW` into grayscale masks
 //! - `card`    — the dictation error card
-//! - `anim`    — easing, tracks, waveform sampler, looping keyframes
+//! - `anim`    — easing, tracks, waveform envelope + delay line, looping keyframes
+//! - `diag`    — per-recording timing diagnostics (one log line)
 //! - `theme`   — design tokens and system theme lookup
 //! - `window`  — Win32 layer: layered window, DPI, hit-testing, drag, menu, animation timer
 //! - `preview` — `--render-pill` CLI and golden scenarios
@@ -27,6 +28,7 @@ mod allocs;
 mod anim;
 mod capture;
 mod card;
+mod diag;
 mod glass;
 mod glow;
 mod model;
@@ -82,7 +84,8 @@ pub struct Pill {
 }
 
 impl Pill {
-    /// Create the window (hidden or idle per options). `level` is the live mic RMS (f32 bits).
+    /// Create the window (hidden or idle per options). `level` is the live mic display level, 0..1 and
+    /// exactly 0 in a silent room (f32 bits; see `audio::meter`).
     /// `on_event` runs on the UI thread from the window procedure.
     pub fn create(level: Arc<AtomicU32>, opts: PillOptions, on_event: Box<dyn FnMut(PillEvent)>) -> Result<Pill, String> {
         let win = window::Window::create(level, opts, on_event)?;

@@ -2,18 +2,20 @@
 //! premultiplied BGRA frame via `UpdateLayeredWindow`; alpha-based hit-testing, hover tracking,
 //! click-vs-drag, the right-click menu, per-monitor DPI and the on-demand 60 fps animation timer.
 
-use super::anim::{QuietRun, SLOW_TICK_MS, TICK_MS, level_band};
+use super::anim::{QuietRun, SLOW_TICK_MS, TICK_MS};
 use super::capture::{GlassHost, Refresh, ScreenEvents, WM_APP_GLASS, WM_APP_SCREEN_EVENT};
 use super::card::CardHover;
 use super::model::{Hit, Pointer, RenderState, TickOutcome};
-use super::pacer::{Hint, Vsync};
+use super::diag::Series;
+use super::pacer::{Hint, PaceSnapshot, PaceStats, Vsync};
 use super::raster::DevRect;
-use super::render::{BAR_EPS, FrameCache, FrameOutcome, pixel_size};
+use super::render::{FrameCache, FrameOutcome, pixel_size};
 use super::theme::{Palette, resolve_dark};
 use super::{PillEvent, PillMode, PillOptions};
 use crate::core::config::{PanelPosition, Theme};
 use crate::core::timing::now_ms;
-use crate::daemon::audio::{arm_level_wake, disarm_level_wake};
+use crate::daemon::audio::{arm_level_wake, disarm_level_wake, take_peak};
+use crate::log_info;
 use std::sync::atomic::AtomicU64;
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -62,26 +64,30 @@ const GLASS_SETTLE_MS: u32 = 400;
 /// Backdrop refresh period while the pointer is on the pill or it is being dragged: 8 Hz (a
 /// dragged window must keep its picture under it).
 const GLASS_FAST_MS: u32 = 125;
-/// Backdrop refresh period while recording, thinking or animating: 4 Hz. The glass
-/// frosts ~10 px of the screen, so it changes slowly; every capture costs ~1 ms of CPU at 2x (PLAN
-/// section 1 caps recording at 1.5 %), and a capture of an unchanged screen repaints nothing.
+/// Backdrop refresh period while thinking or animating: 4 Hz. The glass frosts ~10 px of the screen,
+/// so it changes slowly; every capture costs ~1 ms of CPU at 2x (PLAN section 1 caps recording at
+/// 1.5 %), and a capture of an unchanged screen repaints nothing. NOT used while recording: a screen
+/// `BitBlt` waits for the compositor and may delay the next composition, which the waveform shows as
+/// a hitch four times a second, so a recording captures on events only (see [`glass_period_ms`]).
 const GLASS_ACTIVE_MS: u32 = 250;
 /// Two captures are never closer than this, whatever asks for one.
 const GLASS_MIN_GAP_MS: f64 = 100.0;
 
 // --- pure helpers (unit-tested) ------------------------------------------------------------
 
-/// Period of the backdrop timer: the fast rate for hover and drag, the active rate while something is
-/// going on, and 0 (no timer) otherwise: while the window is hidden or cannot capture, and while the
-/// pill rests (PLAN section 1: an idle daemon runs no timers). The resting circle's backdrop is
-/// refreshed on events instead (show, state / size / scale / dock / position change, hover, and the
-/// [`ScreenEvents`] hooks), so its frost can be slightly stale.
-fn glass_period_ms(shown_and_capturing: bool, fast: bool, busy: bool) -> u32 {
+/// Period of the backdrop timer: the fast rate for hover and drag, the active rate while the pill
+/// thinks or animates, and 0 (no timer) otherwise: while the window is hidden or cannot capture,
+/// while the pill rests (PLAN section 1: an idle daemon runs no timers), and **while it records**.
+/// A recording refreshes its backdrop on events only: when it shows, when a screen event arrives
+/// (another window activated, moved, minimised; after the 400 ms settle), when the pill is resized
+/// or moved and has settled. The frost can therefore lag a changing screen a little while
+/// recording; that is by design (the periodic capture was a suspect for waveform hitches).
+fn glass_period_ms(shown_and_capturing: bool, fast: bool, busy: bool, recording: bool) -> u32 {
     if !shown_and_capturing {
         0
     } else if fast {
         GLASS_FAST_MS
-    } else if busy {
+    } else if busy && !recording {
         GLASS_ACTIVE_MS
     } else {
         0
@@ -113,6 +119,15 @@ struct SendHandle(isize);
 // SAFETY: Win32 kernel handles may be used from any thread.
 unsafe impl Send for SendHandle {}
 
+/// Queue a tick through `post` unless one is already queued (`pending`, cleared by the handler).
+/// A failed post (a full message queue) clears the flag again, so the next tick can try: left set,
+/// ticks would stop for good.
+fn request_tick(pending: &AtomicBool, post: impl FnOnce() -> bool) {
+    if !pending.swap(true, Ordering::AcqRel) && !post() {
+        pending.store(false, Ordering::Release);
+    }
+}
+
 fn handle(raw: isize) -> HANDLE {
     HANDLE(raw as *mut core::ffi::c_void)
 }
@@ -134,6 +149,8 @@ struct TimerCore {
     wake_token: AtomicU64,
     /// When the frame of the tick being handled is shown (set by the vsync-paced thread).
     hint: Hint,
+    /// What the compositor's clock did (diagnostics).
+    pace: Arc<PaceStats>,
 }
 
 impl TimerCore {
@@ -177,6 +194,8 @@ pub struct AnimTimer {
     core: Arc<TimerCore>,
     /// Set while a tick message is queued; the window clears it when it consumes one.
     pending: Arc<AtomicBool>,
+    /// `now_ms` bits of the moment the queued tick was posted (diagnostics: how long it waited).
+    posted: Arc<AtomicU64>,
     join: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -184,22 +203,22 @@ impl AnimTimer {
     /// Timer that posts `WM_APP_TICK` to `hwnd` (coalescing ticks the window has not consumed yet).
     pub fn new(hwnd: HWND) -> Result<AnimTimer, String> {
         let pending = Arc::new(AtomicBool::new(false));
-        let (h, p) = (SendHandle(hwnd.0 as isize), pending.clone());
+        let posted = Arc::new(AtomicU64::new(0));
+        let (h, p, at) = (SendHandle(hwnd.0 as isize), pending.clone(), posted.clone());
         let sink = move || {
-            if !p.swap(true, Ordering::AcqRel) {
+            request_tick(&p, || {
+                at.store(now_ms().to_bits(), Ordering::Relaxed);
                 let hwnd = HWND(h.0 as *mut core::ffi::c_void);
                 // SAFETY: posting to a window handle is safe from any thread; a stale handle just fails.
-                unsafe {
-                    let _ = PostMessageW(Some(hwnd), WM_APP_TICK, WPARAM(0), LPARAM(0));
-                }
-            }
+                unsafe { PostMessageW(Some(hwnd), WM_APP_TICK, WPARAM(0), LPARAM(0)) }.is_ok()
+            });
         };
-        Self::with_sink(Box::new(sink), pending)
+        Self::with_sink(Box::new(sink), pending, posted)
     }
 
     /// Timer that calls `sink` on every tick (from the timer thread). `pending` is only what
-    /// [`AnimTimer::ack`] clears.
-    fn with_sink(sink: Box<dyn Fn() + Send>, pending: Arc<AtomicBool>) -> Result<AnimTimer, String> {
+    /// [`AnimTimer::ack`] clears; `posted` is whatever stamps the post time.
+    fn with_sink(sink: Box<dyn Fn() + Send>, pending: Arc<AtomicBool>, posted: Arc<AtomicU64>) -> Result<AnimTimer, String> {
         let event = || -> Result<isize, String> {
             // SAFETY: plain auto-reset event creation.
             unsafe { CreateEventW(None, false, false, None) }.map(|h| h.0 as isize).map_err(|e| e.to_string())
@@ -214,10 +233,11 @@ impl AnimTimer {
             woken: AtomicBool::new(false),
             wake_token: AtomicU64::new(0),
             hint: Hint::new(),
+            pace: Arc::new(PaceStats::default()),
         });
         let c = core.clone();
         let join = std::thread::Builder::new().name("pill-anim".into()).spawn(move || anim_thread(c, sink)).map_err(|e| e.to_string())?;
-        Ok(AnimTimer { core, pending, join: Some(join) })
+        Ok(AnimTimer { core, pending, posted, join: Some(join) })
     }
 
     /// Run at full rate (also wakes a slowed timer).
@@ -287,6 +307,17 @@ impl AnimTimer {
     pub fn ack(&self) {
         self.pending.store(false, Ordering::Release);
     }
+
+    /// How long the tick being handled at `now` waited in the message queue (ms); 0 when unknown.
+    pub fn delivery_ms(&self, now: f64) -> f64 {
+        let at = f64::from_bits(self.posted.load(Ordering::Relaxed));
+        if at.is_finite() && at > 0.0 { (now - at).max(0.0) } else { 0.0 }
+    }
+
+    /// The compositor-clock readings since the last call.
+    pub fn take_pace(&self) -> PaceSnapshot {
+        self.core.pace.take()
+    }
 }
 
 impl Drop for AnimTimer {
@@ -311,7 +342,7 @@ fn anim_thread(core: Arc<TimerCore>, sink: Box<dyn Fn() + Send>) {
         let Ok(timer) = timer else { return };
         // The compositor's clock paces the full-rate cadence (see `pacer`); the fixed-rate timer
         // remains for the slow cadence and for a machine whose compositor does not block.
-        let mut vsync = Vsync::new();
+        let mut vsync = Vsync::new(core.pace.clone());
         // first tick one period from now, then periodic
         let arm = |slow: bool| {
             let ms = if slow { SLOW_TICK_MS } else { TICK_MS };
@@ -552,6 +583,27 @@ pub(super) struct Inner {
     glass_settle: bool,
     /// WinEvent hooks that report other windows' activation / move / minimise while the pill is shown.
     screen_events: Option<ScreenEvents>,
+    /// Timing measurements of the current recording (logged when it ends).
+    diag: RecDiag,
+}
+
+/// Measurements of one recording, collected only while the pill is in the Recording mode and written
+/// to the log as one line when it ends (see `diag.rs`).
+#[derive(Default)]
+struct RecDiag {
+    on: bool,
+    /// Wall time between frames that were drawn and pushed to the compositor.
+    frame_gap: Series,
+    /// Wall time between handled animation ticks.
+    tick_gap: Series,
+    /// Time a tick message waited between the animation thread and the UI thread's handler.
+    delivery: Series,
+    /// `UpdateLayeredWindow` wall time, any kind.
+    ulw: Series,
+    last_frame: Option<f64>,
+    last_tick: Option<f64>,
+    /// `frames`, `skipped`, `partial` and the glass counters when the recording began.
+    base: [u64; 5],
 }
 
 /// What the window procedure asks the outer layer to do after the borrow is released.
@@ -802,7 +854,7 @@ impl Inner {
         // as it appears is enough (rebuilding its glass costs up to ~30 ms at 2x), so it refreshes on
         // events only, like the resting circle
         let busy = !matches!(self.st.mode(), PillMode::Idle | PillMode::Hidden) || (self.st.error().is_none() && self.st.is_animating(now));
-        glass_period_ms(self.visible && self.glass.available(), fast, busy)
+        glass_period_ms(self.visible && self.glass.available(), fast, busy, self.st.mode() == PillMode::Recording)
     }
 
     /// Run the backdrop timer only while something is going on, at the rate the state calls for. With
@@ -965,6 +1017,7 @@ impl Inner {
         let size = SIZE { cx: dib.w, cy: dib.h };
         let src = POINT { x: 0, y: 0 };
         let blend = BLENDFUNCTION { BlendOp: AC_SRC_OVER as u8, BlendFlags: 0, SourceConstantAlpha: 255, AlphaFormat: AC_SRC_ALPHA as u8 };
+        let ulw_start = self.diag.on.then(std::time::Instant::now);
         // SAFETY: all pointers reference live locals; the DIB DC stays selected.
         unsafe {
             if !self.visible {
@@ -998,6 +1051,60 @@ impl Inner {
                 let _ = UpdateLayeredWindow(self.hwnd, None, Some(&pos), Some(&size), Some(dib.dc), Some(&src), COLORREF(0), Some(&blend), ULW_ALPHA);
             }
         }
+        if let Some(t0) = ulw_start {
+            self.diag.ulw.push(t0.elapsed().as_secs_f32() * 1000.0);
+            let wall = now_ms();
+            if let Some(prev) = self.diag.last_frame.replace(wall) {
+                self.diag.frame_gap.push((wall - prev) as f32);
+            }
+        }
+    }
+
+    // --- diagnostics ---------------------------------------------------------------------
+
+    /// A recording starts: start measuring.
+    fn diag_begin(&mut self) {
+        self.diag = RecDiag {
+            on: true,
+            base: [self.frames, self.skipped, self.partial, self.glass.grabs, self.glass.unchanged],
+            ..RecDiag::default()
+        };
+        if let Some(t) = &self.timer {
+            let _ = t.take_pace();
+        }
+        if let Ok(mut g) = self.glass.timing.lock() {
+            g.clear();
+        }
+    }
+
+    /// The recording ended: one log line with everything measured, so a report of lag comes with numbers.
+    fn diag_end(&mut self) {
+        if !self.diag.on {
+            return;
+        }
+        self.diag.on = false;
+        let d = std::mem::take(&mut self.diag);
+        let (frames, skipped, partial) = (self.frames - d.base[0], self.skipped - d.base[1], self.partial - d.base[2]);
+        let (grabs, unchanged) = (self.glass.grabs - d.base[3], self.glass.unchanged - d.base[4]);
+        let pace = self.timer.as_ref().map(|t| t.take_pace()).unwrap_or_default();
+        let bitblt = self.glass.timing.lock().map(|g| g.summary()).unwrap_or_default();
+        log_info!(
+            "pill recording: {frames} ticks, {} drawn ({partial} partial, {} full), {skipped} skipped; frame gap {}; tick gap {}; tick wait {}; UpdateLayeredWindow {}; \
+             DwmFlush {} blocks, mean {:.2} max {:.2} ms, {} early, {} guard trips; glass {} ({grabs} grabs, {unchanged} unchanged) BitBlt {}",
+            frames - skipped,
+            (frames - skipped).saturating_sub(partial),
+            d.frame_gap.summary(),
+            d.tick_gap.summary(),
+            d.delivery.summary(),
+            d.ulw.summary(),
+            pace.flushes,
+            pace.mean_ms,
+            pace.max_ms,
+            pace.early,
+            pace.trips,
+            if self.glass.available() { "on" } else { "off" },
+            bitblt,
+        );
     }
 
     fn sync_timer(&mut self) {
@@ -1011,20 +1118,22 @@ impl Inner {
     }
 
     /// The recording is visually static: tick slowly and ask the capture thread to wake the timer
-    /// as soon as the mic level leaves the band that would change a bar. Nothing polls.
+    /// as soon as the mic gate opens. Nothing polls. The meter publishes exactly 0.0 while the room
+    /// is silent, so "anything above 0" is the whole condition; a sound that is on (a steady tone
+    /// is still a picture that cannot change for 130 ms) keeps the full rate.
     fn go_slow(&mut self) {
         let Some(timer) = &self.timer else { return };
         if timer.is_slow() || timer.take_woken() {
             return;
         }
-        let baseline = f32::from_bits(self.level.load(Ordering::Relaxed));
-        let (lo, hi) = level_band(baseline, BAR_EPS);
+        if f32::from_bits(self.level.load(Ordering::Relaxed)) > 0.0 {
+            return;
+        }
         // Order matters: flag first, then arm, then re-check, so a rise at any point in between is
         // either announced by the capture thread or caught here.
         timer.slow_down();
-        timer.wake_on_level_outside(lo, hi);
-        let now_level = f32::from_bits(self.level.load(Ordering::Relaxed));
-        if now_level < lo || now_level > hi {
+        timer.wake_on_level_outside(0.0, 0.0);
+        if f32::from_bits(self.level.load(Ordering::Relaxed)) > 0.0 {
             timer.wake();
         }
     }
@@ -1232,9 +1341,19 @@ impl Inner {
                 // The frame is sampled when it will be shown (the next vblank), not when this
                 // message happens to be handled: a late tick cannot slow the animation down.
                 let now = self.now();
+                let wall = now;
                 let now = self.timer.as_ref().map_or(now, |t| t.present_time(now));
-                let rms = f32::from_bits(self.level.load(Ordering::Relaxed));
-                let o: TickOutcome = self.st.tick(now, rms);
+                if self.diag.on {
+                    let wait = self.timer.as_ref().map_or(0.0, |t| t.delivery_ms(wall));
+                    self.diag.delivery.push(wait as f32);
+                    if let Some(prev) = self.diag.last_tick.replace(wall) {
+                        self.diag.tick_gap.push((wall - prev) as f32);
+                    }
+                }
+                // the live level, and the highest one since the previous frame (nothing between two
+                // frames is lost); the meter publishes exactly 0.0 in silence
+                let level = f32::from_bits(self.level.load(Ordering::Relaxed));
+                let o: TickOutcome = self.st.tick(now, level, take_peak());
                 if o.error_expired {
                     out.events.push(PillEvent::ErrorDismissed);
                 }
@@ -1450,6 +1569,7 @@ impl Window {
                 bd_origin: (0, 0),
                 glass_settle: false,
                 screen_events: None,
+                diag: RecDiag::default(),
             };
             let rc = Rc::new(RefCell::new(inner));
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, Rc::into_raw(rc.clone()) as isize);
@@ -1478,6 +1598,11 @@ impl Inner {
     pub fn set_mode(&mut self, mode: PillMode) {
         let now = self.now();
         self.st.set_mode(mode, now);
+        match self.st.mode() {
+            PillMode::Recording if !self.diag.on => self.diag_begin(),
+            PillMode::Recording | PillMode::Unavailable => {}
+            _ => self.diag_end(),
+        }
         self.refresh();
     }
 
@@ -1550,17 +1675,49 @@ mod tests {
     #[test]
     fn backdrop_timer_runs_only_while_shown_and_at_the_rate_the_state_needs() {
         // hidden or unable to capture: no timer at all (idle CPU stays flat)
-        assert_eq!(glass_period_ms(false, true, true), 0);
-        assert_eq!(glass_period_ms(false, false, false), 0);
+        assert_eq!(glass_period_ms(false, true, true, false), 0);
+        assert_eq!(glass_period_ms(false, false, false, false), 0);
         // resting circle (and a still error card): no timer either (PLAN section 1), it refreshes on
-        // events; recording / thinking: 4 Hz; hover / drag: 8 Hz
-        assert_eq!(glass_period_ms(true, false, false), 0);
-        assert_eq!(glass_period_ms(true, false, true), GLASS_ACTIVE_MS);
-        assert_eq!(glass_period_ms(true, true, false), GLASS_FAST_MS);
-        assert_eq!(glass_period_ms(true, true, true), GLASS_FAST_MS);
+        // events; thinking / animating: 4 Hz; hover / drag: 8 Hz
+        assert_eq!(glass_period_ms(true, false, false, false), 0);
+        assert_eq!(glass_period_ms(true, false, true, false), GLASS_ACTIVE_MS);
+        assert_eq!(glass_period_ms(true, true, false, false), GLASS_FAST_MS);
+        assert_eq!(glass_period_ms(true, true, true, false), GLASS_FAST_MS);
+        // recording: no periodic capture (screen events, show and resize end only) ...
+        assert_eq!(glass_period_ms(true, false, true, true), 0, "a recording runs no backdrop timer");
+        // ... except while the pointer is on the pill or it is dragged (the dragged picture must follow)
+        assert_eq!(glass_period_ms(true, true, true, true), GLASS_FAST_MS);
         // the rates are ordered and keep the rate limit meaningful
         const { assert!(GLASS_FAST_MS < GLASS_ACTIVE_MS && GLASS_SETTLE_MS as f64 > GLASS_MIN_GAP_MS) };
         const { assert!(GLASS_FAST_MS as f64 >= GLASS_MIN_GAP_MS) };
+    }
+
+    #[test]
+    fn a_failed_tick_post_does_not_wedge_the_timer() {
+        let pending = AtomicBool::new(false);
+        let mut posts = 0;
+        request_tick(&pending, || {
+            posts += 1;
+            true
+        });
+        assert!(pending.load(Ordering::SeqCst), "queued until the handler acks");
+        request_tick(&pending, || {
+            posts += 1;
+            true
+        });
+        assert_eq!(posts, 1, "ticks coalesce while one is queued");
+        pending.store(false, Ordering::SeqCst); // the handler's ack
+        request_tick(&pending, || {
+            posts += 1;
+            false
+        });
+        assert_eq!(posts, 2);
+        assert!(!pending.load(Ordering::SeqCst), "a failed post clears the flag");
+        request_tick(&pending, || {
+            posts += 1;
+            true
+        });
+        assert_eq!(posts, 3, "and the next tick tries again");
     }
 
     #[test]
@@ -1590,7 +1747,7 @@ mod tests {
         let stamps = Arc::new(std::sync::Mutex::new(Vec::new()));
         let s = stamps.clone();
         let sink = move || s.lock().unwrap_or_else(|e| e.into_inner()).push(std::time::Instant::now());
-        (AnimTimer::with_sink(Box::new(sink), Arc::new(AtomicBool::new(false))).expect("timer"), stamps)
+        (AnimTimer::with_sink(Box::new(sink), Arc::new(AtomicBool::new(false)), Arc::new(AtomicU64::new(0))).expect("timer"), stamps)
     }
 
     fn tick_count(stamps: &std::sync::Mutex<Vec<std::time::Instant>>) -> usize {
@@ -1687,27 +1844,51 @@ mod tests {
         assert!(n >= 12, "full rate after a wake: {n} ticks in 320 ms");
     }
 
-    /// The capture side signals the timer: a level outside the armed band wakes it, no polling.
+    /// 10 ms packets of what a real room sounds like (white noise at about -55 dBFS), or of a voiced
+    /// sound, through the real meter; every completed hop is published like the capture thread does.
+    fn feed_mic(meter: &mut crate::daemon::audio::meter::Meter, level: &AtomicU32, ms: usize, voice: bool, seed: &mut u32) {
+        for p in 0..ms / 10 {
+            let pkt: Vec<i16> = (0..160)
+                .map(|n| {
+                    *seed ^= *seed << 13;
+                    *seed ^= *seed >> 17;
+                    *seed ^= *seed << 5;
+                    if voice { (6000.0 * ((p * 160 + n) as f32 * 0.07).sin()) as i16 } else { ((*seed % 101) as i32 - 50) as i16 }
+                })
+                .collect();
+            meter.push(&pkt, |h| crate::daemon::audio::publish_level(level, h.level));
+        }
+    }
+
+    /// The capture side signals the timer. A silent recording with a real, noisy microphone reaches
+    /// the slow cadence and stays there (the old 1/255 px band was left by room noise on nearly every
+    /// packet, so it never did); the first sound wakes it at once, no polling.
     #[test]
-    fn capture_level_change_wakes_a_slow_timer() {
-        use crate::daemon::audio::{publish_level, serial_guard};
+    fn capture_level_change_wakes_a_slow_timer_and_room_noise_does_not() {
+        use crate::daemon::audio::{meter::Meter, serial_guard};
         use std::time::{Duration, Instant};
         let _serial = serial_guard();
         let level = AtomicU32::new(0);
         let (timer, stamps) = recording_timer();
         timer.start();
         timer.slow_down();
-        let (lo, hi) = level_band(0.0, BAR_EPS);
-        timer.wake_on_level_outside(lo, hi);
+        timer.wake_on_level_outside(0.0, 0.0);
         std::thread::sleep(Duration::from_millis(150));
-        // inside the band (digital silence): the timer stays slow
-        publish_level(&level, 0.0);
+        let (mut meter, mut seed) = (Meter::new(), 0x1234_5679u32);
+        // 2 s of room noise, fed in 10 ms packets as fast as possible
+        feed_mic(&mut meter, &level, 2000, false, &mut seed);
+        assert!(timer.is_slow(), "room noise never wakes a slow timer");
+        let n0 = tick_count(&stamps);
+        std::thread::sleep(Duration::from_millis(1000));
+        let wakeups = tick_count(&stamps) - n0;
+        assert!(wakeups < 20, "{wakeups} timer wakeups in one noisy-but-silent second");
         assert!(timer.is_slow());
+        // a voiced sound: the first open hop wakes the timer
         let before = tick_count(&stamps);
         let t0 = Instant::now();
-        publish_level(&level, 0.05);
-        let lat = first_tick_after(&stamps, before, t0).expect("a tick after the level rise");
-        assert!(lat <= Duration::from_millis(40), "level rise to tick: {lat:?}");
+        feed_mic(&mut meter, &level, 50, true, &mut seed);
+        let lat = first_tick_after(&stamps, before, t0).expect("a tick after the sound started");
+        assert!(lat <= Duration::from_millis(40), "sound to tick: {lat:?}");
         assert!(!timer.is_slow());
         assert!(timer.take_woken());
     }
@@ -1732,13 +1913,41 @@ mod steady {
     use std::time::{Duration, Instant};
     use windows::Win32::UI::WindowsAndMessaging::{DispatchMessageW, MSG, PM_REMOVE, PeekMessageW, TranslateMessage};
 
-    /// Pump messages for `ms`, feeding `level` a speech-like RMS (or silence) every few ms.
+    thread_local! {
+        /// The test's microphone: the real meter, fed 10 ms packets in real time.
+        static MIC: RefCell<(crate::daemon::audio::meter::Meter, u32, Option<Instant>, u64)> =
+            RefCell::new((crate::daemon::audio::meter::Meter::new(), 0x9E37_79B9, None, 0));
+    }
+
+    /// Pump messages for `ms`, feeding `level` like the capture thread would: 10 ms packets of speech
+    /// (a voiced, syllable-modulated sound) or of silence, which is a noisy room at about -55 dBFS, not
+    /// digital zero, through the real meter.
     fn pump(level: &AtomicU32, ms: u64, speaking: bool) {
         let t0 = Instant::now();
         while t0.elapsed() < Duration::from_millis(ms) {
-            let rms = if speaking { 0.02 + 0.2 * ((t0.elapsed().as_secs_f32() * 7.3).sin().abs()) } else { 0.0 };
-            // what the capture thread does with each packet (store the level, wake a slowed timer)
-            crate::daemon::audio::publish_level(level, rms);
+            MIC.with(|m| {
+                let (meter, seed, start, sent) = &mut *m.borrow_mut();
+                let begin = *start.get_or_insert_with(Instant::now);
+                // all the packets that are due by now
+                while *sent * 10 <= begin.elapsed().as_millis() as u64 {
+                    let pkt: Vec<i16> = (0..160u64)
+                        .map(|n| {
+                            *seed ^= *seed << 13;
+                            *seed ^= *seed >> 17;
+                            *seed ^= *seed << 5;
+                            let k = *sent * 160 + n;
+                            if speaking {
+                                let syl = 0.5 + 0.5 * (k as f32 / 16_000.0 * 2.0 * std::f32::consts::PI * 4.0).sin();
+                                (9000.0 * syl * (k as f32 * 0.07).sin()) as i16
+                            } else {
+                                ((*seed % 101) as i32 - 50) as i16
+                            }
+                        })
+                        .collect();
+                    meter.push(&pkt, |h| crate::daemon::audio::publish_level(level, h.level));
+                    *sent += 1;
+                }
+            });
             // SAFETY: standard message pump on the creating thread.
             unsafe {
                 let mut msg = MSG::default();
@@ -1749,6 +1958,59 @@ mod steady {
             }
             std::thread::sleep(Duration::from_millis(2));
         }
+    }
+
+    /// Dispatch the messages that are queued for this thread.
+    fn dispatch_messages() {
+        // SAFETY: standard message pump on the creating thread.
+        unsafe {
+            let mut msg = MSG::default();
+            while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+    }
+
+    /// Ten seconds of the real microphone drive the real pill; the numbers the log line would carry
+    /// are printed and held to the acceptance targets (a tick gap p95 of at most 40 ms, which is 2.4
+    /// refresh periods at 60 Hz and is what a missed vblank run looks like; `UpdateLayeredWindow` p95
+    /// under 2 ms). Speak during the run for the speaking numbers. Needs a real, unlocked desktop.
+    #[test]
+    #[ignore = "desktop: needs a microphone and a composed desktop"]
+    fn desktop_pill_waveform_diagnostics_with_the_real_microphone() {
+        let _serial = crate::daemon::audio::serial_guard();
+        let level = Arc::new(AtomicU32::new(0));
+        let rec = match crate::daemon::audio::Recorder::start(None, level.clone(), None) {
+            Ok(r) => r,
+            Err(e) => {
+                println!("no microphone ({e}); nothing to measure");
+                return;
+            }
+        };
+        let w = make(level.clone());
+        w.with(|i| i.set_mode(PillMode::Recording));
+        let t0 = Instant::now();
+        while t0.elapsed() < Duration::from_secs(10) {
+            dispatch_messages();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let (frame, tick, wait, ulw, pace, grab) = w.with(|i| {
+            (
+                i.diag.frame_gap.summary(),
+                i.diag.tick_gap.summary(),
+                i.diag.delivery.summary(),
+                i.diag.ulw.summary(),
+                i.timer.as_ref().map(|t| t.take_pace()).unwrap_or_default(),
+                i.glass.timing.lock().map(|g| g.summary()).unwrap_or_default(),
+            )
+        });
+        let (_audio, stats) = rec.stop_with_stats();
+        println!("frame gap: {frame}\ntick gap: {tick}\ntick wait: {wait}\nUpdateLayeredWindow: {ulw}\nDwmFlush: {pace:?}\nBitBlt: {grab}");
+        println!("packet gap mean {:.1} max {:.1} ms, gate open {:.0}%, floor {:.0} dBFS", stats.mean_gap_ms, stats.max_gap_ms, stats.gate_open_pct, stats.floor_dbfs);
+        assert!(tick.n == 0 || tick.p95 <= 40.0, "tick gap p95 {} ms", tick.p95);
+        assert!(ulw.n == 0 || ulw.p95 < 2.0, "UpdateLayeredWindow p95 {} ms", ulw.p95);
+        w.with(|i| i.set_mode(PillMode::Idle));
     }
 
     fn make(level: Arc<AtomicU32>) -> Window {
@@ -1785,7 +2047,7 @@ mod steady {
         assert!(w.with(|i| dib_matches_pixmap(i)), "DIB equals the pixmap after dirty-rect uploads");
 
         // silence: the bars settle at 4 px, every later tick is skipped and the timer slows down
-        pump(&level, 1300, false); // the 11-sample history (880 ms) flushes out
+        pump(&level, 2600, false); // the envelope lets go (~0.6 s) and the 880 ms history flushes out
         assert!(w.with(|i| i.timer.as_ref().is_some_and(|t| t.is_slow())), "a silent recording runs the slow cadence");
         let (f2, s2, p2) = w.with(|i| (i.frames, i.skipped, i.partial));
         pump(&level, 1000, false);
@@ -1799,7 +2061,7 @@ mod steady {
         // speech starts: the capture side wakes the timer and the next tick is a full-rate one
         let frames_before = w.with(|i| i.frames);
         let t_rise = Instant::now();
-        crate::daemon::audio::publish_level(&level, 0.2);
+        crate::daemon::audio::publish_level(&level, 0.6);
         let mut first_frame = None;
         while t_rise.elapsed() < Duration::from_millis(200) {
             // SAFETY: standard message pump on the creating thread.
@@ -1828,9 +2090,9 @@ mod steady {
             for k in 0..n {
                 std::thread::sleep(Duration::from_millis(81));
                 total += w.with(|i| {
-                    let rms = if k % 2 == 0 { 0.2f32 } else { 0.05 };
+                    let lvl = if k % 2 == 0 { 0.9f32 } else { 0.25 };
                     let now = i.now();
-                    i.st.tick(now, rms);
+                    i.st.tick(now, lvl, lvl);
                     std::thread::sleep(Duration::from_millis(25)); // bars are mid-ease
                     if force_full {
                         i.cache.reset();

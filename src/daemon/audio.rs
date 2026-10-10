@@ -2,11 +2,15 @@
 //! i16 so the OS does the resampling; own downmix + windowed-sinc resampler as fallback).
 //!
 //! - `Recorder::start` returns as soon as the stream runs; device activation cost is logged.
-//! - The capture thread publishes RMS of the latest ~43 ms window into `level` (f32 bits).
+//! - The capture thread runs a streaming [`meter::Meter`] over each packet and publishes the
+//!   display level (0..1, exactly 0.0 while the room is silent) into `level` (f32 bits), plus the
+//!   highest level since the pill last looked ([`take_peak`]), so no short sound falls between
+//!   two animation frames.
 //! - Optional `sink` receives each PCM packet for streaming STT.
 //! - `vad` offers energy-based speech detection + silence trimming (150 ms padding).
 //! - `OPENTALK_INJECT_WAV=<file>` replaces the microphone with a WAV played back in real time
 //!   (e2e tests and benchmarks), see [`inject_wav`].
+pub mod meter;
 mod resample;
 pub mod vad;
 pub(crate) mod wasapi;
@@ -22,8 +26,6 @@ use std::time::{Duration, Instant};
 
 /// Capture format delivered to callers.
 pub const SAMPLE_RATE: u32 = 16_000;
-/// Level window: ~43 ms at 16 kHz.
-pub const LEVEL_WINDOW: usize = 688;
 /// Environment variable naming a WAV to play instead of opening the microphone.
 pub const INJECT_ENV: &str = "OPENTALK_INJECT_WAV";
 /// How long `stop` waits for the capture thread before returning what it has.
@@ -63,6 +65,10 @@ pub struct CaptureStats {
     pub samples: u64,
     /// The device disappeared (or the stream broke) before `stop`.
     pub device_lost: bool,
+    /// Share of 10 ms level hops with the noise gate open, percent.
+    pub gate_open_pct: f32,
+    /// Adaptive noise floor at the end of the recording, dBFS.
+    pub floor_dbfs: f32,
 }
 
 /// State shared between the capture thread and the `Recorder` handle.
@@ -71,32 +77,44 @@ pub(crate) struct Shared {
     samples: Mutex<Vec<i16>>,
     count: AtomicU64,
     lost: AtomicBool,
+    /// Level meter totals (hops, hops with the gate open, floor dBFS as f32 bits), for the log line.
+    meter_hops: AtomicU64,
+    meter_open: AtomicU64,
+    meter_floor: AtomicU32,
 }
 
 /// Capture-thread side of [`Shared`]: appends PCM, publishes the level, feeds the sink.
 pub(crate) struct Output {
     shared: Arc<Shared>,
     level: Arc<AtomicU32>,
+    meter: meter::Meter,
     sink: Option<PcmSink>,
 }
 
 impl Output {
     pub(crate) fn new(level: Arc<AtomicU32>, sink: Option<PcmSink>, shared: Arc<Shared>) -> Output {
         shared.samples.lock().unwrap_or_else(|e| e.into_inner()).reserve(SAMPLE_RATE as usize * 10);
-        Output { shared, level, sink }
+        reset_peak();
+        Output { shared, level, meter: meter::Meter::new(), sink }
     }
 
     pub(crate) fn push(&mut self, pcm: &[i16]) {
         if pcm.is_empty() {
             return;
         }
-        let rms = {
+        {
             let mut v = self.shared.samples.lock().unwrap_or_else(|e| e.into_inner());
             v.extend_from_slice(pcm);
             self.shared.count.store(v.len() as u64, Ordering::Relaxed);
-            rms_tail(&v)
-        };
-        publish_level(&self.level, rms);
+        }
+        // The meter runs outside the sample lock; every 10 ms hop it completes is published (the
+        // level, the peak since the pill last looked, and the wake for a slowed timer).
+        let level = &self.level;
+        self.meter.push(pcm, |hop| publish_level(level, hop.level));
+        let st = self.meter.stats();
+        self.shared.meter_hops.store(st.hops, Ordering::Relaxed);
+        self.shared.meter_open.store(st.open_hops, Ordering::Relaxed);
+        self.shared.meter_floor.store(st.floor_db.to_bits(), Ordering::Relaxed);
         if let Some(sink) = self.sink.as_mut() {
             // A misbehaving sink must not take the capture thread (and the recording) down.
             if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sink(pcm))).is_err() {
@@ -160,14 +178,34 @@ pub fn disarm_level_wake(token: u64) {
     }
 }
 
-/// Store the live level and fire the armed wake if it left its band. One relaxed load when nothing is armed.
-pub(crate) fn publish_level(level: &AtomicU32, rms: f32) {
-    level.store(rms.to_bits(), Ordering::Relaxed);
+/// Highest display level published since [`take_peak`] last ran (f32 bits; non-negative floats order
+/// like their bits, so `fetch_max` works). There is one microphone, hence one process-wide slot.
+static PEAK: AtomicU32 = AtomicU32::new(0);
+
+/// The highest level published since the previous call, and reset. The pill calls this once per
+/// frame, so a sound shorter than a frame still moves the bars.
+pub fn take_peak() -> f32 {
+    f32::from_bits(PEAK.swap(0, Ordering::Relaxed))
+}
+
+/// Forget the peak (a recording starts or ends).
+pub(crate) fn reset_peak() {
+    PEAK.store(0, Ordering::Relaxed);
+}
+
+/// Store the live level (and raise the peak) and fire the armed wake if it left its band. One relaxed
+/// load when nothing is armed. A level that is not a finite number in 0..=1 is clamped (NaN -> 0).
+pub(crate) fn publish_level(level: &AtomicU32, value: f32) {
+    let v = if value.is_finite() { value.clamp(0.0, 1.0) } else { 0.0 };
+    level.store(v.to_bits(), Ordering::Relaxed);
+    if v > 0.0 {
+        PEAK.fetch_max(v.to_bits(), Ordering::Relaxed);
+    }
     if !WAKE_ON.load(Ordering::Acquire) {
         return;
     }
     let (lo, hi) = (f32::from_bits(WAKE_LO.load(Ordering::Relaxed)), f32::from_bits(WAKE_HI.load(Ordering::Relaxed)));
-    if rms >= lo && rms <= hi {
+    if v >= lo && v <= hi {
         return;
     }
     // one-shot: whoever clears the flag owns the notification
@@ -185,16 +223,6 @@ pub(crate) fn publish_level(level: &AtomicU32, rms: f32) {
 pub(crate) fn serial_guard() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: Mutex<()> = Mutex::new(());
     LOCK.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-/// RMS (full scale = 1.0) of the last [`LEVEL_WINDOW`] samples.
-fn rms_tail(samples: &[i16]) -> f32 {
-    let tail = &samples[samples.len().saturating_sub(LEVEL_WINDOW)..];
-    if tail.is_empty() {
-        return 0.0;
-    }
-    let sum: f64 = tail.iter().map(|&s| (s as f64) * (s as f64)).sum();
-    ((sum / tail.len() as f64).sqrt() / 32768.0) as f32
 }
 
 /// Manual-reset "please stop" event shared with the capture thread.
@@ -298,7 +326,13 @@ impl Recorder {
         }
         let samples = std::mem::take(&mut *self.shared.samples.lock().unwrap_or_else(|e| e.into_inner()));
         self.level.store(0f32.to_bits(), Ordering::Relaxed);
+        reset_peak();
         stats.samples = samples.len() as u64;
+        let hops = self.shared.meter_hops.load(Ordering::Relaxed);
+        if hops > 0 {
+            stats.gate_open_pct = self.shared.meter_open.load(Ordering::Relaxed) as f32 * 100.0 / hops as f32;
+            stats.floor_dbfs = f32::from_bits(self.shared.meter_floor.load(Ordering::Relaxed));
+        }
         stats.device_lost |= self.shared.lost.load(Ordering::Relaxed);
         (Audio { samples, sample_rate: SAMPLE_RATE }, stats)
     }
@@ -474,14 +508,62 @@ mod tests {
         assert_eq!(inject_path_from(Some("a.wav".into())), Some(PathBuf::from("a.wav")));
     }
 
+    /// The peak slot keeps the highest level between two looks and is empty after each look; garbage
+    /// levels are clamped instead of poisoning it.
     #[test]
-    fn rms_tail_uses_last_window_only() {
-        let mut v = vec![i16::MAX; 5000];
-        v.extend(vec![0i16; LEVEL_WINDOW]);
-        assert_eq!(rms_tail(&v), 0.0);
-        let v = vec![16384i16; 100];
-        assert!((rms_tail(&v) - 0.5).abs() < 1e-4);
-        assert_eq!(rms_tail(&[]), 0.0);
+    fn peak_keeps_the_highest_level_between_looks() {
+        let _serial = serial_guard();
+        let level = AtomicU32::new(0);
+        reset_peak();
+        assert_eq!(take_peak(), 0.0);
+        for v in [0.1f32, 0.6, 0.3, 0.0, 0.2] {
+            publish_level(&level, v);
+        }
+        assert_eq!(read_level(&level), 0.2, "the live level is the newest one");
+        assert_eq!(take_peak(), 0.6, "the peak is the highest since the last look");
+        assert_eq!(take_peak(), 0.0, "and starts over after it");
+        publish_level(&level, f32::NAN);
+        publish_level(&level, -0.5);
+        publish_level(&level, f32::INFINITY);
+        assert_eq!(take_peak(), 0.0, "NaN, negative and infinite inputs publish 0");
+        assert_eq!(read_level(&level), 0.0);
+        publish_level(&level, 7.0);
+        assert_eq!(read_level(&level), 1.0, "levels above 1 are clamped");
+        assert_eq!(take_peak(), 1.0);
+    }
+
+    /// Packets of any size feed the meter and the whole path (meter -> level -> peak) stays silent
+    /// for room noise and exactly flat for digital silence.
+    #[test]
+    fn output_publishes_meter_levels_and_stays_flat_in_a_quiet_room() {
+        let _serial = serial_guard();
+        let level = Arc::new(AtomicU32::new(0));
+        let shared = Arc::new(Shared::default());
+        let mut out = Output::new(level.clone(), None, shared.clone());
+        // 3 s of hiss at about -55 dBFS (+-1.7 LSB-ish scaled): no packet may move the level
+        let mut x = 0x2545_F491u32;
+        let mut peak_seen = 0.0f32;
+        for _ in 0..300 {
+            let pkt: Vec<i16> = (0..160)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 17;
+                    x ^= x << 5;
+                    ((x % 121) as i32 - 60) as i16
+                })
+                .collect();
+            out.push(&pkt);
+            assert_eq!(read_level(&level), 0.0);
+            peak_seen = peak_seen.max(take_peak());
+        }
+        assert_eq!(peak_seen, 0.0, "room noise never reaches the pill");
+        // a loud burst opens the gate within one packet
+        let tone: Vec<i16> = (0..160).map(|n| (8000.0 * (n as f32 * 0.2).sin()) as i16).collect();
+        out.push(&tone);
+        out.push(&tone);
+        assert!(read_level(&level) > 0.3, "speech level {}", read_level(&level));
+        assert!(take_peak() > 0.3);
+        assert!(shared.meter_hops.load(Ordering::Relaxed) >= 300 && shared.meter_open.load(Ordering::Relaxed) >= 1);
     }
 
     #[test]
@@ -506,7 +588,7 @@ mod tests {
         let (audio, stats) = rec.stop_with_stats();
         let wall = t.elapsed().as_millis() as u64;
 
-        assert!(mid_level > 0.2 && mid_level < 0.5, "level {mid_level}");
+        assert!(mid_level > 0.5 && mid_level <= 1.0, "a loud steady tone shows a high display level, got {mid_level}");
         // Real-time pacing, in both directions: the stream is never ahead of the clock (a fast-forward
         // would deliver the whole 3 s tone at once), and it has made real progress. How far behind a
         // starved thread may lag is not part of the contract, so the lower bound is generous.

@@ -4,6 +4,7 @@
 //! PlaySoundW(SND_MEMORY | SND_ASYNC | SND_NODEFAULT). TASK win-input implements.
 
 use std::sync::OnceLock;
+use std::sync::mpsc::{Sender, channel};
 
 const START_NOTES: [f32; 2] = [523.25, 659.25];
 const STOP_NOTES: [f32; 2] = [587.33, 440.0];
@@ -36,13 +37,14 @@ fn cues() -> &'static Cues {
     })
 }
 
-/// Render both cues now and play 20 ms of silence so the first hotkey press neither synthesises
-/// nor pays PlaySound's one-time cost (loading winmm, opening the device: ~12 ms measured).
-/// Call once at start-up; it blocks for that one-time cost.
+/// Render both cues now and queue 20 ms of silence so the first hotkey press neither synthesises
+/// nor pays PlaySound's one-time cost (loading winmm, opening the device: ~12 ms measured). The
+/// silence plays on the cue thread, ahead of any cue asked for later, so this returns after the
+/// synthesis only (a few ms) and is safe to call from the UI thread.
 pub fn init() {
     static WARMED: std::sync::Once = std::sync::Once::new();
-    let c = cues();
-    WARMED.call_once(|| play(&c.warmup));
+    let _ = cues();
+    WARMED.call_once(|| post(Cue::Warm));
 }
 
 /// How long the start cue sounds: the lead, the notes (one pitch apart) and the last note's tail.
@@ -52,12 +54,57 @@ pub fn start_cue_duration() -> std::time::Duration {
     std::time::Duration::from_secs_f64(LEAD + (START_NOTES.len() - 1) as f64 * pitch + NOTE_DURATION + NOTE_TAIL)
 }
 
+/// Play the start cue. Returns at once: the first `PlaySound` of a process can take tens of ms (it
+/// loads winmm and opens the audio path), and this is called on the UI thread just as the pill's
+/// entrance animation begins.
 pub fn play_start() {
-    play(&cues().start);
+    post(Cue::Start);
 }
 
+/// Play the stop cue (returns at once, see [`play_start`]).
 pub fn play_stop() {
-    play(&cues().stop);
+    post(Cue::Stop);
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Cue {
+    Warm,
+    Start,
+    Stop,
+}
+
+/// `PlaySound` is process-global (a new sound cuts off the one playing), so one thread plays every
+/// cue, in the order they were asked for.
+static PLAYER: OnceLock<Option<Sender<Cue>>> = OnceLock::new();
+
+fn play_cue(c: Cue) {
+    play(match c {
+        Cue::Warm => &cues().warmup,
+        Cue::Start => &cues().start,
+        Cue::Stop => &cues().stop,
+    });
+}
+
+/// A thread that plays what it is sent, in order, with `play`.
+fn spawn_player(play: impl Fn(Cue) + Send + 'static) -> Option<Sender<Cue>> {
+    let (tx, rx) = channel::<Cue>();
+    std::thread::Builder::new()
+        .name("cue-player".into())
+        .spawn(move || {
+            while let Ok(c) = rx.recv() {
+                play(c);
+            }
+        })
+        .ok()
+        .map(|_| tx)
+}
+
+fn post(c: Cue) {
+    let tx = PLAYER.get_or_init(|| spawn_player(play_cue));
+    // no thread (or it died): play here rather than lose the cue
+    if !tx.as_ref().is_some_and(|tx| tx.send(c).is_ok()) {
+        play_cue(c);
+    }
 }
 
 fn play(wav: &'static [u8]) {
@@ -157,6 +204,33 @@ mod tests {
 
     fn peak(s: &[i16]) -> i32 {
         s.iter().map(|&v| i32::from(v).abs()).max().unwrap_or(0)
+    }
+
+    /// Cues are queued, not played inline: asking returns at once even when playing is slow, and the
+    /// order of the requests is the order of the sounds.
+    #[test]
+    fn cues_play_on_their_own_thread_in_request_order() {
+        use std::sync::{Arc, Mutex};
+        use std::time::{Duration, Instant};
+        let log: Arc<Mutex<Vec<(Cue, std::thread::ThreadId)>>> = Arc::new(Mutex::new(Vec::new()));
+        let l = log.clone();
+        let tx = spawn_player(move |c| {
+            std::thread::sleep(Duration::from_millis(40)); // a slow first PlaySound
+            l.lock().unwrap().push((c, std::thread::current().id()));
+        })
+        .expect("player");
+        let t0 = Instant::now();
+        for c in [Cue::Start, Cue::Stop, Cue::Start] {
+            tx.send(c).unwrap();
+        }
+        assert!(t0.elapsed() < Duration::from_millis(30), "asking for a cue blocked for {:?}", t0.elapsed());
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while log.lock().unwrap().len() < 3 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let got = log.lock().unwrap().clone();
+        assert_eq!(got.iter().map(|g| g.0).collect::<Vec<_>>(), [Cue::Start, Cue::Stop, Cue::Start]);
+        assert!(got.iter().all(|g| g.1 != std::thread::current().id()), "played off the calling thread");
     }
 
     #[test]

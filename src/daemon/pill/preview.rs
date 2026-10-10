@@ -51,7 +51,8 @@ pub struct Scene {
     pub scale: f32,
     /// Straight RGBA icon for the app bubble: (name, rgba, size).
     pub icon: Option<(String, Vec<u8>, u32)>,
-    /// Constant microphone RMS, or a synthetic speech-like signal when `None`.
+    /// Constant display level (0 = silence, a flat 4 px line; 1 = full height) as the audio meter
+    /// would publish it, or a synthetic speech-like signal when `None`.
     pub level: Option<f32>,
     pub position: PanelPosition,
     /// Backdrop fixture name (`white`, `black`, `gradient`, `busy-text`) or PNG path; `None` renders
@@ -123,7 +124,8 @@ pub fn composite_over_fixture(st: &RenderState, window: &Pixmap, png: &Pixmap) -
     Some(out)
 }
 
-/// Deterministic speech-like RMS signal (syllable bursts with pauses).
+/// Deterministic speech-like display level (what the audio meter publishes: 0..1, exactly 0 in the
+/// pauses between phrases and syllables).
 pub fn synthetic_level(t_ms: f64) -> f32 {
     let slot = (t_ms / 80.0).floor() as i64;
     // cheap integer hash -> 0..1
@@ -132,16 +134,20 @@ pub fn synthetic_level(t_ms: f64) -> f32 {
     h = h.wrapping_mul(0xBF58_476D_1CE4_E5B9);
     h ^= h >> 32;
     let r = (h & 0xffff) as f32 / 65535.0;
-    // phrase envelope: ~1.1 s phrases with short pauses
+    // phrase envelope: ~1.1 s phrases with short pauses (the gate is shut there)
     let phase = t_ms.rem_euclid(1100.0) as f32 / 1100.0;
-    let env = if phase < 0.82 { (std::f32::consts::PI * phase / 0.82).sin().powf(0.6) } else { 0.04 };
-    (0.004 + r * 0.16 * env).max(0.0)
+    if phase >= 0.82 {
+        return 0.0;
+    }
+    let env = (std::f32::consts::PI * phase / 0.82).sin().powf(0.6);
+    // a few syllables inside a phrase dip to silence
+    if r < 0.12 { 0.0 } else { (env * (0.2 + 0.8 * r)).clamp(0.0, 1.0) }
 }
 
 fn run(st: &mut RenderState, from: f64, to: f64, level: &dyn Fn(f64) -> f32) {
     let mut t = from;
     while t <= to + 1e-6 {
-        st.tick(t, level(t));
+        st.tick_level(t, level(t));
         t += FRAME_MS;
     }
 }
@@ -368,6 +374,7 @@ fn composite_preview(pm: &Pixmap, up: u32, bg: Option<u32>) -> Pixmap {
 /// `--render-pill <state> <t_ms> <out.png> [--dark] [--scale s] [--app-icon path] [--level 0..1]
 ///   [--position bottom-right|bottom-left|center] [--upscale N] [--bg RRGGBB] [--dump-icon out.png]
 ///   [--backdrop white|black|gradient|busy-text|path.png [--composite]]`
+/// `--level` is the display level the audio meter publishes (not a raw RMS): bar height = 4 + level * 18 px.
 /// `--render-pill bench 0 -` prints render timings.
 pub fn cli_render(args: &[String]) -> i32 {
     if args.len() < 3 {
@@ -679,9 +686,9 @@ mod golden {
     fn synthetic_level_is_deterministic_and_speechlike() {
         assert_eq!(synthetic_level(1234.0), synthetic_level(1234.0));
         let vals: Vec<f32> = (0..100).map(|i| synthetic_level(i as f64 * 80.0)).collect();
-        assert!(vals.iter().all(|v| (0.0..0.2).contains(v)));
-        assert!(vals.iter().cloned().fold(0.0, f32::max) > 0.05);
-        assert!(vals.iter().cloned().fold(1.0, f32::min) < 0.02);
+        assert!(vals.iter().all(|v| (0.0..=1.0).contains(v)));
+        assert!(vals.iter().cloned().fold(0.0, f32::max) > 0.7);
+        assert!(vals.contains(&0.0), "pauses are exactly silent");
     }
 
     /// Contact sheets of the expand (260..560 ms after the start, every 20 ms) and of the stop shrink
@@ -764,6 +771,129 @@ mod golden {
                     std::fs::create_dir_all(dir).unwrap();
                     sheet.save_png(dir.join(format!("transition_{}_{}.png", if dark { "dark" } else { "light" }, bd))).unwrap();
                 }
+            }
+        }
+    }
+
+    /// Contact sheets of the waveform answering to a voice, frame by frame: 600 ms of room noise, a
+    /// phrase of seven syllables (onset, dips, a quiet one), a half-second pause, a second phrase,
+    /// then silence. The audio runs through the real meter and the real envelope / delay line with
+    /// the packet clock and the 60 Hz frame clock unrelated; every third frame (50 ms, from 250 ms to 4.75 s) is one tile,
+    /// left to right and top to bottom, with a gauge over it: the display level the meter published
+    /// (white) and the peak since the previous frame (orange). Written only when `OPENTALK_SHOT_DIR`
+    /// is set, e.g. `OPENTALK_SHOT_DIR=docs/screenshots/waveform cargo test --bin opentalk waveform_contact_sheets`.
+    /// Always checks that the room before the voice and the silence after it are exactly flat and
+    /// that the lane follows the voice.
+    #[test]
+    fn waveform_contact_sheets() {
+        use crate::daemon::audio::meter::Meter;
+        const CROP: (u32, u32, u32, u32) = (190, 138, 208, 84); // device px at 2x: x, y, w, h
+        let out = std::env::var_os("OPENTALK_SHOT_DIR").map(PathBuf::from);
+        let mut seed = 0x1357_9BDFu64;
+        let mut noise = |db: f32, ms: usize| -> Vec<i16> {
+            let a = 10f32.powf(db / 20.0) * 3f32.sqrt() * 32768.0;
+            (0..ms * 16)
+                .map(|_| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    ((((seed >> 11) as f64 / (1u64 << 53) as f64) as f32 * 2.0 - 1.0) * a) as i16
+                })
+                .collect()
+        };
+        let syllable = |db: f32, ms: usize| -> Vec<i16> {
+            let a = 10f32.powf(db / 20.0) * 2f32.sqrt() * 32768.0;
+            (0..ms * 16)
+                .map(|n| {
+                    // a quick onset and a softer tail, like a spoken syllable
+                    let x = n as f32 / (ms * 16) as f32;
+                    let env = (x * 12.0).min(1.0) * (1.0 - x).powf(0.5);
+                    (a * env * (n as f32 * 2.0 * std::f32::consts::PI * 170.0 / 16_000.0).sin()) as i16
+                })
+                .collect()
+        };
+        let mut pcm = noise(-62.0, 600);
+        let phrase1 = [(-22.0, 180), (-25.0, 140), (-20.0, 220), (-31.0, 130), (-24.0, 170), (-21.0, 200), (-27.0, 150)];
+        for (k, &(db, ms)) in phrase1.iter().enumerate() {
+            pcm.extend(syllable(db, ms));
+            pcm.extend(noise(-62.0, if k == 2 { 140 } else { 60 }));
+        }
+        pcm.extend(noise(-62.0, 500));
+        for &(db, ms) in &[(-23.0, 200), (-26.0, 160), (-21.0, 260)] {
+            pcm.extend(syllable(db, ms));
+            pcm.extend(noise(-62.0, 70));
+        }
+        pcm.extend(noise(-62.0, 2200));
+
+        for dark in [false, true] {
+            let mut st = RenderState::new(Palette::get(dark), 2.0, PanelPosition::BottomRight);
+            st.set_mode(PillMode::Recording, -PREROLL_MS);
+            st.settle();
+            let png = Pixmap::load_png(backdrop_path("gradient")).expect("backdrop fixture");
+            st.set_backdrop(fixture_backdrop(&st, &png));
+            let mut meter = Meter::new();
+            let (mut level, mut peak) = (0.0f32, 0.0f32);
+            let mut tiles: Vec<(Pixmap, f32, f32)> = Vec::new();
+            let total_ms = pcm.len() as f64 / 16.0;
+            let (mut next_frame, mut frame_no) = (3.0, 0u32);
+            let mut flat_before = true;
+            let mut peak_h = 0.0f32;
+            let mut end_flat = false;
+            for (k, packet) in pcm.chunks(160).enumerate() {
+                let delivered = (k + 1) as f64 * 10.0;
+                while next_frame < delivered && next_frame < total_ms {
+                    st.tick(next_frame, level, peak);
+                    if frame_no % 3 == 0 && (250.0..=4750.0).contains(&next_frame) {
+                        let win = render_frame(&st, next_frame).expect("frame");
+                        tiles.push((composite_over_fixture(&st, &win, &png).expect("composite"), level, peak));
+                    }
+                    let hs = st.waveform().heights(next_frame);
+                    if next_frame < 590.0 {
+                        flat_before &= hs.iter().all(|&h| h == 4.0);
+                    }
+                    peak_h = peak_h.max(hs.iter().cloned().fold(0.0, f32::max));
+                    end_flat = hs.iter().all(|&h| h == 4.0);
+                    peak = 0.0;
+                    next_frame += FRAME_MS;
+                    frame_no += 1;
+                }
+                meter.push(packet, |h| {
+                    level = h.level;
+                    peak = peak.max(h.level);
+                });
+            }
+            assert!(flat_before, "the room before the voice must draw an exactly flat lane");
+            assert!(peak_h > 18.0, "the voice reaches near full height, got {peak_h}");
+            assert!(end_flat, "the silence after the voice is exactly flat again");
+            if let Some(dir) = &out {
+                let (cw, ch, cols) = (CROP.2, CROP.3 + 10, 6u32);
+                let rows = (tiles.len() as u32).div_ceil(cols);
+                let mut sheet = Pixmap::new(cw * cols, ch * rows).expect("sheet");
+                sheet.fill(tiny_skia::Color::from_rgba8(24, 24, 28, 255));
+                let sw = cw * cols;
+                for (n, (f, lvl, pk)) in tiles.iter().enumerate() {
+                    let (col, row) = (n as u32 % cols, n as u32 / cols);
+                    let (ox, oy) = (col * cw, row * ch);
+                    let dst = sheet.data_mut();
+                    for y in 0..CROP.3 {
+                        for x in 0..CROP.2 {
+                            let si = (((CROP.1 + y) * f.width() + CROP.0 + x) * 4) as usize;
+                            let di = (((oy + y) * sw + ox + x) * 4) as usize;
+                            dst[di..di + 4].copy_from_slice(&f.data()[si..si + 4]);
+                        }
+                    }
+                    // gauges: the level the meter published (white), the peak since the last frame (orange)
+                    for (yy, v, rgb) in [(CROP.3 + 1, *lvl, [255u8, 255, 255]), (CROP.3 + 5, *pk, [255, 140, 0])] {
+                        for y in yy..yy + 3 {
+                            for x in 0..(CROP.2 as f32 * v.clamp(0.0, 1.0)) as u32 {
+                                let di = (((oy + y) * sw + ox + x) * 4) as usize;
+                                dst[di..di + 4].copy_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
+                            }
+                        }
+                    }
+                }
+                std::fs::create_dir_all(dir).unwrap();
+                sheet.save_png(dir.join(format!("waveform_{}.png", if dark { "dark" } else { "light" }))).unwrap();
             }
         }
     }

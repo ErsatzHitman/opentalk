@@ -839,10 +839,10 @@ mod tests {
     #[test]
     fn waveform_bars_follow_levels() {
         let mut s = rec_state(false);
-        // constant loud level for 1500 ms at 60 fps
+        // constant full-scale display level for 1500 ms at 60 fps
         let mut t = 0.0;
         while t <= 1500.0 {
-            s.tick(t, 0.2);
+            s.tick_level(t, 1.0);
             t += 1000.0 / 60.0;
         }
         let pm = render(&s, 1500.0);
@@ -856,7 +856,7 @@ mod tests {
         let mut s2 = rec_state(false);
         let mut t = 0.0;
         while t <= 1500.0 {
-            s2.tick(t, 0.0);
+            s2.tick_level(t, 0.0);
             t += 1000.0 / 60.0;
         }
         let pm2 = render(&s2, 1500.0);
@@ -872,7 +872,7 @@ mod tests {
         let mut s = rec_state(true);
         let mut t = 0.0;
         while t <= 1000.0 {
-            s.tick(t, 0.05);
+            s.tick_level(t, 0.4);
             t += 1000.0 / 60.0;
         }
         let mut pm = Pixmap::new(208, 120).unwrap();
@@ -932,16 +932,16 @@ mod tests {
 
     const FRAME: f64 = 1000.0 / 60.0;
 
-    /// Tick a state at 60 fps from `*t` up to (and including) `until`; `level` is the mic RMS.
+    /// Tick a state at 60 fps from `*t` up to (and including) `until`; `level` is the mic display level (0..1).
     fn run(s: &mut RenderState, t: &mut f64, until: f64, level: &dyn Fn(f64) -> f32) {
         while *t <= until {
-            s.tick(*t, level(*t));
+            s.tick_level(*t, level(*t));
             *t += FRAME;
         }
     }
 
     fn speech(t: f64) -> f32 {
-        0.02 + 0.2 * (t / 137.0).sin().abs() as f32
+        0.1 + 0.85 * (t / 137.0).sin().abs() as f32
     }
 
     fn new_pm(s: &RenderState) -> Pixmap {
@@ -983,7 +983,7 @@ mod tests {
             let lane = lane_dev(scale, &pm);
             let (mut dirty, mut skipped) = (0, 0);
             for _ in 0..180 {
-                s.tick(t, speech(t));
+                s.tick_level(t, speech(t));
                 let before = pm.data().to_vec();
                 match cache.render(&s, t, &mut pm) {
                     FrameOutcome::Skip => {
@@ -1017,7 +1017,7 @@ mod tests {
             let mut cache = FrameCache::new();
             cache.render(&s, t, &mut pm);
             for _ in 0..60 {
-                s.tick(t, speech(t));
+                s.tick_level(t, speech(t));
                 if let FrameOutcome::Dirty(r) = cache.render(&s, t, &mut pm) {
                     assert!(r.area() * 10 < full_rect(&pm).area(), "{pos:?}: {r:?} is not small");
                 }
@@ -1051,7 +1051,7 @@ mod tests {
             let bubble = bubble_dev(&s, t0, &pm);
             let mut mid = None;
             while t < t0 + ICON_SWAP_MS + 4.0 * FRAME {
-                s.tick(t, speech(t));
+                s.tick_level(t, speech(t));
                 cache.render(&s, t, &mut pm);
                 // the cached path never drifts from a full render while the icons cross-fade
                 assert!(max_diff(&pm, &render(&s, t)) <= 2, "dark {dark}: drifted at {}", t - t0);
@@ -1090,7 +1090,7 @@ mod tests {
         assert!(matches!(cache.render(&s, t, &mut pm), FrameOutcome::Dirty(_)));
         for _ in 0..120 {
             t += FRAME;
-            s.tick(t, 0.0);
+            s.tick_level(t, 0.0);
             assert_eq!(cache.render(&s, t, &mut pm), FrameOutcome::Skip, "silent input needs no repaint at {t}");
         }
         assert_eq!(pm.data(), render(&s, t).data());
@@ -1098,11 +1098,47 @@ mod tests {
         let mut woke = false;
         for _ in 0..30 {
             t += FRAME;
-            s.tick(t, 0.2);
+            s.tick_level(t, 0.8);
             woke |= matches!(cache.render(&s, t, &mut pm), FrameOutcome::Dirty(_));
         }
         assert!(woke);
         assert_eq!(pm.data(), render(&s, t).data());
+    }
+
+    /// A real microphone in a quiet room is never digital zero: through the meter its noise is still
+    /// an exactly flat lane, so the renderer skips every frame (the old raw-RMS path repainted
+    /// nearly every one, since room noise moved the bars by fractions of a pixel).
+    #[test]
+    fn a_noisy_room_through_the_meter_skips_every_frame() {
+        use crate::daemon::audio::meter::Meter;
+        let mut s = rec_state(true);
+        let mut t = 0.0;
+        run(&mut s, &mut t, 1500.0, &|_| 0.0);
+        let mut pm = new_pm(&s);
+        let mut cache = FrameCache::new();
+        assert!(matches!(cache.render(&s, t, &mut pm), FrameOutcome::Dirty(_)));
+        let (mut meter, mut seed, mut level) = (Meter::new(), 0x2545_F491u32, 0.0f32);
+        let mut skipped = 0;
+        for _ in 0..600 {
+            // 16.7 ms of room noise (about -58 dBFS), in 10 ms packets as they arrive
+            let pkt: Vec<i16> = (0..267)
+                .map(|_| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 17;
+                    seed ^= seed << 5;
+                    ((seed % 141) as i32 - 70) as i16
+                })
+                .collect();
+            for p in pkt.chunks(160) {
+                meter.push(p, |h| level = h.level);
+            }
+            t += FRAME;
+            s.tick_level(t, level);
+            if cache.render(&s, t, &mut pm) == FrameOutcome::Skip {
+                skipped += 1;
+            }
+        }
+        assert_eq!(skipped, 600, "every frame of a noisy-but-silent recording is skipped");
     }
 
     #[test]
@@ -1112,7 +1148,7 @@ mod tests {
         let mut cache = FrameCache::new();
         // entrance: the capsule is still growing
         for ms in [0.0, 100.0, 300.0, 450.0] {
-            s.tick(ms, 0.1);
+            s.tick_level(ms, 0.5);
             assert_eq!(cache.render(&s, ms, &mut pm), FrameOutcome::Dirty(full_rect(&pm)));
             assert_eq!(pm.data(), render(&s, ms).data());
         }
@@ -1131,7 +1167,7 @@ mod tests {
         fn settle_incrementally(cache: &mut FrameCache, s: &mut RenderState, t: &mut f64, pm: &mut Pixmap) {
             for _ in 0..30 {
                 *t += FRAME;
-                s.tick(*t, speech(*t));
+                s.tick_level(*t, speech(*t));
                 match cache.render(s, *t, pm) {
                     FrameOutcome::Dirty(r) if r == full_rect(pm) => {}
                     _ => return,
@@ -1189,7 +1225,7 @@ mod tests {
         let incremental = |cache: &mut FrameCache, s: &mut RenderState, t: &mut f64, pm: &mut Pixmap| {
             for _ in 0..4 {
                 *t += FRAME;
-                s.tick(*t, speech(*t));
+                s.tick_level(*t, speech(*t));
                 if cache.render(s, *t, pm) != FrameOutcome::Dirty(full_rect(pm)) {
                     return true;
                 }
@@ -1199,7 +1235,7 @@ mod tests {
         assert!(incremental(&mut cache, &mut s, &mut t, &mut pm), "the lane updates incrementally");
         // a new picture under the glass: full repaint, identical to the reference renderer
         assert!(s.set_backdrop(Some(flat([30, 60, 200], 0))));
-        s.tick(t, speech(t));
+        s.tick_level(t, speech(t));
         assert_eq!(cache.render(&s, t, &mut pm), FrameOutcome::Dirty(full_rect(&pm)));
         assert_eq!(pm.data(), render(&s, t).data());
         assert!(incremental(&mut cache, &mut s, &mut t, &mut pm), "steady again after the rebuild");
@@ -1252,7 +1288,7 @@ mod tests {
             let (mut steady, mut lane_only) = (Vec::new(), 0);
             for _ in 0..90 {
                 t += FRAME;
-                s.tick(t, speech(t));
+                s.tick_level(t, speech(t));
                 let t0 = std::time::Instant::now();
                 let out = cache.render(&s, t, &mut pm);
                 steady.push(t0.elapsed().as_secs_f64() * 1000.0);
@@ -1334,7 +1370,7 @@ mod tests {
             assert!(matches!(cache.render(&s, t, &mut pm), FrameOutcome::Dirty(_)));
             let mut partial = 0;
             for _ in 0..90 {
-                s.tick(t, speech(t));
+                s.tick_level(t, speech(t));
                 if let FrameOutcome::Dirty(r) = cache.render(&s, t, &mut pm) {
                     partial += (r != full_rect(&pm)) as u32;
                 }
@@ -1365,7 +1401,7 @@ mod tests {
             let mut worst = 0;
             for _ in 0..200 {
                 t += FRAME;
-                s.tick(t, 0.0);
+                s.tick_level(t, 0.0);
                 let out = cache.render(&s, t, &mut pm);
                 let FrameOutcome::Dirty(r) = out else { panic!("the glow never rests") };
                 assert!(r.area() < full_rect(&pm).area(), "glow update is a sub-rect: {r:?}");
@@ -1457,7 +1493,7 @@ mod tests {
         let mut full = std::time::Duration::ZERO;
         for _ in 0..n {
             t += FRAME;
-            s.tick(t, speech(t));
+            s.tick_level(t, speech(t));
             let t0 = std::time::Instant::now();
             cache.render(&s, t, &mut pm);
             cached += t0.elapsed();
@@ -1505,7 +1541,7 @@ mod tests {
             // the resting circle for a while (steady shape), then the recording starts
             let mut t = -400.0;
             while t < 0.0 {
-                s.tick(t, 0.0);
+                s.tick_level(t, 0.0);
                 cache.render(&s, t, &mut pm);
                 t += FRAME;
             }
@@ -1514,7 +1550,7 @@ mod tests {
             let (bakes, held) = (glass::bake_count(), glass::disp_cache_len());
             let mut expand_bakes = 0;
             while t <= 2200.0 {
-                s.tick(t, speech(t));
+                s.tick_level(t, speech(t));
                 let before = glass::bake_count();
                 let t0 = std::time::Instant::now();
                 cache.render(&s, t, &mut pm);
@@ -1535,7 +1571,7 @@ mod tests {
             let t_stop = t;
             let mut shrink_bakes = 0;
             while t <= t_stop + 320.0 {
-                s.tick(t, 0.0);
+                s.tick_level(t, 0.0);
                 let before = glass::bake_count();
                 let t0 = std::time::Instant::now();
                 cache.render(&s, t, &mut pm);
@@ -1575,7 +1611,7 @@ mod tests {
             let mut cache = FrameCache::new();
             let mut t = 0.0;
             while t < 1500.0 {
-                s.tick(t, speech(t));
+                s.tick_level(t, speech(t));
                 cache.render(&s, t, &mut pm);
                 t += FRAME;
             }
@@ -1586,7 +1622,7 @@ mod tests {
                 s.set_pointer(Pointer { group: over, pill: over, bubble: false, cancel: false }, t);
                 let t_end = t + CANCEL_EMERGE_MS - 20.0;
                 while t < t_end {
-                    s.tick(t, speech(t));
+                    s.tick_level(t, speech(t));
                     let before = glass::bake_count();
                     let t0 = std::time::Instant::now();
                     cache.render(&s, t, &mut pm);
@@ -1597,7 +1633,7 @@ mod tests {
                     t += FRAME;
                 }
                 for _ in 0..6 {
-                    s.tick(t, speech(t));
+                    s.tick_level(t, speech(t));
                     cache.render(&s, t, &mut pm);
                     t += FRAME;
                 }
@@ -1624,13 +1660,13 @@ mod tests {
             let mut steady = mk();
             let mut t = 0.0;
             while t <= 2000.0 {
-                steady.tick(t, 0.0);
+                steady.tick_level(t, 0.0);
                 t += FRAME;
             }
             let mut sparse = mk();
             for (i, t) in (0..).map(|i| (i, i as f64 * 41.0 + (i % 3) as f64 * 7.0)).take_while(|(_, t)| *t <= 2000.0) {
                 if i % 2 == 0 {
-                    sparse.tick(t, 0.0);
+                    sparse.tick_level(t, 0.0);
                 }
             }
             for st in [&mut steady, &mut sparse] {
@@ -1703,25 +1739,25 @@ mod tests {
             // warm: thread-local tables, the cached base, the glow sprites (built when the window is created)
             let _ = glow::Sprites::get(scale);
             while t <= 300.0 {
-                s.tick(t, speech(t));
+                s.tick_level(t, speech(t));
                 cache.render(&s, t, &mut pm);
                 t += FRAME;
             }
             let ((), expand) = allocs::count(|| {
                 while t <= 540.0 {
-                    s.tick(t, speech(t));
+                    s.tick_level(t, speech(t));
                     cache.render(&s, t, &mut pm);
                     t += FRAME;
                 }
             });
             while t <= 2000.0 {
-                s.tick(t, speech(t));
+                s.tick_level(t, speech(t));
                 cache.render(&s, t, &mut pm);
                 t += FRAME;
             }
             let ((), steady) = allocs::count(|| {
                 for _ in 0..60 {
-                    s.tick(t, speech(t));
+                    s.tick_level(t, speech(t));
                     cache.render(&s, t, &mut pm);
                     t += FRAME;
                 }
@@ -1730,7 +1766,7 @@ mod tests {
             let t_stop = t;
             let ((), shrink) = allocs::count(|| {
                 while t <= t_stop + 250.0 {
-                    s.tick(t, 0.0);
+                    s.tick_level(t, 0.0);
                     cache.render(&s, t, &mut pm);
                     t += FRAME;
                 }
