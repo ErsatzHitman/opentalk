@@ -16,7 +16,8 @@ the same floating recording pill, and adds a deterministic filler-word cleaner, 
   The surfaces are **liquid glass**: they frost and refract the screen behind them. Because that needs a clean copy of the
   screen, the pill is excluded from screen capture, so it does **not appear in screenshots, screen recordings or screen
   sharing** (Windows 10 2004 or newer; on older builds, or when a capture fails, it falls back to neutral frosted glass).
-  The capture only runs while the pill is visible (see "Pill surface material" in [docs/SPEC.md](docs/SPEC.md)).
+  The capture only runs while the pill is visible: a small copy of the screen around it, about 4 times a second while
+  recording and once every 4 seconds while it rests (see "Pill surface material" in [docs/SPEC.md](docs/SPEC.md)).
 - **Fast.** Mic stream prepared in advance, TLS connection pre-warmed at key press, silence trimmed before upload, streaming
   transport for Deepgram / AssemblyAI / OpenAI Realtime / Gemini Live. Local post-processing is a few milliseconds.
 - **Clean text.** Deterministic filler removal (um, uh, "you know", stutters, loops, hallucinated "Thanks for watching"),
@@ -76,7 +77,7 @@ Command line (the exe is a GUI-subsystem program, so run these from a terminal a
 | `opentalk.exe --hidden` | Start straight into the tray (what launch-at-login uses) |
 | `opentalk.exe --settings [history\|dictionary\|settings[:section]]` | Open the control panel |
 | `opentalk.exe --transcribe-file x.wav [--provider id] [--model m] [--llm\|--no-llm]` | Run the full pipeline headless, print JSON `{raw, text, provider, model, stt_ms, cleanup_ms, total_ms}` |
-| `opentalk.exe --render-pill <state> <t_ms> out.png [--dark] [--backdrop white|black|gradient|busy-text]` | Render a pill state to PNG (visual goldens), optionally over a backdrop fixture |
+| `opentalk.exe --render-pill <state> <t_ms> out.png [--dark] [--backdrop white\|black\|gradient\|busy-text [--composite]] [--upscale N]` | Render a pill state to PNG (visual goldens), optionally over a backdrop fixture (`--composite` shows the window over the fixture it sits on) |
 | `opentalk.exe --bench ...` | Benchmark helpers: `toggle`, `dictate <n> <wav>`, `latency`, `mock-stt`, `info` (see `bench/bench.ps1`) |
 
 Automation hooks: `OPENTALK_HOME` (data directory), `OPENTALK_INJECT_WAV` (play a WAV instead of the microphone),
