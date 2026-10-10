@@ -9,18 +9,51 @@ use std::time::Duration;
 
 pub const USER_AGENT: &str = concat!("OpenTalk/", env!("CARGO_PKG_VERSION"), " (Windows)");
 
-static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+static AGENT: OnceLock<Result<ureq::Agent, String>> = OnceLock::new();
+/// Fallback used by [`agent`] when schannel is unavailable: plain HTTP works, HTTPS fails
+/// with a transport error from ureq (no TLS backend configured) instead of panicking.
+static PLAIN_AGENT: OnceLock<ureq::Agent> = OnceLock::new();
 
+fn builder() -> ureq::AgentBuilder {
+    ureq::AgentBuilder::new()
+        .user_agent(USER_AGENT)
+        .timeout_connect(Duration::from_secs(10))
+        .max_idle_connections_per_host(4)
+}
+
+/// Shared keep-alive agent over schannel, or `HttpError::Network` if schannel TLS cannot be
+/// created (the failure is logged once, at first use; the message carries no values).
+pub fn try_agent() -> Result<&'static ureq::Agent, HttpError> {
+    let slot = AGENT.get_or_init(|| match native_tls::TlsConnector::new() {
+        Ok(tls) => Ok(builder().tls_connector(Arc::new(tls)).build()),
+        Err(e) => {
+            crate::log_err!("schannel TLS unavailable: {e}");
+            Err(tls_unavailable_message())
+        }
+    });
+    agent_result(slot)
+}
+
+fn tls_unavailable_message() -> String { "TLS (schannel) unavailable".to_string() }
+
+/// Map the cached agent slot to the public result (pure; unit-tested).
+fn agent_result(slot: &'static Result<ureq::Agent, String>) -> Result<&'static ureq::Agent, HttpError> {
+    slot.as_ref().map_err(|m| HttpError::Network(m.clone()))
+}
+
+/// Shared agent for callers that cannot handle a failure. If schannel is unavailable this
+/// returns a TLS-less agent whose HTTPS requests fail with a transport error (never panics).
 pub fn agent() -> &'static ureq::Agent {
-    AGENT.get_or_init(|| {
-        let tls = native_tls::TlsConnector::new().expect("schannel TLS available");
-        ureq::AgentBuilder::new()
-            .tls_connector(Arc::new(tls))
-            .user_agent(USER_AGENT)
-            .timeout_connect(Duration::from_secs(10))
-            .max_idle_connections_per_host(4)
-            .build()
-    })
+    match try_agent() {
+        Ok(a) => a,
+        Err(_) => PLAIN_AGENT.get_or_init(|| builder().build()),
+    }
+}
+
+/// Agent for one request: plain `http://` URLs (local/self-hosted endpoints) never need TLS,
+/// so only `https://` requests fail when schannel is unavailable.
+fn agent_for(url: &str) -> Result<&'static ureq::Agent, HttpError> {
+    if url.get(..7).is_some_and(|p| p.eq_ignore_ascii_case("http://")) { Ok(agent()) } else { try_agent() }
 }
 
 #[derive(Debug, Clone)]
@@ -90,7 +123,7 @@ fn convert(res: Result<ureq::Response, ureq::Error>) -> Result<HttpResponse, Htt
 
 /// POST raw bytes.
 pub fn post(url: &str, headers: &[(&str, &str)], content_type: &str, body: &[u8], timeout: Duration) -> Result<HttpResponse, HttpError> {
-    let mut req = agent().post(url).timeout(timeout).set("Content-Type", content_type);
+    let mut req = agent_for(url)?.post(url).timeout(timeout).set("Content-Type", content_type);
     for (k, v) in headers {
         req = req.set(k, v);
     }
@@ -103,7 +136,7 @@ pub fn post_json(url: &str, headers: &[(&str, &str)], body: &serde_json::Value, 
 }
 
 pub fn get(url: &str, headers: &[(&str, &str)], timeout: Duration) -> Result<HttpResponse, HttpError> {
-    let mut req = agent().get(url).timeout(timeout);
+    let mut req = agent_for(url)?.get(url).timeout(timeout);
     for (k, v) in headers {
         req = req.set(k, v);
     }
@@ -111,7 +144,7 @@ pub fn get(url: &str, headers: &[(&str, &str)], timeout: Duration) -> Result<Htt
 }
 
 pub fn delete(url: &str, headers: &[(&str, &str)], timeout: Duration) -> Result<HttpResponse, HttpError> {
-    let mut req = agent().delete(url).timeout(timeout);
+    let mut req = agent_for(url)?.delete(url).timeout(timeout);
     for (k, v) in headers {
         req = req.set(k, v);
     }
@@ -128,8 +161,9 @@ pub fn prewarm(url: &str) {
     std::thread::Builder::new()
         .name("prewarm".into())
         .spawn(move || {
+            let Ok(agent) = try_agent() else { return };
             let t = crate::core::timing::now_ms();
-            let r = agent().head(&format!("{origin}/")).timeout(Duration::from_secs(5)).call();
+            let r = agent.head(&format!("{origin}/")).timeout(Duration::from_secs(5)).call();
             crate::log_debug!("prewarm {origin} -> {} in {:.0} ms", match &r { Ok(x) => x.status(), Err(ureq::Error::Status(c, _)) => *c, Err(_) => 0 }, crate::core::timing::now_ms() - t);
             // Drain so the connection returns to the pool.
             if let Ok(resp) | Err(ureq::Error::Status(_, resp)) = r {
@@ -188,11 +222,19 @@ mod tests {
         m.text("model", "whisper-1").file("file", "audio.wav", "audio/wav", b"RIFF");
         let (ct, body) = m.finish();
         let b = String::from_utf8_lossy(&body);
-        let boundary = ct.split("boundary=").nth(1).unwrap();
+        let boundary = ct.split("boundary=").nth(1).unwrap_or_default();
         assert!(b.starts_with(&format!("--{boundary}\r\n")));
         assert!(b.contains("name=\"model\"\r\n\r\nwhisper-1\r\n"));
         assert!(b.contains("filename=\"audio.wav\"\r\nContent-Type: audio/wav\r\n\r\nRIFF\r\n"));
         assert!(b.ends_with(&format!("--{boundary}--\r\n")));
+    }
+
+    #[test]
+    fn agent_failure_maps_to_network_error() {
+        let failed: &'static Result<ureq::Agent, String> = Box::leak(Box::new(Err(tls_unavailable_message())));
+        assert_eq!(agent_result(failed).err(), Some(HttpError::Network("TLS (schannel) unavailable".into())));
+        let ok: &'static Result<ureq::Agent, String> = Box::leak(Box::new(Ok(builder().build())));
+        assert!(agent_result(ok).is_ok());
     }
 
     #[test]

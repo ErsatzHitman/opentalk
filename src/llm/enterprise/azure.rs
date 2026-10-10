@@ -19,7 +19,10 @@ pub(super) fn complete(cfg: &Config, system: &str, user: &str, deadline: &Deadli
         return Err(LlmError::NotConfigured);
     }
     let key = secret("azure_openai").ok_or(LlmError::NotConfigured)?;
-    run(&endpoint, &deployment, version, &key, system, user, deadline)
+    // The explicit underlying model, when set, decides the request shape; the deployment name is
+    // free text and often says nothing about the model behind it.
+    let model = if ai.azure_model.trim().is_empty() { deployment.clone() } else { ai.azure_model.trim().to_string() };
+    run(&endpoint, &deployment, &model, version, &key, system, user, deadline)
 }
 
 /// `https://<resource>.openai.azure.com` from what the user typed: a bare host gets `https://`, and
@@ -36,27 +39,48 @@ fn accepts_temperature(deployment: &str) -> bool {
     !crate::llm::providers::openai_rejects_temperature(deployment)
 }
 
+/// Chat-completions body shaped by the model name (see [`body_for`]).
+#[cfg(test)]
+fn request_body(model: &str, version: &str, system: &str, user: &str) -> Value {
+    body_for(!accepts_temperature(model), model, version, system, user)
+}
+
 /// Chat-completions body. Reasoning deployments (gpt-5*, o-series) take `max_completion_tokens`
 /// (hidden thinking spends it, so it gets a generous floor) and, on API versions that know the
 /// field, the lowest `reasoning_effort` so a cleanup fits the deadline; others get `temperature: 0`.
-fn request_body(deployment: &str, version: &str, system: &str, user: &str) -> Value {
+fn body_for(reasoning: bool, model: &str, version: &str, system: &str, user: &str) -> Value {
     let mut body = json!({ "messages": [
         { "role": "system", "content": system },
         { "role": "user", "content": user },
     ]});
     let budget = max_tokens_for(user);
-    if accepts_temperature(deployment) {
-        body["temperature"] = json!(0);
-        body["max_tokens"] = json!(budget);
-    } else {
+    if reasoning {
         body["max_completion_tokens"] = json!(budget.max(4096));
         if supports_reasoning_effort(version) {
-            if let Some(effort) = crate::llm::providers::openai::reasoning_effort(deployment) {
+            if let Some(effort) = crate::llm::providers::openai::reasoning_effort(model) {
                 body["reasoning_effort"] = json!(effort);
             }
         }
+    } else {
+        body["temperature"] = json!(0);
+        body["max_tokens"] = json!(budget);
     }
     body
+}
+
+/// A 400 that says the other body shape is needed: `Some(true)` = switch to the reasoning shape
+/// (the deployment rejected `temperature`/`max_tokens`), `Some(false)` = back to the classic shape
+/// (it rejected `max_completion_tokens`). `None` for any other failure.
+fn shape_switch(status: u16, body: &str, tried_reasoning: bool) -> Option<bool> {
+    if status != 400 {
+        return None;
+    }
+    let b = body.to_ascii_lowercase();
+    if tried_reasoning {
+        b.contains("max_completion_tokens").then_some(false)
+    } else {
+        (b.contains("temperature") || b.contains("max_tokens")).then_some(true)
+    }
 }
 
 /// `reasoning_effort` on gpt-5 needs 2025-04-01 or later (dated), or the undated `v1`/`preview`.
@@ -67,19 +91,31 @@ fn supports_reasoning_effort(version: &str) -> bool {
     }
 }
 
-fn run(endpoint: &str, deployment: &str, version: &str, key: &str, system: &str, user: &str, deadline: &Deadline) -> Result<String, LlmError> {
+#[allow(clippy::too_many_arguments)]
+fn run(endpoint: &str, deployment: &str, model: &str, version: &str, key: &str, system: &str, user: &str, deadline: &Deadline) -> Result<String, LlmError> {
     let url = format!(
         "{endpoint}/openai/deployments/{}/chat/completions?api-version={}",
         uri_encode(deployment),
         uri_encode(version)
     );
-    let body = request_body(deployment, version, system, user);
-    let resp = http::post_json(&url, &[("api-key", key)], &body, deadline.remaining()?).map_err(net_err)?;
-    if !resp.ok() {
-        return Err(http_error(resp.status, &resp.body));
+    let mut reasoning = !accepts_temperature(model);
+    let mut retried = false;
+    loop {
+        let body = body_for(reasoning, model, version, system, user);
+        let resp = http::post_json(&url, &[("api-key", key)], &body, deadline.remaining()?).map_err(net_err)?;
+        if resp.ok() {
+            let v = resp.json().map_err(|e| LlmError::InvalidOutput(format!("bad JSON: {e}")))?;
+            return extract(&v);
+        }
+        // One retry with the other shape, inside the same deadline (`remaining()` above bounds it).
+        match shape_switch(resp.status, &resp.body, reasoning) {
+            Some(next) if !retried => {
+                retried = true;
+                reasoning = next;
+            }
+            _ => return Err(http_error(resp.status, &resp.body)),
+        }
     }
-    let v = resp.json().map_err(|e| LlmError::InvalidOutput(format!("bad JSON: {e}")))?;
-    extract(&v)
 }
 
 /// `choices[0].message.content` (string, or an array of text parts).
@@ -109,7 +145,7 @@ mod tests {
     fn request_shape_and_response() {
         let mock = serve(|_| (200, OK.into()));
         let deadline = Deadline::new(5000);
-        let out = run(&mock.base, "my dep", "2024-10-21", "KEY123", "SYS", "USR", &deadline).unwrap();
+        let out = run(&mock.base, "my dep", "my dep", "2024-10-21", "KEY123", "SYS", "USR", &deadline).unwrap();
         assert_eq!(out, "Hello, world.");
         let reqs = mock.reqs.lock().unwrap();
         let r = &reqs[0];
@@ -153,14 +189,117 @@ mod tests {
         assert!(n.get("max_completion_tokens").is_none());
     }
 
+    const UNSUPPORTED_TEMP: &str = r#"{"error":{"code":"unsupported_parameter","message":"Unsupported parameter: 'max_tokens' is not supported with this model. Use 'max_completion_tokens' instead."}}"#;
+
+    /// Mock deployment that behaves like gpt-5: rejects `temperature`/`max_tokens` with a 400.
+    fn reasoning_backend() -> super::super::testutil::Mock {
+        serve(|r| {
+            let b: Value = serde_json::from_str(&r.body).unwrap();
+            if b.get("temperature").is_some() || b.get("max_tokens").is_some() { (400, UNSUPPORTED_TEMP.into()) } else { (200, OK.into()) }
+        })
+    }
+
+    #[test]
+    fn unsupported_parameter_400_retries_with_reasoning_body() {
+        let mock = reasoning_backend();
+        // Deployment "cleanup" gives no hint, so the first body is the classic shape.
+        let out = run(&mock.base, "cleanup", "cleanup", "2024-10-21", "K", "s", "u", &Deadline::new(5000)).unwrap();
+        assert_eq!(out, "Hello, world.");
+        let reqs = mock.reqs.lock().unwrap();
+        assert_eq!(reqs.len(), 2);
+        let first: Value = serde_json::from_str(&reqs[0].body).unwrap();
+        let second: Value = serde_json::from_str(&reqs[1].body).unwrap();
+        assert_eq!(first["temperature"], json!(0));
+        assert!(second.get("temperature").is_none() && second.get("max_tokens").is_none());
+        assert_eq!(second["max_completion_tokens"], json!(4096));
+    }
+
+    #[test]
+    fn retry_happens_once_and_only_for_shape_errors() {
+        // A persistent 400 about temperature is retried exactly once, then reported.
+        let mock = serve(|_| (400, UNSUPPORTED_TEMP.into()));
+        let e = run(&mock.base, "cleanup", "cleanup", "2024-10-21", "K", "s", "u", &Deadline::new(5000)).unwrap_err();
+        assert!(matches!(e, LlmError::Http { status: 400, .. }));
+        assert_eq!(mock.reqs.lock().unwrap().len(), 2);
+        // An unrelated 400 is not retried.
+        let mock = serve(|_| (400, r#"{"error":{"message":"content filter"}}"#.into()));
+        assert!(run(&mock.base, "cleanup", "cleanup", "2024-10-21", "K", "s", "u", &Deadline::new(5000)).is_err());
+        assert_eq!(mock.reqs.lock().unwrap().len(), 1);
+        // Neither is another status.
+        let mock = serve(|_| (500, "temperature".into()));
+        assert!(run(&mock.base, "cleanup", "cleanup", "2024-10-21", "K", "s", "u", &Deadline::new(5000)).is_err());
+        assert_eq!(mock.reqs.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn reasoning_shape_rejected_falls_back_to_classic_once() {
+        let mock = serve(|r| {
+            let b: Value = serde_json::from_str(&r.body).unwrap();
+            if b.get("max_completion_tokens").is_some() {
+                (400, r#"{"error":{"message":"Unrecognized request argument supplied: max_completion_tokens"}}"#.into())
+            } else {
+                (200, OK.into())
+            }
+        });
+        // "o-series"-looking name on a deployment that is really a classic model.
+        assert_eq!(run(&mock.base, "o3-proxy", "o3-proxy", "2024-10-21", "K", "s", "u", &Deadline::new(5000)).unwrap(), "Hello, world.");
+        assert_eq!(mock.reqs.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn retry_stays_inside_the_deadline() {
+        let mock = serve(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            (400, UNSUPPORTED_TEMP.into())
+        });
+        let t = std::time::Instant::now();
+        let r = run(&mock.base, "cleanup", "cleanup", "2024-10-21", "K", "s", "u", &Deadline::new(400));
+        assert!(r.is_err());
+        assert!(t.elapsed() < std::time::Duration::from_millis(1500), "took {:?}", t.elapsed());
+    }
+
+    #[test]
+    fn explicit_azure_model_picks_reasoning_body_first_try() {
+        // SAFETY: same variable and value as `complete_uses_config_and_override`.
+        unsafe { std::env::set_var("OPENTALK_SECRET_AZURE_OPENAI", "ENVKEY") };
+        let mock = reasoning_backend();
+        let mut c = cfg(LlmProviderId::AzureOpenai);
+        c.ai_cleanup.azure_endpoint = "https://unused.openai.azure.com".into();
+        c.ai_cleanup.azure_deployment = "cleanup".into();
+        c.ai_cleanup.azure_model = " gpt-5-mini ".into();
+        c.ai_cleanup.azure_api_version = "2025-04-01-preview".into();
+        assert_eq!(complete_with(&c, "s", "u", 5000, Some(&mock.base)).unwrap(), "Hello, world.");
+        let reqs = mock.reqs.lock().unwrap();
+        assert_eq!(reqs.len(), 1, "no retry needed when the model is known");
+        assert!(reqs[0].target.starts_with("/openai/deployments/cleanup/"), "URL still uses the deployment: {}", reqs[0].target);
+        let b: Value = serde_json::from_str(&reqs[0].body).unwrap();
+        assert_eq!(b["max_completion_tokens"], json!(4096));
+        assert_eq!(b["reasoning_effort"], json!("minimal"));
+        assert!(b.get("temperature").is_none());
+    }
+
+    #[test]
+    fn explicit_azure_model_can_force_classic_shape() {
+        // SAFETY: same variable and value as `complete_uses_config_and_override`.
+        unsafe { std::env::set_var("OPENTALK_SECRET_AZURE_OPENAI", "ENVKEY") };
+        let mock = serve(|_| (200, OK.into()));
+        let mut c = cfg(LlmProviderId::AzureOpenai);
+        c.ai_cleanup.azure_endpoint = "https://unused.openai.azure.com".into();
+        c.ai_cleanup.azure_deployment = "gpt-5-prod-name".into();
+        c.ai_cleanup.azure_model = "gpt-4.1-mini".into();
+        complete_with(&c, "s", "u", 5000, Some(&mock.base)).unwrap();
+        let b: Value = serde_json::from_str(&mock.reqs.lock().unwrap()[0].body).unwrap();
+        assert_eq!(b["temperature"], json!(0));
+    }
+
     #[test]
     fn errors_map() {
         let mock = serve(|_| (401, r#"{"error":{"code":"401","message":"Access denied"}}"#.into()));
-        let e = run(&mock.base, "d", "v", "bad", "s", "u", &Deadline::new(5000)).unwrap_err();
+        let e = run(&mock.base, "d", "d", "v", "bad", "s", "u", &Deadline::new(5000)).unwrap_err();
         assert_eq!(e, LlmError::Http { status: 401, detail: "Access denied".into() });
 
         let mock = serve(|_| (200, r#"{"choices":[{"message":{"content":""}}]}"#.into()));
-        assert!(matches!(run(&mock.base, "d", "v", "k", "s", "u", &Deadline::new(5000)), Err(LlmError::InvalidOutput(_))));
+        assert!(matches!(run(&mock.base, "d", "d", "v", "k", "s", "u", &Deadline::new(5000)), Err(LlmError::InvalidOutput(_))));
     }
 
     #[test]

@@ -211,11 +211,17 @@ pub fn classify(provider: &str, status: u16, body: &str) -> SttError {
 /// Like [`classify`], with the model (for "doesn't recognize the model" text) and the
 /// self-hosted flag (user-run endpoints: "Your server ..." wording, 404 is a wrong URL).
 pub fn classify_for(provider: &str, model: Option<&str>, self_hosted: bool, status: u16, body: &str) -> SttError {
+    classify_with(provider, model, self_hosted, status, body, &[])
+}
+
+/// [`classify_for`] that also removes the configured `secrets` (API key, client secret) from
+/// the detail before it is bounded, so a provider echoing the key never leaks it.
+pub fn classify_with(provider: &str, model: Option<&str>, self_hosted: bool, status: u16, body: &str, secrets: &[&str]) -> SttError {
     let code = code_for_status(status, body, self_hosted);
     SttError {
         code,
         message: message_for(code, provider, model, self_hosted),
-        detail: format!("HTTP {status}: {}", sanitize_detail(body)),
+        detail: format!("HTTP {status}: {}", sanitize_detail(body, secrets)),
         status: Some(status),
     }
 }
@@ -227,14 +233,25 @@ pub fn check_response(
     self_hosted: bool,
     res: Result<HttpResponse, HttpError>,
 ) -> Result<HttpResponse, SttError> {
+    check_response_with(provider, model, self_hosted, res, &[])
+}
+
+/// [`check_response`] that removes the configured `secrets` from every error text.
+pub fn check_response_with(
+    provider: &str,
+    model: Option<&str>,
+    self_hosted: bool,
+    res: Result<HttpResponse, HttpError>,
+    secrets: &[&str],
+) -> Result<HttpResponse, SttError> {
     match res {
-        Err(e) => Err(from_transport(provider, self_hosted, &e)),
+        Err(e) => Err(from_transport_with(provider, self_hosted, &e, secrets)),
         Ok(r) if r.ok() => Ok(r),
         Ok(r) => {
-            let mut err = classify_for(provider, model, self_hosted, r.status, &r.body);
+            let mut err = classify_with(provider, model, self_hosted, r.status, &r.body, secrets);
             let id = ["x-request-id", "request-id", "cf-ray"].iter().find_map(|h| r.header(h));
             if let Some(id) = id {
-                err.detail.push_str(&format!(" (request id {})", redact(id)));
+                err.detail.push_str(&format!(" (request id {})", redact_with(id, secrets)));
             }
             Err(err)
         }
@@ -243,11 +260,17 @@ pub fn check_response(
 
 /// Transport-level failure (DNS/connect/TLS/timeout).
 pub fn from_transport(provider: &str, self_hosted: bool, e: &HttpError) -> SttError {
+    from_transport_with(provider, self_hosted, e, &[])
+}
+
+/// [`from_transport`] that removes the configured `secrets` (a URL-borne key can appear in
+/// the transport error text).
+pub fn from_transport_with(provider: &str, self_hosted: bool, e: &HttpError, secrets: &[&str]) -> SttError {
     let (code, status) = match e {
         HttpError::Timeout => (SttErrorCode::Timeout, None),
         HttpError::Network(_) => (SttErrorCode::Unreachable, None),
     };
-    SttError { code, message: message_for(code, provider, None, self_hosted), detail: redact(&e.to_string()), status }
+    SttError { code, message: message_for(code, provider, None, self_hosted), detail: redact_with(&e.to_string(), secrets), status }
 }
 
 pub fn not_configured(provider: &str) -> SttError {
@@ -264,9 +287,14 @@ pub fn streaming_only(provider: &str, model: &str) -> SttError {
 
 /// A 2xx response whose body we cannot use.
 pub fn bad_response(provider: &str, self_hosted: bool, what: &str, body: &str) -> SttError {
+    bad_response_with(provider, self_hosted, what, body, &[])
+}
+
+/// [`bad_response`] that removes the configured `secrets` from the detail.
+pub fn bad_response_with(provider: &str, self_hosted: bool, what: &str, body: &str, secrets: &[&str]) -> SttError {
     let name = if self_hosted { SELF_HOSTED_NAME } else { provider };
     SttError::new(SttErrorCode::Other, format!("{name} returned an unexpected response."))
-        .with_detail(format!("{what}: {}", sanitize_detail(body)))
+        .with_detail(format!("{what}: {}", sanitize_detail(body, secrets)))
 }
 
 // ---- redaction ----
@@ -279,9 +307,82 @@ fn run_len(b: &[u8], from: usize, ok: impl Fn(u8) -> bool) -> usize {
     b[from..].iter().take_while(|c| ok(**c)).count()
 }
 
+/// Secrets shorter than this are not matched literally (too likely to mangle ordinary text).
+const MIN_SECRET_LEN: usize = 8;
+
+thread_local! {
+    /// Credentials of the batch call running on this thread (see [`scope_secrets`]).
+    static AMBIENT_SECRETS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Guard returned by [`scope_secrets`]; restores the previous set on drop.
+pub struct SecretScope(Vec<String>);
+
+impl Drop for SecretScope {
+    fn drop(&mut self) {
+        AMBIENT_SECRETS.with(|a| *a.borrow_mut() = std::mem::take(&mut self.0));
+    }
+}
+
+/// Register `secrets` as configured credentials for every [`redact`] on this thread until the
+/// guard drops. The batch dispatcher uses it so providers that build errors without threading
+/// their key explicitly are still covered.
+pub fn scope_secrets(secrets: impl IntoIterator<Item = String>) -> SecretScope {
+    let new: Vec<String> = secrets.into_iter().collect();
+    SecretScope(AMBIENT_SECRETS.with(|a| std::mem::replace(&mut *a.borrow_mut(), new)))
+}
+
+/// Replace every occurrence of each configured secret (and its percent-encoded form, which is
+/// how URL-borne keys show up) with `[redacted]`. Longest first; secrets shorter than
+/// [`MIN_SECRET_LEN`] after trimming are ignored.
+fn strip_secrets(text: &str, secrets: &[&str]) -> String {
+    let mut all: Vec<String> = Vec::new();
+    let mut add = |s: &str| {
+        let s = s.trim();
+        if s.len() < MIN_SECRET_LEN {
+            return;
+        }
+        let enc = super::providers::percent_encode(s);
+        // The streaming encoder also escapes `!*'()` (strict RFC 3986 unreserved set).
+        let strict: String = enc
+            .chars()
+            .map(|c| match c {
+                '!' | '*' | '\'' | '(' | ')' => format!("%{:02X}", c as u8),
+                c => c.to_string(),
+            })
+            .collect();
+        for v in [s.to_string(), enc, strict] {
+            if !all.contains(&v) {
+                all.push(v);
+            }
+        }
+    };
+    secrets.iter().for_each(|s| add(s));
+    AMBIENT_SECRETS.with(|a| a.borrow().iter().for_each(|s| add(s)));
+    all.sort_by_key(|s| std::cmp::Reverse(s.len()));
+    let mut out = text.to_string();
+    for s in &all {
+        if out.contains(s.as_str()) {
+            out = out.replace(s.as_str(), "[redacted]");
+        }
+    }
+    out
+}
+
 /// Strip API keys / bearer tokens from text (`sk-`, `sk-or-`, `gsk_`, `AIza`, `xai-`,
-/// `Bearer ...`, `Token ...`).
+/// `Bearer ...`, `Token ...`) and any credential registered with [`scope_secrets`].
 pub fn redact(text: &str) -> String {
+    redact_with(text, &[])
+}
+
+/// [`redact`] plus the explicitly configured `secrets` (API key, client secret, ...), which
+/// catches prefix-less keys (Deepgram, Mistral, AssemblyAI, custom/Azure) the patterns cannot.
+/// Secrets are replaced before the patterns run.
+pub fn redact_with(text: &str, secrets: &[&str]) -> String {
+    redact_patterns(&strip_secrets(text, secrets))
+}
+
+fn redact_patterns(text: &str) -> String {
     let b = text.as_bytes();
     let mut out = String::with_capacity(text.len());
     let mut i = 0;
@@ -336,12 +437,12 @@ pub fn redact(text: &str) -> String {
 }
 
 /// Redacted, single-line, length-bounded body for `SttError::detail`.
-fn sanitize_detail(body: &str) -> String {
+fn sanitize_detail(body: &str, secrets: &[&str]) -> String {
     let lower = body.to_ascii_lowercase();
     if ["<!doctype", "<html", "<body", "<head"].iter().any(|t| lower.contains(t)) {
         return "<HTML response>".into();
     }
-    let red = redact(body);
+    let red = redact_with(body, secrets);
     let flat = red.split_whitespace().collect::<Vec<_>>().join(" ");
     if flat.chars().count() > MAX_DETAIL_CHARS {
         let cut: String = flat.chars().take(MAX_DETAIL_CHARS).collect();
@@ -437,6 +538,43 @@ mod tests {
         let long = classify("OpenAI", 500, &"x ".repeat(1000));
         assert!(long.detail.chars().count() < 520);
         assert_eq!(classify("OpenAI", 502, "<!DOCTYPE html><html>").detail, "HTTP 502: <HTML response>");
+    }
+
+    const KEY: &str = "dg3f9a1c77b25e0d84aa6c1e";
+
+    #[test]
+    fn configured_key_is_redacted_without_a_known_prefix() {
+        let body = format!("{{\"err\":\"Invalid credentials {KEY}\"}}");
+        assert!(classify("Deepgram", 401, &body).detail.contains(KEY), "patterns alone cannot see it");
+        let e = classify_with("Deepgram", None, false, 401, &body, &[KEY]);
+        assert!(!e.detail.contains(KEY) && !e.message.contains(KEY) && !e.to_string().contains(KEY));
+        assert!(e.detail.contains("[redacted]"));
+        assert!(!redact_with(&format!("k={}", crate::stt::providers::percent_encode("a key/with+odd=chars")), &["a key/with+odd=chars"]).contains("odd"));
+        // both encoder flavours: the batch one keeps `!*'()`, the streaming one escapes them
+        assert!(!redact_with("k=key%21%28x%29secret", &["key!(x)secret"]).contains("secret"));
+        assert!(!redact_with("k=key!(x)secret", &["key!(x)secret"]).contains("secret"));
+        // short secrets are ignored, long ones win over a contained shorter one
+        assert_eq!(redact_with("abc abc", &["abc"]), "abc abc");
+        assert_eq!(redact_with("xx 12345678-abcd yy", &["12345678", "12345678-abcd"]), "xx [redacted] yy");
+    }
+
+    #[test]
+    fn key_cut_by_the_length_bound_cannot_survive() {
+        // Redaction runs before truncation, so a key straddling the 500-char cut is gone.
+        let body = format!("{}{KEY}", "x".repeat(MAX_DETAIL_CHARS - 10));
+        let e = classify_with("Mistral", None, false, 500, &body, &[KEY]);
+        assert!(!e.detail.contains(&KEY[..6]));
+    }
+
+    #[test]
+    fn scoped_secrets_cover_every_redact_until_dropped() {
+        {
+            let _g = scope_secrets([KEY.to_string()]);
+            assert!(!classify("Deepgram", 401, KEY).detail.contains(KEY));
+            assert!(!bad_response("Deepgram", false, "no text", KEY).detail.contains(KEY));
+            assert!(!from_transport("Deepgram", false, &HttpError::Network(format!("GET /x?key={KEY}"))).detail.contains(KEY));
+        }
+        assert!(classify("Deepgram", 401, KEY).detail.contains(KEY), "scope restored on drop");
     }
 
     #[test]

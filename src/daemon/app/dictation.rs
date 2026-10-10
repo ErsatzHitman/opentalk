@@ -126,6 +126,11 @@ fn preflight(cfg: &Config) -> Option<(String, String)> {
     creds.api_key.is_none().then(|| (format!("Add your {} API key", info.name), "Open Settings > Speech-to-Text to add it.".to_string()))
 }
 
+/// The paste will put the user's clipboard back afterwards, so it needs a snapshot of it.
+fn restores_clipboard(cfg: &Config) -> bool {
+    cfg.auto_paste && !cfg.keep_in_clipboard
+}
+
 fn friendly_exe(exe: &str) -> String {
     let stem = exe.trim_end_matches(".exe").trim_end_matches(".EXE");
     let mut c = stem.chars();
@@ -218,7 +223,13 @@ impl App {
 
         // Bring the stream up off the UI thread, then pause media (both can block).
         let (hwnd, level, device, pause) = (self.hwnd, self.level.clone(), cfg.mic_device_id.clone(), cfg.pause_media);
+        let prefetch = restores_clipboard(&cfg);
         let spawned = std::thread::Builder::new().name("rec-start".into()).spawn(move || {
+            // Read the user's clipboard now (on its own worker), so the paste after transcription
+            // does not have to: delay-rendered owners (Excel ranges) take seconds to render.
+            if prefetch {
+                paste::prepare_clipboard_snapshot();
+            }
             let result = Recorder::start(device.as_deref(), level, Some(sink));
             let started = result.is_ok();
             notify(hwnd, Note::RecStarted { seq, result });
@@ -228,6 +239,7 @@ impl App {
         });
         if let Err(e) = spawned {
             log_warn!("cannot spawn the recorder thread: {e}");
+            paste::discard_clipboard_snapshot();
             if let Some(s) = take_session(feed) {
                 s.cancel();
             }
@@ -290,6 +302,7 @@ impl App {
     fn on_rec_started(&mut self, seq: u64, result: Result<Recorder, String>) {
         let Some(rec) = self.rec.as_mut().filter(|r| r.seq == seq) else {
             // Cancelled while the stream was coming up.
+            paste::discard_clipboard_snapshot();
             if let Ok(r) = result {
                 discard_recorder(r, &self.cfg);
             }
@@ -298,6 +311,7 @@ impl App {
         match result {
             Err(e) => {
                 log_warn!("cannot start the microphone: {e}");
+                paste::discard_clipboard_snapshot();
                 let rec = self.rec.take();
                 if let Some(s) = take_session(rec.and_then(|r| r.feed)) {
                     s.cancel();
@@ -416,6 +430,10 @@ impl App {
         self.job = Some(ActiveJob { id, cancel: job.cancel.clone() });
         let spawned = std::thread::Builder::new().name("dictation-worker".into()).spawn(move || {
             let live = matches!(job.capture, Capture::Live { .. });
+            // A retry has no recording start to hook into: read the clipboard while it transcribes.
+            if !live && restores_clipboard(&job.cfg) {
+                paste::prepare_clipboard_snapshot();
+            }
             let (mic, warm) = (job.cfg.mic_device_id.clone(), job.cfg.mic_warm_hold_secs);
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_job(job))).unwrap_or_else(|_| Outcome::Failed {
                 title: "Something went wrong".into(),
@@ -430,6 +448,7 @@ impl App {
         if let Err(e) = spawned {
             log_warn!("cannot start the worker thread: {e}");
             self.job = None;
+            paste::discard_clipboard_snapshot();
             self.machine.step(Input::JobDone);
             crate::daemon::hotkey::set_esc_capture(false);
             self.set_idle();
@@ -443,6 +462,8 @@ impl App {
             return;
         }
         self.job = None;
+        // A paste consumed the clipboard snapshot; any other outcome leaves it unused.
+        paste::discard_clipboard_snapshot();
         self.machine.step(Input::JobDone);
         crate::daemon::hotkey::set_esc_capture(self.machine.is_busy());
         self.apply_outcome(outcome);
@@ -478,6 +499,7 @@ impl App {
 
     pub(super) fn cancel_recording(&mut self) {
         self.kill_timer(TIMER_CAP);
+        paste::discard_clipboard_snapshot();
         if let Some(rec) = self.rec.take() {
             if let Some(session) = take_session(rec.feed) {
                 session.cancel();
@@ -502,6 +524,7 @@ impl App {
             self.cancel_recording();
         }
         if let Some(job) = self.job.take() {
+            paste::discard_clipboard_snapshot();
             job.cancel.store(true, Ordering::Relaxed);
             log_info!("dictation #{} cancelled", job.id);
         }
@@ -610,7 +633,7 @@ fn run_job(job: Job) -> Outcome {
 
     let t_paste = now_ms();
     let note = if cfg.auto_paste {
-        let opts = PasteOptions { restore_clipboard: !cfg.keep_in_clipboard, smart_spacing: cfg.smart_spacing };
+        let opts = PasteOptions { restore_clipboard: restores_clipboard(&cfg), smart_spacing: cfg.smart_spacing };
         match paste::paste_text(&cleaned.text, target.as_ref(), opts) {
             PasteOutcome::Pasted => None,
             PasteOutcome::CopiedOnly { reason } => Some(reason),

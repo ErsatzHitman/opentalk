@@ -202,6 +202,8 @@ fn desktop_pill_frame_cost() {
     let t0 = Instant::now();
     w.with(|i| {
         for _ in 0..n {
+            // drop the frame cache so every present is a full repaint (silent input would be skipped)
+            i.cache.reset();
             i.present();
         }
     });

@@ -24,7 +24,16 @@ pub fn native_options() -> eframe::NativeOptions {
         .with_min_inner_size([760.0, 520.0])
         .with_decorations(false)
         .with_icon(std::sync::Arc::new(app_icon()));
-    eframe::NativeOptions { viewport, centered: true, ..Default::default() }
+    // egui needs no depth/stencil buffer or MSAA; asking for none keeps the pixel format minimal.
+    // These are eframe's defaults, spelled out so the GL config is explicit and cannot drift.
+    // Measured on an NVIDIA driver: none of them (nor software GL, which egui_glow rejects as
+    // GL 1.1) changes the ~265 MB of private commit the driver makes; see docs/BENCHMARK.md.
+    let glow_options = eframe::egui_glow::GlowConfiguration {
+        hardware_acceleration: eframe::egui_glow::HardwareAcceleration::Preferred,
+        vsync: true,
+        ..Default::default()
+    };
+    eframe::NativeOptions { viewport, centered: true, depth_buffer: 0, stencil_buffer: 0, multisampling: 0, glow_options, ..Default::default() }
 }
 
 pub struct App {

@@ -141,16 +141,23 @@ pub fn show(ui: &mut Ui, env: &mut Env, st: &mut SettingsState) -> bool {
         LlmProviderId::AzureOpenai => {
             ui.add_space(10.0);
             w::panel(ui, &p, |ui| {
-                for (i, (label, hint)) in [("Endpoint", "https://my-resource.openai.azure.com"), ("Deployment", "gpt-5-mini"), ("API version", "2024-10-21")].into_iter().enumerate() {
+                let rows = [
+                    ("Endpoint", "", "https://my-resource.openai.azure.com"),
+                    ("Deployment", "", "gpt-5-mini"),
+                    ("API version", "", "2024-10-21"),
+                    ("Underlying model (optional)", "The model behind the deployment. Set it when the deployment name does not contain it (e.g. a deployment named \"cleanup\" serving gpt-5), so the right request parameters are used.", "gpt-5-mini"),
+                ];
+                for (i, (label, desc, hint)) in rows.into_iter().enumerate() {
                     if i > 0 {
                         w::divider(ui, &p);
                     }
-                    w::row_stacked(ui, &p, label, "", |ui| {
+                    w::row_stacked(ui, &p, label, desc, |ui| {
                         let wd = ui.available_width();
                         let buf = match i {
                             0 => &mut cfgc.azure_endpoint,
                             1 => &mut cfgc.azure_deployment,
-                            _ => &mut cfgc.azure_api_version,
+                            2 => &mut cfgc.azure_api_version,
+                            _ => &mut cfgc.azure_model,
                         };
                         changed |= w::text_input(ui, &p, buf, hint, wd, false).changed();
                     });

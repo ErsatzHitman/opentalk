@@ -113,6 +113,10 @@ pub struct AiCleanupConfig {
     pub azure_endpoint: String,
     pub azure_deployment: String,
     pub azure_api_version: String,
+    /// Optional underlying model name (e.g. `gpt-5-mini`) behind the deployment. Decides the
+    /// request shape (reasoning vs classic) when the deployment name does not say. Empty = guess
+    /// from the deployment name.
+    pub azure_model: String,
     /// Enterprise: AWS Bedrock region; Vertex project/location.
     pub bedrock_region: String,
     pub vertex_project: String,
@@ -131,6 +135,7 @@ impl Default for AiCleanupConfig {
             azure_endpoint: String::new(),
             azure_deployment: String::new(),
             azure_api_version: "2024-10-21".into(),
+            azure_model: String::new(),
             bedrock_region: "us-east-1".into(),
             vertex_project: String::new(),
             vertex_location: "us-central1".into(),
@@ -288,6 +293,19 @@ mod tests {
         assert_eq!(c.stt.provider, SttProviderId::Groq);
         assert!(c.auto_paste);
         assert_eq!(c.stt.timeout_ms, 30_000);
+    }
+    #[test]
+    fn azure_model_defaults_empty_for_old_files() {
+        // A config written before `azure_model` existed still loads, with the field empty.
+        let c: Config = serde_json::from_str(r#"{"version":1,"ai_cleanup":{"provider":"azure-openai","azure_deployment":"cleanup"}}"#).unwrap();
+        assert_eq!(c.ai_cleanup.azure_deployment, "cleanup");
+        assert_eq!(c.ai_cleanup.azure_model, "");
+        assert_eq!(c.ai_cleanup.azure_api_version, "2024-10-21");
+        assert_eq!(Config::default().ai_cleanup.azure_model, "");
+        let mut m = c;
+        m.ai_cleanup.azure_model = "gpt-5".into();
+        let back: Config = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
+        assert_eq!(back.ai_cleanup.azure_model, "gpt-5");
     }
     #[test]
     fn roundtrip() {

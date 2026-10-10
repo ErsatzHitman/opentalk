@@ -4,7 +4,8 @@
 
 use super::card::CardHover;
 use super::model::{Hit, Pointer, RenderState, TickOutcome};
-use super::render::{pixel_size, render_into};
+use super::raster::DevRect;
+use super::render::{FrameCache, FrameOutcome, pixel_size};
 use super::theme::{Palette, resolve_dark};
 use super::{PillEvent, PillMode, PillOptions};
 use crate::core::config::{PanelPosition, Theme};
@@ -14,7 +15,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use tiny_skia::Pixmap;
-use windows::Win32::Foundation::{COLORREF, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, SIZE, WAIT_OBJECT_0, WPARAM, CloseHandle};
+use windows::Win32::Foundation::{COLORREF, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WAIT_OBJECT_0, WPARAM, CloseHandle};
 use windows::Win32::Graphics::Gdi::{
     AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS, DeleteDC,
     DeleteObject, GetMonitorInfoW, HBITMAP, HDC, HGDIOBJ, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint,
@@ -31,7 +32,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow, GWLP_USERDATA, GetCursorPos, GetWindowLongPtrW, HMENU,
     HTCLIENT, HTTRANSPARENT, HWND_TOPMOST, IDC_ARROW, IDC_HAND, IDC_NO, IDC_SIZEALL, LoadCursorW, MF_GRAYED, MF_STRING, MA_NOACTIVATE, PostMessageW,
     RegisterClassExW, SPI_SETWORKAREA, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SetCursor, SetForegroundWindow,
-    SetWindowLongPtrW, SetWindowPos, ShowWindow, TPM_BOTTOMALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, ULW_ALPHA, UpdateLayeredWindow,
+    SetWindowLongPtrW, SetWindowPos, ShowWindow, TPM_BOTTOMALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, ULW_ALPHA, UPDATELAYEREDWINDOWINFO,
+    UpdateLayeredWindow, UpdateLayeredWindowIndirect,
     WM_APP, WM_DESTROY, WM_DISPLAYCHANGE, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_NCHITTEST, WM_NULL,
     WM_RBUTTONUP, WM_SETCURSOR, WM_SETTINGCHANGE, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
@@ -244,19 +246,28 @@ impl Dib {
         }
     }
 
-    /// Copy a premultiplied RGBA frame into the BGRA bitmap.
-    fn upload(&mut self, rgba: &[u8]) {
+    /// Copy the `r` part of a premultiplied RGBA frame into the BGRA bitmap (the whole frame for the
+    /// full rect). `r` is clipped to the bitmap.
+    fn upload(&mut self, rgba: &[u8], r: DevRect) {
         let n = (self.w * self.h * 4) as usize;
         if rgba.len() < n {
             return;
         }
+        let r = DevRect { x0: r.x0.max(0), y0: r.y0.max(0), x1: r.x1.min(self.w), y1: r.y1.min(self.h) };
+        if r.is_empty() {
+            return;
+        }
         // SAFETY: `bits` points to w*h*4 bytes owned by the DIB section.
         let dst = unsafe { std::slice::from_raw_parts_mut(self.bits, n) };
-        for (d, s) in dst.chunks_exact_mut(4).zip(rgba.chunks_exact(4)) {
-            d[0] = s[2];
-            d[1] = s[1];
-            d[2] = s[0];
-            d[3] = s[3];
+        let (stride, x0, x1) = (self.w as usize * 4, r.x0 as usize * 4, r.x1 as usize * 4);
+        for y in r.y0 as usize..r.y1 as usize {
+            let row = y * stride;
+            for (d, s) in dst[row + x0..row + x1].chunks_exact_mut(4).zip(rgba[row + x0..row + x1].chunks_exact(4)) {
+                d[0] = s[2];
+                d[1] = s[1];
+                d[2] = s[0];
+                d[3] = s[3];
+            }
         }
     }
 }
@@ -298,8 +309,15 @@ pub(super) struct Inner {
     tracking: bool,
     down: Option<Down>,
     last_hit: Hit,
-    /// Frames pushed to the screen (tests and diagnostics).
+    /// Renders only what moves once an animation has settled (see `render::FrameCache`).
+    cache: FrameCache,
+    /// Frames handled: every present call that had something to show, whether it was drawn or
+    /// skipped because nothing visible changed (tests and diagnostics).
     pub frames: u64,
+    /// Frames skipped because no pixel changed.
+    pub skipped: u64,
+    /// Frames that updated only part of the window (the dirty rect).
+    pub partial: u64,
 }
 
 /// What the window procedure asks the outer layer to do after the borrow is released.
@@ -360,10 +378,12 @@ impl Inner {
         if self.pm.width() as i32 != w || self.pm.height() as i32 != h {
             if let Some(pm) = Pixmap::new(w as u32, h as u32) {
                 self.pm = pm;
+                self.cache.reset();
             }
         }
         if self.dib.as_ref().map(|d| d.w != w || d.h != h).unwrap_or(true) {
             self.dib = Dib::new(w, h);
+            self.cache.reset();
         }
     }
 
@@ -383,6 +403,8 @@ impl Inner {
     /// Re-layout (window size may have changed) and push a frame.
     fn relayout(&mut self) {
         self.ensure_buffers();
+        // the window may have moved or been re-docked: push a full frame so the position is applied
+        self.cache.reset();
         self.pos = match (self.custom_pos, self.st.error().is_some()) {
             (Some(p), false) => p,
             _ => self.default_pos(),
@@ -402,12 +424,26 @@ impl Inner {
                 }
                 self.visible = false;
             }
+            self.cache.reset();
             return;
         }
         self.ensure_buffers();
-        render_into(&self.st, t, &mut self.pm);
-        let Some(dib) = self.dib.as_mut() else { return };
-        dib.upload(self.pm.data());
+        if !self.visible {
+            self.cache.reset();
+        }
+        let outcome = self.cache.render(&self.st, t, &mut self.pm);
+        self.frames += 1;
+        let FrameOutcome::Dirty(dirty) = outcome else {
+            // the pixmap and the DIB already show this frame
+            self.skipped += 1;
+            return;
+        };
+        let Some(dib) = self.dib.as_mut() else {
+            self.cache.reset();
+            return;
+        };
+        let full = dirty.is_full(dib.w, dib.h);
+        dib.upload(self.pm.data(), dirty);
         let pos = POINT { x: self.pos.0, y: self.pos.1 };
         let size = SIZE { cx: dib.w, cy: dib.h };
         let src = POINT { x: 0, y: 0 };
@@ -419,9 +455,29 @@ impl Inner {
                 let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
                 self.visible = true;
             }
-            let _ = UpdateLayeredWindow(self.hwnd, None, Some(&pos), Some(&size), Some(dib.dc), Some(&src), COLORREF(0), Some(&blend), ULW_ALPHA);
+            let mut pushed = false;
+            if !full {
+                // only `prcDirty` is recomposited; position and size stay as they are (a drag moves the
+                // window with SetWindowPos)
+                let rc = RECT { left: dirty.x0, top: dirty.y0, right: dirty.x1, bottom: dirty.y1 };
+                let info = UPDATELAYEREDWINDOWINFO {
+                    cbSize: std::mem::size_of::<UPDATELAYEREDWINDOWINFO>() as u32,
+                    hdcSrc: dib.dc,
+                    pptSrc: &src,
+                    pblend: &blend,
+                    dwFlags: ULW_ALPHA,
+                    prcDirty: &rc,
+                    ..Default::default()
+                };
+                pushed = UpdateLayeredWindowIndirect(self.hwnd, &info).as_bool();
+                if pushed {
+                    self.partial += 1;
+                }
+            }
+            if !pushed {
+                let _ = UpdateLayeredWindow(self.hwnd, None, Some(&pos), Some(&size), Some(dib.dc), Some(&src), COLORREF(0), Some(&blend), ULW_ALPHA);
+            }
         }
-        self.frames += 1;
     }
 
     fn sync_timer(&mut self) {
@@ -809,7 +865,10 @@ impl Window {
                 tracking: false,
                 down: None,
                 last_hit: Hit::None,
+                cache: FrameCache::new(),
                 frames: 0,
+                skipped: 0,
+                partial: 0,
             };
             let rc = Rc::new(RefCell::new(inner));
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, Rc::into_raw(rc.clone()) as isize);
@@ -940,6 +999,125 @@ mod tests {
         let g = st.geometry(0.0);
         assert_eq!(1920.0 - (wx as f32 + g.pill.r), 16.0);
         assert_eq!(1040.0 - (wy as f32 + g.pill.b), 16.0);
+    }
+}
+
+/// Desktop tests of the incremental present path (real layered window). Run with
+/// `cargo test desktop_ -- --ignored --test-threads=1`.
+#[cfg(test)]
+mod steady {
+    use super::*;
+    use std::time::{Duration, Instant};
+    use windows::Win32::UI::WindowsAndMessaging::{DispatchMessageW, MSG, PM_REMOVE, PeekMessageW, TranslateMessage};
+
+    /// Pump messages for `ms`, feeding `level` a speech-like RMS (or silence) every few ms.
+    fn pump(level: &AtomicU32, ms: u64, speaking: bool) {
+        let t0 = Instant::now();
+        while t0.elapsed() < Duration::from_millis(ms) {
+            let rms = if speaking { 0.02 + 0.2 * ((t0.elapsed().as_secs_f32() * 7.3).sin().abs()) } else { 0.0 };
+            level.store(rms.to_bits(), Ordering::Relaxed);
+            // SAFETY: standard message pump on the creating thread.
+            unsafe {
+                let mut msg = MSG::default();
+                while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                    let _ = TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    fn make(level: Arc<AtomicU32>) -> Window {
+        let opts = PillOptions { position: PanelPosition::BottomRight, auto_hide: false, show_app_bubble: false, theme: Theme::Dark, hotkey_label: String::new() };
+        Window::create(level, opts, Box::new(|_| {})).expect("create pill window")
+    }
+
+    /// The DIB the window shows must equal the pixmap the cache maintains.
+    fn dib_matches_pixmap(i: &Inner) -> bool {
+        let Some(d) = i.dib.as_ref() else { return false };
+        let n = (d.w * d.h * 4) as usize;
+        // SAFETY: `bits` points to w*h*4 bytes owned by the DIB section.
+        let bgra = unsafe { std::slice::from_raw_parts(d.bits, n) };
+        i.pm.data().chunks_exact(4).zip(bgra.chunks_exact(4)).all(|(p, b)| p[0] == b[2] && p[1] == b[1] && p[2] == b[0] && p[3] == b[3])
+    }
+
+    #[test]
+    #[ignore]
+    fn desktop_pill_steady_recording_presents_only_the_dirty_lane() {
+        let level = Arc::new(AtomicU32::new(0));
+        let w = make(level.clone());
+        w.with(|i| i.set_mode(PillMode::Recording));
+        pump(&level, 1500, true); // entrance (full frames) is over
+        let (f0, s0, p0) = w.with(|i| (i.frames, i.skipped, i.partial));
+        pump(&level, 1000, true);
+        let (f1, s1, p1) = w.with(|i| (i.frames, i.skipped, i.partial));
+        let (frames, skipped, partial) = (f1 - f0, s1 - s0, p1 - p0);
+        println!("speaking: {frames} frames, {partial} dirty-rect presents, {skipped} skipped");
+        assert!((40..=80).contains(&frames), "~60 fps timer, got {frames}");
+        assert!(partial >= frames / 2, "most speaking frames are dirty-rect updates ({partial}/{frames})");
+        assert!(frames - skipped - partial <= 2, "no full repaints in steady state ({} of {frames})", frames - skipped - partial);
+        assert!(w.with(|i| dib_matches_pixmap(i)), "DIB equals the pixmap after dirty-rect uploads");
+
+        // silence: the bars settle at 4 px and every later tick is skipped
+        pump(&level, 1300, false); // the 11-sample history (880 ms) flushes out
+        let (f2, s2, p2) = w.with(|i| (i.frames, i.skipped, i.partial));
+        pump(&level, 600, false);
+        let (f3, s3, p3) = w.with(|i| (i.frames, i.skipped, i.partial));
+        println!("silent: {} frames, {} dirty, {} skipped", f3 - f2, p3 - p2, s3 - s2);
+        assert!(f3 - f2 > 30);
+        assert_eq!(p3 - p2, 0, "silence presents nothing");
+        assert_eq!(s3 - s2, f3 - f2, "every silent tick is skipped");
+        assert!(w.with(|i| dib_matches_pixmap(i)));
+
+        // cost of one lane present vs a forced full repaint, timed around `present()` alone: stop the
+        // timer thread's ticks from interfering by pumping nothing while a bar eases
+        pump(&level, 200, true);
+        let cost = |force_full: bool| {
+            let (mut total, n) = (Duration::ZERO, 12);
+            for k in 0..n {
+                std::thread::sleep(Duration::from_millis(81));
+                total += w.with(|i| {
+                    let rms = if k % 2 == 0 { 0.2f32 } else { 0.05 };
+                    let now = i.now();
+                    i.st.tick(now, rms);
+                    std::thread::sleep(Duration::from_millis(25)); // bars are mid-ease
+                    if force_full {
+                        i.cache.reset();
+                    }
+                    let t0 = Instant::now();
+                    i.present();
+                    t0.elapsed()
+                });
+            }
+            total.as_secs_f64() * 1000.0 / n as f64
+        };
+        let (lane, full) = (cost(false), cost(true));
+        println!("present cost: lane update {lane:.3} ms vs full repaint {full:.3} ms");
+        assert!(lane < full, "the lane update is the cheaper one");
+    }
+
+    #[test]
+    #[ignore]
+    fn desktop_pill_thinking_glow_presents_partial_frames() {
+        let level = Arc::new(AtomicU32::new(0));
+        let w = make(level.clone());
+        w.with(|i| i.set_mode(PillMode::Recording));
+        pump(&level, 900, true);
+        w.with(|i| i.set_mode(PillMode::Thinking));
+        pump(&level, 1200, false); // shrink + glow fade-in are full frames
+        let (f0, p0) = w.with(|i| (i.frames, i.partial));
+        pump(&level, 800, false);
+        let (f1, p1) = w.with(|i| (i.frames, i.partial));
+        println!("thinking: {} frames, {} dirty-rect presents", f1 - f0, p1 - p0);
+        assert!(f1 - f0 > 30 && p1 - p0 >= (f1 - f0) * 9 / 10, "glow frames are dirty-rect updates");
+        assert!(w.with(|i| dib_matches_pixmap(i)));
+        // back to idle: the animation stops and the frame counter freezes
+        w.with(|i| i.set_mode(PillMode::Idle));
+        pump(&level, 900, false);
+        let f2 = w.with(|i| i.frames);
+        pump(&level, 400, false);
+        assert_eq!(w.with(|i| i.frames), f2, "no frames while idle");
     }
 }
 

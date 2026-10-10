@@ -74,13 +74,15 @@ impl BatchProvider for Corti {
         let to = timeout(opts);
 
         let token = token(&target, client_id, client_secret)?;
+        // Everything credential-shaped: the client id/secret and the minted access token.
+        let secrets = [client_id, client_secret, token.as_str()];
         let tenant = target.tenant.as_str();
         let auth = format!("Bearer {token}");
         let api = target.api.as_str();
         let call = |url: String, content_type: &str, body: &[u8]| -> Result<Value, SttError> {
             let headers = [("Authorization", auth.as_str()), ("Tenant-Name", tenant)];
-            let resp = errors::check_response(NAME, None, false, http::post(&url, &headers, content_type, body, to))?;
-            resp.json().map_err(|e| errors::bad_response(NAME, false, &format!("invalid JSON ({e})"), &resp.body))
+            let resp = errors::check_response_with(NAME, None, false, http::post(&url, &headers, content_type, body, to), &secrets)?;
+            resp.json().map_err(|e| errors::bad_response_with(NAME, false, &format!("invalid JSON ({e})"), &resp.body, &secrets))
         };
 
         let created = call(
@@ -90,11 +92,11 @@ impl BatchProvider for Corti {
                 .to_string()
                 .as_bytes(),
         )?;
-        let interaction = field(&created, "interactionId")?;
+        let interaction = field(&created, "interactionId", &secrets)?;
 
         let result = (|| {
             let rec = call(format!("{api}/interactions/{interaction}/recordings/"), "application/octet-stream", &wav)?;
-            let recording = field(&rec, "recordingId")?;
+            let recording = field(&rec, "recordingId", &secrets)?;
             // Corti needs a concrete primaryLanguage; default to English when auto-detecting.
             let language = opts.language.as_deref().filter(|l| !l.is_empty() && *l != "auto").map_or_else(|| "en".to_string(), super::base_lang);
             let tr = call(
@@ -120,11 +122,11 @@ impl BatchProvider for Corti {
     }
 }
 
-fn field(v: &Value, name: &str) -> Result<String, SttError> {
+fn field(v: &Value, name: &str, secrets: &[&str]) -> Result<String, SttError> {
     v.get(name)
         .and_then(|x| x.as_str())
         .map(String::from)
-        .ok_or_else(|| errors::bad_response(NAME, false, &format!("no `{name}`"), &v.to_string()))
+        .ok_or_else(|| errors::bad_response_with(NAME, false, &format!("no `{name}`"), &v.to_string(), secrets))
 }
 
 fn delete_later(url: String, auth: String, tenant: String) {
@@ -160,8 +162,8 @@ fn token(t: &Target, client_id: &str, client_secret: &str) -> Result<String, Stt
         super::percent_encode(client_secret)
     );
     let res = http::post(&t.token_url, &[], "application/x-www-form-urlencoded", form.as_bytes(), TOKEN_TIMEOUT);
-    let resp = errors::check_response(NAME, None, false, res)?;
-    let v: Value = resp.json().map_err(|e| errors::bad_response(NAME, false, &format!("invalid token JSON ({e})"), ""))?;
+    let resp = errors::check_response_with(NAME, None, false, res, &[client_id, client_secret])?;
+    let v: Value = resp.json().map_err(|e| errors::bad_response_with(NAME, false, &format!("invalid token JSON ({e})"), "", &[client_id, client_secret]))?;
     let Some(access) = v.get("access_token").and_then(|a| a.as_str()).filter(|a| !a.is_empty()) else {
         return Err(SttError::new(SttErrorCode::AuthFailed, "Corti authentication failed: no access token in response"));
     };
@@ -300,5 +302,26 @@ mod tests {
         assert_eq!(Corti.transcribe(&audio(), &opts("m"), &c).unwrap_err().code, SttErrorCode::BadRequest);
         let c = Credentials { api_key: Some("id".into()), base_url: None, extra: vec![("client_secret".into(), "s".into())] };
         assert_eq!(Corti.prewarm_url(&c).as_deref(), Some("https://api.us.corti.app/v2"));
+    }
+
+    #[test]
+    fn client_secret_and_access_token_echoed_by_corti_are_redacted() {
+        const SECRET: &str = "cs-Qm4Xr8Tz2Lw6Vb1Nd9Hf3Jk7";
+        let mock = serve(vec![Resp::json(401, &format!(r#"{{"error":"invalid_client","error_description":"bad secret {SECRET}"}}"#))]);
+        let e = Corti.transcribe(&audio(), &opts("m"), &corti_creds(&mock, SECRET)).unwrap_err();
+        assert_eq!(e.code, SttErrorCode::AuthFailed);
+        assert_no_leak(&e, SECRET);
+
+        // the minted access token is a credential too
+        const TOKEN: &str = "tk-Zp5Cv9Bn3Mq7Wx1Ys6Ud2Lh8";
+        const SECRET2: &str = "cs-Ht6Nw2Kb8Rj4Xv0Lq5Zd3Mf9";
+        let mock = serve(vec![
+            Resp::json(200, &format!(r#"{{"access_token":"{TOKEN}","expires_in":300}}"#)),
+            Resp::json(403, &format!(r#"{{"message":"token {TOKEN} lacks scope"}}"#)),
+            Resp::json(200, "{}"),
+        ]);
+        let e = Corti.transcribe(&audio(), &opts("m"), &corti_creds(&mock, SECRET2)).unwrap_err();
+        assert_eq!(e.code, SttErrorCode::AccessDenied);
+        assert_no_leak(&e, TOKEN);
     }
 }

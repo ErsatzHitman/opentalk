@@ -26,16 +26,16 @@ use std::time::Duration;
 pub(crate) const BYOK_FILE_LIMIT: usize = 25 * 1024 * 1024;
 
 pub fn get(id: SttProviderId) -> &'static dyn BatchProvider {
-    static OPENAI: openai::Openai = openai::Openai;
-    static GROQ: groq::Groq = groq::Groq;
-    static XAI: xai::Xai = xai::Xai;
-    static MISTRAL: mistral::Mistral = mistral::Mistral;
-    static GEMINI: gemini::Gemini = gemini::Gemini;
-    static DEEPGRAM: deepgram::Deepgram = deepgram::Deepgram;
-    static CORTI: corti::Corti = corti::Corti;
-    static TINFOIL: tinfoil::Tinfoil = tinfoil::Tinfoil;
-    static OPENROUTER: openrouter::Openrouter = openrouter::Openrouter;
-    static CUSTOM: custom::Custom = custom::Custom;
+    static OPENAI: Scrubbed = Scrubbed(&openai::Openai);
+    static GROQ: Scrubbed = Scrubbed(&groq::Groq);
+    static XAI: Scrubbed = Scrubbed(&xai::Xai);
+    static MISTRAL: Scrubbed = Scrubbed(&mistral::Mistral);
+    static GEMINI: Scrubbed = Scrubbed(&gemini::Gemini);
+    static DEEPGRAM: Scrubbed = Scrubbed(&deepgram::Deepgram);
+    static CORTI: Scrubbed = Scrubbed(&corti::Corti);
+    static TINFOIL: Scrubbed = Scrubbed(&tinfoil::Tinfoil);
+    static OPENROUTER: Scrubbed = Scrubbed(&openrouter::Openrouter);
+    static CUSTOM: Scrubbed = Scrubbed(&custom::Custom);
     static ASSEMBLYAI: StreamingOnly = StreamingOnly(SttProviderId::Assemblyai);
     match id {
         SttProviderId::Openai => &OPENAI,
@@ -49,6 +49,24 @@ pub fn get(id: SttProviderId) -> &'static dyn BatchProvider {
         SttProviderId::Openrouter => &OPENROUTER,
         SttProviderId::Custom => &CUSTOM,
         SttProviderId::Assemblyai => &ASSEMBLYAI,
+    }
+}
+
+/// Dispatcher wrapper: registers the call's credentials with `errors::scope_secrets`, so
+/// every error a provider builds on this thread (including providers that don't thread their
+/// key explicitly) has the configured secrets removed before it is bounded.
+struct Scrubbed(&'static dyn BatchProvider);
+
+impl BatchProvider for Scrubbed {
+    fn id(&self) -> SttProviderId {
+        self.0.id()
+    }
+    fn prewarm_url(&self, creds: &Credentials) -> Option<String> {
+        self.0.prewarm_url(creds)
+    }
+    fn transcribe(&self, audio: &Audio, opts: &SttOptions, creds: &Credentials) -> Result<Transcript, SttError> {
+        let _scope = errors::scope_secrets(secrets(creds).into_iter().map(String::from));
+        self.0.transcribe(audio, opts, creds)
     }
 }
 
@@ -81,6 +99,12 @@ pub(crate) fn base_url(creds: &Credentials, default: &str) -> String {
 
 pub(crate) fn api_key<'a>(creds: &'a Credentials, provider: &str) -> Result<&'a str, SttError> {
     creds.api_key.as_deref().map(str::trim).filter(|k| !k.is_empty()).ok_or_else(|| errors::not_configured(provider))
+}
+
+/// The credential values of `creds` that must never reach an error text: the API key and the
+/// Corti client secret.
+pub(crate) fn secrets(creds: &Credentials) -> Vec<&str> {
+    creds.api_key.as_deref().into_iter().chain(extra(creds, "client_secret")).collect()
 }
 
 pub(crate) fn extra<'a>(creds: &'a Credentials, name: &str) -> Option<&'a str> {
@@ -152,9 +176,14 @@ pub(crate) fn prompt_limit(groq: bool, model: &str) -> usize {
 
 /// `{"text": "...", "language": "..."}` bodies (OpenAI, Groq, xAI, Mistral, Tinfoil, custom).
 pub(crate) fn text_json(provider: &str, self_hosted: bool, resp: &HttpResponse) -> Result<Transcript, SttError> {
-    let v = resp.json().map_err(|e| errors::bad_response(provider, self_hosted, &format!("invalid JSON ({e})"), &resp.body))?;
+    text_json_with(provider, self_hosted, resp, &[])
+}
+
+/// [`text_json`] that removes the configured `secrets` from error details.
+pub(crate) fn text_json_with(provider: &str, self_hosted: bool, resp: &HttpResponse, secrets: &[&str]) -> Result<Transcript, SttError> {
+    let v = resp.json().map_err(|e| errors::bad_response_with(provider, self_hosted, &format!("invalid JSON ({e})"), &resp.body, secrets))?;
     let Some(text) = v.get("text").and_then(|t| t.as_str()) else {
-        return Err(errors::bad_response(provider, self_hosted, "no `text` field", &resp.body));
+        return Err(errors::bad_response_with(provider, self_hosted, "no `text` field", &resp.body, secrets));
     };
     let detected_language = v.get("language").and_then(|l| l.as_str()).map(str::trim).filter(|l| !l.is_empty()).map(String::from);
     Ok(Transcript { text: text.to_string(), detected_language })
@@ -404,6 +433,13 @@ pub(crate) mod testutil {
 
     pub fn opts(model: &str) -> SttOptions {
         SttOptions { model: model.into(), language: None, hints: vec![], timeout_ms: 5_000 }
+    }
+
+    /// The error must carry no byte of `secret` anywhere a user, log or history could see it.
+    pub fn assert_no_leak(e: &super::super::SttError, secret: &str) {
+        for text in [e.message.clone(), e.detail.clone(), e.to_string(), format!("{e:?}")] {
+            assert!(!text.contains(secret), "secret leaked into: {text}");
+        }
     }
 
     pub fn creds(mock: &Mock, key: &str) -> Credentials {

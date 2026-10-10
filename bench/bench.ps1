@@ -39,6 +39,17 @@ $R = @{}
 
 function Section([string]$t) { Write-Host ("`n== {0}" -f $t) -ForegroundColor Cyan }
 
+# CPU of the thread(s) named $name between two Get-ThreadTimes snapshots, as % of one core.
+function Get-ThreadPct($before, $after, [double]$seconds, [string]$name) {
+    $ms = 0.0
+    foreach ($id in $after.Keys) {
+        if ($after[$id].Name -ne $name) { continue }
+        $b = if ($before.ContainsKey($id)) { $before[$id].Ms } else { 0 }
+        $ms += $after[$id].Ms - $b
+    }
+    return [math]::Round($ms / ($seconds * 1000) * 100, 2)
+}
+
 # Sample $proc until $until (a process) exits, or for $seconds.
 function Measure-Until($proc, $until) {
     $cores = [Environment]::ProcessorCount
@@ -177,7 +188,9 @@ try {
     Invoke-Ot $Exe @('--bench', 'toggle') $e 15 | Out-Null
     $thr0 = Get-ThreadTimes $daemon.Id
     $R['recording_injected'] = Measure-Process $daemon $RecordSec
-    $R.recording_injected | Add-Member top_threads (Get-TopThreads $thr0 (Get-ThreadTimes $daemon.Id) $RecordSec)
+    $thr1 = Get-ThreadTimes $daemon.Id
+    $R.recording_injected | Add-Member top_threads (Get-TopThreads $thr0 $thr1 $RecordSec)
+    $R.recording_injected | Add-Member main_thread_pct (Get-ThreadPct $thr0 $thr1 $RecordSec 'main')
     $R.recording_injected | Add-Member private_ws_mb (Get-PrivateWsMB $daemon.Id)
     Invoke-Ot $Exe @('--bench', 'toggle') $e 15 | Out-Null
     Wait-History $h ($before + 1) 30 | Out-Null
@@ -230,9 +243,14 @@ if (-not $SkipMic) {
             Write-Host 'no usable microphone on this machine; skipped' -ForegroundColor Yellow
             $R['recording_mic'] = $null
         } else {
+            $thr0 = Get-ThreadTimes $daemon.Id
             $R['recording_mic'] = Measure-Process $daemon $RecordSec
+            $thr1 = Get-ThreadTimes $daemon.Id
             $R.recording_mic | Add-Member private_ws_mb (Get-PrivateWsMB $daemon.Id)
-            Write-Host ("recording (mic): {0}% of all cores ({1}% of one core), WS peak {2} MB, private peak {3} MB" -f $R.recording_mic.CpuPctAll, $R.recording_mic.CpuPctCore, $R.recording_mic.WsPeakMB, $R.recording_mic.PrivPeakMB)
+            $R.recording_mic | Add-Member top_threads (Get-TopThreads $thr0 $thr1 $RecordSec)
+            # the main thread owns the message loop and the pill; this is the number the pill work is judged by
+            $R.recording_mic | Add-Member main_thread_pct (Get-ThreadPct $thr0 $thr1 $RecordSec 'main')
+            Write-Host ("recording (mic): {0}% of all cores ({1}% of one core), main thread {4}% of one core, WS peak {2} MB, private peak {3} MB; busiest threads: {5}" -f $R.recording_mic.CpuPctAll, $R.recording_mic.CpuPctCore, $R.recording_mic.WsPeakMB, $R.recording_mic.PrivPeakMB, $R.recording_mic.main_thread_pct, ($R.recording_mic.top_threads -join ', '))
             Invoke-Ot $Exe @('--bench', 'cancel') $e 15 | Out-Null
         }
     }
@@ -273,7 +291,7 @@ if (-not $SkipLive) {
     if (-not $key -or $models.Count -eq 0) {
         Write-Host 'skipped (no key, or no :free model)' -ForegroundColor Yellow
     } else {
-        $live = [ordered]@{ models = $models; rounds = 0; ok = 0; per_model = [ordered]@{} }
+        $live = [ordered]@{ models = $models; rounds = 0; ok = 0; verified = 0; per_model = [ordered]@{} }
         $round = 0
         foreach ($m in $models) {
             if ($round -ge $LiveDictations) { break }
@@ -287,14 +305,17 @@ if (-not $SkipLive) {
                 $round += $n
                 $hist = Read-History $h
                 $ok = @($hist | Where-Object { $_.status -eq 'ok' })
-                $live.rounds += $hist.Count; $live.ok += $ok.Count
+                # A dictation only counts as verified when the transcript has the words in the fixture (tts_fillers.wav).
+                $verified = @($ok | Where-Object { $_.text -match '(?i)friday|release' })
+                $live.rounds += $hist.Count; $live.ok += $ok.Count; $live.verified += $verified.Count
                 $live.per_model[$m] = [ordered]@{
-                    ok = $ok.Count; total = $hist.Count
+                    ok = $ok.Count; verified = $verified.Count; total = $hist.Count
                     errors = @($hist | Where-Object { $_.status -ne 'ok' } | ForEach-Object { if ($_.error) { $_.error } else { "status $($_.status)" } } | Select-Object -Unique)
                     texts = @($ok | ForEach-Object { $_.text })
                 }
                 if ($ok.Count) { $live.latency = (Invoke-Ot $Exe @('--bench', 'latency') $e 30).Out | ConvertFrom-Json }
-                Write-Host ("live {0}: {1}/{2} ok {3}" -f $m, $ok.Count, $hist.Count, (($live.per_model[$m].errors) -join ' | '))
+                $verdict = if ($verified.Count) { 'VERIFIED' } else { 'UNVERIFIED' }
+                Write-Host ("live {0}: {4} - {1}/{2} ok, {5} with the spoken words {3}" -f $m, $ok.Count, $hist.Count, (($live.per_model[$m].errors) -join ' | '), $verdict, $verified.Count)
             }
             finally {
                 Stop-Daemon $Exe $daemon $e
@@ -330,6 +351,8 @@ the one-core figure (100% = one fully busy core) is given in brackets.
 | Recording CPU ($recLabel, $RecordSec s) | $($rec.CpuPctAll)% ($($rec.CpuPctCore)% of one core) | <= 1.5% | ~3% | $(Verdict ($rec.CpuPctAll -le 1.5)) |
 | Recording CPU, projected on a 4-core laptop (one-core % / 4) | $([math]::Round($rec.CpuPctCore / 4, 2))% | <= 1.5% | ~3% | $(Verdict ($rec.CpuPctCore / 4 -le 1.5)) |
 | Busiest daemon threads while recording (injected, % of one core) | $(if ($R.recording_injected.top_threads) { $R.recording_injected.top_threads -join ', ' } else { 'n/a' }) | - | - | - |
+$(if ($null -ne $R.recording_mic.main_thread_pct) { "| Main thread while recording (real mic, % of one core; message loop + pill) | $($R.recording_mic.main_thread_pct)% (projected on 4 cores: $([math]::Round($R.recording_mic.main_thread_pct / 4, 2))%) | <= 6% (<= 1.5% on 4 cores) | - | $(Verdict ($R.recording_mic.main_thread_pct -le 6)) |" })
+$(if ($R.recording_mic.top_threads) { "| Busiest daemon threads while recording (real mic, % of one core) | $($R.recording_mic.top_threads -join ', ') | - | - | - |" })
 | Daemon working set, idle (mean / peak) | $($R.idle.WsMeanMB) / $($R.idle.WsPeakMB) MB | <= 25 MB | ~110 MB | $(Verdict ($R.idle.WsPeakMB -le 25)) |
 | Daemon private bytes, idle (mean / peak) | $($R.idle.PrivMeanMB) / $($R.idle.PrivPeakMB) MB | <= 15 MB | n/a | $(Verdict ($R.idle.PrivPeakMB -le 15)) |
 | Daemon private working set, idle (Task Manager "Memory") | $(Fmt $R.idle.private_ws_mb ' MB') | n/a | ~110 MB | - |
@@ -338,6 +361,7 @@ the one-core figure (100% = one fully busy core) is given in brackets.
 $(if ($R.recording_mic) { "| Daemon working set while recording, real mic, app bubble off (peak / private WS) | $($R.recording_mic.WsPeakMB) / $(Fmt $R.recording_mic.private_ws_mb ' MB') | <= 25 MB | ~110 MB | $(Verdict ($R.recording_mic.WsPeakMB -le 25)) |" })
 | Settings window working set (mean / peak) | $(if ($R.settings) { "$($R.settings.WsMeanMB) / $($R.settings.WsPeakMB) MB" } else { 'n/a' }) | <= 80 MB, only while open | n/a | $(if ($R.settings) { Verdict ($R.settings.WsPeakMB -le 80) } else { '-' }) |
 | Settings window CPU while idle | $(if ($R.settings) { "$($R.settings.CpuPctAll)%" } else { 'n/a' }) | ~0 | n/a | - |
+| Settings window private bytes (commit, only while open; mean / peak / private WS) | $(if ($R.settings) { "$($R.settings.PrivMeanMB) / $($R.settings.PrivPeakMB) / $(Fmt $R.settings.private_ws_mb ' MB')" } else { 'n/a' }) | <= 80 MB as working set | n/a | $(if ($R.settings) { 'documented deviation: GL driver commit, see the Settings private bytes note' } else { '-' }) |
 | Executable size | $($R.env.exe_mb) MB | <= 8 MB | n/a | $(Verdict ($R.env.exe_mb -le 8)) |
 | Startup (process start -> daemon window, median of 5) | $($R.startup.process_to_window_ms_median) ms (daemon reports ready at $(Fmt $R.startup.daemon_ready_log_ms_median ' ms')) | - | - | - |
 | Daemon threads / handles (idle) | $($R.idle.Threads) / $($R.idle.Handles) | - | - | - |
@@ -403,7 +427,7 @@ $(if ($R.settings) { "Settings window: opened in $($R.settings_open_ms) ms; priv
 
 ## Live check (OpenRouter, ``:free`` models only)
 
-$(if ($R.live) { "$($R.live.ok) of $($R.live.rounds) live dictations succeeded.`n`n| Model | OK | Errors reported (redacted by OpenTalk) |`n|---|---|---|`n" + (($R.live.per_model.Keys | ForEach-Object { $pm = $R.live.per_model[$_]; "| ``$_`` | $($pm.ok) / $($pm.total) | $((@($pm.errors) | ForEach-Object { $_ -replace '\|', '/' }) -join '; ') |" }) -join "`n") } else { 'Not run.' })
+$(if ($R.live) { "$($R.live.verified) of $($R.live.rounds) live dictations VERIFIED (transcript contains the spoken words); $($R.live.ok) returned any text. $(if ($R.live.verified -eq 0) { '**UNVERIFIED:** no free model produced a transcript of the audio, so this run says nothing about live STT correctness.' })`n`n| Model | OK | Errors reported (redacted by OpenTalk) |`n|---|---|---|`n" + (($R.live.per_model.Keys | ForEach-Object { $pm = $R.live.per_model[$_]; "| ``$_`` | $($pm.ok) / $($pm.total) | $((@($pm.errors) | ForEach-Object { $_ -replace '\|', '/' }) -join '; ') |" }) -join "`n") } else { 'Not run.' })
 
 Free OpenRouter models are rate limited and sometimes not available to non-agent clients, so this section is a smoke test of the real
 network path, not a latency reference; the table above is measured against a local mock to isolate OpenTalk's own cost.
@@ -427,10 +451,18 @@ network path, not a latency reference; the table above is measured against a loc
   this machine) then treated the daemon as a 3D app: its private commit jumped from ~2 MB to ~58 MB at the first STA
   ``CoInitializeEx``. With the delay-load import the daemon never loads the DLL; Settings loads it on its first WGL call.
   The Settings process's large private-bytes figure is that same injector inside a real GL process; its working set is small.
-- **Recording CPU is dominated by the pill**: the ``main`` thread renders and uploads the 60 fps capsule animation
-  (~0.7 ms per frame); WASAPI capture and the VAD/level meter stay well under 1% of one core. On this 24-core machine that is far
-  below the 1.5% target; the 4-core projection above is the number to watch (the pill could drop to 30 fps once its
-  entrance has finished, see the open issues).
+- **Settings private bytes**: the PLAN section 1 Settings figure (80 MB) is read as working set, not as ``PrivateMemorySize64``.
+  The Settings process commits ~265 MB, almost all of it the OpenGL driver's command and shader pools reserved at context
+  creation (plus any overlay hook such as ``RTSSHooks64.dll``); it is mostly untouched, so it never enters the working set.
+  ``ui/app.rs::native_options`` already asks for no depth, stencil or MSAA (eframe's defaults), and vsync or
+  ``hardware_acceleration`` do not change it; software GL is 1.1, which ``egui_glow`` rejects. Only a non-GL renderer would
+  avoid it. Documented deviation; the daemon never loads ``opengl32.dll`` and does not pay it.
+- **Recording CPU is the pill, kept to the lane**: once the entrance has settled the pill caches its static layer (shadow,
+  body, logo) and each frame redraws only the 52x24 waveform lane, uploads only that rectangle and presents it with
+  ``UpdateLayeredWindowIndirect`` (``prcDirty``). A frame whose bars all moved by <= 1/255 px is skipped, which is every
+  frame while the input is silent. The thinking glow keeps its 60 fps but also caches the chrome. WASAPI capture and the
+  VAD/level meter stay well under 1% of one core. The row "Main thread while recording" is the figure the pill is judged by
+  (<= 6% of one core is <= 1.5% on a 4-core laptop).
 - **Working set and the app bubble**: the active-app icon is fetched with ``IShellItemImageFactory``, which loads ~35 shell
   DLLs (XAML, StateRepository, thumbcache, ...) into the daemon on the first dictation. They are shared image pages, so the
   working set grows by ~17 MB while the private working set (Task Manager's "Memory") grows by ~2-4 MB. With the bubble off

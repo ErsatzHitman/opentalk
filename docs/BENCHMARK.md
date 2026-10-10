@@ -22,6 +22,7 @@ the one-core figure (100% = one fully busy core) is given in brackets.
 | Daemon working set while recording, real mic, app bubble off (peak / private WS) | 19.5 / n/a | <= 25 MB | ~110 MB | meets |
 | Settings window working set (mean / peak) | 13 / 13.1 MB | <= 80 MB, only while open | n/a | meets |
 | Settings window CPU while idle | 0.006% | ~0 | n/a | - |
+| Settings window private bytes (commit, only while open; mean / peak / private WS) | 266.6 / 266.7 / n/a | <= 80 MB as working set | n/a | documented deviation: GL driver commit, see the Settings private bytes note |
 | Executable size | 7.51 MB | <= 8 MB | n/a | meets |
 | Startup (process start -> daemon window, median of 5) | 27 ms (daemon reports ready at 20 ms) | - | - | - |
 | Daemon threads / handles (idle) | 8 / 276 | - | - | - |
@@ -45,6 +46,49 @@ Upload per dictation: 249964.0 bytes (16 kHz mono PCM WAV after silence trim).
 The paste stage here only writes the clipboard (the benchmark runs with `auto_paste = false`); a real paste adds the
 10 ms clipboard settle plus `SendInput`. The desktop was **locked** during this run (LogonUI active), where Windows denies clipboard access, so the clipboard write retries and fails; its time is not representative. Re-run on an unlocked desktop for the real figure.
 
+
+## FLAC upload experiment (PLAN 9.5, Phase 8)
+
+**Decision: not adopted; uploads stay 16 kHz mono PCM WAV.** The bar was "saves at least 30 ms on a median connection".
+
+Method: a throwaway program (not part of the repo) encodes the fixture clips with `flacenc` 0.5.1 (pure Rust, `default-features = false`, default config, fixed 4096-sample blocks, release build with fat LTO) and times 21 encodes per clip. The clean clip's FLAC was decoded with ffmpeg and is bit-exact with the source WAV. Upload time was measured on a paced 127.0.0.1 TCP transfer (1460-byte writes, deadline-paced to the simulated uplink, wall time until the receiver has all bytes and replies; median of 5). Two inputs bracket real audio: the TTS fixture as is (the best case for FLAC, digital silence between words) and the same clip with +-30 LSB uniform noise added (about -60 dBFS, a typical quiet-room mic floor; real mics are often noisier, which compresses worse).
+
+| Clip (16 kHz mono) | WAV bytes | FLAC bytes | FLAC / WAV | Encode median / p95 (ms) |
+|---|---|---|---|---|
+| tts_clean.wav, 6.03 s | 193,004 | 83,207 | 0.431 | 9.6 / 12.1 |
+| tts_fillers.wav, 8.47 s | 271,244 | 128,297 | 0.473 | 14.9 / 32.7 |
+| tts_clean.wav + noise 30 | 193,004 | 109,206 | 0.566 | 11.2 / 24.3 |
+| tts_fillers.wav + noise 30 | 271,244 | 158,109 | 0.583 | 16.5 / 29.1 |
+| tts_fillers.wav + noise 100 (about -50 dBFS) | 271,244 | 171,025 | 0.631 | 15.7 / 36.4 |
+
+Measured paced upload of the 8.47 s clip (milliseconds, WAV vs FLAC, before encode time):
+
+| Uplink | Clean: WAV / FLAC / saved | Noise 30: WAV / FLAC / saved |
+|---|---|---|
+| 2 Mbps | 1087 / 585 / 502 | 1086 / 665 / 421 |
+| 5 Mbps | 437 / 211 / 226 | 436 / 257 / 179 |
+| 10 Mbps | 217 / 103 / 114 | 220 / 130 / 90 |
+
+The 20 and 50 Mbps rows of the paced test were not usable: Windows timer granularity (about 1 ms sleeps against 0.5 ms packet intervals) made the runs bounce (for example 362 ms against an expected 108 ms), so those rows come from the arithmetic that the 2/5/10 Mbps measurements confirm to within 1%: `bytes * 8 / rate`.
+
+Net saving (upload time saved minus encode time, ms; encode cost taken as 1.76 ms per audio second clean, 1.94 noisy). Format: saved before encode / net after encode.
+
+| Dictation, content | 2 Mbps | 5 Mbps | 10 Mbps | 20 Mbps | 50 Mbps |
+|---|---|---|---|---|---|
+| 5 s, clean | 337 / 328 | 135 / 126 | 67 / 59 | 34 / 25 | 13 / 5 |
+| 5 s, mic noise | 267 / 257 | 107 / 97 | 53 / 44 | 27 / 17 | 11 / 1 |
+| 8.5 s, clean | 571 / 556 | 229 / 214 | 114 / 99 | 57 / 42 | 23 / 8 |
+| 8.5 s, mic noise | 452 / 436 | 181 / 164 | 90 / 74 | 45 / 29 | 18 / 2 |
+
+Reading:
+
+- FLAC clears 30 ms net only on slow uplinks: below roughly 13 Mbps for a 5 s dictation and below roughly 20 Mbps for an 8.5 s one (noisy input; 17 Mbps for 5 s clean). On a 20-50 Mbps uplink, which is a conservative stand-in for a median fixed connection (mobile is lower, broadband usually higher), a typical 5-8.5 s dictation nets 1-42 ms, and only the clean (best-case) 8.5 s clip at 20 Mbps clears 30 ms; every mic-noise case is under the bar.
+- The model ignores TCP slow start and TLS record overhead. With a pre-warmed keep-alive socket (PLAN 9.3) the 130-270 KB body spans several round trips either way, so the real saving at high bandwidth is bounded by the bandwidth term above plus at most about one RTT, and no measurement here supports counting on that.
+- Cost: `flacenc` adds 248,320 bytes to a release binary (526,336 against 278,016 bytes for the same program without it), about 242 KB. That is 3.2% of the 7.51 MB executable and about half of the 0.49 MB left under the 8 MB budget, for no win at the target connection speed.
+- Compatibility risk the WAV path does not have: every provider needs a verified FLAC accept path (content type, file name, extension sniffing; Gemini inline data and the Realtime/streaming providers differ), and each would need a WAV fallback on rejection.
+- The encode is also on the stop-to-text path (about 15 ms for 8.5 s) unless it is moved into the recording thread, which spends CPU while the 1.5% recording target is tight on small laptops (see the 4-core projection above).
+
+Revisit only as an opt-in for slow uplinks (for example when a measured upload rate stays below about 10 Mbps), not as the default format. Until then the PLAN section 1 upload row stays "silence-trimmed 16 kHz mono PCM WAV", logged in bytes per request (249,964 bytes in the benchmark above).
 
 ## Binary size
 
@@ -129,10 +173,43 @@ network path, not a latency reference; the table above is measured against a loc
   (~0.7 ms per frame); WASAPI capture and the VAD/level meter stay well under 1% of one core. On this 24-core machine that is far
   below the 1.5% target; the 4-core projection above is the number to watch (the pill could drop to 30 fps once its
   entrance has finished, see the open issues).
-- **Working set and the app bubble**: the active-app icon is fetched with `IShellItemImageFactory`, which loads ~35 shell
-  DLLs (XAML, StateRepository, thumbcache, ...) into the daemon on the first dictation. They are shared image pages, so the
-  working set grows by ~17 MB while the private working set (Task Manager's "Memory") grows by ~2-4 MB. With the bubble off
-  the daemon stays at ~19 MB WS / ~3.6 MB private WS while recording. A lighter icon path for plain Win32 executables
-  (`SHGetFileInfoW`/`PrivateExtractIconsW`) is an open follow-up for the app-icon module.
+- **Working set and the app bubble**: the active-app icon used to be fetched with `IShellItemImageFactory` first, which loads
+  ~35 shell DLLs (windows.storage, XAML, StateRepository, thumbcache, ...) into the daemon on the first dictation. They are
+  shared image pages, so the working set grew by ~17 MB (peak 38-39 MB against 19.6 MB with the bubble off) while the private
+  working set (Task Manager's "Memory") grew by only ~2-4 MB. `src/daemon/appicon.rs` now routes by executable: classic Win32
+  programs use `PrivateExtractIconsW` (exact size, user32 only) and then `SHGetFileInfoW`; the shell factory is reserved for
+  packaged apps (a `WindowsApps` path or `ApplicationFrameHost.exe`) and for Win32 files where both cheap paths return nothing.
+  The per-exe cache and the rendering (straight alpha, current-DPI size) are unchanged. Guards: the unit test
+  `win32_exe_never_reaches_shell_factory` injects the shell backend and fails if a Win32 exe reaches it, and the desktop test
+  `desktop_win32_icon_loads_no_shell_dlls` (run alone with `--ignored`) checks `windows.storage.dll`, `StateRepository.Core.dll`
+  and `thumbcache.dll` stay unloaded (its positive control, a `shell_backend` call, loads them) and prints the working-set
+  change: 9.3 MB -> 10.7 MB for the Notepad and Explorer icons, versus ~+17 MB through the shell factory.
+  The acceptance run (bench.ps1 on an unlocked desktop, Notepad or Explorer as the target, WS peak <= 25 MB over the 10
+  dictations) needs a foreground window, so it has to be repeated on an unlocked desktop. Status: the fix was verified on a
+  locked workstation (LogonUI active, no foreground window), so the table above still shows the pre-fix 38-39 MB figures until
+  `bench/bench.ps1` is re-run unlocked.
 - Clipboard and paste timings are only meaningful on an unlocked desktop: Windows refuses clipboard access while the
   workstation is locked, so `copy_to_clipboard` exhausts its retries (~95 ms) and real-paste e2e runs are skipped.
+- **Settings private bytes (266 MB commit vs the 80 MB target)**: the PLAN section 1 figure is taken as working set / private
+  working set (what Task Manager's "Memory" column shows), not as `PrivateMemorySize64` (committed virtual memory). The Settings
+  process measures 13 MB working set (up to ~44 MB after navigating pages) but commits ~266 MB private bytes with 28 threads.
+  That commit is almost entirely the OpenGL driver, not OpenTalk's heap: the process maps `nvoglv64.dll` / `nvwgf2umx.dll`
+  (NVIDIA) plus `RTSSHooks64.dll` (the RivaTuner/MSI Afterburner overlay hook, loaded into every GL process on this machine), and
+  the driver reserves and commits its command and shader pools at context creation, mostly never touched, so they do not enter
+  the working set. Experiment (release build, Settings idle for 6 s, `OPENTALK_HOME` temp dir, WS / private bytes):
+
+  | `NativeOptions` | WS | Private bytes |
+  |---|---|---|
+  | defaults (depth 0, stencil 0, MSAA 0, hardware acceleration Preferred, vsync on) | 13.4 MB | 322.9 MB (first run, cold shader cache) |
+  | same, re-run | 40.5 MB | 266.4 MB |
+  | `hardware_acceleration: Required` | 12.8 MB | 269.5 MB |
+  | vsync off | 39.5 MB | 266.8 MB |
+  | explicit depth/stencil/MSAA 0 + Preferred + vsync on (shipped) | 12.8 MB | 269.7 MB |
+  | `hardware_acceleration: Off` | does not start | `egui_glow requires opengl 2.0+` (Windows' software GL is 1.1) |
+
+  eframe's defaults already ask for no depth, stencil or multisampling, so spelling them out in `ui/app.rs::native_options` changes
+  nothing measurable; the commit is the driver's. Only the Settings process pays it, and only while the window is open (the
+  daemon never loads `opengl32.dll`, see the delay-load note above, and stays at ~5 MB private). A software-rendering or
+  non-GL backend (wgpu, or a CPU painter) would avoid the commit but costs binary size and per-frame CPU and is out of scope.
+  Verdict: justified deviation; the working-set figure (13 MB) is the one that meets the 80 MB target. `bench/bench.ps1` still
+  prints the private-bytes column and reports the working set against the 80 MB target.

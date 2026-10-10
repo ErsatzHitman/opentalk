@@ -2,6 +2,7 @@
 //!
 //! - `transcribe_file_*`: headless pipeline against the in-repo mock STT server (no network).
 //! - `live_*` (ignored): OpenRouter, `:free` models only, key via `OPENTALK_SECRET_OPENROUTER`.
+//!   They print VERIFIED / UNVERIFIED / FAILED; `OPENTALK_LIVE_REQUIRE=1` turns UNVERIFIED into a failure.
 //! - `desktop_e2e_notepad` (ignored): `tests/e2e.ps1` - daemon + injected WAV + paste into Notepad.
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
@@ -129,33 +130,103 @@ fn bench_summary_of_an_empty_log_is_valid_json() {
     assert_eq!(v["count"], 0);
 }
 
-/// Live OpenRouter smoke test. Upstream rate limits, capacity errors and models that are gated
-/// or do not take audio are reported, not failed: only a successful reply is checked.
+/// Outcome of a live STT run. A live test is only a verification when a model returned a
+/// transcript of the spoken audio; everything short of that is `Unverified`, never a quiet pass.
+#[derive(Debug, PartialEq)]
+enum Live {
+    /// A free model transcribed the audio (the transcript contains the spoken keywords).
+    Verified(String),
+    /// No free model produced a transcript (rate limits, gated models, audio dropped upstream).
+    Unverified(String),
+    /// Our side is wrong or the key is bad (auth, unknown model, bad request): always a failure.
+    Failed(String),
+}
+
+/// Whether an `--transcribe-file` error message is an upstream limitation of the free tier
+/// (rate limit, capacity, timeout, gated model, a reply that dropped the audio) rather than a
+/// fault of the request or the key.
+fn is_upstream_limit(msg: &str) -> bool {
+    ["rate-limited", "having problems", "took too long", "denied access", "No audio detected"].iter().any(|k| msg.contains(k))
+}
+
+/// Maps a finished live run to a test result. `Unverified` passes unless `require` is set
+/// (`OPENTALK_LIVE_REQUIRE=1`); `Failed` never passes.
+fn live_result(outcome: &Live, require: bool) -> Result<(), String> {
+    match outcome {
+        Live::Verified(_) => Ok(()),
+        Live::Unverified(_) if !require => Ok(()),
+        Live::Unverified(why) => Err(format!("OPENTALK_LIVE_REQUIRE=1 and STT was not verified: {why}")),
+        Live::Failed(why) => Err(format!("live STT failed: {why}")),
+    }
+}
+
+/// Prints a `VERIFIED` / `UNVERIFIED` / `FAILED` line and panics when `live_result` says so.
+fn report_live(test: &str, outcome: Live) {
+    match &outcome {
+        Live::Verified(t) => eprintln!("{test}: VERIFIED live transcript: {t:?}"),
+        Live::Unverified(why) => eprintln!("{test}: UNVERIFIED - no free model produced a transcript of the audio: {why}"),
+        Live::Failed(why) => eprintln!("{test}: FAILED - {why}"),
+    }
+    let require = std::env::var("OPENTALK_LIVE_REQUIRE").is_ok_and(|v| v == "1");
+    if let Err(e) = live_result(&outcome, require) {
+        panic!("{test}: {e}");
+    }
+}
+
+#[test]
+fn live_verdicts_distinguish_verified_unverified_and_failed() {
+    let (v, u, f) = (Live::Verified("t".into()), Live::Unverified("x".into()), Live::Failed("y".into()));
+    assert!(live_result(&v, false).is_ok() && live_result(&v, true).is_ok());
+    assert!(live_result(&u, false).is_ok());
+    assert!(live_result(&u, true).unwrap_err().contains("not verified"));
+    assert!(live_result(&f, false).is_err() && live_result(&f, true).is_err());
+    assert!(is_upstream_limit("OpenRouter rate-limited the request. Wait a moment and try again."));
+    assert!(is_upstream_limit("OpenRouter denied access. Your key may not include this model."));
+    assert!(is_upstream_limit("No audio detected"));
+    assert!(!is_upstream_limit("OpenRouter rejected your API key."));
+    assert!(!is_upstream_limit("OpenRouter doesn't recognize the model “x”."));
+}
+
+/// Live OpenRouter smoke test (`:free` models only; `OPENTALK_LIVE_MODEL` may list several,
+/// comma separated). Prints `VERIFIED`, `UNVERIFIED` or `FAILED`: upstream limits (429/5xx,
+/// gated models, a free endpoint that drops the audio) are `UNVERIFIED`, never a green pass
+/// with `OPENTALK_LIVE_REQUIRE=1`; a bad key or request is `FAILED`.
 #[test]
 #[ignore = "live: OpenRouter free model (needs OPENTALK_SECRET_OPENROUTER)"]
 fn live_transcribe_file_openrouter_free() {
     if std::env::var_os("OPENTALK_SECRET_OPENROUTER").is_none() {
-        eprintln!("OPENTALK_SECRET_OPENROUTER not set; skipping");
+        report_live("live_transcribe_file_openrouter_free", Live::Unverified("OPENTALK_SECRET_OPENROUTER not set".into()));
         return;
     }
-    let model = std::env::var("OPENTALK_LIVE_MODEL").unwrap_or_else(|_| "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free".into());
-    assert!(model.ends_with(":free"), "live tests may only use :free models");
+    let models = std::env::var("OPENTALK_LIVE_MODEL").unwrap_or_else(|_| "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free".into());
     let home = Home::new("live");
     let wav = fixture("tts_fillers.wav");
-    let mut last = serde_json::Value::Null;
-    for attempt in 0..4 {
-        let (code, v) = transcribe(&home, &[wav.to_str().unwrap(), "--provider", "openrouter", "--model", &model, "--no-llm"], &[]);
-        if code == 0 {
-            let text = v["text"].as_str().unwrap_or_default().to_lowercase();
-            eprintln!("live transcript: {text}");
-            assert!(text.contains("friday") || text.contains("release"), "unexpected transcript: {v}");
-            return;
+    let mut notes = Vec::new();
+    for model in models.split(',').map(str::trim).filter(|m| !m.is_empty()) {
+        assert!(model.ends_with(":free"), "live tests may only use :free models");
+        for attempt in 0..4u64 {
+            let (code, v) = transcribe(&home, &[wav.to_str().unwrap(), "--provider", "openrouter", "--model", model, "--no-llm"], &[]);
+            if code == 0 {
+                let text = v["text"].as_str().unwrap_or_default().to_lowercase();
+                if text.contains("friday") || text.contains("release") {
+                    return report_live("live_transcribe_file_openrouter_free", Live::Verified(text));
+                }
+                notes.push(format!("{model}: reply without the spoken words ({text:?})"));
+                break;
+            }
+            let msg = v["error"].as_str().unwrap_or_default().to_string();
+            if !is_upstream_limit(&msg) {
+                return report_live("live_transcribe_file_openrouter_free", Live::Failed(format!("{model}: {msg}")));
+            }
+            eprintln!("{model} attempt {attempt}: {msg}");
+            if attempt == 3 {
+                notes.push(format!("{model}: {msg}"));
+            } else {
+                std::thread::sleep(std::time::Duration::from_secs(6 * (attempt + 1)));
+            }
         }
-        eprintln!("attempt {attempt}: {v}");
-        last = v;
-        std::thread::sleep(std::time::Duration::from_secs(6 * (attempt + 1)));
     }
-    eprintln!("no live transcript (upstream limits / gated / no audio support): {last}");
+    report_live("live_transcribe_file_openrouter_free", Live::Unverified(notes.join("; ")));
 }
 
 /// True when the interactive desktop can be driven: the session is not locked (the Win10/11 lock

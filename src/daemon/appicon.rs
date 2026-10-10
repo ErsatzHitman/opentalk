@@ -1,10 +1,12 @@
 //! Foreground application icon for the Spokenly-style bubble. TASK win-output implements:
-//! exe path -> high-quality icon (IShellItemImageFactory / SHGetFileInfo / ExtractIconEx at
-//! >= 48 px), UWP via package logo when needed, friendly name from FileDescription; per-exe cache.
+//! exe path -> high-quality icon (PrivateExtractIconsW / SHGetFileInfo at >= 48 px, the shell image
+//! factory for packaged apps), friendly name from FileDescription; per-exe cache.
 //!
-//! Extraction order: `IShellItemImageFactory` (sharp, alpha-correct, any size; for packaged apps it
-//! is asked for the `shell:AppsFolder\<AUMID>` item, which yields the Start-menu tile), then
-//! `PrivateExtractIconsW` (exact-size resource icon), then `SHGetFileInfoW` (system large icon).
+//! Extraction order for classic Win32 executables: `PrivateExtractIconsW` (exact-size resource icon,
+//! user32 only), then `SHGetFileInfoW` (system large icon), and `IShellItemImageFactory` only when both
+//! return nothing. The factory loads ~35 shell DLLs (windows.storage, XAML, ...) into the process for
+//! the rest of its life (about +17 MB working set), so it is reserved for packaged (UWP / MSIX) apps,
+//! where it is asked for the `shell:AppsFolder\<AUMID>` item and yields the Start-menu tile.
 //! Icons from `HICON`s are rasterised on black and white to recover their alpha channel.
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -89,31 +91,77 @@ pub fn load_path(path: &str, px: u32) -> Option<AppIcon> {
     Some(icon)
 }
 
-fn extract(path: &str, pid: u32, px: u32) -> Option<AppIcon> {
-    let _com = Com::init();
-    let exe_name = file_name(path).to_ascii_lowercase();
+/// Which extraction strategy a target takes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Route {
+    /// Classic executable: resource icon, then the system icon; the shell factory only as a last resort.
+    Win32,
+    /// UWP / MSIX app (or the frame host that fronts it): the shell factory is the right tool.
+    Packaged,
+}
 
-    // Packaged (UWP / MSIX) apps: the exe has no good icon; use the Start-menu tile instead.
-    let mut packaged_name = None;
-    let mut rgba = None;
-    if pid != 0 && path.to_ascii_lowercase().contains("\\windowsapps\\") {
-        if let Some(aumid) = aumid_of(pid) {
-            let item = format!("shell:AppsFolder\\{aumid}");
-            if let Some(img) = shell_image(&item, px) {
-                packaged_name = display_name(&item);
-                rgba = Some(img);
-            }
-        }
+/// Packaged apps live under `...\WindowsApps\` or are shown through `ApplicationFrameHost.exe`.
+fn route_for(path: &str) -> Route {
+    let lower = path.to_ascii_lowercase();
+    if lower.contains(r"\windowsapps\") || file_name(&lower) == "applicationframehost.exe" {
+        Route::Packaged
+    } else {
+        Route::Win32
     }
-    let rgba = rgba
-        .or_else(|| shell_image(path, px))
-        .or_else(|| private_extract(path, px))
-        .or_else(|| shgetfileinfo(path, px))?;
+}
+
+/// `IShellItemImageFactory` backend (COM apartment scoped to the call).
+fn shell_backend(item: &str, px: u32) -> Option<Vec<u8>> {
+    let _com = Com::init();
+    shell_image(item, px)
+}
+
+/// Cheap backends: exact-size resource icon (user32 only), then the system large icon.
+fn cheap_backend(path: &str, px: u32) -> Option<Vec<u8>> {
+    private_extract(path, px).or_else(|| shgetfileinfo(path, px))
+}
+
+fn extract(path: &str, pid: u32, px: u32) -> Option<AppIcon> {
+    extract_with(path, pid, px, &cheap_backend, &shell_backend)
+}
+
+/// [`extract`] with both backends injected so tests can prove a Win32 path never reaches the shell one.
+fn extract_with(
+    path: &str,
+    pid: u32,
+    px: u32,
+    cheap: &dyn Fn(&str, u32) -> Option<Vec<u8>>,
+    shell: &dyn Fn(&str, u32) -> Option<Vec<u8>>,
+) -> Option<AppIcon> {
+    let exe_name = file_name(path).to_ascii_lowercase();
+    let mut packaged_name = None;
+    let rgba = match route_for(path) {
+        Route::Win32 => cheap(path, px).or_else(|| shell(path, px)),
+        Route::Packaged => {
+            let mut tile = None;
+            if pid != 0 {
+                if let Some(aumid) = aumid_of(pid) {
+                    let item = format!(r"shell:AppsFolder\{aumid}");
+                    if let Some(img) = shell(&item, px) {
+                        packaged_name = display_name_scoped(&item);
+                        tile = Some(img);
+                    }
+                }
+            }
+            tile.or_else(|| shell(path, px)).or_else(|| cheap(path, px))
+        }
+    }?;
 
     let name = packaged_name
         .or_else(|| friendly_name(path))
         .unwrap_or_else(|| name_from_stem(&exe_name));
     Some(AppIcon { name, exe_name, rgba, size: px })
+}
+
+/// [`display_name`] inside its own COM apartment.
+fn display_name_scoped(path: &str) -> Option<String> {
+    let _com = Com::init();
+    display_name(path)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -494,7 +542,9 @@ fn private_extract(path: &str, px: u32) -> Option<Vec<u8>> {
     }
 }
 
+/// `SHGetFileInfoW(SHGFI_ICON)`; its docs require COM on the calling thread, so it gets its own apartment.
 fn shgetfileinfo(path: &str, px: u32) -> Option<Vec<u8>> {
+    let _com = Com::init();
     let w = wide(path);
     let mut info = SHFILEINFOW::default();
     // SAFETY: `info` is a valid out struct; its HICON is destroyed after drawing.
@@ -605,6 +655,66 @@ mod tests {
     }
 
     #[test]
+    fn routes() {
+        assert_eq!(route_for(r"C:\Windows\System32\notepad.exe"), Route::Win32);
+        assert_eq!(route_for(r"C:\Windows\explorer.exe"), Route::Win32);
+        assert_eq!(route_for(r"C:\Windows\System32\ApplicationFrameHost.exe"), Route::Packaged);
+        assert_eq!(
+            route_for(r"C:\Program Files\WindowsApps\Microsoft.WindowsCalculator_1.0_x64__8wekyb3d8bbwe\Calculator.exe"),
+            Route::Packaged
+        );
+        assert_eq!(route_for(r"C:\Tools\windowsapps-helper.exe"), Route::Win32);
+    }
+
+    /// A classic Win32 exe must be served by the cheap extractors; the shell factory (which pulls ~35
+    /// DLLs into the daemon) is never reached.
+    #[test]
+    fn win32_exe_never_reaches_shell_factory() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for name in ["notepad.exe", "explorer.exe", r"System32\cmd.exe"] {
+            let path = system_exe(name);
+            if !std::path::Path::new(&path).exists() {
+                continue;
+            }
+            let calls = AtomicUsize::new(0);
+            let shell = |_: &str, _: u32| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                None
+            };
+            let icon = extract_with(&path, 0, 48, &cheap_backend, &shell).expect("cheap path icon");
+            assert_eq!(calls.load(Ordering::SeqCst), 0, "{name} reached the shell factory");
+            assert_eq!(icon.rgba.len(), 48 * 48 * 4);
+            assert!(icon.rgba.chunks_exact(4).any(|p| p[3] > 200));
+        }
+    }
+
+    /// The shell factory stays reachable as a last resort, and for packaged apps.
+    #[test]
+    fn shell_factory_is_last_resort_and_for_packaged() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = AtomicUsize::new(0);
+        let shell = |_: &str, px: u32| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Some(vec![9u8; (px * px * 4) as usize])
+        };
+        // Cheap paths return nothing for a Win32 exe: the factory is asked exactly once, last.
+        let none = |_: &str, _: u32| None;
+        let got = extract_with(r"C:\Tools\plain.exe", 0, 32, &none, &shell);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(got.unwrap().rgba.len(), 32 * 32 * 4);
+        // Cheap paths succeed: the factory is never asked.
+        calls.store(0, Ordering::SeqCst);
+        let some = |_: &str, px: u32| Some(vec![7u8; (px * px * 4) as usize]);
+        assert!(extract_with(r"C:\Tools\plain.exe", 0, 32, &some, &shell).is_some());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        // Packaged path (no live process): the factory is asked for the exe path directly.
+        calls.store(0, Ordering::SeqCst);
+        let pkg = r"C:\Program Files\WindowsApps\X_1.0_x64__abc\x.exe";
+        assert!(extract_with(pkg, 0, 32, &none, &shell).is_some());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn missing_file_is_none() {
         assert!(load_path(r"C:\definitely\not\here.exe", 48).is_none());
         let t = Target::default();
@@ -643,6 +753,42 @@ mod tests {
             let name = display_name(item);
             eprintln!("packaged tile name: {name:?}");
             assert!(name.is_some_and(|n| !n.is_empty()));
+        }
+    }
+
+    /// Run alone (`--ignored`): loading a Win32 exe's icon must not drag the shell DLLs (the source of
+    /// the ~17 MB working-set growth) into the process.
+    #[test]
+    #[ignore]
+    fn desktop_win32_icon_loads_no_shell_dlls() {
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        let loaded = |name: &str| {
+            let w = wide(name);
+            // SAFETY: `w` is NUL-terminated and outlives the call.
+            unsafe { GetModuleHandleW(PCWSTR(w.as_ptr())) }.is_ok()
+        };
+        let ws_mb = || {
+            use windows::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+            use windows::Win32::System::Threading::GetCurrentProcess;
+            let mut c = PROCESS_MEMORY_COUNTERS::default();
+            // SAFETY: `c` is a valid out struct sized as reported.
+            let ok = unsafe {
+                GetProcessMemoryInfo(GetCurrentProcess(), &mut c, size_of::<PROCESS_MEMORY_COUNTERS>() as u32)
+            };
+            if ok.is_ok() { c.WorkingSetSize as f64 / 1048576.0 } else { 0.0 }
+        };
+        let ws0 = ws_mb();
+        let probes = ["windows.storage.dll", "StateRepository.Core.dll", "thumbcache.dll"];
+        let before: Vec<bool> = probes.iter().map(|p| loaded(p)).collect();
+        for name in ["notepad.exe", "explorer.exe"] {
+            let icon = load_path(&system_exe(name), 48).expect("icon");
+            assert!(!icon.name.is_empty());
+        }
+        eprintln!("working set: {ws0:.1} MB -> {:.1} MB after Win32 icon loads", ws_mb());
+        for (p, was) in probes.iter().zip(before) {
+            if !was {
+                assert!(!loaded(p), "{p} was loaded by the Win32 icon path");
+            }
         }
     }
 

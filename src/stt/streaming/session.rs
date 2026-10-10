@@ -380,7 +380,8 @@ fn spec_secret(spec: &ConnectSpec) -> String {
     if let Some((_, v)) = spec.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("authorization")) {
         return v.rsplit(' ').next().unwrap_or(v).to_string();
     }
-    spec.url.split(['?', '&']).filter_map(|kv| kv.strip_prefix("key=").or_else(|| kv.strip_prefix("token="))).next().unwrap_or("").to_string()
+    // The query value is percent-encoded; the server echoes the decoded credential.
+    spec.url.split(['?', '&']).filter_map(|kv| kv.strip_prefix("key=").or_else(|| kv.strip_prefix("token="))).next().map(util::percent_decode).unwrap_or_default()
 }
 
 struct Loop<'a> {
@@ -627,5 +628,18 @@ impl Loop<'_> {
             let _ = self.ws.flush();
         }
         let _ = self.ws.get_ref().tcp().shutdown(Shutdown::Both);
+    }
+}
+
+#[cfg(test)]
+mod secret_tests {
+    use super::*;
+
+    #[test]
+    fn spec_secret_decodes_query_credentials() {
+        let q = ConnectSpec { url: "wss://h/ws?sample_rate=16000&token=tok%2B%2F%3D".into(), headers: vec![] };
+        assert_eq!(spec_secret(&q), "tok+/=");
+        let h = ConnectSpec { url: "wss://h/ws".into(), headers: vec![("Authorization".into(), "Token abc+def".into())] };
+        assert_eq!(spec_secret(&h), "abc+def");
     }
 }
