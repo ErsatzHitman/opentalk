@@ -1,12 +1,15 @@
 //! Foreground application icon for the Spokenly-style bubble. TASK win-output implements:
-//! exe path -> high-quality icon (PrivateExtractIconsW / SHGetFileInfo at >= 48 px, the shell image
-//! factory for packaged apps), friendly name from FileDescription; per-exe cache.
+//! exe path -> high-quality icon (PrivateExtractIconsW / SHGetFileInfo at >= 48 px, the package
+//! manifest's logo for packaged apps), friendly name from FileDescription; per-exe cache.
 //!
 //! Extraction order for classic Win32 executables: `PrivateExtractIconsW` (exact-size resource icon,
 //! user32 only), then `SHGetFileInfoW` (system large icon), and `IShellItemImageFactory` only when both
 //! return nothing. The factory loads ~35 shell DLLs (windows.storage, XAML, ...) into the process for
-//! the rest of its life (about +17 MB working set), so it is reserved for packaged (UWP / MSIX) apps,
-//! where it is asked for the `shell:AppsFolder\<AUMID>` item and yields the Start-menu tile.
+//! the rest of its life (about +17 MB working set), so packaged (UWP / MSIX) apps never use it. They
+//! read the logo the package declares instead: the install folder (from the executable's path or the
+//! process's package identity), `AppxManifest.xml`'s `Square44x44Logo`, the nearest `targetsize-N` /
+//! `scale-N` PNG next to it, decoded by tiny-skia's PNG decoder. No COM and no shell DLLs; callers run
+//! this on a helper thread and the result stays in the per-exe cache.
 //! Icons from `HICON`s are rasterised on black and white to recover their alpha channel.
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -20,14 +23,14 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::Storage::FileSystem::{
     FILE_FLAGS_AND_ATTRIBUTES, GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW,
 };
-use windows::Win32::Storage::Packaging::Appx::GetApplicationUserModelId;
+use windows::Win32::Storage::Packaging::Appx::{GetApplicationUserModelId, GetPackageFullName, GetPackagePathByFullName};
 use windows::Win32::System::Com::{
-    COINIT_APARTMENTTHREADED, CoInitializeEx, CoTaskMemFree, CoUninitialize,
+    COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize,
 };
 use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
 use windows::Win32::UI::Shell::{
-    IShellItem, IShellItemImageFactory, SHCreateItemFromParsingName, SHGFI_ICON, SHGFI_LARGEICON,
-    SHGetFileInfoW, SHFILEINFOW, SIIGBF_BIGGERSIZEOK, SIIGBF_ICONONLY, SIGDN_NORMALDISPLAY,
+    IShellItemImageFactory, SHCreateItemFromParsingName, SHGFI_ICON, SHGFI_LARGEICON,
+    SHGetFileInfoW, SHFILEINFOW, SIIGBF_BIGGERSIZEOK, SIIGBF_ICONONLY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     DI_NORMAL, DestroyIcon, DrawIconEx, HICON, PrivateExtractIconsW,
@@ -96,14 +99,16 @@ pub fn load_path(path: &str, px: u32) -> Option<AppIcon> {
 enum Route {
     /// Classic executable: resource icon, then the system icon; the shell factory only as a last resort.
     Win32,
-    /// UWP / MSIX app (or the frame host that fronts it): the shell factory is the right tool.
+    /// UWP / MSIX app (or the frame host that fronts it): the logo the package declares, then the
+    /// cheap extractors. Never the shell factory.
     Packaged,
 }
 
-/// Packaged apps live under `...\WindowsApps\` or are shown through `ApplicationFrameHost.exe`.
+/// Packaged apps live under `...\WindowsApps\` (or the inbox `...\SystemApps\`) or are shown through
+/// `ApplicationFrameHost.exe`.
 fn route_for(path: &str) -> Route {
     let lower = path.to_ascii_lowercase();
-    if lower.contains(r"\windowsapps\") || file_name(&lower) == "applicationframehost.exe" {
+    if package_folder_end(path).is_some() || file_name(&lower) == "applicationframehost.exe" {
         Route::Packaged
     } else {
         Route::Win32
@@ -121,55 +126,315 @@ fn cheap_backend(path: &str, px: u32) -> Option<Vec<u8>> {
     private_extract(path, px).or_else(|| shgetfileinfo(path, px))
 }
 
-fn extract(path: &str, pid: u32, px: u32) -> Option<AppIcon> {
-    extract_with(path, pid, px, &cheap_backend, &shell_backend)
+/// What the package route yields: `px` x `px` straight RGBA plus the manifest's display name when
+/// that is a literal string (resource references fall back to the exe's FileDescription).
+struct PackagedIcon {
+    rgba: Vec<u8>,
+    name: Option<String>,
 }
 
-/// [`extract`] with both backends injected so tests can prove a Win32 path never reaches the shell one.
+fn extract(path: &str, pid: u32, px: u32) -> Option<AppIcon> {
+    extract_with(path, pid, px, &cheap_backend, &shell_backend, &packaged_backend)
+}
+
+/// [`extract`] with the backends injected so tests can prove which ones a route reaches. The shell
+/// factory backs only the Win32 route's last resort; a packaged target never touches it.
 fn extract_with(
     path: &str,
     pid: u32,
     px: u32,
     cheap: &dyn Fn(&str, u32) -> Option<Vec<u8>>,
     shell: &dyn Fn(&str, u32) -> Option<Vec<u8>>,
+    packaged: &dyn Fn(&str, u32, u32) -> Option<PackagedIcon>,
 ) -> Option<AppIcon> {
     let exe_name = file_name(path).to_ascii_lowercase();
     let mut packaged_name = None;
     let rgba = match route_for(path) {
         Route::Win32 => cheap(path, px).or_else(|| shell(path, px)),
-        Route::Packaged => {
-            let mut tile = None;
-            if pid != 0 {
-                if let Some(aumid) = aumid_of(pid) {
-                    let item = format!(r"shell:AppsFolder\{aumid}");
-                    if let Some(img) = shell(&item, px) {
-                        packaged_name = display_name_scoped(&item);
-                        tile = Some(img);
-                    }
-                }
+        Route::Packaged => match packaged(path, pid, px) {
+            Some(p) => {
+                packaged_name = p.name;
+                Some(p.rgba)
             }
-            if tile.is_some() {
-                tile
-            } else if exe_name == "applicationframehost.exe" {
-                // No AUMID tile: the frame host's own shell icon is a generic window and costs ~35 shell
-                // DLLs (+17 MB WS), so try the cheap extractors first and the factory only as a last resort.
-                cheap(path, px).or_else(|| shell(path, px))
-            } else {
-                shell(path, px).or_else(|| cheap(path, px))
-            }
-        }
+            // No readable manifest logo (assets only inside resources.pri, access denied, the frame
+            // host itself): the exe's own icon, which is at worst generic.
+            None => cheap(path, px),
+        },
     }?;
 
     let name = packaged_name
-        .or_else(|| friendly_name(path))
+        .or_else(|| friendly_name(path).map(|d| tidy_description(&d)))
         .unwrap_or_else(|| name_from_stem(&exe_name));
     Some(AppIcon { name, exe_name, rgba, size: px })
 }
 
-/// [`display_name`] inside its own COM apartment.
-fn display_name_scoped(path: &str) -> Option<String> {
-    let _com = Com::init();
-    display_name(path)
+// ---------------------------------------------------------------------------------------------
+// Packaged apps: manifest + logo files
+// ---------------------------------------------------------------------------------------------
+
+/// Largest manifest or logo file we read (real ones are a few KB to a few hundred KB).
+const MAX_PACKAGE_FILE: u64 = 4 << 20;
+
+fn packaged_backend(path: &str, pid: u32, px: u32) -> Option<PackagedIcon> {
+    let root = package_root_from_path(path).or_else(|| package_root_of_pid(pid))?;
+    let xml = read_capped(&root.join("AppxManifest.xml"))?;
+    let xml = String::from_utf8_lossy(&xml);
+    let apps = parse_manifest(xml.trim_start_matches('\u{feff}'));
+    let app_id = if pid != 0 { aumid_of(pid).and_then(|a| a.split_once('!').map(|(_, id)| id.to_owned())) } else { None };
+    let app = pick_app(&apps, app_id.as_deref(), file_name(path))?;
+    let rgba = app.logos.iter().find_map(|(rel, base_edge)| load_logo(&root, rel, *base_edge, px))?;
+    // A literal DisplayName only: `ms-resource:` strings need the MRT loader (SHLoadIndirectString),
+    // which maps 11 more DLLs and ~6 MB of working set into the daemon. The caller falls back to the
+    // exe's FileDescription.
+    let name = app.display_name.as_deref().filter(|n| !n.starts_with("ms-resource:")).and_then(clean_description);
+    Some(PackagedIcon { rgba, name })
+}
+
+/// Folders packaged apps are installed under: store apps and the inbox ones (LockApp, Search, Settings).
+const PACKAGE_FOLDERS: [&str; 2] = [r"\windowsapps\", r"\systemapps\"];
+
+/// Offset just past the package folder marker in `path` (case-insensitive), if there is one.
+fn package_folder_end(path: &str) -> Option<usize> {
+    let lower = path.to_ascii_lowercase();
+    PACKAGE_FOLDERS.iter().find_map(|m| lower.find(m).map(|i| i + m.len()))
+}
+
+/// Install folder of a package whose executable sits under `...\WindowsApps\<PackageFullName>\`
+/// (or `...\SystemApps\<PackageFullName>\`).
+fn package_root_from_path(path: &str) -> Option<std::path::PathBuf> {
+    let at = package_folder_end(path)?;
+    let end = path[at..].find(['\\', '/'])?;
+    if end == 0 {
+        return None;
+    }
+    Some(std::path::PathBuf::from(&path[..at + end]))
+}
+
+/// Install folder of a running packaged process, from its package identity.
+fn package_root_of_pid(pid: u32) -> Option<std::path::PathBuf> {
+    if pid == 0 {
+        return None;
+    }
+    // SAFETY: handle closed on every path; buffers sized by the APIs' own length reports.
+    unsafe {
+        let h: HANDLE = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let mut len = 0u32;
+        let _ = GetPackageFullName(h, &mut len, None);
+        let full = if len > 1 {
+            let mut buf = vec![0u16; len as usize];
+            let rc = GetPackageFullName(h, &mut len, Some(PWSTR(buf.as_mut_ptr())));
+            if rc.0 == 0 { Some(buf) } else { None }
+        } else {
+            None
+        };
+        let _ = CloseHandle(h);
+        let full = full?;
+        let mut plen = 0u32;
+        let _ = GetPackagePathByFullName(PCWSTR(full.as_ptr()), &mut plen, None);
+        if plen <= 1 {
+            return None;
+        }
+        let mut pbuf = vec![0u16; plen as usize];
+        if GetPackagePathByFullName(PCWSTR(full.as_ptr()), &mut plen, Some(PWSTR(pbuf.as_mut_ptr()))).0 != 0 {
+            return None;
+        }
+        let end = pbuf.iter().position(|&u| u == 0).unwrap_or(pbuf.len());
+        Some(std::path::PathBuf::from(String::from_utf16_lossy(&pbuf[..end])))
+    }
+}
+
+fn read_capped(path: &std::path::Path) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut buf = Vec::new();
+    std::fs::File::open(path).ok()?.take(MAX_PACKAGE_FILE + 1).read_to_end(&mut buf).ok()?;
+    (buf.len() as u64 <= MAX_PACKAGE_FILE).then_some(buf)
+}
+
+/// One `<Application>` of a package manifest.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct ManifestApp {
+    id: String,
+    /// `Executable` attribute (may carry a sub-folder: `Notepad\Notepad.exe`).
+    exe: String,
+    /// Logo paths in preference order with the edge (px) an unqualified file of that kind has:
+    /// `Square44x44Logo` (44), `Square150x150Logo` (150), `Logo` (50).
+    logos: Vec<(String, u32)>,
+    display_name: Option<String>,
+}
+
+/// Value of attribute `name` in one tag (`name="v"` or `name='v'`, whole-word, entities decoded).
+fn xml_attr(tag: &str, name: &str) -> Option<String> {
+    let mut from = 0;
+    while let Some(i) = tag[from..].find(name) {
+        let at = from + i;
+        from = at + name.len();
+        if !tag[..at].ends_with(|c: char| c.is_ascii_whitespace()) {
+            continue;
+        }
+        let rest = tag[from..].trim_start();
+        let Some(rest) = rest.strip_prefix('=') else { continue };
+        let rest = rest.trim_start();
+        let quote = rest.chars().next().filter(|c| *c == '"' || *c == '\'')?;
+        let body = &rest[1..];
+        let end = body.find(quote)?;
+        return Some(
+            body[..end]
+                .replace("&lt;", "<")
+                .replace("&gt;", ">")
+                .replace("&quot;", "\"")
+                .replace("&apos;", "'")
+                .replace("&amp;", "&"),
+        );
+    }
+    None
+}
+
+/// The text of the tag that starts at `start` (`<` included) up to its closing `>`.
+fn tag_at(xml: &str, start: usize) -> &str {
+    let end = xml[start..].find('>').map_or(xml.len(), |e| start + e + 1);
+    &xml[start..end]
+}
+
+/// Every `<Application ...>` with its `VisualElements` logos. A tolerant scanner, not an XML parser:
+/// manifests are machine-written and only a handful of attributes matter.
+fn parse_manifest(xml: &str) -> Vec<ManifestApp> {
+    let starts: Vec<usize> = xml
+        .match_indices("<Application")
+        .filter(|(i, _)| xml[i + "<Application".len()..].starts_with(|c: char| c.is_ascii_whitespace()))
+        .map(|(i, _)| i)
+        .collect();
+    let mut apps = Vec::new();
+    for (n, &s) in starts.iter().enumerate() {
+        let seg = &xml[s..starts.get(n + 1).copied().unwrap_or(xml.len())];
+        let head = tag_at(seg, 0);
+        let mut app = ManifestApp {
+            id: xml_attr(head, "Id").unwrap_or_default(),
+            exe: xml_attr(head, "Executable").unwrap_or_default(),
+            ..Default::default()
+        };
+        let ve = seg
+            .match_indices("VisualElements")
+            .find(|(i, _)| seg[..*i].ends_with(['<', ':']))
+            .and_then(|(i, _)| seg[..i].rfind('<'))
+            .map(|lt| tag_at(seg, lt));
+        if let Some(ve) = ve {
+            for (attr, edge) in [("Square44x44Logo", 44), ("Square150x150Logo", 150), ("Logo", 50)] {
+                if let Some(v) = xml_attr(ve, attr).filter(|v| !v.is_empty()) {
+                    app.logos.push((v, edge));
+                }
+            }
+            app.display_name = xml_attr(ve, "DisplayName");
+        }
+        apps.push(app);
+    }
+    apps
+}
+
+/// The app a process belongs to: its AUMID's app id, else the one whose `Executable` is this file,
+/// else the first.
+fn pick_app<'a>(apps: &'a [ManifestApp], app_id: Option<&str>, exe_file: &str) -> Option<&'a ManifestApp> {
+    app_id
+        .and_then(|id| apps.iter().find(|a| a.id.eq_ignore_ascii_case(id)))
+        .or_else(|| apps.iter().find(|a| file_name(&a.exe).eq_ignore_ascii_case(exe_file)))
+        .or_else(|| apps.first())
+}
+
+/// How a logo variant is drawn: the plated tile, or the glyph alone on transparency.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Form {
+    Plated,
+    Unplated,
+    LightUnplated,
+}
+
+/// A candidate file next to the manifest's logo path.
+#[derive(Clone, Debug, PartialEq)]
+struct Variant {
+    file: String,
+    /// Edge in pixels: `targetsize-N`, or base edge x `scale-N` / 100.
+    edge: u32,
+    form: Form,
+}
+
+/// Classify `file` as a variant of `stem`.`ext` (`Square44x44Logo.targetsize-48_altform-unplated.png`).
+/// High-contrast, language and theme variants are skipped: they are not the app's normal look.
+fn parse_variant(file: &str, stem: &str, ext: &str, base_edge: u32) -> Option<Variant> {
+    let lower = file.to_ascii_lowercase();
+    let rest = lower.strip_prefix(&stem.to_ascii_lowercase())?;
+    let rest = rest.strip_suffix(&format!(".{}", ext.to_ascii_lowercase()))?;
+    let mut edge = None;
+    let mut form = Form::Plated;
+    if !rest.is_empty() {
+        for tok in rest.strip_prefix('.')?.split('_') {
+            if let Some(n) = tok.strip_prefix("targetsize-") {
+                edge = Some(n.parse::<u32>().ok()?);
+            } else if let Some(n) = tok.strip_prefix("scale-") {
+                let scale = n.parse::<u32>().ok()?;
+                edge.get_or_insert(base_edge * scale / 100);
+            } else if tok == "altform-unplated" {
+                form = Form::Unplated;
+            } else if tok == "altform-lightunplated" {
+                form = Form::LightUnplated;
+            } else {
+                return None;
+            }
+        }
+    }
+    let edge = edge.unwrap_or(base_edge);
+    (edge > 0).then(|| Variant { file: file.to_owned(), edge, form })
+}
+
+/// Best variant for `px`: the preferred form first, then the smallest image at least `px` wide
+/// (downscaling keeps it crisp), else the largest smaller one.
+fn pick_variant(variants: &[Variant], px: u32) -> Option<&Variant> {
+    variants.iter().min_by_key(|v| {
+        let fits = v.edge >= px;
+        (v.form, !fits, if fits { v.edge } else { u32::MAX - v.edge })
+    })
+}
+
+/// Read the best logo file for `px` from the folder of manifest path `rel` and fit it to `px` x `px`.
+fn load_logo(root: &std::path::Path, rel: &str, base_edge: u32, px: u32) -> Option<Vec<u8>> {
+    let full = root.join(rel.replace('/', "\\"));
+    let dir = full.parent()?;
+    let file = full.file_name()?.to_str()?;
+    let (stem, ext) = file.rsplit_once('.')?;
+    let mut left: Vec<Variant> = std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(|e| e.ok()?.file_name().into_string().ok())
+        .filter_map(|n| parse_variant(&n, stem, ext, base_edge))
+        .collect();
+    // A file that fails to decode must not hide the next best one.
+    while let Some(best) = pick_variant(&left, px).cloned() {
+        if let Some(img) = read_capped(&dir.join(&best.file)).and_then(|b| decode_png_rgba(&b, px)) {
+            return Some(img);
+        }
+        left.retain(|v| v.file != best.file);
+    }
+    None
+}
+
+/// PNG bytes -> straight RGBA `px` x `px` (any colour type or depth; non-square art is letterboxed).
+fn decode_png_rgba(bytes: &[u8], px: u32) -> Option<Vec<u8>> {
+    let mut dec = png::Decoder::new(std::io::Cursor::new(bytes));
+    dec.set_transformations(png::Transformations::normalize_to_color8());
+    let mut reader = dec.read_info().ok()?;
+    let mut buf = vec![0u8; reader.output_buffer_size()?];
+    let info = reader.next_frame(&mut buf).ok()?;
+    let (w, h) = (info.width, info.height);
+    if w == 0 || h == 0 || w > 4096 || h > 4096 {
+        return None;
+    }
+    let data = &buf[..info.buffer_size()];
+    let mut rgba = Vec::with_capacity(w as usize * h as usize * 4);
+    match info.color_type {
+        png::ColorType::Rgba => rgba.extend_from_slice(data),
+        png::ColorType::Rgb => data.chunks_exact(3).for_each(|p| rgba.extend_from_slice(&[p[0], p[1], p[2], 255])),
+        png::ColorType::Grayscale => data.iter().for_each(|&g| rgba.extend_from_slice(&[g, g, g, 255])),
+        png::ColorType::GrayscaleAlpha => data.chunks_exact(2).for_each(|p| rgba.extend_from_slice(&[p[0], p[0], p[0], p[1]])),
+        png::ColorType::Indexed => return None,
+    }
+    fit_square(rgba, w, h, px)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -259,6 +524,28 @@ fn friendly_name(path: &str) -> Option<String> {
     }
 }
 
+/// Some packaged apps leave their file name as the description ("Notepad.exe", "SnippingTool.exe"):
+/// drop the extension and split CamelCase into words ("Snipping Tool").
+fn tidy_description(s: &str) -> String {
+    let Some(stem) = s.len().checked_sub(4).filter(|&i| s.is_char_boundary(i) && s[i..].eq_ignore_ascii_case(".exe")).map(|i| &s[..i])
+    else {
+        return s.to_owned();
+    };
+    if stem.is_empty() || stem.contains(' ') {
+        return stem.to_owned();
+    }
+    let mut out = String::with_capacity(stem.len() + 2);
+    let mut prev: Option<char> = None;
+    for c in stem.chars() {
+        if c.is_uppercase() && prev.is_some_and(|p| p.is_lowercase() || p.is_ascii_digit()) {
+            out.push(' ');
+        }
+        out.push(c);
+        prev = Some(c);
+    }
+    out
+}
+
 /// Trim and reject empty / control-laden descriptions.
 fn clean_description(s: &str) -> Option<String> {
     let t: String = s.chars().filter(|c| !c.is_control()).collect();
@@ -287,19 +574,6 @@ fn aumid_of(pid: u32) -> Option<String> {
         };
         let _ = CloseHandle(h);
         r
-    }
-}
-
-/// Shell display name of an item path ("Calculator" for an AppsFolder item).
-fn display_name(path: &str) -> Option<String> {
-    let w = wide(path);
-    // SAFETY: the returned PWSTR is CoTaskMem-allocated and freed here.
-    unsafe {
-        let item: IShellItem = SHCreateItemFromParsingName(PCWSTR(w.as_ptr()), None).ok()?;
-        let p = item.GetDisplayName(SIGDN_NORMALDISPLAY).ok()?;
-        let s = p.to_string().ok();
-        CoTaskMemFree(Some(p.0 as *const c_void));
-        s.and_then(|s| clean_description(&s))
     }
 }
 
@@ -591,6 +865,17 @@ mod tests {
     }
 
     #[test]
+    fn descriptions_that_are_file_names_are_tidied() {
+        assert_eq!(tidy_description("Notepad.exe"), "Notepad");
+        assert_eq!(tidy_description("SnippingTool.EXE"), "Snipping Tool");
+        assert_eq!(tidy_description("Windows Terminal Host"), "Windows Terminal Host");
+        assert_eq!(tidy_description("Paint 3D.exe"), "Paint 3D");
+        assert_eq!(tidy_description(".exe"), "");
+        assert_eq!(tidy_description("é.exe"), "é");
+        assert_eq!(tidy_description("é"), "é");
+    }
+
+    #[test]
     fn description_cleaning() {
         assert_eq!(clean_description("  Notepad \r\n").as_deref(), Some("Notepad"));
         assert_eq!(clean_description("   "), None);
@@ -672,10 +957,19 @@ mod tests {
             Route::Packaged
         );
         assert_eq!(route_for(r"C:\Tools\windowsapps-helper.exe"), Route::Win32);
+        assert_eq!(route_for(r"C:\Windows\SystemApps\Microsoft.LockApp_cw5n1h2txyewy\LockApp.exe"), Route::Packaged);
+    }
+
+    fn no_packaged(_: &str, _: u32, _: u32) -> Option<PackagedIcon> {
+        None
+    }
+
+    fn solid(px: u32, v: u8) -> Vec<u8> {
+        vec![v; (px * px * 4) as usize]
     }
 
     /// A classic Win32 exe must be served by the cheap extractors; the shell factory (which pulls ~35
-    /// DLLs into the daemon) is never reached.
+    /// DLLs into the daemon) is never reached, and neither is the package route.
     #[test]
     fn win32_exe_never_reaches_shell_factory() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -689,69 +983,264 @@ mod tests {
                 calls.fetch_add(1, Ordering::SeqCst);
                 None
             };
-            let icon = extract_with(&path, 0, 48, &cheap_backend, &shell).expect("cheap path icon");
+            let icon = extract_with(&path, 0, 48, &cheap_backend, &shell, &no_packaged).expect("cheap path icon");
             assert_eq!(calls.load(Ordering::SeqCst), 0, "{name} reached the shell factory");
             assert_eq!(icon.rgba.len(), 48 * 48 * 4);
             assert!(icon.rgba.chunks_exact(4).any(|p| p[3] > 200));
         }
     }
 
-    /// The shell factory stays reachable as a last resort, and for packaged apps.
+    /// For a classic exe the factory stays reachable, but only as the very last resort.
     #[test]
-    fn shell_factory_is_last_resort_and_for_packaged() {
+    fn shell_factory_is_last_resort_for_win32() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let calls = AtomicUsize::new(0);
         let shell = |_: &str, px: u32| {
             calls.fetch_add(1, Ordering::SeqCst);
-            Some(vec![9u8; (px * px * 4) as usize])
+            Some(solid(px, 9))
         };
         // Cheap paths return nothing for a Win32 exe: the factory is asked exactly once, last.
         let none = |_: &str, _: u32| None;
-        let got = extract_with(r"C:\Tools\plain.exe", 0, 32, &none, &shell);
+        let got = extract_with(r"C:\Tools\plain.exe", 0, 32, &none, &shell, &no_packaged);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(got.unwrap().rgba.len(), 32 * 32 * 4);
         // Cheap paths succeed: the factory is never asked.
         calls.store(0, Ordering::SeqCst);
-        let some = |_: &str, px: u32| Some(vec![7u8; (px * px * 4) as usize]);
-        assert!(extract_with(r"C:\Tools\plain.exe", 0, 32, &some, &shell).is_some());
+        let some = |_: &str, px: u32| Some(solid(px, 7));
+        assert!(extract_with(r"C:\Tools\plain.exe", 0, 32, &some, &shell, &no_packaged).is_some());
         assert_eq!(calls.load(Ordering::SeqCst), 0);
-        // Packaged path (no live process): the factory is asked for the exe path directly.
-        calls.store(0, Ordering::SeqCst);
-        let pkg = r"C:\Program Files\WindowsApps\X_1.0_x64__abc\x.exe";
-        assert!(extract_with(pkg, 0, 32, &none, &shell).is_some());
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
-    /// `ApplicationFrameHost.exe` with no resolvable AUMID (pid 0, unresolved child window) takes the
-    /// cheap extractors; the shell factory is only the last resort when they find nothing.
+    /// The Packaged route never calls the in-process shell backend (it maps ~35 shell DLLs into the
+    /// daemon for good): not when the manifest logo is found, not when it is missing, not for the
+    /// frame host, whether or not the cheap extractors find anything.
     #[test]
-    fn frame_host_without_aumid_prefers_cheap_backend() {
+    fn packaged_route_never_calls_shell_backend() {
         use std::sync::atomic::{AtomicUsize, Ordering};
-        let frame_host = r"C:\Windows\System32\ApplicationFrameHost.exe";
         let shell_calls = AtomicUsize::new(0);
         let shell = |_: &str, px: u32| {
             shell_calls.fetch_add(1, Ordering::SeqCst);
-            Some(vec![9u8; (px * px * 4) as usize])
+            Some(solid(px, 9))
         };
         let cheap_calls = AtomicUsize::new(0);
         let cheap = |_: &str, px: u32| {
             cheap_calls.fetch_add(1, Ordering::SeqCst);
-            Some(vec![7u8; (px * px * 4) as usize])
+            Some(solid(px, 7))
         };
-        let icon = extract_with(frame_host, 0, 32, &cheap, &shell).expect("cheap icon");
-        assert_eq!(shell_calls.load(Ordering::SeqCst), 0, "the shell factory must not be asked");
-        assert_eq!(cheap_calls.load(Ordering::SeqCst), 1);
-        assert!(icon.rgba.iter().all(|&b| b == 7));
-        // Cheap finds nothing: the factory is still the last resort.
         let none = |_: &str, _: u32| None;
-        assert!(extract_with(frame_host, 0, 32, &none, &shell).is_some());
-        assert_eq!(shell_calls.load(Ordering::SeqCst), 1);
-        // A WindowsApps exe keeps asking the factory first.
-        shell_calls.store(0, Ordering::SeqCst);
-        cheap_calls.store(0, Ordering::SeqCst);
-        let pkg = r"C:\Program Files\WindowsApps\X_1.0_x64__abc\x.exe";
-        assert!(extract_with(pkg, 0, 32, &cheap, &shell).is_some());
-        assert_eq!((shell_calls.load(Ordering::SeqCst), cheap_calls.load(Ordering::SeqCst)), (1, 0));
+        let pkg = r"C:\Program Files\WindowsApps\Microsoft.WindowsTerminal_1.0_x64__abc\WindowsTerminal.exe";
+        let frame_host = r"C:\Windows\System32\ApplicationFrameHost.exe";
+        let found = |_: &str, _: u32, px: u32| Some(PackagedIcon { rgba: solid(px, 5), name: Some("Terminal".into()) });
+
+        for path in [pkg, frame_host] {
+            for pid in [0, 4242] {
+                // Manifest logo found: used as is, no other backend asked.
+                cheap_calls.store(0, Ordering::SeqCst);
+                let icon = extract_with(path, pid, 32, &cheap, &shell, &found).expect("packaged icon");
+                assert!(icon.rgba.iter().all(|&b| b == 5));
+                assert_eq!(icon.name, "Terminal");
+                assert_eq!(cheap_calls.load(Ordering::SeqCst), 0);
+                // No manifest logo: the cheap extractors, still not the factory.
+                let icon = extract_with(path, pid, 32, &cheap, &shell, &no_packaged).expect("cheap icon");
+                assert!(icon.rgba.iter().all(|&b| b == 7));
+                // Nothing at all: no icon, rather than the factory.
+                assert!(extract_with(path, pid, 32, &none, &shell, &no_packaged).is_none());
+            }
+        }
+        assert_eq!(shell_calls.load(Ordering::SeqCst), 0, "the shell factory must not be asked");
+    }
+
+    const MANIFEST: &str = r##"<?xml version="1.0" encoding="utf-8"?>
+<Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10" xmlns:uap="x">
+  <Identity Name="Microsoft.Test" Version="1.0.0.0" />
+  <Applications>
+    <Application Id="App" Executable="Test\Test.exe" EntryPoint="Windows.FullTrustApplication">
+      <uap:VisualElements DisplayName="ms-resource:AppName" BackgroundColor="#0078D4"
+          Square150x150Logo="Assets\Med.png" Square44x44Logo="Assets\List.png" Description="d">
+        <uap:DefaultTile Wide310x150Logo="Assets\Wide.png" />
+      </uap:VisualElements>
+    </Application>
+    <Application Id="Second" Executable="other.exe">
+      <uap:VisualElements DisplayName="Other &amp; Co" Logo="Assets\Store.png" />
+    </Application>
+  </Applications>
+</Package>"##;
+
+    #[test]
+    fn manifest_parsing() {
+        let apps = parse_manifest(MANIFEST);
+        assert_eq!(apps.len(), 2);
+        assert_eq!(apps[0].id, "App");
+        assert_eq!(apps[0].exe, r"Test\Test.exe");
+        assert_eq!(
+            apps[0].logos,
+            vec![(r"Assets\List.png".to_owned(), 44), (r"Assets\Med.png".to_owned(), 150)]
+        );
+        assert_eq!(apps[0].display_name.as_deref(), Some("ms-resource:AppName"));
+        // `Logo` is matched whole-word: it must not be read out of `Square44x44Logo`.
+        assert_eq!(apps[1].logos, vec![(r"Assets\Store.png".to_owned(), 50)]);
+        assert_eq!(apps[1].display_name.as_deref(), Some("Other & Co"));
+        // A manifest without applications, or garbage, yields nothing rather than panicking.
+        assert!(parse_manifest("<Package/>").is_empty());
+        assert!(parse_manifest("<Application ").is_empty() || parse_manifest("<Application ")[0].logos.is_empty());
+    }
+
+    #[test]
+    fn app_selection() {
+        let apps = parse_manifest(MANIFEST);
+        assert_eq!(pick_app(&apps, Some("second"), "test.exe").unwrap().id, "Second");
+        assert_eq!(pick_app(&apps, None, "OTHER.EXE").unwrap().id, "Second");
+        assert_eq!(pick_app(&apps, None, "Test.exe").unwrap().id, "App");
+        assert_eq!(pick_app(&apps, Some("Nope"), "zzz.exe").unwrap().id, "App");
+        assert!(pick_app(&[], None, "a.exe").is_none());
+    }
+
+    #[test]
+    fn package_roots() {
+        let root = package_root_from_path(r"C:\Program Files\WindowsApps\Pkg_1.0_x64__abc\Sub\app.exe").unwrap();
+        assert_eq!(root, std::path::PathBuf::from(r"C:\Program Files\WindowsApps\Pkg_1.0_x64__abc"));
+        let sys = package_root_from_path(r"C:\windows\systemapps\Microsoft.LockApp_cw5n1h2txyewy\LockApp.exe").unwrap();
+        assert_eq!(sys, std::path::PathBuf::from(r"C:\windows\systemapps\Microsoft.LockApp_cw5n1h2txyewy"));
+        assert!(package_root_from_path(r"C:\Windows\System32\ApplicationFrameHost.exe").is_none());
+        assert!(package_root_from_path(r"C:\Program Files\WindowsApps\").is_none());
+        assert!(package_root_from_path(r"C:\Program Files\WindowsApps\Pkg_only").is_none());
+        // Not a running packaged process.
+        assert!(package_root_of_pid(0).is_none());
+        assert!(package_root_of_pid(std::process::id()).is_none());
+    }
+
+    fn variants(names: &[&str], stem: &str, ext: &str, base: u32) -> Vec<Variant> {
+        names.iter().filter_map(|n| parse_variant(n, stem, ext, base)).collect()
+    }
+
+    #[test]
+    fn variant_parsing_skips_contrast_and_foreign_files() {
+        let v = variants(
+            &[
+                "Square44x44Logo.scale-200.png",
+                "Square44x44Logo.scale-200_contrast-black.png",
+                "Square44x44Logo.targetsize-48.png",
+                "Square44x44Logo.targetsize-48_altform-unplated.png",
+                "Square44x44Logo.targetsize-48_altform-lightunplated.png",
+                "Square44x44Logo.targetsize-48_altform-unplated_contrast-white.png",
+                "square44x44logo.png",
+                "Square44x44Logo2.png",
+                "Square44x44Logo.language-de.png",
+                "Other.png",
+                "Square44x44Logo.targetsize-48.ico",
+            ],
+            "Square44x44Logo",
+            "png",
+            44,
+        );
+        let got: Vec<(&str, u32, Form)> = v.iter().map(|v| (v.file.as_str(), v.edge, v.form)).collect();
+        assert_eq!(
+            got,
+            vec![
+                ("Square44x44Logo.scale-200.png", 88, Form::Plated),
+                ("Square44x44Logo.targetsize-48.png", 48, Form::Plated),
+                ("Square44x44Logo.targetsize-48_altform-unplated.png", 48, Form::Unplated),
+                ("Square44x44Logo.targetsize-48_altform-lightunplated.png", 48, Form::LightUnplated),
+                ("square44x44logo.png", 44, Form::Plated),
+            ]
+        );
+    }
+
+    #[test]
+    fn variant_choice_prefers_smallest_that_fits() {
+        let names = [
+            "L.targetsize-16.png",
+            "L.targetsize-32.png",
+            "L.targetsize-48.png",
+            "L.targetsize-256.png",
+            "L.scale-100.png",
+            "L.scale-200.png",
+        ];
+        let v = variants(&names, "L", "png", 44);
+        assert_eq!(pick_variant(&v, 64).unwrap().file, "L.scale-200.png"); // 88 is the smallest >= 64
+        assert_eq!(pick_variant(&v, 48).unwrap().file, "L.targetsize-48.png");
+        assert_eq!(pick_variant(&v, 40).unwrap().edge, 44); // scale-100
+        assert_eq!(pick_variant(&v, 200).unwrap().file, "L.targetsize-256.png");
+        // Nothing big enough: the largest available.
+        let small = variants(&names[..2], "L", "png", 44);
+        assert_eq!(pick_variant(&small, 64).unwrap().file, "L.targetsize-32.png");
+        assert!(pick_variant(&[], 64).is_none());
+    }
+
+    fn encode_png(w: u32, h: u32, color: png::ColorType, data: &[u8], palette: Option<&[u8]>, trns: Option<&[u8]>) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut enc = png::Encoder::new(&mut out, w, h);
+        enc.set_color(color);
+        enc.set_depth(png::BitDepth::Eight);
+        if let Some(p) = palette {
+            enc.set_palette(p.to_vec());
+        }
+        if let Some(t) = trns {
+            enc.set_trns(t.to_vec());
+        }
+        let mut wr = enc.write_header().unwrap();
+        wr.write_image_data(data).unwrap();
+        wr.finish().unwrap();
+        out
+    }
+
+    #[test]
+    fn png_decoding_all_colour_types() {
+        let rgba = encode_png(2, 2, png::ColorType::Rgba, &[10, 20, 30, 40].repeat(4), None, None);
+        assert_eq!(decode_png_rgba(&rgba, 2).unwrap(), [10, 20, 30, 40].repeat(4));
+        let rgb = encode_png(2, 2, png::ColorType::Rgb, &[1, 2, 3].repeat(4), None, None);
+        assert_eq!(decode_png_rgba(&rgb, 2).unwrap(), [1, 2, 3, 255].repeat(4));
+        let gray = encode_png(2, 2, png::ColorType::Grayscale, &[90; 4], None, None);
+        assert_eq!(decode_png_rgba(&gray, 2).unwrap(), [90, 90, 90, 255].repeat(4));
+        let ga = encode_png(2, 2, png::ColorType::GrayscaleAlpha, &[90, 128].repeat(4), None, None);
+        assert_eq!(decode_png_rgba(&ga, 2).unwrap(), [90, 90, 90, 128].repeat(4));
+        // Palette with a transparent entry: expanded, alpha kept.
+        let idx = encode_png(2, 2, png::ColorType::Indexed, &[0, 1, 1, 0], Some(&[255, 0, 0, 0, 255, 0]), Some(&[255, 0]));
+        let (red, clear) = ([255, 0, 0, 255], [0, 255, 0, 0]);
+        assert_eq!(decode_png_rgba(&idx, 2).unwrap(), [red, clear, clear, red].concat());
+        // Resampled to the requested size, garbage rejected.
+        assert_eq!(decode_png_rgba(&rgba, 8).unwrap().len(), 8 * 8 * 4);
+        assert!(decode_png_rgba(b"not a png", 8).is_none());
+        assert!(decode_png_rgba(&rgba[..rgba.len() / 2], 8).is_none());
+    }
+
+    /// A fake installed package on disk (`...\windowsapps\<full name>\`), end to end through
+    /// [`extract`]: manifest, nearest variant, display name, and a missing-asset fallback.
+    #[test]
+    fn packaged_icon_from_a_package_folder() {
+        let base = std::env::temp_dir().join(format!("opentalk-appicon-{}", std::process::id()));
+        let root = base.join("windowsapps").join("Fake.App_1.0_x64__abc");
+        let assets = root.join("Assets");
+        std::fs::create_dir_all(&assets).unwrap();
+        let manifest = MANIFEST.replace("ms-resource:AppName", "Fake App");
+        std::fs::write(root.join("AppxManifest.xml"), manifest).unwrap();
+        let red = |n: u32| encode_png(n, n, png::ColorType::Rgba, &[200, 0, 0, 255].repeat((n * n) as usize), None, None);
+        let blue = |n: u32| encode_png(n, n, png::ColorType::Rgba, &[0, 0, 200, 255].repeat((n * n) as usize), None, None);
+        std::fs::write(assets.join("List.targetsize-48.png"), red(48)).unwrap();
+        std::fs::write(assets.join("List.targetsize-256.png"), red(256)).unwrap();
+        std::fs::write(assets.join("List.targetsize-48_contrast-black.png"), blue(48)).unwrap();
+        std::fs::write(assets.join("List.targetsize-64_altform-unplated.png"), blue(64)).unwrap();
+        // A corrupt best candidate must not hide the next one.
+        std::fs::write(assets.join("List.targetsize-64.png"), b"broken").unwrap();
+
+        let exe = root.join("Test").join("Test.exe");
+        let icon = extract(exe.to_str().unwrap(), 0, 64).expect("package icon");
+        assert_eq!(icon.size, 64);
+        assert_eq!(icon.name, "Fake App");
+        assert_eq!(icon.exe_name, "test.exe");
+        assert_eq!(icon.rgba.len(), 64 * 64 * 4);
+        // Plated 48 px art scaled up to 64 beats the unplated and the contrast files.
+        let centre = ((32 * 64 + 32) * 4) as usize;
+        assert_eq!(&icon.rgba[centre..centre + 4], &[200, 0, 0, 255]);
+
+        // Same package, cached by the public loader as well.
+        let t = Target { exe_path: exe.to_str().unwrap().to_owned(), ..Default::default() };
+        assert_eq!(load(&t, 64).unwrap().name, "Fake App");
+
+        // Manifest gone: falls back to the cheap extractors (the file is not an exe, so no icon).
+        std::fs::remove_file(root.join("AppxManifest.xml")).unwrap();
+        assert!(packaged_backend(exe.to_str().unwrap(), 0, 64).is_none());
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -760,7 +1249,6 @@ mod tests {
         let t = Target::default();
         assert!(load(&t, 48).is_none());
     }
-
     #[test]
     fn fallback_extractors_work() {
         let path = system_exe("notepad.exe");
@@ -780,20 +1268,6 @@ mod tests {
     fn friendly_name_from_version_info() {
         let n = friendly_name(&system_exe("notepad.exe"));
         assert!(n.is_some_and(|s| !s.is_empty()));
-    }
-
-    #[test]
-    fn packaged_app_tile() {
-        // Settings ships with every Windows 11; tolerate machines that lack it.
-        let _com = Com::init();
-        let item = r"shell:AppsFolder\windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel";
-        if let Some(img) = shell_image(item, 48) {
-            assert_eq!(img.len(), 48 * 48 * 4);
-            assert!(img.chunks_exact(4).any(|p| p[3] > 200));
-            let name = display_name(item);
-            eprintln!("packaged tile name: {name:?}");
-            assert!(name.is_some_and(|n| !n.is_empty()));
-        }
     }
 
     /// Run alone (`--ignored`): loading a Win32 exe's icon must not drag the shell DLLs (the source of
@@ -828,6 +1302,86 @@ mod tests {
         for (p, was) in probes.iter().zip(before) {
             if !was {
                 assert!(!loaded(p), "{p} was loaded by the Win32 icon path");
+            }
+        }
+    }
+
+    /// Install folders of common packaged apps on this machine (PowerShell; `WindowsApps` cannot be listed).
+    fn installed_packages() -> Vec<(String, String)> {
+        let script = "Get-AppxPackage | Where-Object { $_.Name -match '^Microsoft\\.(WindowsTerminal|WindowsNotepad|WindowsCalculator|Paint|Windows\\.Photos|ScreenSketch)$' } | ForEach-Object { $_.Name + '|' + $_.InstallLocation }";
+        let out = std::process::Command::new("powershell").args(["-NoProfile", "-Command", script]).output();
+        let Ok(out) = out else { return Vec::new() };
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| l.trim().split_once('|').map(|(n, p)| (n.to_owned(), p.to_owned())))
+            .collect()
+    }
+
+    /// Run alone (`--ignored`): packaged apps get their manifest logo (PNGs under `target/`) and the
+    /// shell DLLs the image factory maps never enter the process.
+    #[test]
+    #[ignore]
+    fn desktop_packaged_icons_load_no_shell_dlls() {
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        let loaded = |name: &str| {
+            let w = wide(name);
+            // SAFETY: `w` is NUL-terminated and outlives the call.
+            unsafe { GetModuleHandleW(PCWSTR(w.as_ptr())) }.is_ok()
+        };
+        let modules = || -> Vec<String> {
+            use windows::Win32::Foundation::HMODULE;
+            use windows::Win32::System::ProcessStatus::{EnumProcessModules, GetModuleBaseNameW};
+            use windows::Win32::System::Threading::GetCurrentProcess;
+            let mut mods = vec![HMODULE::default(); 2048];
+            let mut needed = 0u32;
+            // SAFETY: the buffers are sized as passed; the pseudo handle needs no close.
+            unsafe {
+                let me = GetCurrentProcess();
+                if EnumProcessModules(me, mods.as_mut_ptr(), (mods.len() * size_of::<HMODULE>()) as u32, &mut needed).is_err() {
+                    return Vec::new();
+                }
+                mods.truncate(needed as usize / size_of::<HMODULE>());
+                mods.iter().map(|m| { let mut b = [0u16; 260]; let n = GetModuleBaseNameW(me, Some(*m), &mut b) as usize; String::from_utf16_lossy(&b[..n]).to_ascii_lowercase() }).collect()
+            }
+        };
+        let ws_now = || {
+            use windows::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+            use windows::Win32::System::Threading::GetCurrentProcess;
+            let mut c = PROCESS_MEMORY_COUNTERS::default();
+            // SAFETY: `c` is a valid out struct sized as reported.
+            let ok = unsafe { GetProcessMemoryInfo(GetCurrentProcess(), &mut c, size_of::<PROCESS_MEMORY_COUNTERS>() as u32) };
+            if ok.is_ok() { c.WorkingSetSize as f64 / 1048576.0 } else { 0.0 }
+        };
+        let ws0 = ws_now();
+        let mods0 = modules();
+        let pkgs = installed_packages();
+        if pkgs.is_empty() {
+            eprintln!("no packaged apps found; nothing to check");
+            return;
+        }
+        let probes = ["windows.storage.dll", "StateRepository.Core.dll", "thumbcache.dll", "Windows.UI.dll"];
+        let before: Vec<bool> = probes.iter().map(|p| loaded(p)).collect();
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target");
+        for (name, root) in &pkgs {
+            // The manifest's first app, as the foreground capture would see its exe.
+            let manifest = read_capped(&std::path::Path::new(root).join("AppxManifest.xml")).unwrap_or_default();
+            let apps = parse_manifest(&String::from_utf8_lossy(&manifest));
+            let exe = format!(r"{root}\{}", apps.first().map_or("app.exe", |a| a.exe.as_str()));
+            let icon = load_path(&exe, 64).unwrap_or_else(|| panic!("{name}: no manifest icon"));
+            eprintln!("{name}: {:?}", icon.name);
+            assert!(icon.rgba.chunks_exact(4).any(|p| p[3] > 200), "{name}: icon is empty");
+            let mut pm = tiny_skia::Pixmap::new(64, 64).unwrap();
+            for (dst, src) in pm.pixels_mut().iter_mut().zip(icon.rgba.chunks_exact(4)) {
+                *dst = tiny_skia::ColorU8::from_rgba(src[0], src[1], src[2], src[3]).premultiply();
+            }
+            pm.save_png(dir.join(format!("appicon_pkg_{name}.png"))).unwrap();
+        }
+        eprintln!("working set {:.1} MB -> {:.1} MB", ws0, ws_now());
+        let added: Vec<String> = modules().into_iter().filter(|m| !mods0.contains(m)).collect();
+        eprintln!("{} modules added by the packaged icon path: {}", added.len(), added.join(", "));
+        for (p, was) in probes.iter().zip(before) {
+            if !was {
+                assert!(!loaded(p), "{p} was loaded by the packaged icon path");
             }
         }
     }

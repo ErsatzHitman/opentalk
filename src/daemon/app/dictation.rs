@@ -327,8 +327,21 @@ impl App {
             if let Some(t) = target.clone() {
                 let hwnd = self.hwnd;
                 let _ = std::thread::Builder::new().name("app-icon".into()).spawn(move || {
-                    if let Some(icon) = appicon::load(&t, APP_ICON_PX) {
-                        notify(hwnd, Note::Icon { seq, icon });
+                    // Off the message loop: packaged apps read their manifest and PNGs from disk.
+                    let started = now_ms();
+                    // Bench hook: `OPENTALK_BENCH_APP_EXE=<exe>` looks up that app's icon whatever is in
+                    // front (bench\bench.ps1 uses it where no packaged app can be brought to the foreground).
+                    let t = match std::env::var("OPENTALK_BENCH_APP_EXE") {
+                        Ok(p) if !p.is_empty() => Target { exe_path: p, pid: 0, ..t },
+                        _ => t,
+                    };
+                    let exe = t.exe_path.rsplit(['\\', '/']).next().unwrap_or("").to_ascii_lowercase();
+                    match appicon::load(&t, APP_ICON_PX) {
+                        Some(icon) => {
+                            log_info!("app icon for {exe}: {:?} in {:.0} ms", icon.name, now_ms() - started);
+                            notify(hwnd, Note::Icon { seq, icon });
+                        }
+                        None => log_info!("app icon for {exe}: none in {:.0} ms", now_ms() - started),
                     }
                 });
             }
