@@ -495,6 +495,23 @@ impl BandKey {
     }
 }
 
+/// Key of a cached shadow ring: the surface size plus every parameter of the shadow, so a theme
+/// switch (other offset, blur and colour) or a differently coloured button never reuses a ring.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ShadowKey {
+    size: SizeKey,
+    dy: u32,
+    blur: u32,
+    rgba: [u8; 4],
+}
+
+impl ShadowKey {
+    pub fn new(o: &Outline, sh: &ShadowTok) -> Self {
+        let c = sh.color;
+        Self { size: SizeKey::new(o.w, o.h, o.r), dy: sh.dy.to_bits(), blur: sh.blur.to_bits(), rgba: [c.r, c.g, c.b, (c.a * 255.0).round() as u8] }
+    }
+}
+
 /// Band depth rows (points inside the rim) and the fade weight of each.
 const BAND_ROWS: [f32; 6] = [0.0, 0.75, 1.75, 3.25, 5.25, 8.0];
 const BAND_DEPTH: f32 = 8.0;
@@ -513,7 +530,7 @@ struct Band {
 #[derive(Default)]
 struct Cache {
     outlines: HashMap<SizeKey, Rc<Outline>>,
-    shadows: HashMap<(SizeKey, u32, u32), Rc<Mesh>>,
+    shadows: HashMap<ShadowKey, Rc<Mesh>>,
     bands: HashMap<BandKey, Rc<Band>>,
 }
 
@@ -659,11 +676,11 @@ fn shadow_mesh(o: &Outline, sh: &ShadowTok) -> Mesh {
     m
 }
 
-fn shadow_shape(o: &Outline, origin: Pos2, sh: &ShadowTok, layer: u32, tag: u32) -> Option<Shape> {
+fn shadow_shape(o: &Outline, origin: Pos2, sh: &ShadowTok) -> Option<Shape> {
     if sh.color.a <= 0.0 {
         return None;
     }
-    let key = (SizeKey::new(o.w, o.h, o.r), layer, tag);
+    let key = ShadowKey::new(o, sh);
     let mesh = CACHE.with(|c| {
         let mut c = c.borrow_mut();
         if c.shadows.len() > CACHE_LIMIT {
@@ -753,7 +770,7 @@ pub fn panel_shapes(g: &Gl, rect: Rect, radius: f32, hover: f32) -> Vec<Shape> {
     let o = outline(rect.width(), rect.height(), radius);
     let origin = rect.min;
     let mut shapes = Vec::with_capacity(6);
-    shapes.extend(shadow_shape(&o, origin, &t.shadow, 0, 0));
+    shapes.extend(shadow_shape(&o, origin, &t.shadow));
     shapes.push(band_shape(&o, origin, rect.size(), g));
     let h = rect.height().max(1.0);
     shapes.push(Shape::mesh(fill_fan(&o, origin, |p| tint_px(t, hover, p.y / h))));
@@ -781,8 +798,8 @@ pub fn menu_shapes(g: &Gl, rect: Rect, radius: f32) -> Vec<Shape> {
     let o = outline(rect.width(), rect.height(), radius);
     let origin = rect.min;
     let mut shapes = Vec::with_capacity(6);
-    for (i, sh) in t.menu_shadow.iter().enumerate() {
-        shapes.extend(shadow_shape(&o, origin, sh, 1 + i as u32, 0));
+    for sh in &t.menu_shadow {
+        shapes.extend(shadow_shape(&o, origin, sh));
     }
     let wash = t.menu_surface.px(0.55);
     // Window position of the rect is needed for the stand-in; the fan works in local space.
@@ -802,7 +819,7 @@ pub fn modal_shapes(g: &Gl, rect: Rect, radius: f32) -> Vec<Shape> {
     let frost = t.modal_tint.px(1.0);
     let scrim = t.scrim.px(1.0);
     let mut shapes = Vec::with_capacity(7);
-    shapes.extend(shadow_shape(&o, origin, &t.shadow, 0, 1));
+    shapes.extend(shadow_shape(&o, origin, &t.shadow));
     // The page behind the modal, dimmed by the scrim and blurred away.
     shapes.push(Shape::mesh(fill_fan(&o, origin, |p| over(scrim, solid_backdrop_px(origin + p, t, g.window)))));
     shapes.push(band_shape(&o, origin, rect.size(), g));
@@ -834,7 +851,7 @@ pub fn colored_shapes(g: &Gl, rect: Rect, radius: f32, base: Color32, hover: f32
     let mut shapes = Vec::with_capacity(5);
     if shadow {
         let sh = ShadowTok { dy: (h * 0.18).clamp(3.0, 12.0), blur: (h * 0.5).clamp(8.0, 28.0), color: Rgba::new(dark(r), dark(gr), dark(b), 0.34) };
-        shapes.extend(shadow_shape(&o, origin, &sh, 3 + (h as u32 / 4), 2));
+        shapes.extend(shadow_shape(&o, origin, &sh));
     }
     shapes.push(Shape::mesh(fill_fan(&o, origin, |p| lerp_px(top, bot, gradient_t(155.0, p, w, h)))));
     shapes.push(border_shape(rect, radius, Rgba::new(r, gr, b, 0.5).color()));
@@ -1263,6 +1280,29 @@ mod tests {
         assert!((0..n).all(|k| m.vertices[8 * n + k].color.a() == 0));
         // All geometry lies on or outside the outline (never under the glass).
         assert!(m.vertices.iter().all(|v| sdf_rrect(v.pos.to_vec2(), 200.0, 100.0, 12.0) >= -1e-3));
+    }
+
+    #[test]
+    fn shadow_cache_follows_theme_and_colour() {
+        let rect = Rect::from_min_size(pos2(10.0, 10.0), vec2(321.0, 123.0));
+        let sum_alpha = |shapes: &[Shape]| -> u32 {
+            shapes.iter().map(|s| if let Shape::Mesh(m) = s { m.vertices.iter().map(|v| v.color.a() as u32).sum() } else { 0 }).sum()
+        };
+        let light = Gl { dark: false, window: WIN };
+        let dark = Gl { dark: true, window: WIN };
+        // Same size drawn in light, then dark, then light again: each must get its own shadow.
+        let a1 = sum_alpha(&panel_shapes(&light, rect, RADIUS, 0.0)[..1]);
+        let b = sum_alpha(&panel_shapes(&dark, rect, RADIUS, 0.0)[..1]);
+        let a2 = sum_alpha(&panel_shapes(&light, rect, RADIUS, 0.0)[..1]);
+        assert_eq!(a1, a2);
+        assert_ne!(a1, b, "dark theme reused the light shadow");
+        // Two coloured buttons of equal size but different hue must not share a shadow ring.
+        let r = Rect::from_min_size(pos2(0.0, 0.0), vec2(90.0, 32.0));
+        let red = colored_shapes(&light, r, 16.0, Color32::from_rgb(220, 30, 30), 0.0, true);
+        let blue = colored_shapes(&light, r, 16.0, Color32::from_rgb(30, 30, 220), 0.0, true);
+        let tint = |s: &Shape| if let Shape::Mesh(m) = s { m.vertices.iter().max_by_key(|v| v.color.a()).map(|v| v.color) } else { None };
+        let (cr_, cb) = (tint(&red[0]).unwrap(), tint(&blue[0]).unwrap());
+        assert!(cr_.r() > cr_.b() && cb.b() > cb.r(), "shadow hue must follow the button colour");
     }
 
     #[test]
