@@ -130,12 +130,19 @@ enter the numbers. Full report: [docs/BENCHMARK.md](docs/BENCHMARK.md).
 | Idle CPU (60 s) | 0.0% | ~0% | ~3% |
 | Recording CPU (30 s, real mic) | 0.03% of all cores (0.78% of one core; ~0.2% projected on 4 cores) | <= 1.5% | ~3% |
 | Daemon memory, idle | 17.9 MB working set, 4.4 MB private bytes | <= 25 MB | ~110 MB |
-| Daemon memory, recording / 10 dictations (peak) | 19.1 MB WS (app bubble off), 23.2-23.4 MB WS with the app bubble | <= 25 MB | ~110 MB |
+| Daemon memory, recording / 10 dictations (peak) | 19.1 MB WS (app bubble off), 23.2-23.4 MB WS with the app bubble and no foreground app; **37-40 MB WS with a packaged app such as Windows Terminal in front** (misses, see below) | <= 25 MB | ~110 MB |
 | Settings window | 12.4 MB working set, separate process, ~0% CPU idle (commits ~267 MB of GL driver pools, documented) | <= 80 MB | - |
-| Executable | 7.55 MB, one file | <= 8 MB | - |
+| Executable | 7.25 MB (7,248,896 bytes), one file | <= 8 MB (8,000,000 bytes) | - |
 | Start-up | daemon ready in ~21 ms | - | - |
 | Hotkey -> pill / -> first mic packet | 1.6 ms / 20.5 ms (median) | <= 16 / <= 50 ms | - |
 | Local overhead stop -> paste (excluding STT) | ~1 ms before paste; ~18 ms including a real `SendInput` paste (earlier unlocked-desktop run) | <= 40 ms | - |
 
 Live checks use OpenRouter `:free` models only: AI cleanup works through `nvidia/nemotron-3.5-lightning:free` (~1 s); no free
 audio model returned a transcript during these runs (gated to "agentic harnesses", or upstream capacity errors).
+
+**Not yet verified.** Every benchmark run so far had the workstation locked, where Windows denies clipboard access and
+`SendInput`. Still to run on an unlocked desktop: the real paste into Notepad (`tests/e2e.ps1`), the `desktop_*` hotkey and
+paste tests (including Excel stop-to-paste and clipboard restore, and delay-rendered clipboard owners), the daemon memory
+with Notepad or Explorer in front, and Settings private bytes with RTSS exited. Live speech-to-text stays UNVERIFIED: no free
+OpenRouter model delivers the audio, and a paid run needs the owner's decision (PLAN section 12b). Details:
+[docs/BENCHMARK.md, "Not yet verified"](docs/BENCHMARK.md).

@@ -33,5 +33,73 @@ codegen-units = 1
 strip = true
 debug = false
 
+# Size, not speed, for code off the dictation hot path: the Settings window stack (egui, GL, fonts),
+# Vertex RS256 signing, and network/JSON plumbing that waits on the network anyway. tiny-skia (pill
+# rendering), windows and the crate itself stay at opt-level 3. Saves ~700 KiB (PLAN section 1 budget).
+[profile.release.package.eframe]
+opt-level = "s"
+[profile.release.package.egui]
+opt-level = "s"
+[profile.release.package.epaint]
+opt-level = "s"
+[profile.release.package.emath]
+opt-level = "s"
+[profile.release.package.ecolor]
+opt-level = "s"
+[profile.release.package.egui_glow]
+opt-level = "s"
+[profile.release.package.egui-winit]
+opt-level = "s"
+[profile.release.package.glow]
+opt-level = "s"
+[profile.release.package.glutin]
+opt-level = "s"
+[profile.release.package.winit]
+opt-level = "s"
+[profile.release.package.accesskit]
+opt-level = "s"
+[profile.release.package.arboard]
+opt-level = "s"
+[profile.release.package.skrifa]
+opt-level = "s"
+[profile.release.package.read-fonts]
+opt-level = "s"
+[profile.release.package.harfrust]
+opt-level = "s"
+[profile.release.package.vello_cpu]
+opt-level = "s"
+[profile.release.package.vello_common]
+opt-level = "s"
+[profile.release.package.kurbo]
+opt-level = "s"
+[profile.release.package.peniko]
+opt-level = "s"
+[profile.release.package.guillotiere]
+opt-level = "s"
+[profile.release.package.image]
+opt-level = "s"
+[profile.release.package.png]
+opt-level = "s"
+[profile.release.package.moxcms]
+opt-level = "s"
+[profile.release.package.rsa]
+opt-level = "s"
+[profile.release.package.num-bigint-dig]
+opt-level = "s"
+[profile.release.package.ureq]
+opt-level = "s"
+[profile.release.package.tungstenite]
+opt-level = "s"
+[profile.release.package.serde_json]
+opt-level = "s"
+[profile.release.package.url]
+opt-level = "s"
+[profile.release.package.idna]
+opt-level = "s"
+[profile.release.package.icu_normalizer]
+opt-level = "s"
+[profile.release.package.icu_properties]
+opt-level = "s"
+
 [profile.dev.package."*"]
 opt-level = 2
