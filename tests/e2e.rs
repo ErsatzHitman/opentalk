@@ -158,30 +158,121 @@ fn live_transcribe_file_openrouter_free() {
     eprintln!("no live transcript (upstream limits / gated / no audio support): {last}");
 }
 
+/// True when the interactive desktop can be driven: the session is not locked (the Win10/11 lock
+/// screen runs on the normal desktop, so `OpenInputDesktop` alone still succeeds there) and
+/// `OpenInputDesktop` works (it fails on the secure desktop: LogonUI, UAC). Nothing injected reaches
+/// an app otherwise.
+fn input_desktop_available() -> bool {
+    use windows::Win32::System::RemoteDesktop::{
+        WTS_CURRENT_SERVER_HANDLE, WTS_CURRENT_SESSION, WTSFreeMemory, WTSINFOEXW, WTSQuerySessionInformationW,
+        WTSSessionInfoEx,
+    };
+    use windows::Win32::System::StationsAndDesktops::{CloseDesktop, DESKTOP_CONTROL_FLAGS, DESKTOP_SWITCHDESKTOP, OpenInputDesktop};
+    let mut buf = windows::core::PWSTR::null();
+    let mut len = 0u32;
+    // SAFETY: the WTS buffer is read once (unaligned, size-checked) and freed; the desktop handle is closed.
+    unsafe {
+        if WTSQuerySessionInformationW(Some(WTS_CURRENT_SERVER_HANDLE), WTS_CURRENT_SESSION, WTSSessionInfoEx, &mut buf, &mut len).is_ok() {
+            let mut locked = false;
+            if !buf.is_null() && len as usize >= std::mem::size_of::<WTSINFOEXW>() {
+                let info = std::ptr::read_unaligned(buf.0 as *const WTSINFOEXW);
+                locked = info.Level == 1 && info.Data.WTSInfoExLevel1.SessionFlags == 0; // WTS_SESSIONSTATE_LOCK
+            }
+            WTSFreeMemory(buf.0 as *mut std::ffi::c_void);
+            if locked {
+                return false;
+            }
+        }
+        match OpenInputDesktop(DESKTOP_CONTROL_FLAGS(0), false, DESKTOP_SWITCHDESKTOP) {
+            Ok(d) => {
+                let _ = CloseDesktop(d);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+}
+
+/// Returns false (after saying why) when an input-dependent desktop test cannot run.
+fn require_input_desktop(test: &str) -> bool {
+    let ok = input_desktop_available();
+    if !ok {
+        eprintln!("SKIPPED {test}: no usable input desktop (workstation locked, or OpenInputDesktop failed)");
+    }
+    ok
+}
+
+/// Process ids of every running `image` (e.g. `notepad.exe`).
+fn pids_of(image: &str) -> std::collections::HashSet<u32> {
+    let out = Command::new("tasklist").args(["/FO", "CSV", "/NH", "/FI", &format!("IMAGENAME eq {image}")]).output();
+    let text = out.map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
+    text.lines().filter_map(|l| l.split("\",\"").nth(1)?.parse().ok()).collect()
+}
+
+/// Run `cmd` with a hard time limit; true when it exits successfully in time. A hang (a lost
+/// foreground, a stuck UI Automation call) used to block the whole suite and leave Notepad and
+/// daemons behind: on timeout the process tree is killed and every `sweep` image (e.g. Notepad) that
+/// appeared since the start is ended too.
+fn run_limited(mut cmd: Command, limit: std::time::Duration, sweep: &[&str]) -> bool {
+    let before: Vec<_> = sweep.iter().map(|img| pids_of(img)).collect();
+    let mut child = cmd.spawn().expect("spawn");
+    match child.wait_timeout_ms(limit.as_millis() as u64) {
+        Some(status) => status.success(),
+        None => {
+            eprintln!("{cmd:?} exceeded {limit:?}; killing it and what it opened");
+            let _ = Command::new("taskkill").args(["/F", "/T", "/PID", &child.id().to_string()]).output();
+            let _ = child.wait();
+            for (img, before) in sweep.iter().zip(&before) {
+                for pid in pids_of(img).difference(before) {
+                    let _ = Command::new("taskkill").args(["/F", "/T", "/PID", &pid.to_string()]).output();
+                }
+            }
+            false
+        }
+    }
+}
+
+/// Run `tests/e2e.ps1` for the given STT mode under `limit`.
+fn run_e2e_script(stt: &str, limit: std::time::Duration) -> bool {
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/e2e.ps1");
+    let image = std::path::Path::new(EXE).file_name().and_then(|n| n.to_str()).unwrap_or("opentalk.exe").to_owned();
+    let mut cmd = Command::new("powershell");
+    cmd.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"]).arg(script).args(["-Exe", EXE, "-Stt", stt]);
+    run_limited(cmd, limit, &["notepad.exe", &image])
+}
+
+#[test]
+fn a_hung_child_is_killed_with_what_it_started() {
+    let mut cmd = Command::new("cmd");
+    cmd.args(["/C", "ping -n 60 127.0.0.1 >nul"]);
+    let before = pids_of("PING.EXE");
+    let t0 = std::time::Instant::now();
+    assert!(!run_limited(cmd, std::time::Duration::from_millis(1500), &["PING.EXE"]));
+    assert!(t0.elapsed() < std::time::Duration::from_secs(10), "the limit was not enforced");
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let leftovers: Vec<_> = pids_of("PING.EXE").difference(&before).copied().collect();
+    assert!(leftovers.is_empty(), "the hung child's ping outlived the limit: {leftovers:?}");
+}
+
+/// Upper bound for one e2e script run (it normally takes ~15-25 s).
+const E2E_LIMIT: std::time::Duration = std::time::Duration::from_secs(180);
+
 #[test]
 #[ignore = "desktop: opens Notepad, injects a WAV, pastes into it (tests/e2e.ps1)"]
 fn desktop_e2e_notepad() {
-    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/e2e.ps1");
-    let status = Command::new("powershell")
-        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
-        .arg(script)
-        .args(["-Exe", EXE, "-Stt", "mock"])
-        .status()
-        .expect("run powershell");
-    assert!(status.success(), "tests/e2e.ps1 failed");
+    if !require_input_desktop("desktop_e2e_notepad") {
+        return;
+    }
+    assert!(run_e2e_script("mock", E2E_LIMIT), "tests/e2e.ps1 failed");
 }
 
 #[test]
 #[ignore = "desktop: like desktop_e2e_notepad, with the Deepgram live protocol from the local mock (tests/e2e.ps1 -Stt mock-stream)"]
 fn desktop_e2e_notepad_streaming() {
-    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/e2e.ps1");
-    let status = Command::new("powershell")
-        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
-        .arg(script)
-        .args(["-Exe", EXE, "-Stt", "mock-stream"])
-        .status()
-        .expect("run powershell");
-    assert!(status.success(), "tests/e2e.ps1 -Stt mock-stream failed");
+    if !require_input_desktop("desktop_e2e_notepad_streaming") {
+        return;
+    }
+    assert!(run_e2e_script("mock-stream", E2E_LIMIT), "tests/e2e.ps1 -Stt mock-stream failed");
 }
 
 /// Post one IPC message (`core::ipc`: WM_APP + 4 toggle, + 5 cancel) straight to the daemon window,

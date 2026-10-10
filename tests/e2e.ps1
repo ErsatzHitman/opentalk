@@ -32,13 +32,46 @@ $wav = (Resolve-Path (Join-Path $PSScriptRoot 'fixtures\tts_fillers.wav')).Path
 $wavMs = Get-WavMs $wav
 
 $home_ = New-TempHome 'opentalk-e2e'
-$daemon = $null; $mock = $null; $notepad = $null; $hwnd = [IntPtr]::Zero
+$daemon = $null; $mock = $null; $notepad = $null; $hwnd = [IntPtr]::Zero; $targetPid = 0
 $envv = @{ OPENTALK_HOME = $home_; OPENTALK_INJECT_WAV = $wav }
 $cfg = @{ audio_cues = $false; auto_paste = $true; keep_in_clipboard = $false; history_enabled = $true; show_app_bubble = $true; stt = @{ provider = 'openai' } }
 $result = [ordered]@{ stt = $Stt; llm = [bool]$Llm; pass = $false }
-$sessionId = (Get-Process -Id $PID).SessionId
-$locked = [bool](Get-Process -Name LogonUI -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -eq $sessionId })
+# Nothing sent by SendInput reaches an app while the session is locked. The Win10/11 lock screen
+# (LockApp) runs on the normal desktop, so OpenInputDesktop alone still succeeds there: also read the
+# session's lock flag (WTSSessionInfoEx). OpenInputDesktop fails on the secure desktop (LogonUI, UAC).
+# The LogonUI process alone is no proof: it can linger after an unlock.
+if (-not ('OtDesk' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class OtDesk {
+    [DllImport("user32.dll", SetLastError = true)] static extern IntPtr OpenInputDesktop(uint flags, bool inherit, uint access);
+    [DllImport("user32.dll")] static extern bool CloseDesktop(IntPtr desk);
+    [DllImport("wtsapi32.dll")] static extern bool WTSQuerySessionInformationW(IntPtr server, uint session, int cls, out IntPtr buf, out uint len);
+    [DllImport("wtsapi32.dll")] static extern void WTSFreeMemory(IntPtr p);
+    static bool SessionLocked() {
+        IntPtr buf; uint len;
+        if (!WTSQuerySessionInformationW(IntPtr.Zero, 0xFFFFFFFF, 25 /* WTSSessionInfoEx */, out buf, out len)) return false;
+        try { return len >= 32 && Marshal.ReadInt32(buf, 0) == 1 && Marshal.ReadInt32(buf, 16) == 0; /* WTS_SESSIONSTATE_LOCK */ }
+        finally { WTSFreeMemory(buf); }
+    }
+    public static bool InputDesktopAvailable() {
+        if (SessionLocked()) return false;
+        IntPtr d = OpenInputDesktop(0, false, 0x0100); // DESKTOP_SWITCHDESKTOP
+        if (d == IntPtr.Zero) return false;
+        CloseDesktop(d);
+        return true;
+    }
+}
+'@
+}
+$locked = -not [OtDesk]::InputDesktopAvailable()
 if ($Mode -eq 'auto') { $Mode = if ($locked) { 'clipboard' } else { 'paste' } }
+if ($Mode -eq 'paste' -and $locked) {
+    Write-Host 'E2E SKIPPED: paste mode needs an unlocked interactive desktop (session locked or OpenInputDesktop failed); use -Mode clipboard'
+    Remove-Item -Recurse -Force $home_ -ErrorAction SilentlyContinue
+    exit 0
+}
 $result.mode = $Mode
 $result.desktop_locked = $locked
 $result.paste_verified = ($Mode -eq 'paste')
@@ -101,6 +134,7 @@ try {
             }
         }
         if ($hwnd -eq [IntPtr]::Zero) { throw 'target window not found' }
+        if ($useNotepad) { [uint32]$wpid = 0; [OtWin32]::GetWindowThreadProcessId($hwnd, [ref]$wpid) | Out-Null; $targetPid = [int]$wpid }
         if (-not (Set-Foreground $hwnd)) { throw 'could not bring the target to the foreground' }
         Start-Sleep -Milliseconds 400
     }
@@ -174,6 +208,12 @@ finally {
         Start-Sleep -Milliseconds 500
     }
     if ($notepad -and -not $notepad.HasExited) { try { $notepad.Kill() } catch {} }
+    # Notepad is a packaged app: the process we started may be a stub, so end the one that owned the
+    # window (it is ours: -Target notepad/auto only opens one when none was running).
+    if ($targetPid -gt 0) {
+        for ($i = 0; $i -lt 10 -and (Get-Process -Id $targetPid -ErrorAction SilentlyContinue); $i++) { Start-Sleep -Milliseconds 100 }
+        try { Stop-Process -Id $targetPid -Force -ErrorAction SilentlyContinue } catch {}
+    }
     Stop-Daemon $Exe $daemon $envv
     if ($mock) { Stop-Quietly $mock.Proc }
     Remove-Item -Recurse -Force $home_ -ErrorAction SilentlyContinue

@@ -520,6 +520,9 @@ mod desktop_tests {
     #[test]
     #[ignore = "installs a global keyboard hook and injects keys"]
     fn desktop_capture_ctrl_win() {
+        if !crate::daemon::paste::require_input_desktop("desktop_capture_ctrl_win") {
+            return;
+        }
         allow_injected(true);
         let ctx = egui::Context::default();
         let c = Capture::start(&ctx).expect("hook installs");
@@ -536,6 +539,9 @@ mod desktop_tests {
     #[test]
     #[ignore = "installs a global keyboard hook and injects keys"]
     fn desktop_capture_escape_cancels_and_f8_works() {
+        if !crate::daemon::paste::require_input_desktop("desktop_capture_escape_cancels_and_f8_works") {
+            return;
+        }
         allow_injected(true);
         let ctx = egui::Context::default();
         let c = Capture::start(&ctx).expect("hook installs");
