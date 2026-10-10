@@ -1791,7 +1791,9 @@ mod tests {
                     let _ = DestroyWindow(h);
                 }
             }
-            let _ = restore_clipboard(&self.clip);
+            if !restore_clipboard(&self.clip) {
+                eprintln!("NotepadCleanup: could not restore the user's clipboard");
+            }
         }
     }
 
