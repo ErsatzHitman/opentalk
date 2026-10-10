@@ -13,14 +13,19 @@ pub use snippets::{expand_snippets, trigger_ranges};
 pub use terms::{case_fix, fuzzy_fix};
 
 /// Groq rejects prompts > 896 chars; 890 leaves margin for UTF-16 vs codepoint counting drift.
+#[allow(dead_code)] // ported OpenWhispr API: pinned by tests, not yet wired into the pipeline
 pub const GROQ_PROMPT_CHARS: usize = 890;
 /// Whisper-family decoders read at most 223 prompt tokens; 900 chars only bounds the request.
+#[allow(dead_code)] // ported OpenWhispr API: pinned by tests, not yet wired into the pipeline
 pub const WHISPER_PROMPT_CHARS: usize = 900;
 /// What the decoder's 223-token window is worth in characters (UI warning, not a trim).
+#[allow(dead_code)] // ported OpenWhispr API: pinned by tests, not yet wired into the pipeline
 pub const WHISPER_DECODER_PROMPT_CHARS: usize = 550;
 /// gpt-4o-transcribe family: a guard against absurd lists, not a limit anyone should hit.
+#[allow(dead_code)] // ported OpenWhispr API: pinned by tests, not yet wired into the pipeline
 pub const TRANSCRIBE_PROMPT_CHARS: usize = 8000;
 /// OpenAI accepts exactly 65,536 characters of overflow prompt for gpt-transcribe.
+#[allow(dead_code)] // ported OpenWhispr API: pinned by tests, not yet wired into the pipeline
 pub const TRANSCRIPTION_OVERFLOW_PROMPT_CHARS: usize = 65536;
 
 /// Words fed to STT/LLM as hints: dictionary words + snippet triggers (deduped, case-insensitive).
@@ -111,20 +116,26 @@ pub fn is_prompt_echo(text: &str, prompt: &str) -> bool {
 
 /// Shape analysis of a possible prompt continuation (OpenWhispr `analyzeDictionaryPromptFragment`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[allow(dead_code)] // ported OpenWhispr API: pinned by tests, not yet wired into the pipeline
 pub struct PromptFragment {
     pub is_prompt_fragment: bool,
     pub has_repeated_words: bool,
     pub unique_word_count: usize,
 }
 
+#[allow(dead_code)] // ported OpenWhispr API: pinned by tests, not yet wired into the pipeline
 const MAX_SHORT_FRAGMENT_CHARS: usize = 30;
+#[allow(dead_code)] // ported OpenWhispr API: pinned by tests, not yet wired into the pipeline
 const LOOPED_WORD_MIN_OCCURRENCES: usize = 3;
+#[allow(dead_code)] // ported OpenWhispr API: pinned by tests, not yet wired into the pipeline
 const MIN_CONSECUTIVE_TERM_RUN: usize = 3;
 
+#[allow(dead_code)] // ported OpenWhispr API: pinned by tests, not yet wired into the pipeline
 fn is_delimiter(c: char) -> bool {
     matches!(c, ',' | '、' | '，')
 }
 
+#[allow(dead_code)] // ported OpenWhispr API: pinned by tests, not yet wired into the pipeline
 fn has_looped_word(words: &[&str]) -> bool {
     let mut counts = std::collections::HashMap::new();
     words.iter().any(|w| {
@@ -135,6 +146,7 @@ fn has_looped_word(words: &[&str]) -> bool {
 }
 
 /// True when the text is 3+ consecutive prompt entries in the prompt's own order.
+#[allow(dead_code)] // ported OpenWhispr API: pinned by tests, not yet wired into the pipeline
 fn matches_consecutive_term_run(text_words: &[&str], prompt: &str) -> bool {
     let mut seq: Vec<(String, usize)> = Vec::new();
     let mut term_index = 0;
@@ -157,6 +169,7 @@ fn matches_consecutive_term_run(text_words: &[&str], prompt: &str) -> bool {
 
 /// Detects Whisper continuing the dictionary prompt: a looped term, a short fragment left dangling
 /// on the prompt's separator ("testing, "), or a run of consecutive entries in prompt order.
+#[allow(dead_code)] // ported OpenWhispr API: pinned by tests, not yet wired into the pipeline
 pub fn analyze_prompt_fragment(text: &str, prompt: &str) -> PromptFragment {
     if text.is_empty() || prompt.is_empty() {
         return PromptFragment::default();
@@ -182,6 +195,7 @@ pub fn analyze_prompt_fragment(text: &str, prompt: &str) -> PromptFragment {
 }
 
 /// Shorthand for `analyze_prompt_fragment(..).is_prompt_fragment`.
+#[allow(dead_code)] // ported OpenWhispr API: pinned by tests, not yet wired into the pipeline
 pub fn is_prompt_fragment(text: &str, prompt: &str) -> bool {
     analyze_prompt_fragment(text, prompt).is_prompt_fragment
 }

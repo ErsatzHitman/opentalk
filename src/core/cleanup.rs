@@ -28,6 +28,8 @@ pub struct CleanupCtx<'a> {
     pub language: &'a str,
     pub filler_mode: FillerMode,
     pub dictionary: &'a [String],
+    /// Only read by [`process`] (tests); the pipeline expands snippets itself, after the LLM.
+    #[allow(dead_code)]
     pub snippets: &'a [Snippet],
     /// Milliseconds of detected speech in the recording (hallucination guard). None = unknown.
     pub speech_ms: Option<u64>,
@@ -56,6 +58,8 @@ fn has_break_phrase(s: &str) -> bool {
 }
 
 /// Full deterministic pipeline. Returns "" when nothing but fillers/hallucination remains.
+/// The daemon runs [`process_pre_llm`] and expands snippets itself, so only tests call this.
+#[cfg(test)]
 pub fn process(raw: &str, ctx: &CleanupCtx) -> String {
     let text = process_pre_llm(raw, ctx);
     if text.is_empty() {

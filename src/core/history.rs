@@ -90,11 +90,13 @@ pub fn prune(days: u32) -> io::Result<usize> {
     prune_in(&paths::history_file(), days, timing::unix_ms())
 }
 /// Case-insensitive substring search over text/raw/app_name, newest first.
+#[allow(dead_code)] // history query API; the settings page does not call it yet, tests pin it
 pub fn search(query: &str) -> Vec<Entry> {
     search_in(&paths::history_file(), query)
 }
 /// `(count, words, avg_latency_ms)` over successful entries (`Status::Ok`): how many, total
 /// words in the pasted text, and mean end-to-end latency of those with a recorded latency.
+#[allow(dead_code)] // history query API; the settings page does not call it yet, tests pin it
 pub fn stats() -> (usize, u64, u64) {
     stats_of(&load_all())
 }
@@ -251,6 +253,7 @@ fn prune_in(path: &Path, days: u32, now_ms: i64) -> io::Result<usize> {
     rewrite_keeping(path, |e| e.ts >= cutoff)
 }
 
+#[allow(dead_code)] // history query API; the settings page does not call it yet, tests pin it
 fn search_in(path: &Path, query: &str) -> Vec<Entry> {
     let all = load_from(path);
     let q = query.trim().to_lowercase();
@@ -266,6 +269,7 @@ fn search_in(path: &Path, query: &str) -> Vec<Entry> {
         .collect()
 }
 
+#[allow(dead_code)] // history query API; the settings page does not call it yet, tests pin it
 fn stats_of(entries: &[Entry]) -> (usize, u64, u64) {
     let ok = || entries.iter().filter(|e| e.status == Status::Ok);
     let count = ok().count();
