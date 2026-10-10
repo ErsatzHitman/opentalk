@@ -143,6 +143,6 @@ network path, not a latency reference; the table above is measured against a loc
   The acceptance run (bench.ps1 on an unlocked desktop, Notepad or Explorer as the target, WS peak <= 25 MB over the 10
   dictations) needs a foreground window, so it has to be repeated on an unlocked desktop. Status: the fix was verified on a
   locked workstation (LogonUI active, no foreground window), so the table above still shows the pre-fix 38-39 MB figures until
-  `benchench.ps1` is re-run unlocked.
+  `bench/bench.ps1` is re-run unlocked.
 - Clipboard and paste timings are only meaningful on an unlocked desktop: Windows refuses clipboard access while the
   workstation is locked, so `copy_to_clipboard` exhausts its retries (~95 ms) and real-paste e2e runs are skipped.
