@@ -729,7 +729,10 @@ impl App {
                 session.cancel();
             }
             if rec.media_paused {
-                after_unmute(unmuted, media::resume);
+                // A stop that is still waiting for the microphone already queued its unmute (it is
+                // in `rec.unmuted`, `release_mute_rx` above found nothing left to release): the
+                // media must not resume before that one has been done either.
+                after_unmute(unmuted.or(rec.unmuted), media::resume);
             }
             // A recorder still starting is discarded when its note arrives (seq no longer matches).
             if let Some(r) = rec.recorder {
