@@ -2,14 +2,15 @@
 //! milliseconds: the hotkey handler only captures the target, shows the pill and spawns helpers.
 //!
 //! - start thread: `Recorder::start` (20 ms with a prepared stream, up to seconds cold or on a
-//!   hung driver), then the optional media pause (up to 120 ms);
+//!   hung driver; abandoned after `START_TIMEOUT`), then the optional media pause (up to 120 ms);
 //! - icon thread: the active-app icon (`IShellItemImageFactory` can take tens of ms cold);
 //! - worker thread: stop + VAD + trim, STT (stream finish or batch), cleanup, paste, history.
 //!
 //! Helpers report back through [`MAILBOX`] + `WM_NOTE`; every note carries the dictation's `seq`,
 //! so a note for a dictation that was cancelled or stopped meanwhile is cleaned up, not applied.
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 use super::host::{App, TIMER_CAP, WM_NOTE, post};
 use super::latency::{self, Sample};
@@ -171,6 +172,69 @@ fn discard_recorder(recorder: Recorder, cfg: &Config) {
     }
 }
 
+/// How long the start thread waits for `Recorder::start` before giving up on the microphone.
+const START_TIMEOUT: Duration = Duration::from_secs(5);
+const START_TIMEOUT_MSG: &str = "microphone did not start within 5 s";
+
+/// Hand-off between [`start_with_timeout`] and its helper thread.
+struct StartSlot<T> {
+    result: Option<Result<T, String>>,
+    /// The waiter gave up: whatever the helper produces now is not delivered.
+    abandoned: bool,
+}
+
+/// Run `starter` on a helper thread and wait at most `timeout` for it. On timeout the caller gets
+/// `Err` at once; if `starter` succeeds later, its value goes to `discard` on the helper thread
+/// (never to the caller), so a stream that comes up late is stopped instead of left running.
+/// One helper thread per call, and it ends when `starter` returns.
+fn start_with_timeout<T: Send + 'static>(
+    timeout: Duration,
+    starter: impl FnOnce() -> Result<T, String> + Send + 'static,
+    discard: impl FnOnce(T) + Send + 'static,
+) -> Result<T, String> {
+    let slot = Arc::new((Mutex::new(StartSlot { result: None, abandoned: false }), Condvar::new()));
+    let helper_slot = slot.clone();
+    let spawned = std::thread::Builder::new().name("rec-open".into()).spawn(move || {
+        let result = starter();
+        let (lock, cv) = &*helper_slot;
+        let mut g = lock.lock().unwrap_or_else(|e| e.into_inner());
+        if g.abandoned {
+            drop(g);
+            if let Ok(late) = result {
+                discard(late);
+            }
+        } else {
+            g.result = Some(result);
+            cv.notify_one();
+        }
+    });
+    if let Err(e) = spawned {
+        return Err(format!("cannot spawn the microphone thread: {e}"));
+    }
+    let (lock, cv) = &*slot;
+    let g = lock.lock().unwrap_or_else(|e| e.into_inner());
+    let (mut g, _) = cv.wait_timeout_while(g, timeout, |s| s.result.is_none()).unwrap_or_else(|e| e.into_inner());
+    // A result that landed right at the deadline still counts.
+    match g.result.take() {
+        Some(result) => result,
+        None => {
+            g.abandoned = true;
+            Err(START_TIMEOUT_MSG.to_string())
+        }
+    }
+}
+
+/// How a finished paste ends the job: the history note for a delivered paste (`Some` when it was
+/// only copied), or `Err(Outcome::Cancelled)` when Esc stopped it (no history entry, no latency
+/// sample).
+fn paste_note(outcome: PasteOutcome) -> Result<Option<String>, Outcome> {
+    match outcome {
+        PasteOutcome::Pasted => Ok(None),
+        PasteOutcome::CopiedOnly { reason } => Ok(Some(reason)),
+        PasteOutcome::Cancelled => Err(Outcome::Cancelled),
+    }
+}
+
 impl App {
     /// Begin a dictation (state machine already moved to Recording). `t_trigger` is when the event
     /// that starts recording arrived (key press, or the end of hold-mode arming), `t0` when the
@@ -224,13 +288,24 @@ impl App {
         // Bring the stream up off the UI thread, then pause media (both can block).
         let (hwnd, level, device, pause) = (self.hwnd, self.level.clone(), cfg.mic_device_id.clone(), cfg.pause_media);
         let prefetch = restores_clipboard(&cfg);
+        let warm = cfg.mic_warm_hold_secs;
         let spawned = std::thread::Builder::new().name("rec-start".into()).spawn(move || {
             // Read the user's clipboard now (on its own worker), so the paste after transcription
             // does not have to: delay-rendered owners (Excel ranges) take seconds to render.
             if prefetch {
                 paste::prepare_clipboard_snapshot();
             }
-            let result = Recorder::start(device.as_deref(), level, Some(sink));
+            // A hung driver must not leave the pill in Thinking until Esc (a stop may be pending).
+            let mic = device.clone();
+            let result = start_with_timeout(
+                START_TIMEOUT,
+                move || Recorder::start(device.as_deref(), level, Some(sink)),
+                // A recorder that comes up after the timeout is stopped right here, on the helper.
+                move |late: Recorder| {
+                    late.cancel();
+                    super::micpolicy::after_recording(mic.as_deref(), warm);
+                },
+            );
             let started = result.is_ok();
             notify(hwnd, Note::RecStarted { seq, result });
             if started && pause && media::pause_if_playing() {
@@ -634,9 +709,10 @@ fn run_job(job: Job) -> Outcome {
     let t_paste = now_ms();
     let note = if cfg.auto_paste {
         let opts = PasteOptions { restore_clipboard: restores_clipboard(&cfg), smart_spacing: cfg.smart_spacing };
-        match paste::paste_text(&cleaned.text, target.as_ref(), opts) {
-            PasteOutcome::Pasted => None,
-            PasteOutcome::CopiedOnly { reason } => Some(reason),
+        // Esc during the paste step (the modifier wait, the focus return) stops the keystroke.
+        match paste_note(paste::paste_text_cancellable(&cleaned.text, target.as_ref(), opts, &cancelled)) {
+            Ok(note) => note,
+            Err(cancelled) => return cancelled,
         }
     } else if paste::copy_to_clipboard(&cleaned.text) {
         None
@@ -743,6 +819,100 @@ mod tests {
         match failure(&cfg, &AppInfo::default(), e, audio, 500) {
             Outcome::Failed { retry, .. } => assert!(retry.is_none()),
             _ => panic!("expected a failure"),
+        }
+    }
+
+    /// Stands in for a `Recorder`: counts how often it is dropped.
+    struct Probe(Arc<std::sync::atomic::AtomicUsize>);
+    impl Drop for Probe {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn wait_for(cond: impl Fn() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !cond() {
+            assert!(std::time::Instant::now() < deadline, "condition never became true");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn hung_start_times_out() {
+        // The starter hangs until the test lets it go (a bad driver), far past the 50 ms timeout.
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        let t = std::time::Instant::now();
+        let r = start_with_timeout(
+            Duration::from_millis(50),
+            move || {
+                let _ = gate.recv();
+                Ok(())
+            },
+            |()| {},
+        );
+        assert_eq!(r, Err(START_TIMEOUT_MSG.to_string()));
+        assert!(t.elapsed() >= Duration::from_millis(50), "waited for the timeout: {:?}", t.elapsed());
+        drop(release); // lets the helper thread finish
+    }
+
+    #[test]
+    fn late_start_is_dropped_never_delivered() {
+        let dropped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let discarded = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (d, dis) = (dropped.clone(), discarded.clone());
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        let r = start_with_timeout(
+            Duration::from_millis(50),
+            move || {
+                let _ = gate.recv(); // comes up only after the caller gave up
+                Ok(Probe(d))
+            },
+            move |late| {
+                dis.fetch_add(1, Ordering::SeqCst);
+                drop(late);
+            },
+        );
+        assert!(r.is_err(), "timeout reports an error");
+        assert_eq!(dropped.load(Ordering::SeqCst), 0, "still starting at the deadline");
+        release.send(()).unwrap(); // the stream finally comes up
+        wait_for(|| dropped.load(Ordering::SeqCst) == 1);
+        assert_eq!(discarded.load(Ordering::SeqCst), 1, "the late value went through discard exactly once");
+    }
+
+    #[test]
+    fn fast_start_is_delivered_and_not_discarded() {
+        let dropped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let discarded = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (d, dis) = (dropped.clone(), discarded.clone());
+        let r = start_with_timeout(
+            Duration::from_secs(5),
+            move || Ok(Probe(d)),
+            move |late| {
+                dis.fetch_add(1, Ordering::SeqCst);
+                drop(late);
+            },
+        );
+        let probe = r.ok().expect("delivered");
+        assert_eq!(dropped.load(Ordering::SeqCst), 0, "the caller owns it");
+        drop(probe);
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+        assert_eq!(discarded.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn start_error_is_passed_through() {
+        let r = start_with_timeout(Duration::from_secs(5), || Err::<(), _>("no device".to_string()), |()| {});
+        assert_eq!(r, Err("no device".to_string()));
+    }
+
+    #[test]
+    fn cancelled_paste_maps_to_cancelled_outcome() {
+        assert!(matches!(paste_note(PasteOutcome::Cancelled), Err(Outcome::Cancelled)));
+        assert!(matches!(paste_note(PasteOutcome::Pasted), Ok(None)));
+        match paste_note(PasteOutcome::CopiedOnly { reason: "r".into() }) {
+            Ok(Some(r)) => assert_eq!(r, "r"),
+            _ => panic!("expected the copied-only note"),
         }
     }
 }
