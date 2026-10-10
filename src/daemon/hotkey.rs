@@ -9,6 +9,9 @@
 //! with an injected [`KeyState`]), and the thin Win32 shell (hook thread, `PostMessageW`, mask
 //! injection). The hook callback only does O(1), allocation-free work: one `try_lock`, a few
 //! `GetAsyncKeyState` reads and a `PostMessageW`.
+//!
+//! Every event is posted with the time the hook saw it in `lParam` ([`encode_stamp`]), so the
+//! latency figures count the time the message then waits in the daemon's queue ([`event_time`]).
 
 use std::sync::Mutex;
 use std::sync::TryLockError;
@@ -513,10 +516,12 @@ impl<K: KeyState> Matcher<K> {
         }
     }
 
+    #[cfg(test)]
     pub fn spec(&self) -> &HotkeySpec {
         &self.spec
     }
 
+    #[cfg(test)]
     pub fn is_active(&self) -> bool {
         self.active
     }
@@ -545,8 +550,9 @@ impl<K: KeyState> Matcher<K> {
         self.allow_injected = on;
     }
 
-    /// Drop transient state and re-read the modifiers from the OS.
-    fn reset(&mut self) -> Option<HotkeyEvent> {
+    /// Drop transient state and re-read the modifiers from the OS. Returns `Up` when a press was
+    /// in flight (the caller posts it).
+    pub fn reset(&mut self) -> Option<HotkeyEvent> {
         let was_active = std::mem::take(&mut self.active);
         self.win_used = false;
         self.alt_used = false;
@@ -559,6 +565,7 @@ impl<K: KeyState> Matcher<K> {
     }
 
     /// Convenience wrapper over [`Self::step`]: `(events, swallow)`.
+    #[cfg(test)]
     pub fn on_key(&mut self, vk: u32, down: bool, injected: bool) -> (Vec<HotkeyEvent>, bool) {
         let o = self.step(vk, down, injected);
         (o.events().collect(), o.swallow)
@@ -767,15 +774,46 @@ fn lock_matcher() -> std::sync::MutexGuard<'static, Matcher<SysKeys>> {
     MATCHER.lock().unwrap_or_else(|p| p.into_inner())
 }
 
-/// Post one event to the daemon window. Allocation-free; safe to call from the hook.
+// The stamp is the bits of an `f64` in an `LPARAM`.
+const _: () = assert!(size_of::<isize>() == size_of::<f64>());
+
+/// A stamp older than this (hook event to window procedure) is not believed.
+const STAMP_MAX_AGE_MS: f64 = 10_000.0;
+
+/// Pack a `core::timing::now_ms()` reading into an `LPARAM` (0 = none: not a positive finite time).
+pub fn encode_stamp(ms: f64) -> isize {
+    if ms.is_finite() && ms > 0.0 { ms.to_bits() as isize } else { 0 }
+}
+
+/// Inverse of [`encode_stamp`]; `None` for 0 or anything that is not a positive finite time.
+pub fn decode_stamp(lparam: isize) -> Option<f64> {
+    if lparam == 0 {
+        return None;
+    }
+    let ms = f64::from_bits(lparam as u64);
+    (ms.is_finite() && ms > 0.0).then_some(ms)
+}
+
+/// When a posted hotkey event happened: its stamp when present and plausible (not after `now`,
+/// not older than ~10 s), else `now`.
+pub fn event_time(lparam: isize, now: f64) -> f64 {
+    match decode_stamp(lparam) {
+        Some(t) if t <= now && now - t <= STAMP_MAX_AGE_MS => t,
+        _ => now,
+    }
+}
+
+/// Post one event to the daemon window, stamped with the current time. Allocation-free; safe to
+/// call from the hook.
 fn post(ev: HotkeyEvent) {
     let hwnd = TARGET_HWND.load(Ordering::Relaxed);
     let msg = TARGET_MSG.load(Ordering::Relaxed);
     if msg == 0 {
         return;
     }
+    let stamp = encode_stamp(crate::core::timing::now_ms());
     // SAFETY: PostMessageW is thread-safe; a stale/invalid HWND only makes it fail.
-    let _ = unsafe { PostMessageW(Some(HWND(hwnd as *mut _)), msg, WPARAM(ev as usize), LPARAM(0)) };
+    let _ = unsafe { PostMessageW(Some(HWND(hwnd as *mut _)), msg, WPARAM(ev as usize), LPARAM(stamp)) };
 }
 
 /// Inject VK 0xE8 down/up so Windows sees "another key was pressed" and skips the Start menu.
@@ -853,11 +891,14 @@ fn hook_thread_main(ready: std::sync::mpsc::Sender<Result<(), String>>) {
     HOOK_THREAD.store(0, Ordering::SeqCst);
 }
 
-/// Install the hook thread. Events are posted as `PostMessageW(hwnd, msg, HotkeyEvent as usize, 0)`.
+/// Install the hook thread. Events are posted as
+/// `PostMessageW(hwnd, msg, HotkeyEvent as usize, stamp)`, `stamp` being [`encode_stamp`] of the
+/// time the hook saw the event (decode with [`event_time`]).
 pub fn start(hwnd: isize, msg: u32, spec: &str) -> Result<(), String> {
     let parsed = parse(spec)?;
     // Held for the whole call so a concurrent `stop`/`start` cannot see a half-started thread.
     let mut slot = HOOK_JOIN.lock().unwrap_or_else(|p| p.into_inner());
+    let cut;
     {
         let mut m = lock_matcher();
         if std::env::var("OPENTALK_ALLOW_INJECTED").is_ok_and(|v| v == "1") {
@@ -865,7 +906,11 @@ pub fn start(hwnd: isize, msg: u32, spec: &str) -> Result<(), String> {
         }
         TARGET_HWND.store(hwnd, Ordering::SeqCst);
         TARGET_MSG.store(msg, Ordering::SeqCst);
-        m.set_spec(parsed);
+        cut = m.set_spec(parsed);
+    }
+    // A press cut short by the new spec (a reinstall mid-hold) still needs its Up.
+    if let Some(ev) = cut {
+        post(ev);
     }
     if slot.as_ref().is_some_and(|h| !h.is_finished()) {
         return Ok(());
@@ -913,6 +958,16 @@ pub fn set_hotkey(spec: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Forget a press in flight and re-read the modifiers (the session was locked). A swallowed
+/// single-key hotkey released on the secure desktop never delivers its key-up, which would keep a
+/// push-to-talk recording running; this posts the `Up` such a press is owed.
+pub fn reset() {
+    let cut = lock_matcher().reset();
+    if let Some(ev) = cut {
+        post(ev);
+    }
+}
+
 pub fn set_esc_capture(on: bool) {
     lock_matcher().set_esc_capture(on);
 }
@@ -928,7 +983,9 @@ pub fn set_start_menu_mask(on: bool) {
     lock_matcher().set_start_menu_mask(on);
 }
 
-/// Let automation-injected (`SendInput`) keys through; production ignores them.
+/// Let automation-injected (`SendInput`) keys through; production ignores them (`start` honours
+/// `OPENTALK_ALLOW_INJECTED=1` for benchmark instances).
+#[cfg(test)]
 pub fn set_allow_injected(on: bool) {
     lock_matcher().set_allow_injected(on);
 }
@@ -1908,6 +1965,80 @@ mod tests {
         assert_eq!(HotkeyEvent::from_wparam(4), None);
     }
 
+    // ---- event stamps ----
+
+    #[test]
+    fn stamp_roundtrip() {
+        for ms in [0.001, 1.0, 1234.5678, 3.6e6, 1e12] {
+            let l = encode_stamp(ms);
+            assert!(l > 0, "positive so it survives as an LPARAM");
+            assert_eq!(decode_stamp(l), Some(ms));
+        }
+    }
+
+    #[test]
+    fn stamp_zero_and_garbage_mean_none() {
+        assert_eq!(encode_stamp(0.0), 0);
+        assert_eq!(encode_stamp(-5.0), 0);
+        assert_eq!(encode_stamp(f64::NAN), 0);
+        assert_eq!(encode_stamp(f64::INFINITY), 0);
+        assert_eq!(decode_stamp(0), None);
+        assert_eq!(decode_stamp(-1), None);
+        assert_eq!(decode_stamp(f64::NAN.to_bits() as isize), None);
+        assert_eq!(decode_stamp(f64::INFINITY.to_bits() as isize), None);
+    }
+
+    #[test]
+    fn event_time_uses_a_plausible_stamp() {
+        let now = 50_000.0;
+        assert_eq!(event_time(encode_stamp(49_990.5), now), 49_990.5);
+        assert_eq!(event_time(encode_stamp(now), now), now);
+        assert_eq!(event_time(encode_stamp(now - 10_000.0), now), now - 10_000.0);
+    }
+
+    #[test]
+    fn event_time_falls_back_to_now() {
+        let now = 50_000.0;
+        assert_eq!(event_time(0, now), now, "no stamp");
+        assert_eq!(event_time(encode_stamp(now + 0.5), now), now, "in the future");
+        assert_eq!(event_time(encode_stamp(now - 10_000.5), now), now, "too old");
+        assert_eq!(event_time(-7, now), now, "garbage");
+    }
+
+    // ---- reset (session lock) ----
+
+    #[test]
+    fn reset_cuts_an_active_hold_exactly_once() {
+        let mut h = harness("F8");
+        assert_eq!(h.press(0x77), (vec![D], true), "swallowed single key");
+        assert_eq!(h.m.reset(), Some(U));
+        assert!(!h.m.is_active());
+        assert_eq!(h.m.reset(), None, "nothing left to cut");
+        // The key-up lost on the secure desktop may still arrive later: it must stay silent...
+        assert_eq!(h.release_ev(0x77), vec![]);
+        // ...and the next press starts cleanly.
+        assert_eq!(h.press_ev(0x77), vec![D]);
+        assert_eq!(h.release_ev(0x77), vec![U]);
+    }
+
+    #[test]
+    fn reset_cuts_an_active_combo() {
+        let mut h = harness("Control+Super");
+        h.press_ev(VK_LCONTROL);
+        assert_eq!(h.press_ev(VK_LWIN), vec![D]);
+        assert_eq!(h.m.reset(), Some(U));
+        assert_eq!(h.m.reset(), None);
+    }
+
+    #[test]
+    fn reset_when_idle_posts_nothing() {
+        let mut h = harness("F8");
+        assert_eq!(h.m.reset(), None);
+        h.press_ev(0x77);
+        h.release_ev(0x77);
+        assert_eq!(h.m.reset(), None, "a finished press leaves nothing to cut");
+    }
+
     // ---- desktop smoke (real hook + SendInput) ----
 
     mod desktop {
@@ -1942,6 +2073,10 @@ mod tests {
         }
 
         fn key(vk: u32, up: bool) -> INPUT {
+            key_extra(vk, up, 0)
+        }
+
+        fn key_extra(vk: u32, up: bool, extra: usize) -> INPUT {
             let mut flags = if up { KEYEVENTF_KEYUP } else { KEYBD_EVENT_FLAGS(0) };
             if vk == VK_LWIN || vk == VK_RWIN {
                 flags |= KEYEVENTF_EXTENDEDKEY;
@@ -1949,13 +2084,18 @@ mod tests {
             INPUT {
                 r#type: INPUT_KEYBOARD,
                 Anonymous: INPUT_0 {
-                    ki: KEYBDINPUT { wVk: VIRTUAL_KEY(vk as u16), wScan: 0, dwFlags: flags, time: 0, dwExtraInfo: 0 },
+                    ki: KEYBDINPUT { wVk: VIRTUAL_KEY(vk as u16), wScan: 0, dwFlags: flags, time: 0, dwExtraInfo: extra },
                 },
             }
         }
 
         fn send(seq: &[(u32, bool)]) {
-            let inputs: Vec<INPUT> = seq.iter().map(|&(vk, up)| key(vk, up)).collect();
+            send_extra(seq, 0);
+        }
+
+        /// As [`send`], stamping every key with `dwExtraInfo = extra`.
+        fn send_extra(seq: &[(u32, bool)], extra: usize) {
+            let inputs: Vec<INPUT> = seq.iter().map(|&(vk, up)| key_extra(vk, up, extra)).collect();
             // SAFETY: valid INPUT slice.
             unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
         }
@@ -2056,6 +2196,45 @@ mod tests {
             unsafe {
                 let _ = DestroyWindow(hwnd);
             }
+        }
+
+        /// With injected input allowed (as a benchmark instance does), our own paste keystrokes
+        /// (`dwExtraInfo` = `PASTE_EXTRA_INFO`) must still never reach the matcher, or a paste of
+        /// Ctrl+V would re-trigger a Ctrl+V hotkey. The same combo from anyone else does.
+        /// Needs an input desktop; unverified while the workstation is locked.
+        #[test]
+        #[ignore = "desktop: installs a real WH_KEYBOARD_LL hook and injects the paste chord"]
+        fn desktop_injected_paste_keys_are_filtered() {
+            if !crate::daemon::paste::require_input_desktop("desktop_injected_paste_keys_are_filtered") {
+                return;
+            }
+            let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            let hwnd = make_window();
+            set_allow_injected(true);
+            let started = start(hwnd.0 as isize, WM_APP + 7, "Control+V");
+            let chord = [(VK_LCONTROL, false), (b'V' as u32, false), (b'V' as u32, true), (VK_LCONTROL, true)];
+            let mut outcome = None;
+            if started.is_ok() {
+                SEEN.lock().unwrap().clear();
+                // Our own paste chord: the hook must not post anything.
+                send_extra(&chord, crate::daemon::paste::PASTE_EXTRA_INFO);
+                let own = pump_until(hwnd, 1, 400);
+                // The identical chord without the stamp is a real hotkey press.
+                send_extra(&chord, 0);
+                let plain = pump_until(hwnd, 2, 1500);
+                outcome = Some((own, plain));
+            }
+            // Always restore the global hook state before asserting.
+            stop();
+            set_allow_injected(false);
+            // SAFETY: destroying the window created above on this thread.
+            unsafe {
+                let _ = DestroyWindow(hwnd);
+            }
+            started.expect("hook installs");
+            let (own, plain) = outcome.expect("ran");
+            assert!(own.is_empty(), "paste-stamped keys reached the matcher: {own:?}");
+            assert_eq!(plain, vec![HotkeyEvent::Down, HotkeyEvent::Up], "an unstamped chord must trigger");
         }
 
         /// `stop()` must wait for the old hook thread, or an immediate `start()` sees it alive,
