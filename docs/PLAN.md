@@ -215,6 +215,7 @@ OpenWhispr has **no deterministic filler removal**. It relies entirely on the LL
 
 - **Tests.** All OpenWhispr fixtures are ported: cleanupOutput, snippets, dictionaryEcho, transcriptionResultParsing. Add 60 or more filler fixtures, among them the Windows TTS sample, whose raw Whisper output is `"Um, so I think, uh, we should like ship the new release on Friday, you know, because the the client is waiting."`.
 - **Settings.** Filler removal Off / Standard (default) / Aggressive. AI cleanup is a separate toggle and runs after the deterministic pass.
+- **Voice rewrite.** A dictation that ends with the configured phrase ("rewrite this concisely") is detected on the deterministic text (`core::rewrite`), its body is sent to the cleanup provider with a rewrite prompt and validator (`llm::rewrite`, 10 s, no retries) and the answer replaces the cleanup call for that dictation; any failure pastes the body as dictated with an informational card. Adds one LLM round trip only on trigger dictations; recording CPU, idle CPU and RAM budgets are unaffected (all work happens after stop). See docs/SPEC.md "Voice rewrite".
 
 ---
 

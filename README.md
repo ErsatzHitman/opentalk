@@ -29,6 +29,8 @@ the same floating recording pill, and adds a deterministic filler-word cleaner, 
 - **Clean text.** Deterministic filler removal (um, uh, "you know", stutters, loops, hallucinated "Thanks for watching"),
   punctuation repair, dictionary casing and fuzzy fixes, snippets; optional AI polish through any BYOK LLM that never
   blocks the paste (4 s timeout, falls back to the deterministic text).
+- **Voice rewrite.** End a dictation with a phrase you choose ("rewrite this concisely" by default) and the text you
+  dictated is rewritten more concisely by your AI provider before it is pasted.
 - **Many providers.** OpenAI, Groq, xAI, Mistral, Gemini, Deepgram, AssemblyAI, Corti, Tinfoil (plain HTTPS), OpenRouter,
   Custom / Azure OpenAI. Cleanup LLMs: OpenAI, Anthropic, Gemini, Groq, OpenRouter, custom OpenAI-compatible, Azure OpenAI, Bedrock, Vertex.
 - **Careful paste.** Full clipboard snapshot and restore, excluded from Windows clipboard history, waits for held modifier keys,
@@ -203,6 +205,23 @@ merged build:
    here is the same as the hotkey: same sounds, mute, app bubble and paste target (the app you were in before you clicked
    the tray). Launching the exe a second time opens History.
 6. If a transcription fails (network, quota) the error card offers **Retry** with the audio that was kept in memory.
+7. **Voice rewrite.** Dictate your message and finish with the rewrite phrase, e.g. *"Let's move the meeting to Friday
+   afternoon because the client is out on Thursday, rewrite this concisely."* OpenTalk sends the text (without the phrase)
+   to your AI cleanup provider, model and key and pastes the shorter version instead. It works even when *Enable AI
+   cleanup* is off, as long as a key is set.
+   - The phrase must be the **last** thing you say; one "please" / "thanks" / "thank you" after it is fine, and a leading
+     "and", "then", "so", "please" or "also" is dropped. Case, punctuation and "re-write" spellings do not matter; there is
+     no fuzzy matching ("write this concisely" does not trigger it).
+   - Change or switch off the phrase in **Settings > Cleanup & AI**: it needs two words (six letters), at most 80 characters,
+     and no filler words (they are removed from dictations before matching). An empty phrase turns the feature off.
+     A sentence that really ends with your phrase is rewritten too; say one more word, or turn it off.
+   - The Thinking glow stays up while the provider answers (up to 10 s, `ai_cleanup.rewrite_timeout_ms` in config.json);
+     **Esc** cancels and pastes nothing. If the call fails, times out or the answer looks wrong (a refusal, longer than
+     your text), your text is pasted as dictated, without the phrase, and a card says why (*Rewrite timed out*, *Check your
+     AI key*, *Add an AI key to rewrite*, ...). Saying only the phrase pastes nothing (*Nothing to rewrite*). Bodies of three
+     words or fewer are pasted as spoken, without a call. Snippets expand after the rewrite.
+   - History keeps the concise text as the entry text, the full recognised speech as the raw text and the text before the
+     rewrite as `original`, with `rewritten: true`.
 
 Command line (the exe is a GUI-subsystem program, so run these from a terminal and capture the output with a pipe):
 
@@ -210,14 +229,15 @@ Command line (the exe is a GUI-subsystem program, so run these from a terminal a
 |---|---|
 | `opentalk.exe --hidden` | Start straight into the tray (what launch-at-login uses) |
 | `opentalk.exe --settings [history\|dictionary\|settings[:section]]` | Open the control panel |
-| `opentalk.exe --transcribe-file x.wav [--provider id] [--model m] [--llm\|--no-llm]` | Run the full pipeline headless, print JSON `{raw, text, provider, model, stt_ms, cleanup_ms, total_ms}` |
+| `opentalk.exe --transcribe-file x.wav [--provider id] [--model m] [--llm\|--no-llm] [--rewrite-trigger "phrase"\|--no-rewrite]` | Run the full pipeline headless, print JSON `{raw, text, provider, model, stt_ms, cleanup_ms, total_ms, ai_cleaned, rewrite, rewritten, rewrite_error, original}` |
 | `opentalk.exe --render-pill <state> <t_ms> out.png [--dark] [--backdrop white\|black\|gradient\|busy-text [--composite]] [--upscale N]` | Render a pill state to PNG (visual goldens), optionally over a backdrop fixture (`--composite` shows the window over the fixture it sits on) |
 | `opentalk.exe --render-tray-popup out.png [--dark] [--recording\|--transcribing] [--recent] [--retry] [--hover <row>] [--focus]` | Render the tray popup to PNG (screenshots, structural goldens) |
 | `opentalk.exe --bench ...` | Benchmark helpers: `toggle`, `dictate <n> <wav>`, `latency`, `mock-stt`, `info` (see `bench/bench.ps1`) |
 
 Automation hooks: `OPENTALK_HOME` (data directory), `OPENTALK_INJECT_WAV` (play a WAV instead of the microphone),
-`OPENTALK_STT_BASE_URL` (point every STT provider at a local server), `OPENTALK_SECRET_<NAME>` (API key without touching
-the secret store), `OPENTALK_LOG=debug`.
+`OPENTALK_STT_BASE_URL` (point every STT provider at a local server), `OPENTALK_LLM_BASE_URL` (the same for the cleanup /
+rewrite LLM; `--bench mock-stt` also answers `/chat/completions`, see `--llm-text`, `--llm-status`, `--llm-delay-ms`),
+`OPENTALK_SECRET_<NAME>` (API key without touching the secret store), `OPENTALK_LOG=debug`.
 
 ## Settings
 
@@ -226,7 +246,7 @@ the secret store), `OPENTALK_LOG=debug`.
 | Preferences | Theme, dictation sounds, pause media while dictating, mute system audio while dictating (on by default), automatic pasting, keep text on the clipboard, floating icon (auto-hide, position, app bubble), language, microphone, launch at login |
 | Hotkeys | Dictation hotkey (modifier-only combos allowed), Tap / Push to talk, Start-menu suppression for Win combos |
 | Speech-to-Text | Provider, model, API key (masked), custom endpoint, streaming preference, **Test** button |
-| Cleanup | Filler removal (Off / Standard / Aggressive), fuzzy dictionary, spoken line breaks, AI cleanup provider / model / key / prompt |
+| Cleanup | Filler removal (Off / Standard / Aggressive), fuzzy dictionary, spoken line breaks, AI cleanup provider / model / key / prompt, voice rewrite on/off and its trigger phrase |
 | Dictionary | Words that bias recognition and fix casing; snippets (trigger -> replacement) |
 | History | Searchable, with app, provider and latency per entry; copy, delete, retry |
 | Privacy & Data | History on/off and retention, keep failed audio for Retry, save discarded dictations |
@@ -246,7 +266,9 @@ theme, cleanup, microphone) without a restart.
   recording ends (stop, cancel, error or quit). It never touches a device that was already muted, and while muted
   it keeps a tiny `muted-device.txt` (the device id) in `%APPDATA%\OpenTalk` so a crash cannot leave you muted.
 - History (text, app name, provider, timing) is a local `history.jsonl` you can clear or auto-prune.
-- With AI cleanup on, the *transcribed text* (not audio) is sent to the LLM provider you chose.
+- With AI cleanup on, or when you end a dictation with your rewrite phrase, the *transcribed text* (not audio) is sent to the
+  LLM provider you chose. Voice rewrite is on by default but only sends text when you say the phrase; turn it off in
+  Settings > Cleanup & AI.
 - Dictation text goes through the clipboard for pasting; it is excluded from Win+V clipboard history and the previous
   clipboard contents are restored afterwards (unless *Keep transcription in clipboard* is on).
 
