@@ -36,7 +36,7 @@ const WGL_EXPORTS: &[&str] = &[
 /// the first STA `CoInitializeEx`. A delay-load import library (dlltool `--output-delaylib`,
 /// resolved by mingw-w64's `__delayLoadHelper2`) is found before the system `libopengl32.a`
 /// through the link search path, so the DLL is only loaded on the first WGL call.
-/// Best effort: without dlltool the normal import is used.
+/// Best effort: without dlltool the normal import is used (see [`dlltool_candidates`]).
 fn delay_load_opengl(out: &Path) {
     if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() != Ok("gnu") || std::env::var_os("OPENTALK_NO_DELAYLOAD").is_some() {
         return;
@@ -51,13 +51,15 @@ fn delay_load_opengl(out: &Path) {
         return;
     }
     let lib = dir.join("libopengl32.a");
-    let ok = Command::new("dlltool")
-        .arg("--input-def")
-        .arg(&def)
-        .args(["--dllname", "opengl32.dll", "--output-delaylib"])
-        .arg(&lib)
-        .status()
-        .is_ok_and(|s| s.success());
+    let ok = dlltool_candidates().iter().any(|tool| {
+        Command::new(tool)
+            .arg("--input-def")
+            .arg(&def)
+            .args(["--dllname", "opengl32.dll", "--output-delaylib"])
+            .arg(&lib)
+            .status()
+            .is_ok_and(|s| s.success())
+    });
     if ok {
         println!("cargo:rustc-link-search=native={}", dir.display());
     } else {
@@ -65,9 +67,35 @@ fn delay_load_opengl(out: &Path) {
     }
 }
 
+/// The dlltool programs to try, in order: `$DLLTOOL` when set; on a non-Windows host the
+/// target-prefixed mingw-w64 one (`x86_64-w64-mingw32-dlltool`), because a bare `dlltool` there is
+/// the host's binutils and fails (it drives the host assembler); then a plain `dlltool` (what WinLibs
+/// and MSYS2 put on PATH on Windows).
+fn dlltool_candidates() -> Vec<String> {
+    let mut tools = Vec::new();
+    if let Some(t) = std::env::var("DLLTOOL").ok().filter(|t| !t.trim().is_empty()) {
+        tools.push(t);
+    }
+    let host_is_windows = std::env::var("HOST").is_ok_and(|h| h.contains("windows"));
+    if !host_is_windows {
+        let prefix = match std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() {
+            Ok("x86") => Some("i686"),
+            Ok("x86_64") => Some("x86_64"),
+            Ok("aarch64") => Some("aarch64"),
+            _ => None,
+        };
+        if let Some(p) = prefix {
+            tools.push(format!("{p}-w64-mingw32-dlltool"));
+        }
+    }
+    tools.push("dlltool".to_string());
+    tools
+}
+
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=OPENTALK_NO_DELAYLOAD");
+    println!("cargo:rerun-if-env-changed=DLLTOOL");
     println!("cargo:rerun-if-changed=assets/opentalk.ico");
     println!("cargo:rerun-if-changed=assets/opentalk.manifest");
     println!("cargo:rerun-if-env-changed=OPENTALK_NO_RESOURCES");
