@@ -240,7 +240,7 @@ struct Precheck {
     waited_idle_ms: f64,
     /// The daemon was still busy after [`IDLE_WAIT`]; it was cancelled.
     cancelled_stale: bool,
-    /// History holds fewer entries than the previous round left (it vanished or never landed).
+    /// History holds fewer entries than right after the previous round (an entry vanished).
     prev_entry_missing: bool,
 }
 
