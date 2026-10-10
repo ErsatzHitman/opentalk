@@ -336,6 +336,7 @@ impl App {
 
         // Backdrop first (skill rule 1): opaque page colour, or a partial-alpha page over the Windows
         // acrylic when that is available and not switched off.
+        glass::sys::hide_caption_buttons(self.hwnd);
         glass::set_opaque(self.cfg.reduce_transparency || !self.acrylic_ok || !self.effects_on);
         if self.backdrop_dark != Some(dark) {
             glass::sys::set_dark(self.hwnd, dark);

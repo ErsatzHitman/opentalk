@@ -9,6 +9,7 @@
 use eframe::egui::{self, Color32};
 
 #[derive(Clone, Copy, Debug)]
+#[allow(dead_code)] // tokens kept complete (docs/SPEC.md); surfaces are painted by glass.rs now
 pub struct Palette {
     pub dark: bool,
     pub primary: Color32,

@@ -121,3 +121,33 @@ few hundred vertex colours (cached geometry, no allocation of textures). No new 
 * Pages that still frame their own surface (`history.rs` panels and keycaps, `dictionary.rs` edit
   dialog, a few `settings/*.rs` fills) were not migrated here; they get translucent washes through
   the `Palette` helpers but should move to `w::panel` / `w::glass_modal`.
+
+## Verification
+
+* **Live window** (`docs/screenshots/glass/live-*.png`): the real `opentalk.exe --settings <page>`,
+  captured with `CopyFromScreen` over a deliberately busy, colourful, text-covered wallpaper window
+  placed behind it, so the acrylic blur is visible. Shell and Settings > Preferences in light and
+  dark, plus the dark shell with Reduce transparency on (opaque page). The wallpaper window and the
+  app were closed afterwards. Popups were not driven live (a scripted click did not open the Support
+  menu); they are covered by the headless renderer below.
+* **Headless frame renderer** (`src/ui/offscreen.rs`, `docs/screenshots/glass/offscreen/*.png`): the
+  real `App::draw` run through egui, tessellated and rasterised on the CPU. It exercises states that
+  are tedious to drive on a desktop (Ctrl+K palette, confirm dialog, Support menu, Speech-to-Text,
+  Dictionary, a tall Preferences with selects). It does not emulate acrylic (a synthetic wallpaper is
+  composited under the translucent window). Regenerate with
+  `OPENTALK_SHOT_DIR=docs/screenshots/glass/offscreen cargo test --bin opentalk offscreen_shots`.
+  Without that variable the test does nothing; `offscreen_shell_has_an_uneven_translucent_backdrop`
+  always runs and asserts the backdrop is uneven and the window translucent in both themes.
+* **Measured, release build, Settings window idle** (10 s after a 6 s settle): working set 13.3 MB
+  (History) / 15.9 MB (Settings modal open), CPU 0 to 0.16 % (one 15.6 ms scheduler tick in 10 s), no
+  repaint while idle. Executable 7,324,672 bytes (+75,776 vs 7,248,896), under the 8,000,000 budget.
+
+## Windows notes
+
+* `winit` hides an undecorated window's frame by zeroing the non-client area but leaves `WS_SYSMENU`
+  set. With the frame extended into the client area (needed for the acrylic), DWM then draws its own
+  caption buttons through our translucent pixels (faint duplicate min / max / close above the bar).
+  `glass::sys::hide_caption_buttons` clears `WS_SYSMENU`; the app re-checks it every frame, since
+  winit re-applies the style on some state changes. Alt+F4 still closes the window.
+* Without `DwmExtendFrameIntoClientArea(-1)` the system backdrop does not show; with winit's
+  blur-behind alone the window shows an unblurred, dark blend of whatever is behind it.

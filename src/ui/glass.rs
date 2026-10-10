@@ -966,8 +966,32 @@ pub mod sys {
             let _ = DwmExtendFrameIntoClientArea(h, &margins);
             let _ = DwmSetWindowAttribute(h, DWMWA_WINDOW_CORNER_PREFERENCE, &round as *const _ as *const c_void, std::mem::size_of_val(&round) as u32);
         }
+        hide_caption_buttons(raw);
         set_dark(raw, dark);
         true
+    }
+
+    /// winit hides the frame of an undecorated window by zeroing the non-client area, but the window
+    /// keeps `WS_SYSMENU`; with the frame extended over the client area DWM then draws its caption
+    /// buttons through our translucent pixels. Dropping the style removes them (we draw our own). winit
+    /// rewrites the style on some state changes (show, maximize), so the app calls this every frame;
+    /// it is a single style read once the bit is gone.
+    pub fn hide_caption_buttons(raw: isize) {
+        if raw == 0 {
+            return;
+        }
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GWL_STYLE, GetWindowLongPtrW, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetWindowLongPtrW, SetWindowPos, WS_SYSMENU,
+        };
+        let h = hwnd(raw);
+        // SAFETY: plain style read / write / refresh on a window handle this process owns.
+        unsafe {
+            let style = GetWindowLongPtrW(h, GWL_STYLE);
+            if style & WS_SYSMENU.0 as isize != 0 {
+                SetWindowLongPtrW(h, GWL_STYLE, style & !(WS_SYSMENU.0 as isize));
+                let _ = SetWindowPos(h, None, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            }
+        }
     }
 
     /// `DWMWA_USE_IMMERSIVE_DARK_MODE`: darkens the acrylic tint to match the theme.
