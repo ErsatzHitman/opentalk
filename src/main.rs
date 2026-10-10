@@ -8,7 +8,6 @@
 //!   opentalk.exe --render-pill S T O  render pill state S at t=T ms to PNG O (goldens)
 //!   opentalk.exe --bench ...          benchmark helpers (see bench/bench.ps1)
 #![cfg_attr(not(test), windows_subsystem = "windows")]
-#![allow(dead_code)]
 // rustc embeds its own default manifest next to ours (build.rs); GNU ld reports the pair.
 #![allow(linker_messages)]
 

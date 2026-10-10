@@ -19,6 +19,7 @@ use windows::core::w;
 use super::paths;
 
 pub struct SecretName;
+#[allow(dead_code)] // full secret-name catalog / listing API; not every name has a caller yet
 impl SecretName {
     pub const OPENAI: &'static str = "openai";
     pub const GROQ: &'static str = "groq";
@@ -62,6 +63,7 @@ pub fn set(name: &str, value: &str) -> io::Result<()> {
 }
 
 /// Names that currently have a stored value.
+#[allow(dead_code)] // full secret-name catalog / listing API; not every name has a caller yet
 pub fn list() -> Vec<String> {
     list_in(&paths::secrets_file())
 }
@@ -124,6 +126,7 @@ fn set_in(path: &Path, name: &str, value: &str) -> io::Result<()> {
     write_atomic(path, &serde_json::to_vec_pretty(&store).map_err(io::Error::other)?)
 }
 
+#[allow(dead_code)] // full secret-name catalog / listing API; not every name has a caller yet
 fn list_in(path: &Path) -> Vec<String> {
     let _g = FILE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     read_store(path).map(|s| s.into_keys().collect()).unwrap_or_default()
