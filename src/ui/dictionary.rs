@@ -139,14 +139,13 @@ pub fn budget_warning(cfg: &Config) -> Option<String> {
 /// or a bare snippet array) or plain text split on commas/newlines.
 pub fn parse_import(text: &str) -> (Vec<String>, Vec<Snippet>) {
     let t = text.trim_start_matches('\u{feff}').trim();
-    if t.starts_with('[') || t.starts_with('{') {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(t) {
+    if (t.starts_with('[') || t.starts_with('{'))
+        && let Ok(v) = serde_json::from_str::<serde_json::Value>(t) {
             let mut words = Vec::new();
             let mut snippets = Vec::new();
             collect_json(&v, &mut words, &mut snippets);
             return (words, snippets);
         }
-    }
     (parse_words(t), Vec::new())
 }
 
@@ -496,8 +495,8 @@ fn bulk_panel(ui: &mut Ui, env: &mut Env, st: &mut DictState) -> bool {
                         st.bulk_text.clear();
                         st.bulk_open = false;
                     }
-                    if w::button(ui, &p, Btn::new("From file...", Variant::Outline).icon(icons::FOLDER).small()).clicked() {
-                        if let Some(path) = super::filedialog::open_file() {
+                    if w::button(ui, &p, Btn::new("From file...", Variant::Outline).icon(icons::FOLDER).small()).clicked()
+                        && let Some(path) = super::filedialog::open_file() {
                             match read_import_file(&path) {
                                 Ok(txt) => {
                                     let (words, snips) = parse_import(&txt);
@@ -510,7 +509,6 @@ fn bulk_panel(ui: &mut Ui, env: &mut Env, st: &mut DictState) -> bool {
                                 Err(e) => env.cmds.push(Cmd::Toast(format!("Could not read the file: {e}"))),
                             }
                         }
-                    }
                 });
             });
         });
@@ -583,14 +581,13 @@ fn snippets_tab(ui: &mut Ui, env: &mut Env, st: &mut DictState) -> bool {
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = 8.0;
-                    if w::button(ui, &p, Btn::new("Export", Variant::Flat).icon(icons::DOWNLOAD).small().enabled(!env.cfg.snippets.is_empty())).clicked() {
-                        if let Some(path) = super::filedialog::save_file("opentalk-snippets.json") {
+                    if w::button(ui, &p, Btn::new("Export", Variant::Flat).icon(icons::DOWNLOAD).small().enabled(!env.cfg.snippets.is_empty())).clicked()
+                        && let Some(path) = super::filedialog::save_file("opentalk-snippets.json") {
                             match std::fs::write(&path, export_snippets_json(&env.cfg.snippets)) {
                                 Ok(()) => env.cmds.push(Cmd::Toast("Snippets exported".into())),
                                 Err(e) => env.cmds.push(Cmd::Toast(format!("Export failed: {e}"))),
                             }
                         }
-                    }
                 });
             });
         });

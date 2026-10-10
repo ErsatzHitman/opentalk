@@ -33,12 +33,11 @@ impl SttState {
 
     /// Pull a finished result from the background thread.
     pub fn poll(&mut self) {
-        if let Some(rx) = &self.rx {
-            if let Ok(o) = rx.try_recv() {
+        if let Some(rx) = &self.rx
+            && let Ok(o) = rx.try_recv() {
                 self.outcome = Some(o);
                 self.rx = None;
             }
-        }
     }
 }
 
@@ -82,14 +81,13 @@ pub fn show(ui: &mut Ui, env: &mut Env, st: &mut SettingsState) -> bool {
     w::section_title(ui, &p, "Provider", "Audio is sent to the provider you choose, using your own API key.");
     let labels: Vec<(&str, &str)> = PROVIDERS.iter().map(|pi| (pi.name, if pi.id == SttProviderId::Openai { "Recommended" } else { "" })).collect();
     let sel = PROVIDERS.iter().position(|pi| pi.id == provider).unwrap_or(0);
-    if let Some(i) = w::pill_tabs(ui, &p, sel, &labels) {
-        if PROVIDERS[i].id != provider {
+    if let Some(i) = w::pill_tabs(ui, &p, sel, &labels)
+        && PROVIDERS[i].id != provider {
             env.cfg.stt.provider = PROVIDERS[i].id;
             st.key_edit = None;
             st.stt.outcome = None;
             changed = true;
         }
-    }
     let provider = env.cfg.stt.provider;
     let info = if provider == info.id { info } else { registry::provider(provider) };
 

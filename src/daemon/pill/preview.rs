@@ -392,8 +392,8 @@ pub fn cli_render(args: &[String]) -> i32 {
     if let Some(p) = parse_str(rest, "--app-icon") {
         match load_icon(p, 48) {
             Some(icon) => {
-                if let Some(dump) = parse_str(rest, "--dump-icon") {
-                    if let Some(mut pm) = Pixmap::new(icon.2, icon.2) {
+                if let Some(dump) = parse_str(rest, "--dump-icon")
+                    && let Some(mut pm) = Pixmap::new(icon.2, icon.2) {
                         for (d, s) in pm.data_mut().chunks_exact_mut(4).zip(icon.1.chunks_exact(4)) {
                             let a = s[3] as u32;
                             d[0] = ((s[0] as u32 * a + 127) / 255) as u8;
@@ -403,7 +403,6 @@ pub fn cli_render(args: &[String]) -> i32 {
                         }
                         let _ = pm.save_png(dump);
                     }
-                }
                 scene.icon = Some(icon);
             }
             None => {
@@ -501,7 +500,7 @@ fn bench(scene: &Scene) -> i32 {
             times.push(t0.elapsed().as_secs_f64() * 1000.0);
         }
         times.sort_by(|a, b| a.total_cmp(b));
-        let label = format!("{state}");
+        let label = state.to_string();
         results.push((Box::leak(label.into_boxed_str()) as &str, percentile(&times, 0.5), percentile(&times, 0.99)));
     }
     for (n, p50, p99) in results {
@@ -654,13 +653,12 @@ mod golden {
                 // GDI text goldens are rendered with Segoe UI on Windows. Under Wine without that font
                 // DrawTextW substitutes another face, so only those cases are skipped there (with the
                 // reason); every non-text golden is still asserted, and on Windows nothing is skipped.
-                if g.text {
-                    if let Some(reason) = wine_skip.get_or_insert_with(|| crate::testenv::wine_text_skip_reason(crate::daemon::pill::text::FONT_FACE)) {
+                if g.text
+                    && let Some(reason) = wine_skip.get_or_insert_with(|| crate::testenv::wine_text_skip_reason(crate::daemon::pill::text::FONT_FACE)) {
                         println!("SKIPPED (Wine: {reason}) golden {}: {count} px differ (max {max}, allowed {allowed})", g.name);
                         skipped += 1;
                         continue;
                     }
-                }
                 failures.push(format!("{}: {count} px differ (max {max}, allowed {allowed})", g.name));
             }
         }

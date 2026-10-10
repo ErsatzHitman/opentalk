@@ -553,12 +553,11 @@ impl Inner {
 
     fn ensure_buffers(&mut self) {
         let (w, h) = self.client_size();
-        if self.pm.width() as i32 != w || self.pm.height() as i32 != h {
-            if let Some(pm) = Pixmap::new(w as u32, h as u32) {
+        if (self.pm.width() as i32 != w || self.pm.height() as i32 != h)
+            && let Some(pm) = Pixmap::new(w as u32, h as u32) {
                 self.pm = pm;
                 self.cache.reset();
             }
-        }
         if self.dib.as_ref().map(|d| d.w != w || d.h != h).unwrap_or(true) {
             self.dib = Dib::new(w, h);
             self.cache.reset();
@@ -910,13 +909,12 @@ impl Inner {
 
     fn sync_timer(&mut self) {
         let t = self.now();
-        if let Some(timer) = &self.timer {
-            if self.st.is_animating(t) {
+        if let Some(timer) = &self.timer
+            && self.st.is_animating(t) {
                 // an outside change (mode, pointer, options) always gets full rate
                 self.quiet.reset();
                 timer.start();
             }
-        }
     }
 
     /// The recording is visually static: tick slowly and ask the capture thread to wake the timer
@@ -1228,20 +1226,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         Err(_) => Outcome::default(),
     };
     let mut events = outcome.events;
-    if outcome.menu {
-        if let Some(ev) = run_menu(&rc, hwnd) {
+    if outcome.menu
+        && let Some(ev) = run_menu(&rc, hwnd) {
             events.push(ev);
         }
-    }
     for ev in events {
         let cb = rc.try_borrow_mut().ok().and_then(|mut i| i.on_event.take());
         if let Some(mut cb) = cb {
             cb(ev);
-            if let Ok(mut i) = rc.try_borrow_mut() {
-                if i.on_event.is_none() {
+            if let Ok(mut i) = rc.try_borrow_mut()
+                && i.on_event.is_none() {
                     i.on_event = Some(cb);
                 }
-            }
         }
     }
     match outcome.result {

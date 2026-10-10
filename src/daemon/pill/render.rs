@@ -96,11 +96,10 @@ fn draw_under(cv: &mut Canvas, st: &RenderState, g: &Geometry, t: f64) {
     let ctx = Ctx { backdrop: &backdrop, dark: pal.dark };
 
     // 2. app bubble
-    if g.bubble_t > 0.003 {
-        if let Some(a) = st.app() {
+    if g.bubble_t > 0.003
+        && let Some(a) = st.app() {
             draw_bubble(cv, st, &ctx, g, &app, a);
         }
-    }
 
     // 3. pill shadow (fades with the chrome once the liquid skin owns the surface)
     let p = g.pill;
@@ -143,8 +142,8 @@ fn draw_over(cv: &mut Canvas, st: &RenderState, g: &Geometry, t: f64) {
     }
 
     // 8. tooltip
-    if st.pointer().pill || st.pointer().bubble {
-        if let Some(txt) = tooltip_for(st) {
+    if (st.pointer().pill || st.pointer().bubble)
+        && let Some(txt) = tooltip_for(st) {
             let anchor = if st.pointer().bubble && g.bubble_t > 0.3 {
                 let (bx, by, br) = g.bubble;
                 (Rect::new(bx - br, by - br, bx + br, by + br), Align::Center)
@@ -153,7 +152,6 @@ fn draw_over(cv: &mut Canvas, st: &RenderState, g: &Geometry, t: f64) {
             };
             draw_tooltip(cv, st, &txt, anchor.0, anchor.1);
         }
-    }
 }
 
 fn tooltip_for(st: &RenderState) -> Option<String> {

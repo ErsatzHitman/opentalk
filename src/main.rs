@@ -25,6 +25,8 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     // Helper modes log to their own file; every daemon launch (no argument, --hidden from
     // launch-at-login, or an unrecognised argument) shares `daemon.log`.
+    // Not `unwrap_or`: any other first argument (`--hidden`, a typo) must still log to `daemon`.
+    #[allow(clippy::manual_unwrap_or)]
     let log_name = match args.first().map(String::as_str) {
         Some(mode @ ("--settings" | "--transcribe-file" | "--render-pill" | "--bench")) => mode,
         _ => "daemon",

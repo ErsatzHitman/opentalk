@@ -61,12 +61,11 @@ pub fn filler_from_index(i: usize) -> FillerMode {
 pub fn show(ui: &mut Ui, env: &mut Env, st: &mut SettingsState) -> bool {
     let p = *env.p;
     let mut changed = false;
-    if let Some(rx) = &st.cleanup.rx {
-        if let Ok(o) = rx.try_recv() {
+    if let Some(rx) = &st.cleanup.rx
+        && let Ok(o) = rx.try_recv() {
             st.cleanup.outcome = Some(o);
             st.cleanup.rx = None;
         }
-    }
 
     w::section_title(ui, &p, "Text cleanup", "Always on and instant: runs on your device before anything is pasted.");
     w::panel(ui, &p, |ui| {
@@ -95,14 +94,13 @@ pub fn show(ui: &mut Ui, env: &mut Env, st: &mut SettingsState) -> bool {
     let provider = env.cfg.ai_cleanup.provider;
     let labels: Vec<(&str, &str)> = PROVIDERS.iter().map(|pi| (pi.name, if pi.enterprise { "Enterprise" } else { "" })).collect();
     let sel = PROVIDERS.iter().position(|pi| pi.id == provider).unwrap_or(0);
-    if let Some(i) = w::pill_tabs(ui, &p, sel, &labels) {
-        if PROVIDERS[i].id != provider {
+    if let Some(i) = w::pill_tabs(ui, &p, sel, &labels)
+        && PROVIDERS[i].id != provider {
             env.cfg.ai_cleanup.provider = PROVIDERS[i].id;
             st.key_edit = None;
             st.cleanup.outcome = None;
             changed = true;
         }
-    }
     let provider = env.cfg.ai_cleanup.provider;
     let info = registry::provider(provider);
 

@@ -89,10 +89,7 @@ fn raster_tri(f: &mut Frame, clip: (i32, i32, i32, i32), v: [(Pos2, [f32; 4], Po
                 continue;
             }
             let (w0, w1, w2) = (w0 as f32, w1 as f32, w2 as f32);
-            let mut col = [0.0f32; 4];
-            for k in 0..4 {
-                col[k] = w0 * v[0].1[k] + w1 * v[1].1[k] + w2 * v[2].1[k];
-            }
+            let mut col: [f32; 4] = std::array::from_fn(|k| w0 * v[0].1[k] + w1 * v[1].1[k] + w2 * v[2].1[k]);
             if let Some(t) = tex {
                 let uv = pos2(w0 * v[0].2.x + w1 * v[1].2.x + w2 * v[2].2.x, w0 * v[0].2.y + w1 * v[1].2.y + w2 * v[2].2.y);
                 let tx = ((uv.x * t.w as f32) as isize).clamp(0, t.w as isize - 1) as usize;
@@ -144,10 +141,8 @@ fn run_passes(
     let mut textures: HashMap<TextureId, Tex> = HashMap::new();
     let mut last = None;
     for pass in 0..passes {
-        let mut input = egui::RawInput::default();
-        input.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, size));
+        let mut input = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)), time: Some(pass as f64 * 0.5), ..Default::default() };
         input.viewports.entry(egui::ViewportId::ROOT).or_default().native_pixels_per_point = Some(ppp);
-        input.time = Some(pass as f64 * 0.5);
         if pass + tail.len() >= passes {
             input.events = tail[pass + tail.len() - passes].clone();
         }
@@ -343,11 +338,10 @@ fn offscreen_shots() {
     let only = std::env::var("OPENTALK_SHOT_ONLY").ok();
     for dark in [false, true] {
         for sc in &scenarios {
-            if let Some(o) = &only {
-                if !sc.name.contains(o.as_str()) {
+            if let Some(o) = &only
+                && !sc.name.contains(o.as_str()) {
                     continue;
                 }
-            }
             // SAFETY: this test is run alone (filtered by name) and no other thread reads the variable.
             unsafe { std::env::set_var("OPENTALK_HOME", if sc.empty_history { &empty } else { &home }) };
             let mut cfg = Config { theme: if dark { Theme::Dark } else { Theme::Light }, ..Config::default() };

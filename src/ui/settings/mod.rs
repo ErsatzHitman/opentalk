@@ -366,12 +366,11 @@ pub fn api_key_field(ui: &mut Ui, env: &mut Env, st: &mut SettingsState, name: &
             if w::button(ui, &p, Btn::new("Edit", Variant::Outline).small()).clicked() {
                 st.key_edit = Some((name.to_string(), String::new()));
             }
-            if w::button(ui, &p, Btn::new("Remove", Variant::DestructiveOutline).small()).clicked() {
-                if st.secrets.set(name, "").is_ok() {
+            if w::button(ui, &p, Btn::new("Remove", Variant::DestructiveOutline).small()).clicked()
+                && st.secrets.set(name, "").is_ok() {
                     saved = true;
                     env.cmds.push(Cmd::Toast("API key removed".into()));
                 }
-            }
         });
     }
     saved

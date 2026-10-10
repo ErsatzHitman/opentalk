@@ -115,11 +115,10 @@ impl ErrorCard {
         self.hover = h;
         if is && !was && self.exit_at.is_none() {
             self.paused_at = Some(now);
-        } else if !is && was {
-            if let Some(p) = self.paused_at.take() {
+        } else if !is && was
+            && let Some(p) = self.paused_at.take() {
                 self.paused_ms += now - p;
             }
-        }
     }
 
     /// Start the exit fade without telling the owner (a new dictation took over).
@@ -174,11 +173,10 @@ impl ErrorCard {
     pub fn layout(&self, scale: f32) -> Arc<CardLayout> {
         let key = (scale * 64.0).round() as u32;
         let mut c = self.layout_cache.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((k, l)) = c.as_ref() {
-            if *k == key {
+        if let Some((k, l)) = c.as_ref()
+            && *k == key {
                 return l.clone();
             }
-        }
         let l = Arc::new(compute_layout(&self.title, &self.desc, self.retry, scale));
         *c = Some((key, l.clone()));
         l
@@ -186,11 +184,10 @@ impl ErrorCard {
 
     pub fn hit_test(&self, lx: f32, ly: f32, scale: f32) -> Hit {
         let l = self.layout(scale);
-        if let Some(r) = l.retry {
-            if r.contains(lx, ly) {
+        if let Some(r) = l.retry
+            && r.contains(lx, ly) {
                 return Hit::ErrorRetry;
             }
-        }
         if l.card.contains(lx, ly) {
             return Hit::ErrorCard;
         }
@@ -436,11 +433,10 @@ pub fn base_layer(card: &ErrorCard, scale: f32, pal: &Palette, backdrop: &Backdr
         backdrop: backdrop.id,
     };
     let mut c = BASE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((k, p)) = c.as_ref() {
-        if *k == key {
+    if let Some((k, p)) = c.as_ref()
+        && *k == key {
             return Some(p.clone());
         }
-    }
     let p = Arc::new(draw_base(card, scale, pal, backdrop)?);
     *c = Some((key, p.clone()));
     Some(p)

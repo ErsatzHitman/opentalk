@@ -91,7 +91,7 @@ pub fn thousands(n: usize) -> String {
     let s = n.to_string();
     let mut out = String::new();
     for (i, c) in s.chars().enumerate() {
-        if i > 0 && (s.len() - i) % 3 == 0 {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(c);
@@ -144,11 +144,10 @@ impl HistoryState {
     pub fn focus(&mut self, id: i64, now: f64) {
         self.highlight = Some((id, now));
         self.scrolled = false;
-        if let Some(e) = self.entries.iter().find(|e| e.id == id) {
-            if e.status == Status::Discarded {
+        if let Some(e) = self.entries.iter().find(|e| e.id == id)
+            && e.status == Status::Discarded {
                 self.show_discarded = true;
             }
-        }
         self.query.clear();
     }
 

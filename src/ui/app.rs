@@ -728,6 +728,17 @@ pub fn app_icon() -> egui::IconData {
     egui::IconData { rgba, width: N as u32, height: N as u32 }
 }
 
+/// Hand the pages the GL driver and font atlas touched at start-up back to Windows. The panel is
+/// idle almost all the time, so this keeps its resident size small; pages fault back in on demand.
+fn trim_working_set() {
+    use windows::Win32::System::ProcessStatus::EmptyWorkingSet;
+    use windows::Win32::System::Threading::GetCurrentProcess;
+    // SAFETY: the pseudo handle from GetCurrentProcess is always valid for this process.
+    unsafe {
+        let _ = EmptyWorkingSet(GetCurrentProcess());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -813,16 +824,5 @@ mod tests {
         accept_page_message(7, 7, ipc::encode_settings_page(launch(Page::History, None)));
         accept_page_message(7, 7, ipc::encode_settings_page(launch(Page::Dictionary, None)));
         assert_eq!(take_page_request(), Some(launch(Page::Dictionary, None)));
-    }
-}
-
-/// Hand the pages the GL driver and font atlas touched at start-up back to Windows. The panel is
-/// idle almost all the time, so this keeps its resident size small; pages fault back in on demand.
-fn trim_working_set() {
-    use windows::Win32::System::ProcessStatus::EmptyWorkingSet;
-    use windows::Win32::System::Threading::GetCurrentProcess;
-    // SAFETY: the pseudo handle from GetCurrentProcess is always valid for this process.
-    unsafe {
-        let _ = EmptyWorkingSet(GetCurrentProcess());
     }
 }

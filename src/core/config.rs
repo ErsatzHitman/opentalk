@@ -13,6 +13,7 @@ pub enum Theme { #[default] Auto, Light, Dark }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
 #[serde(rename_all = "kebab-case")]
+#[allow(clippy::enum_variant_names)] // the names are the serialized config values
 pub enum PanelPosition { #[default] BottomRight, BottomCenter, BottomLeft }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]

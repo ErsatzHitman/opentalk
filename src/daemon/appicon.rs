@@ -797,10 +797,10 @@ fn hicon_to_rgba(hicon: HICON, px: u32) -> Option<Vec<u8>> {
             // white - black = 255 * (1 - alpha) per channel
             let d = (0..3).map(|k| (w[i + k] as i32 - b[i + k] as i32).clamp(0, 255)).sum::<i32>() / 3;
             let a = (255 - d).clamp(0, 255) as u32;
-            if a > 0 {
-                for k in 0..3 {
-                    // b = colour * alpha (premultiplied)
-                    out[i + (2 - k)] = ((b[i + k] as u32 * 255 + a / 2) / a).min(255) as u8;
+            for k in 0..3 {
+                // b = colour * alpha (premultiplied); a fully transparent pixel stays 0
+                if let Some(c) = (b[i + k] as u32 * 255 + a / 2).checked_div(a) {
+                    out[i + (2 - k)] = c.min(255) as u8;
                 }
             }
             out[i + 3] = a as u8;
@@ -1276,12 +1276,11 @@ mod tests {
         if n.is_none() {
             // Wine's builtin notepad.exe carries a version resource without a FileDescription; Windows'
             // own always has one, so this skip can never trigger on Windows
-            if let Some(v) = crate::testenv::wine_version() {
-                if !version_info_has(&path, "FileDescription") {
+            if let Some(v) = crate::testenv::wine_version()
+                && !version_info_has(&path, "FileDescription") {
                     println!("SKIPPED (Wine: the notepad.exe of Wine {v} has no FileDescription in its version resource)");
                     return;
                 }
-            }
         }
         assert!(n.is_some_and(|s| !s.is_empty()));
     }

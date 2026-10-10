@@ -373,7 +373,9 @@ pub fn dist_px(px: f32, py: f32, w: f32, h: f32, r: f32) -> f32 {
 }
 
 /// Refraction offset in points at `(px, py)` inside a `w x h` panel of radius `r`, for a window
-/// of `page_w x page_h` (displacement is viewport-proportional, as in the reference).
+/// of `page_w x page_h` (displacement is viewport-proportional, as in the reference). The argument
+/// list mirrors the reference directive's field function one to one.
+#[allow(clippy::too_many_arguments)]
 pub fn displacement(px: f32, py: f32, w: f32, h: f32, r: f32, page_w: f32, page_h: f32, cfg: &Preset) -> Vec2 {
     let (cx, cy) = (px / w, py / h);
     let d = dist_px(px, py, w, h, r);
@@ -1161,7 +1163,7 @@ mod tests {
         assert_eq!(LIGHT.rim_bottom, DARK.rim_bottom);
         assert_ne!(LIGHT.border, DARK.border);
         assert_ne!(LIGHT.page_bg, DARK.page_bg);
-        assert!(!LIGHT.dark && DARK.dark);
+        const { assert!(!LIGHT.dark && DARK.dark) };
         assert_eq!(tokens(true), &DARK);
         assert_eq!(tokens(false), &LIGHT);
     }
@@ -1408,7 +1410,7 @@ mod tests {
         assert_eq!(over([0.0; 4], [0.2, 0.3, 0.4, 0.5]), [0.2, 0.3, 0.4, 0.5]);
         let o = over([0.1, 0.1, 0.1, 0.5], [0.2, 0.2, 0.2, 1.0]);
         assert!(close(o[3], 1.0, 1e-6) && close(o[0], 0.2, 1e-6));
-        assert_eq!(wash_color(false, 0).a() < wash_color(false, 2).a(), true);
+        assert!(wash_color(false, 0).a() < wash_color(false, 2).a());
     }
 
     #[test]
@@ -1420,7 +1422,7 @@ mod tests {
         assert_eq!(dark.page_alpha_for(false), PAGE_ALPHA_DARK);
         // The process-wide mode starts opaque (until a backdrop is confirmed): read it from a fresh
         // static, not from the shared one other tests flip.
-        assert!(OPAQUE_DEFAULT);
+        const { assert!(OPAQUE_DEFAULT) };
     }
 
     #[cfg(windows)]
