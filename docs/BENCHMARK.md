@@ -42,7 +42,7 @@ tested and audited on a Linux host (cross-compiled to `x86_64-pc-windows-gnu`, r
 
 | Row | Why it is stale |
 |---|---|
-| Recording CPU (injected and real mic), main-thread share | the pill now captures and frosts its backdrop at 4 Hz while recording (worker thread `pill-glass`) and rebuilds its cached base layer when the picture changes |
+| Recording CPU (injected and real mic), main-thread share | the pill captures and frosts its backdrop on events while recording (worker thread `pill-glass`; the 4 Hz timer was removed for recordings in round 3) and rebuilds its cached base layer when the picture changes |
 | Idle CPU (daemon) | the resting circle now holds out-of-context WinEvent hooks (no timer: PLAN section 1); expected ~0, not yet measured |
 | Daemon working set / private bytes, idle and recording | capture DIB (0.5 MB at 1x, 2 MB at 2x, only while a periodic refresh runs), kept frosted picture (~40 KB), baked displacement maps (capped at 2 MiB), one more thread |
 | Settings window working set and idle CPU | every page now paints glass panels, rim bands and the ambient mesh; acrylic backdrop |
@@ -77,7 +77,7 @@ Wine's `GetThreadTimes` reported 0 ms of thread CPU for all of them, so only wal
 
 Expected cadence (from the code, `src/daemon/pill/window.rs`): no capture while the pill is hidden or rests (resting circle,
 error card); one capture per screen event (window activated / move-size end / minimised / restored, 400 ms settle) or
-state, size, DPI or position change; 4 Hz while recording, preparing, thinking or animating; 8 Hz while hovered or dragged.
+state, size, DPI or position change; 4 Hz while preparing, thinking or animating (not while recording since round 3, see below); 8 Hz while hovered or dragged.
 <!-- keep:end glass-merge -->
 
 <!-- keep:begin round-2026-10-10b -->
@@ -129,6 +129,29 @@ No expand, shrink, emerge or retract frame bakes a displacement map or allocates
 allocations over its 250 ms, not on the steady path). Under Wine `DwmFlush` does not block, so pacing falls back to the
 timer there; `desktop_pill_expand_and_shrink_frames_arrive_on_time` checks the real pacing on Windows.
 <!-- keep:end round-2026-10-10b -->
+
+<!-- keep:begin round3-waveform -->
+## Waveform response, stability and diagnostics (round 3)
+Not measurable on Linux / Wine: DWM, `UpdateLayeredWindow`, `DwmFlush` and the real microphone. What is measured here is the
+audio-to-bar part, in a pure simulation (10 ms packets and frames on unrelated clocks, `onset_reaches_half_height_within_the_latency_budget`).
+
+| What | Before (round 2) | Now |
+|---|---|---|
+| Onset to half bar height (audio to bar, excluding WASAPI ~10-30 ms and DWM ~17-33 ms) | mean 77 ms, p90 103, max 116 (research model) | mean 13-16 ms, max 22-24 ms at 60 / 75 / 144 Hz frames |
+| Bar update rate | 12.5 Hz steps (one 43 ms window per 80 ms, 46 % of the audio never seen) | every frame (envelope) plus the peak since the last frame |
+| Noisy-but-silent room (-65 .. -45 dBFS, 10 s) | bars moved on 65-96 % of packets, timer never slowed | published level exactly 0.0, bars exactly 4 px, every frame skipped, timer slow |
+| Meter cost | one 688-sample RMS under the sample lock per packet | ~1 multiply-add per sample outside the lock, 320 adds + one `log10` per 10 ms hop |
+| Backdrop capture while recording | `BitBlt` + frost 4x per second | none periodic (show, screen events after 400 ms settle, resize end) |
+| UI-thread stalls at stop / start | up to 100 ms mute-ack wait before the pill shrinks; `PlaySound` on the UI thread | pill goes to Thinking first; the ack wait, the stop cue and the media resume run on a worker in the same order; cues play on a `cue-player` thread |
+
+Per-recording diagnostics (one `INFO` line each, in `%APPDATA%\OpenTalk\logs\daemon.log`; to be sent back if the owner still sees lag):
+- `pill recording: N ticks, D drawn (P partial, F full), S skipped; frame gap ...; tick gap ...; tick wait ...; UpdateLayeredWindow ...; DwmFlush ... blocks, mean .. max .. ms, E early, T guard trips; glass on|off (G grabs, U unchanged) BitBlt ...`
+  (`frame gap` = wall time between presented frames, `tick wait` = a tick's wait for the UI thread, each as n / mean / p95 / max).
+- `recording #N stopped: ...; packet gap mean .. max .. ms, K discontinuities; level gate open X% of the time, noise floor Y dBFS`.
+- A/B: start the daemon with `OPENTALK_NO_GLASS_CAPTURE=1`; if the lag disappears the screen capture was the cause, otherwise the next suspect is
+  `UpdateLayeredWindow` on an affinity-excluded window (skip `SetWindowDisplayAffinity`).
+- Acceptance on a real machine (ignored desktop tests `desktop_pill_*`): p95 frame gap <= 1.5 x refresh period, ULW p95 < 2 ms, silent recording < 20 wakeups per second.
+<!-- keep:end round3-waveform -->
 
 <!-- keep:begin unverified -->
 ## Not yet verified (audit 2026-10-10)

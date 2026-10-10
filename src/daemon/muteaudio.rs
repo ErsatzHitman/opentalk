@@ -207,13 +207,23 @@ pub fn begin(seq: u64, cue_started: Instant, cue: Duration) {
 /// Dictation `seq` is over: cancel a pending mute, or unmute what was muted. Waits up to `wait`
 /// for the unmute so the stop cue is not played into a muted device.
 pub fn end(seq: u64, wait: Duration) {
-    if !STARTED.load(Ordering::Acquire) {
-        return;
-    }
-    let (ack, done) = mpsc::channel();
-    if send(Cmd::End { seq, ack: Some(ack) }) && done.recv_timeout(wait).is_err() {
+    if let Some(done) = end_nowait(seq)
+        && done.recv_timeout(wait).is_err()
+    {
         log_warn!("mute: unmute did not answer within {} ms; continuing", wait.as_millis());
     }
+}
+
+/// Like [`end`], without waiting: the request is queued before this returns (so it stays ordered
+/// against a later `begin`), and the receiver gets a message once the worker has done it. `None`
+/// when the feature was never used (nothing to undo). The UI thread uses this and hands the receiver
+/// to whatever must run after the unmute.
+pub fn end_nowait(seq: u64) -> Option<mpsc::Receiver<()>> {
+    if !STARTED.load(Ordering::Acquire) {
+        return None;
+    }
+    let (ack, done) = mpsc::channel();
+    send(Cmd::End { seq, ack: Some(ack) }).then_some(done)
 }
 
 /// At daemon start: undo a mute that a previous run left behind. Call from a background thread.

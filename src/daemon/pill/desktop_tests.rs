@@ -352,18 +352,29 @@ fn desktop_pill_backdrop_is_captured_only_while_shown_and_hash_gated() {
     let (grabs, ms, has) = w.with(|i| (i.glass.grabs, i.glass_ms, i.st.backdrop.is_some()));
     assert_eq!((grabs, ms, has), (0, 0, false), "nothing is captured while hidden");
 
-    // show: captured at once, the timer runs at the active rate while recording
+    // show: captured at once; a recording runs no periodic backdrop timer (round 3: the screen
+    // BitBlt waits for the compositor, so a recording refreshes on events only)
     w.with(|i| i.set_mode(PillMode::Recording));
     wait_glass(&w);
     assert!(w.with(|i| i.glass.grabs) >= 1, "captured on show");
     assert!(w.with(|i| i.st.backdrop.is_some()), "a backdrop is installed");
-    pump(300);
-    assert_eq!(w.with(|i| i.glass_ms), 250, "4 Hz while recording");
+    pump(700); // the entrance finishes; a capture owed while the pill resized may land now
+    assert_eq!(w.with(|i| i.glass_ms), 0, "no backdrop timer while recording");
+    let g0 = w.with(|i| (i.glass.grabs, i.glass.unchanged));
+    pump(1500);
+    let g1 = w.with(|i| (i.glass.grabs, i.glass.unchanged));
+    println!("recording: {} captures in 1.5 s on a static screen", g1.0 - g0.0);
+    assert_eq!(g1.0, g0.0, "a recording on a static screen captures nothing periodically");
+
+    // thinking is back at 4 Hz, and a static screen finds the hash unchanged
+    w.with(|i| i.set_mode(PillMode::Thinking));
+    pump(500);
+    assert_eq!(w.with(|i| i.glass_ms), 250, "4 Hz while thinking");
     let g0 = w.with(|i| (i.glass.grabs, i.glass.unchanged));
     pump(1500);
     let g1 = w.with(|i| (i.glass.grabs, i.glass.unchanged));
     let (grabs, unchanged) = (g1.0 - g0.0, g1.1 - g0.1);
-    println!("recording: {grabs} captures in 1.5 s, {unchanged} unchanged");
+    println!("thinking: {grabs} captures in 1.5 s, {unchanged} unchanged");
     assert!((3..=8).contains(&grabs), "at most ~4 Hz, got {grabs} captures in 1.5 s");
     assert!(unchanged * 2 >= grabs, "a static screen finds the hash unchanged ({unchanged}/{grabs})");
 

@@ -685,10 +685,11 @@ impl RenderState {
 
     // --- ticking ---------------------------------------------------------------------------
 
-    /// Advance sampling state. `rms` is the live mic level. Returns the error-expiry flag.
-    pub fn tick(&mut self, now: f64, rms: f32) -> TickOutcome {
+    /// Advance sampling state. `level` is the live mic display level (0..1, exactly 0 in silence)
+    /// and `peak` the highest one since the previous tick. Returns the error-expiry flag.
+    pub fn tick(&mut self, now: f64, level: f32, peak: f32) -> TickOutcome {
         if self.mode == PillMode::Recording {
-            self.wave.tick(now, rms);
+            self.wave.tick(now, level, peak);
         }
         let mut out = TickOutcome::default();
         if let Some(e) = self.error.as_mut() {
@@ -701,6 +702,12 @@ impl RenderState {
             }
         }
         out
+    }
+
+    /// [`RenderState::tick`] with the live level as its own peak (previews, tests and anything
+    /// that has no capture thread behind it).
+    pub fn tick_level(&mut self, now: f64, level: f32) -> TickOutcome {
+        self.tick(now, level, level)
     }
 
     /// `true` while any frame-by-frame animation is running at `t`.

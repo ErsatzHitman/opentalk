@@ -9,6 +9,7 @@
 //! Helpers report back through [`MAILBOX`] + `WM_NOTE`; every note carries the dictation's `seq`,
 //! so a note for a dictation that was cancelled or stopped meanwhile is cleaned up, not applied.
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -59,6 +60,8 @@ pub struct RecSession {
     media_paused: bool,
     /// "Mute system audio" was requested for this recording and not yet released.
     mute_audio: bool,
+    /// Answers once the unmute asked for at the stop has been done (see [`App::release_mute_rx`]).
+    unmuted: Option<mpsc::Receiver<()>>,
     /// The safety cap stopped this recording.
     pub capped: bool,
 }
@@ -382,6 +385,7 @@ impl App {
             hotkey_pill,
             media_paused: false,
             mute_audio: cfg.mute_system_audio,
+            unmuted: None,
             capped: false,
         });
     }
@@ -522,10 +526,7 @@ impl App {
                 if rec.stop_pending {
                     // The stop landed while the mic was opening: honour it now, with its cue
                     // (OpenWhispr plays the stop cue for a stop requested mid-start too).
-                    if self.cfg.audio_cues {
-                        sound::play_stop();
-                    }
-                    self.finish_stop();
+                    self.finish_stop(self.cfg.audio_cues);
                     return;
                 }
                 self.pill.set_mode(PillMode::Recording);
@@ -545,8 +546,13 @@ impl App {
             return;
         };
         self.kill_timer(TIMER_CAP);
-        // Speakers back first: the stop cue below must be heard, and media resumes after this.
-        self.release_mute();
+        // Speakers back first: the stop cue must be heard, and media resumes after this. The request
+        // is queued here (ordered against anything that follows); the wait for its answer, the cue
+        // and the media resume happen on a worker (`after_unmute`), so the pill never waits for them.
+        let unmuted = self.release_mute_rx();
+        if let Some(rec) = self.rec.as_mut() {
+            rec.unmuted = unmuted;
+        }
         self.pill.set_mode(PillMode::Thinking);
         if starting {
             // Still starting: stop right after it comes up.
@@ -555,33 +561,45 @@ impl App {
             }
             return;
         }
-        if self.cfg.audio_cues {
-            sound::play_stop();
-        }
-        self.finish_stop();
+        self.finish_stop(self.cfg.audio_cues);
     }
 
-    /// Give the speakers back if "Mute system audio" took them for this recording. Idempotent;
-    /// the wait is short because the unmute is normally a few ms.
+    /// Give the speakers back if "Mute system audio" took them for this recording. Idempotent. The
+    /// request is queued at once; nothing waits for it on the UI thread.
     pub(super) fn release_mute(&mut self) {
-        self.release_mute_within(muteaudio::END_WAIT);
+        drop(self.release_mute_rx());
     }
 
-    fn release_mute_within(&mut self, wait: Duration) {
+    /// Queue the unmute (if this recording muted) and return the receiver that answers when it is
+    /// done, for whatever must follow it (the stop cue, the media resume).
+    fn release_mute_rx(&mut self) -> Option<mpsc::Receiver<()>> {
+        let rec = self.rec.as_mut().filter(|r| r.mute_audio)?;
+        rec.mute_audio = false;
+        muteaudio::end_nowait(rec.seq)
+    }
+
+    /// Shutdown only: nothing runs after this, so wait for the unmute to land.
+    fn release_mute_blocking(&mut self, wait: Duration) {
         if let Some(rec) = self.rec.as_mut().filter(|r| r.mute_audio) {
             rec.mute_audio = false;
             muteaudio::end(rec.seq, wait);
         }
     }
 
-    /// Hand the live recorder to a worker that stops it and transcribes.
-    fn finish_stop(&mut self) {
+    /// Hand the live recorder to a worker that stops it and transcribes. After the unmute (if any):
+    /// the stop cue (`cue`), then the media resume.
+    fn finish_stop(&mut self, cue: bool) {
         let Some(rec) = self.rec.take() else { return };
-        let RecSession { seq, recorder, target, app, feed, first_audio, t_hotkey, hotkey_pill, media_paused, capped, .. } = rec;
+        let RecSession { seq, recorder, target, app, feed, first_audio, t_hotkey, hotkey_pill, media_paused, unmuted, capped, .. } = rec;
         let Some(recorder) = recorder else { return };
-        if media_paused {
-            media::resume();
-        }
+        after_unmute(unmuted, move || {
+            if cue {
+                sound::play_stop();
+            }
+            if media_paused {
+                media::resume();
+            }
+        });
         self.capped = capped;
         self.spawn_job(Job {
             id: seq,
@@ -700,13 +718,16 @@ impl App {
     pub(super) fn cancel_recording(&mut self) {
         self.kill_timer(TIMER_CAP);
         paste::discard_clipboard_snapshot();
-        self.release_mute(); // before media resumes
+        let unmuted = self.release_mute_rx(); // media resumes after it
         if let Some(rec) = self.rec.take() {
             if let Some(session) = take_session(rec.feed) {
                 session.cancel();
             }
             if rec.media_paused {
-                media::resume();
+                // A stop that is still waiting for the microphone already queued its unmute (it is
+                // in `rec.unmuted`, `release_mute_rx` above found nothing left to release): the
+                // media must not resume before that one has been done either.
+                after_unmute(unmuted.or(rec.unmuted), media::resume);
             }
             // A recorder still starting is discarded when its note arrives (seq no longer matches).
             if let Some(r) = rec.recorder {
@@ -737,7 +758,7 @@ impl App {
     pub(super) fn cancel_everything(&mut self) {
         self.kill_timer(super::host::TIMER_ARM);
         // Quitting: nothing runs after this, so wait longer for the unmute to land.
-        self.release_mute_within(muteaudio::QUIT_WAIT);
+        self.release_mute_blocking(muteaudio::QUIT_WAIT);
         self.cancel_recording();
         self.cancel_job();
     }
@@ -795,6 +816,37 @@ fn delivered_entry(cfg: &Config, app: &AppInfo, cleaned: &Cleaned, speech_ms: u6
     }
 }
 
+/// Run `then` once the unmute requested at a stop has been done, keeping the order the mute feature
+/// guarantees (unmute, then the stop cue, then the media resume) without making the UI thread wait
+/// for it. With nothing to wait for `then` runs right here (it only posts to worker threads);
+/// otherwise a short-lived thread waits up to [`muteaudio::END_WAIT`] for the answer, then runs it.
+fn after_unmute(unmuted: Option<mpsc::Receiver<()>>, then: impl FnOnce() + Send + 'static) {
+    after_unmute_within(unmuted, muteaudio::END_WAIT, then);
+}
+
+fn after_unmute_within(unmuted: Option<mpsc::Receiver<()>>, wait: Duration, then: impl FnOnce() + Send + 'static) {
+    let Some(rx) = unmuted else { return then() };
+    // `then` must survive a failed spawn (the closure is moved into the thread otherwise)
+    type Job = Box<dyn FnOnce() + Send>;
+    let slot: Arc<Mutex<Option<Job>>> = Arc::new(Mutex::new(Some(Box::new(then))));
+    let thread_slot = slot.clone();
+    let spawned = std::thread::Builder::new().name("rec-stop-tail".into()).spawn(move || {
+        if rx.recv_timeout(wait).is_err() {
+            log_warn!("mute: unmute did not answer within {} ms; continuing", wait.as_millis());
+        }
+        let job = thread_slot.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(job) = job {
+            job();
+        }
+    });
+    if spawned.is_err() {
+        let job = slot.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(job) = job {
+            job();
+        }
+    }
+}
+
 fn provider_name(cfg: &Config) -> String {
     format!("{:?}", cfg.stt.provider).to_ascii_lowercase()
 }
@@ -834,11 +886,17 @@ fn run_job(job: Job) -> Outcome {
             let hotkey_audio = if first > 0.0 { first - t_hotkey } else { -1.0 };
             let info = vad::analyze(&audio);
             log_info!(
-                "recording #{id} stopped: {} ms captured, {} ms speech, {} packets, device_lost={}",
+                "recording #{id} stopped: {} ms captured, {} ms speech, {} packets, device_lost={}; \
+                 packet gap mean {:.1} max {:.1} ms, {} discontinuities; level gate open {:.0}% of the time, noise floor {:.0} dBFS",
                 audio.duration_ms(),
                 info.speech_ms,
                 stats.packets,
-                stats.device_lost
+                stats.device_lost,
+                stats.mean_gap_ms,
+                stats.max_gap_ms,
+                stats.discontinuities,
+                stats.gate_open_pct,
+                stats.floor_dbfs
             );
             if cancelled() || pipeline::is_silent(&info) {
                 if let Some(s) = stream {
@@ -941,6 +999,52 @@ fn failure(cfg: &Config, app: &AppInfo, e: SttError, audio: Audio, speech_ms: u6
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The mute feature's ordering guarantee survives moving the wait off the UI thread: the unmute
+    /// finishes, then the stop cue plays, then the media resumes; and the caller is not held up.
+    #[test]
+    fn stop_tail_keeps_unmute_then_cue_then_media_order_without_blocking() {
+        let log: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+        let (ack, rx) = mpsc::channel();
+        let l = log.clone();
+        let worker = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(80)); // a slow COM unmute
+            l.lock().unwrap().push("unmute");
+            let _ = ack.send(());
+        });
+        let l = log.clone();
+        let t0 = Instant::now();
+        after_unmute_within(Some(rx), Duration::from_millis(500), move || {
+            l.lock().unwrap().push("cue");
+            l.lock().unwrap().push("media");
+        });
+        assert!(t0.elapsed() < Duration::from_millis(30), "the UI thread waited {:?}", t0.elapsed());
+        worker.join().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while log.lock().unwrap().len() < 3 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(*log.lock().unwrap(), ["unmute", "cue", "media"]);
+    }
+
+    /// An unmute that never answers delays the cue by the wait and no longer (the worker finishes it).
+    #[test]
+    fn stop_tail_gives_up_waiting_after_the_budget_and_runs_directly_without_a_mute() {
+        let (_ack, rx) = mpsc::channel::<()>();
+        let (done, got) = mpsc::channel();
+        let t0 = Instant::now();
+        after_unmute_within(Some(rx), Duration::from_millis(60), move || {
+            let _ = done.send(Instant::now());
+        });
+        let at = got.recv_timeout(Duration::from_secs(3)).expect("runs after the budget");
+        let waited = at.duration_since(t0);
+        assert!(waited >= Duration::from_millis(55) && waited < Duration::from_millis(1000), "{waited:?}");
+        // nothing to wait for: runs right here, before the call returns
+        let ran = Arc::new(AtomicBool::new(false));
+        let r = ran.clone();
+        after_unmute_within(None, Duration::from_secs(5), move || r.store(true, Ordering::SeqCst));
+        assert!(ran.load(Ordering::SeqCst));
+    }
 
     #[test]
     fn friendly_names() {

@@ -54,9 +54,25 @@ pub fn present_time(hint: f64, period: f64, now: f64) -> f64 {
     (hint + late * period).min(now + 4.0 * period)
 }
 
+/// Share of a tick period a flush must block for to count as pacing (see [`Guard::observe_in`]).
+const PACING_SHARE: f64 = 0.5;
+/// A tick never follows the previous one sooner than this share of its period (`divisor` vblanks),
+/// whatever a misbehaving flush returns: bounds the tick rate at roughly 1.3x the display's.
+const TICK_FLOOR_SHARE: f64 = 0.75;
+
+/// Shortest allowed gap between two ticks (ms) for a display with vblank `period_ms`, ticked every
+/// `divisor` vblanks.
+pub fn min_tick_gap_ms(period_ms: f64, divisor: u32) -> f64 {
+    if !(period_ms.is_finite() && period_ms > 0.0) {
+        return 0.0;
+    }
+    TICK_FLOOR_SHARE * period_ms * divisor.max(1) as f64
+}
+
 /// Detects a `DwmFlush` that does not pace: one that does not block (remote session, DWM off, a
-/// wrapper layer: under [`Guard::MIN_BLOCK_MS`] four times in a row), or one that blocks far longer than
-/// any refresh ([`Guard::MAX_BLOCK_MS`]: a compositor that idles when nothing changes).
+/// wrapper layer: under [`Guard::MIN_BLOCK_MS`], or under half a period when the period is known,
+/// four times in a row), or one that blocks far longer than any refresh ([`Guard::MAX_BLOCK_MS`]: a
+/// compositor that idles when nothing changes).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Guard {
     fast: u32,
@@ -67,13 +83,22 @@ impl Guard {
     pub const MAX_BLOCK_MS: f64 = 100.0;
     const STREAK: u32 = 4;
 
-    /// Record how long one flush blocked; `false` once the flush cannot be trusted any more.
+    /// Record how long one flush blocked (period unknown); `false` once the flush cannot be trusted.
+    #[cfg(test)]
     pub fn observe(&mut self, blocked_ms: f64, ok: bool) -> bool {
+        self.observe_in(blocked_ms, ok, 0.0)
+    }
+
+    /// Like [`Guard::observe`], with the refresh period known: a flush that returns within half a
+    /// period does not pace either (a path that completes every 1.5-5 ms would otherwise tick at
+    /// 200-600 Hz), so the minimum is relative to the display, not an absolute millisecond.
+    pub fn observe_in(&mut self, blocked_ms: f64, ok: bool, period_ms: f64) -> bool {
         if blocked_ms > Self::MAX_BLOCK_MS {
             self.fast = Self::STREAK;
             return false;
         }
-        if ok && blocked_ms >= Self::MIN_BLOCK_MS {
+        let min = if period_ms.is_finite() && period_ms > 0.0 { Self::MIN_BLOCK_MS.max(PACING_SHARE * period_ms) } else { Self::MIN_BLOCK_MS };
+        if ok && blocked_ms >= min {
             self.fast = 0;
         } else {
             self.fast += 1;
@@ -116,6 +141,59 @@ impl Default for Hint {
     }
 }
 
+/// What the animation thread saw of the compositor's clock, for the per-recording log line. Written
+/// by that thread once per tick, read (and reset) by the window.
+#[derive(Default)]
+pub struct PaceStats {
+    flushes: AtomicU64,
+    blocked_us: AtomicU64,
+    max_us: AtomicU64,
+    early: AtomicU64,
+    trips: AtomicU64,
+}
+
+/// A reading of [`PaceStats`].
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PaceSnapshot {
+    pub flushes: u64,
+    pub mean_ms: f64,
+    pub max_ms: f64,
+    /// Flushes that returned in under half a period (not pacing).
+    pub early: u64,
+    /// Times the guard gave up on the compositor clock.
+    pub trips: u64,
+}
+
+impl PaceStats {
+    /// One tick's wait: `blocked_ms` per flush, `period_ms` the display's (0: unknown).
+    pub fn record(&self, blocked_ms: f64, period_ms: f64) {
+        let us = (blocked_ms.max(0.0) * 1000.0) as u64;
+        self.flushes.fetch_add(1, Ordering::Relaxed);
+        self.blocked_us.fetch_add(us, Ordering::Relaxed);
+        self.max_us.fetch_max(us, Ordering::Relaxed);
+        if period_ms > 0.0 && blocked_ms < PACING_SHARE * period_ms {
+            self.early.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn trip(&self) {
+        self.trips.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Read and reset.
+    pub fn take(&self) -> PaceSnapshot {
+        let n = self.flushes.swap(0, Ordering::Relaxed);
+        let sum = self.blocked_us.swap(0, Ordering::Relaxed);
+        PaceSnapshot {
+            flushes: n,
+            mean_ms: if n == 0 { 0.0 } else { sum as f64 / n as f64 / 1000.0 },
+            max_ms: self.max_us.swap(0, Ordering::Relaxed) as f64 / 1000.0,
+            early: self.early.swap(0, Ordering::Relaxed),
+            trips: self.trips.swap(0, Ordering::Relaxed),
+        }
+    }
+}
+
 // --- Win32 -------------------------------------------------------------------------------------
 
 use windows::Win32::Foundation::HWND;
@@ -129,18 +207,21 @@ pub struct Vsync {
     /// Vblanks per tick, from the measured refresh rate.
     divisor: u32,
     period_ms: f64,
+    stats: std::sync::Arc<PaceStats>,
+    /// When the previous tick was released (for the tick-rate floor).
+    last_tick: Option<std::time::Instant>,
 }
 
 impl Vsync {
     /// `None` when there is no usable compositor clock (the caller keeps its fixed-rate timer).
-    pub fn new() -> Option<Vsync> {
+    pub fn new(stats: std::sync::Arc<PaceStats>) -> Option<Vsync> {
         let mut f = 0i64;
         // SAFETY: valid out-pointer.
         unsafe { QueryPerformanceFrequency(&mut f) }.ok()?;
         if f <= 0 {
             return None;
         }
-        let mut v = Vsync { guard: Guard::default(), freq: f as f64, divisor: 1, period_ms: 0.0 };
+        let mut v = Vsync { guard: Guard::default(), freq: f as f64, divisor: 1, period_ms: 0.0, stats, last_tick: None };
         let (_, period) = v.timing()?;
         v.period_ms = period;
         v.divisor = vsync_divisor(1000.0 / period);
@@ -183,9 +264,21 @@ impl Vsync {
         }
         let blocked = t0.elapsed().as_secs_f64() * 1000.0;
         // each flush of a divisor run is judged on its own share
-        if !self.guard.observe(blocked / self.divisor as f64, ok) {
+        let share = blocked / self.divisor as f64;
+        self.stats.record(share, self.period_ms);
+        if !self.guard.observe_in(share, ok, self.period_ms) {
+            self.stats.trip();
             return None;
         }
+        // a flush that returned early (but not often enough to trip the guard) must not double the rate
+        if let Some(prev) = self.last_tick {
+            let floor = min_tick_gap_ms(self.period_ms, self.divisor);
+            let since = prev.elapsed().as_secs_f64() * 1000.0;
+            if since < floor {
+                std::thread::sleep(std::time::Duration::from_secs_f64((floor - since) / 1000.0));
+            }
+        }
+        self.last_tick = Some(std::time::Instant::now());
         // the frame drawn now goes out at the first vblank to come
         let (to_next, period) = self.timing().unwrap_or((0.0, self.period_ms));
         self.period_ms = period;
@@ -273,6 +366,65 @@ mod tests {
         let mut g = Guard::default();
         assert!(g.observe(16.0, true));
         assert!(!g.observe(400.0, true), "a flush that waits for ever is no vsync");
+    }
+
+    #[test]
+    fn guard_distrusts_a_flush_that_returns_in_under_half_a_period() {
+        let p = 1000.0 / 60.0;
+        // 3-4 ms on a 16.7 ms period passes the absolute 1 ms minimum but does not pace
+        let mut g = Guard::default();
+        for _ in 0..3 {
+            assert!(g.observe_in(3.5, true, p));
+        }
+        assert!(!g.observe_in(3.5, true, p), "four flushes under half a period in a row");
+        // the absolute rule alone would have trusted them
+        let mut g = Guard::default();
+        for _ in 0..10 {
+            assert!(g.observe(3.5, true));
+        }
+        // a real flush (most of a period, even with a busy frame before it) is fine, and resets the streak
+        let mut g = Guard::default();
+        for _ in 0..20 {
+            assert!(g.observe_in(9.0, true, p));
+            assert!(g.observe_in(3.0, true, p));
+            assert!(g.observe_in(3.0, true, p));
+        }
+        // unknown period: the absolute minimum, as before
+        let mut g = Guard::default();
+        for _ in 0..10 {
+            assert!(g.observe_in(2.0, true, 0.0));
+        }
+    }
+
+    #[test]
+    fn ticks_are_never_closer_than_most_of_a_period() {
+        for (hz, div) in [(60.0, 1), (75.0, 1), (100.0, 1), (120.0, 2), (144.0, 2), (240.0, 4)] {
+            let period = 1000.0 / hz;
+            let gap = min_tick_gap_ms(period, div);
+            let tick = period * div as f64; // a well-behaved flush gives exactly this
+            assert!(gap < tick, "{hz} Hz: the floor {gap:.2} ms must not throttle a {tick:.2} ms cadence");
+            assert!(gap > 0.7 * tick, "{hz} Hz: the floor {gap:.2} ms is too weak against {tick:.2}");
+            // so the tick rate is bounded near the display's own, even if a flush returned at once
+            assert!(1000.0 / gap < 1.4 * hz / div as f64);
+        }
+        assert_eq!(min_tick_gap_ms(f64::NAN, 1), 0.0);
+        assert_eq!(min_tick_gap_ms(0.0, 1), 0.0);
+        assert_eq!(min_tick_gap_ms(16.0, 0), min_tick_gap_ms(16.0, 1));
+    }
+
+    #[test]
+    fn pace_stats_accumulate_and_reset() {
+        let s = PaceStats::default();
+        assert_eq!(s.take(), PaceSnapshot::default());
+        let p = 16.7;
+        for ms in [16.0, 15.0, 2.0, 17.0] {
+            s.record(ms, p);
+        }
+        s.trip();
+        let t = s.take();
+        assert_eq!((t.flushes, t.early, t.trips), (4, 1, 1));
+        assert!((t.mean_ms - 12.5).abs() < 1e-6 && (t.max_ms - 17.0).abs() < 1e-6, "{t:?}");
+        assert_eq!(s.take(), PaceSnapshot::default(), "reading resets");
     }
 
     #[test]
