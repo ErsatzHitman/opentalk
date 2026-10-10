@@ -229,6 +229,7 @@ fn result_box(ui: &mut Ui, p: &Palette, ok: bool, badge: &str, body: &str) {
     w::notice(ui, p, col, |ui| {
         ui.spacing_mut().item_spacing = vec2(0.0, 4.0);
         ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
             w::text_semi(ui, if ok { "Transcribed" } else { "Error" }, 12.0, col);
             w::text(ui, badge, 12.0, p.muted_a(90));
         });

@@ -330,6 +330,8 @@ fn offscreen_shots() {
         Sc { name: "settings-hotkeys", launch: sett(Section::Hotkeys), size: tall, ..base },
         Sc { name: "settings-stt", launch: sett(Section::SpeechToText), size: tall, ..base },
         Sc { name: "settings-stt-custom", launch: sett(Section::SpeechToText), size: tall, cfg: stt_custom, ..base },
+        Sc { name: "settings-stt-result", launch: sett(Section::SpeechToText), size: tall, setup: |a| a.settings_mut().stt.outcome = Some(super::settings::stt::TestOutcome::Ok { text: "Hey, can you send the quarterly report to Priya by end of day? Thanks.".into(), latency_ms: 640 }), ..base },
+        Sc { name: "settings-stt-error", launch: sett(Section::SpeechToText), size: tall, setup: |a| a.settings_mut().stt.outcome = Some(super::settings::stt::TestOutcome::Err("401 Unauthorized: the API key was rejected.".into())), ..base },
         Sc { name: "settings-cleanup", launch: sett(Section::Cleanup), size: tall, ..base },
         Sc { name: "settings-cleanup-ai", launch: sett(Section::Cleanup), size: tall, cfg: ai_cleanup_on, ..base },
         Sc { name: "settings-privacy", launch: sett(Section::Privacy), size: tall, ..base },

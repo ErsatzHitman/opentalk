@@ -219,6 +219,11 @@ impl App {
     }
 
     #[cfg(test)]
+    pub(super) fn settings_mut(&mut self) -> &mut SettingsState {
+        &mut self.settings
+    }
+
+    #[cfg(test)]
     pub(super) fn dict_mut(&mut self) -> &mut DictState {
         &mut self.dict
     }

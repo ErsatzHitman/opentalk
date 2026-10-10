@@ -299,6 +299,7 @@ fn result(ui: &mut Ui, p: &crate::ui::theme::Palette, ok: bool, badge: &str, bod
     w::notice(ui, p, col, |ui| {
         ui.spacing_mut().item_spacing = vec2(0.0, 4.0);
         ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
             w::text_semi(ui, if ok { "Result" } else { "Error" }, 12.0, col);
             w::text(ui, badge, 12.0, p.muted_a(90));
         });
