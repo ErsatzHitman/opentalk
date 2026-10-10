@@ -628,10 +628,10 @@ fn cli_route(name: &str) -> super::Route {
     if let Some(id) = lower.strip_prefix("entry:").and_then(|n| n.parse().ok()) {
         return Route::HistoryEntry(id);
     }
-    if let Some(p) = lower.strip_prefix("picker:") {
-        if let Some(id) = PickerId::ALL.iter().find(|id| format!("{id:?}").eq_ignore_ascii_case(p)) {
-            return Route::Picker(*id);
-        }
+    if let Some(p) = lower.strip_prefix("picker:")
+        && let Some(id) = PickerId::ALL.iter().find(|id| format!("{id:?}").eq_ignore_ascii_case(p))
+    {
+        return Route::Picker(*id);
     }
     match lower.strip_prefix("snippet:") {
         Some("new") => return Route::SnippetEdit(None),
