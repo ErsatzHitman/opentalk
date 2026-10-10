@@ -796,6 +796,9 @@ mod tests {
     #[test]
     #[ignore]
     fn desktop_foreground_app_icon() {
+        if !super::super::paste::require_input_desktop("desktop_foreground_app_icon") {
+            return;
+        }
         let t = super::super::paste::capture_foreground().expect("foreground window");
         let icon = load(&t, 48).expect("icon for the foreground app");
         eprintln!("foreground app: {} ({})", icon.name, icon.exe_name);

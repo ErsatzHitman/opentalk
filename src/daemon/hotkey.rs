@@ -2179,6 +2179,9 @@ mod tests {
         #[test]
         #[ignore = "desktop: installs a real WH_KEYBOARD_LL hook, takes the foreground and injects keys"]
         fn desktop_main_key_not_typed_into_focused_app() {
+            if !crate::daemon::paste::require_input_desktop("desktop_main_key_not_typed_into_focused_app") {
+                return;
+            }
             let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
             let hwnd = make_window();
             let Some(edit) = make_focused_edit() else {

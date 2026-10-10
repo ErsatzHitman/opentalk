@@ -1690,6 +1690,9 @@ mod tests {
     #[test]
     #[ignore]
     fn desktop_prefetch_keeps_delay_rendered_clipboard_off_the_paste_path() {
+        if !require_input_desktop("desktop_prefetch_keeps_delay_rendered_clipboard_off_the_paste_path") {
+            return;
+        }
         let _g = DESKTOP.lock().unwrap_or_else(|e| e.into_inner());
         let before = snapshot_clipboard().expect("snapshot");
         let (th, owner) = delay_rendered_owner();
