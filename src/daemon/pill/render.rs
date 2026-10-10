@@ -603,6 +603,10 @@ fn signature(st: &RenderState, t: f64, g: &Geometry, size: (u32, u32), kind: Kin
     }
     // the icon's address identifies its pixels; the cache keeps the Arc alive so it cannot be reused
     h.write_usize(st.app().map_or(0, |a| Arc::as_ptr(&a.icon) as usize));
+    // the bubble's tooltip shows the app name, which may change while the icon Arc is reused
+    if let Some(a) = st.app() {
+        h.write(a.name.as_bytes());
+    }
     h.finish()
 }
 
