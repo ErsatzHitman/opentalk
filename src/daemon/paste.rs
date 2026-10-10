@@ -315,7 +315,7 @@ fn is_elevated_pid(pid: u32) -> bool {
 }
 
 /// Describe an arbitrary top-level window as a paste target.
-fn describe_window(hwnd: HWND) -> Option<Target> {
+pub(crate) fn describe_window(hwnd: HWND) -> Option<Target> {
     let frame_pid = pid_of(hwnd);
     if frame_pid == 0 {
         return None;

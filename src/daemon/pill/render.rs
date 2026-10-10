@@ -98,7 +98,7 @@ fn draw_under(cv: &mut Canvas, st: &RenderState, g: &Geometry, t: f64) {
     // 2. app bubble
     if g.bubble_t > 0.003
         && let Some(a) = st.app() {
-            draw_bubble(cv, st, &ctx, g, &app, a);
+            draw_bubble(cv, st, &ctx, g, &app, a, t);
         }
 
     // 3. pill shadow (fades with the chrome once the liquid skin owns the surface)
@@ -303,7 +303,7 @@ fn draw_x_glyph(cv: &mut Canvas, cx: f32, cy: f32, color: Rgba, alpha: f32) {
     });
 }
 
-fn draw_bubble(cv: &mut Canvas, st: &RenderState, ctx: &Ctx, g: &Geometry, app: &Appearance, a: &AppBubble) {
+fn draw_bubble(cv: &mut Canvas, st: &RenderState, ctx: &Ctx, g: &Geometry, app: &Appearance, a: &AppBubble, t: f64) {
     let (bx, by, br) = g.bubble;
     let alpha = g.bubble_t;
     let d = br * 2.0;
@@ -312,16 +312,25 @@ fn draw_bubble(cv: &mut Canvas, st: &RenderState, ctx: &Ctx, g: &Geometry, app: 
     let sdf = move |x: f32, y: f32| sd_capsule(x, y, bx, by, d, d);
     let surf = Surface { field: r, radius: Some(br), sdf: &sdf };
     glass::paint(cv, ctx, &surf, &Params { alpha, shadow: app.shadow, shadow_alpha: alpha, lift: app.lift, edge: app.edge, frost: None });
-    // icon, snapped to whole device pixels
-    let s = st.scale;
-    let ic = &a.icon;
+    // icon, snapped to whole device pixels; a replaced icon fades out while the new one fades in
+    let (mix, prev) = st.icon_mix(t);
+    if let Some(p) = prev {
+        blit_icon(cv, p, (bx, by), st.scale, alpha * (1.0 - mix));
+    }
+    blit_icon(cv, &a.icon, (bx, by), st.scale, alpha * mix);
+}
+
+fn blit_icon(cv: &mut Canvas, ic: &Pixmap, (bx, by): (f32, f32), s: f32, alpha: f32) {
+    if alpha <= 0.0 {
+        return;
+    }
     let (iw, ih) = (ic.width() as i32, ic.height() as i32);
     let ox = (bx * s - iw as f32 * 0.5).round() as i32;
     let oy = (by * s - ih as f32 * 0.5).round() as i32;
+    let d = ic.data();
     for y in 0..ih {
         for x in 0..iw {
             let i = ((y * iw + x) * 4) as usize;
-            let d = ic.data();
             let pa = d[i + 3] as f32 / 255.0;
             if pa <= 0.0 {
                 continue;
@@ -514,7 +523,7 @@ fn classify(st: &RenderState, t: f64) -> Option<Kind> {
     if st.error().is_some() || st.pulse_since.is_some() {
         return None;
     }
-    let tracks = [&st.compact, &st.grad, &st.wave_live, &st.wave_rest, &st.divider, &st.glow, &st.cancel, &st.fused, &st.bubble, &st.cancel_hot];
+    let tracks = [&st.compact, &st.grad, &st.wave_live, &st.wave_rest, &st.divider, &st.glow, &st.cancel, &st.fused, &st.bubble, &st.cancel_hot, &st.icon_swap];
     if tracks.iter().any(|tr| tr.is_active(t)) || st.appearance.is_active(t) {
         return None;
     }
@@ -573,6 +582,7 @@ fn signature(st: &RenderState, t: f64, g: &Geometry, size: (u32, u32), kind: Kin
     }
     // the icon's address identifies its pixels; the cache keeps the Arc alive so it cannot be reused
     h.write_usize(st.app().map_or(0, |a| Arc::as_ptr(&a.icon) as usize));
+    h.f(st.icon_swap.value(t));
     // the bubble's tooltip shows the app name, which may change while the icon Arc is reused
     if let Some(a) = st.app() {
         h.write(a.name.as_bytes());
@@ -1040,6 +1050,59 @@ mod tests {
                 assert!(max_diff(&pm, &render(&s, t)) <= 2, "{pos:?}: drifted at {t}");
                 t += FRAME;
             }
+        }
+    }
+
+    /// The bubble's rectangle in device pixels.
+    fn bubble_dev(s: &RenderState, t: f64, pm: &Pixmap) -> DevRect {
+        let (bx, by, br) = s.geometry(t).bubble;
+        DevRect::of(Rect::new(bx - br - 2.0, by - br - 2.0, bx + br + 2.0, by + br + 2.0), s.scale, pm.width() as i32, pm.height() as i32)
+    }
+
+    #[test]
+    fn an_app_switch_cross_fades_inside_the_bubble_and_settles_on_the_new_icon() {
+        for dark in [false, true] {
+            let icon = |v: [u8; 3]| AppBubble::new("App", &[v[0], v[1], v[2], 255].repeat(16 * 16), 16, 1.0).unwrap();
+            let mut s = RenderState::new(Palette::get(dark), 1.0, PanelPosition::BottomRight);
+            s.set_mode(PillMode::Recording, 0.0);
+            s.set_app(Some(icon([220, 40, 40])), 0.0);
+            let mut t = 0.0;
+            run(&mut s, &mut t, 1500.0, &speech);
+            let mut pm = new_pm(&s);
+            let mut cache = FrameCache::new();
+            cache.render(&s, t, &mut pm);
+            let before = render(&s, t);
+            let t0 = t;
+            s.set_app(Some(icon([40, 40, 220])), t0);
+            let bubble = bubble_dev(&s, t0, &pm);
+            let mut mid = None;
+            while t < t0 + ICON_SWAP_MS + 4.0 * FRAME {
+                s.tick(t, speech(t));
+                cache.render(&s, t, &mut pm);
+                // the cached path never drifts from a full render while the icons cross-fade
+                assert!(max_diff(&pm, &render(&s, t)) <= 2, "dark {dark}: drifted at {}", t - t0);
+                if (t - t0 - ICON_SWAP_MS * 0.5).abs() < FRAME * 0.6 {
+                    mid = Some(pm.clone());
+                }
+                t += FRAME;
+            }
+            // settled: the only icon left is the new one (no leftover of the old, no tracks running)
+            let last = t - FRAME;
+            assert!(max_diff(&pm, &render(&s, last)) <= 2);
+            assert!(s.icon_mix(last).1.is_none() && !s.icon_swap.is_active(last));
+            // mid-way both icons are partly visible: the centre differs from both end states
+            let (cx, cy) = ((bubble.x0 + bubble.x1) / 2, (bubble.y0 + bubble.y1) / 2);
+            let px = |p: &Pixmap| p.pixel(cx as u32, cy as u32).unwrap();
+            let mid = mid.expect("a mid-swap frame");
+            if let Ok(dir) = std::env::var("OPENTALK_SHOT_DIR") {
+                // eyeballing aid: the bubble before, half-way through and after the swap
+                for (name, frame) in [("before", &before), ("mid", &mid), ("after", &pm)] {
+                    let _ = frame.save_png(std::path::Path::new(&dir).join(format!("swap-{}-{name}.png", if dark { "dark" } else { "light" })));
+                }
+            }
+            let (a, m, b) = (px(&before), px(&mid), px(&pm));
+            assert!(a.red() > a.blue() + 100 && b.blue() > b.red() + 100, "end states: {a:?} -> {b:?}");
+            assert!(m.red() > 20 && m.blue() > 20 && m.red() < a.red() && m.blue() < b.blue(), "mid frame blends both: {m:?}");
         }
     }
 

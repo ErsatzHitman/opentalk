@@ -331,6 +331,7 @@ impl App {
         let mode = self.idle_mode();
         self.pill.set_mode(mode);
         self.pill.set_app(None);
+        crate::daemon::foreground::follow_end();
     }
 
     // ---- inputs -------------------------------------------------------------------------
@@ -505,6 +506,7 @@ impl App {
         self.machine.set_mode(self.cfg.activation_mode);
         let opts = pill_options(&self.cfg);
         self.pill.set_options(opts);
+        self.sync_foreground();
         if self.cfg.mic_device_id != old.mic_device_id || self.cfg.mic_warm_hold_secs != old.mic_warm_hold_secs {
             micpolicy::prepare_in_background(self.cfg.mic_device_id.clone(), self.cfg.mic_warm_hold_secs);
         }
@@ -826,6 +828,7 @@ pub fn run(hidden: bool) -> i32 {
         }
     }
     hotkey::set_start_menu_mask(app.cfg.suppress_start_menu);
+    app.sync_foreground();
     let mic = app.cfg.mic_device_id.clone();
     let warm_hold = app.cfg.mic_warm_hold_secs;
     let pause_media = app.cfg.pause_media;

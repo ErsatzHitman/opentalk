@@ -20,6 +20,7 @@ use crate::core::config::Config;
 use crate::core::history::{self, Entry, Status};
 use crate::core::timing::{now_ms, unix_ms};
 use crate::daemon::appicon::{self, AppIcon};
+use crate::daemon::foreground::{self, Change};
 use crate::daemon::audio::{self, Recorder, vad};
 use crate::daemon::paste::{self, PasteOptions, PasteOutcome, Target};
 use crate::daemon::pill::PillMode;
@@ -31,7 +32,7 @@ use crate::{log_debug, log_info, log_warn};
 type Feed = Arc<Mutex<Option<Box<dyn StreamingSession>>>>;
 
 /// Icon size requested for the active-app bubble (the pill downsamples to its DPI).
-const APP_ICON_PX: u32 = 64;
+const APP_ICON_PX: u32 = appicon::BUBBLE_ICON_PX;
 const NO_SPEECH_TITLE: &str = "We didn't catch that";
 const NO_SPEECH_BODY: &str = "Try speaking a little closer to the microphone.";
 
@@ -86,7 +87,10 @@ pub enum Outcome {
 enum Note {
     RecStarted { seq: u64, result: Result<Recorder, String> },
     MediaPaused { seq: u64 },
-    Icon { seq: u64, icon: AppIcon },
+    /// The async icon lookup for `path` finished (`None`: the app has no readable icon).
+    Icon { seq: u64, path: String, icon: Option<AppIcon> },
+    /// The foreground tracker published another app.
+    Foreground,
     JobDone { seq: u64, outcome: Outcome },
 }
 
@@ -142,6 +146,23 @@ fn friendly_exe(exe: &str) -> String {
 
 fn app_info(target: Option<&Target>) -> AppInfo {
     target.map(|t| AppInfo { exe: Some(t.exe_name.clone()), name: Some(friendly_exe(&t.exe_name)) }).unwrap_or_default()
+}
+
+/// The paste goes to the app the bubble shows *now*: the window in front when the text is ready (or,
+/// if that is the tray or a shell surface, the last real one), not the one the hotkey went down in.
+/// Runs on the dictation worker, off the UI thread.
+fn retarget(target: Option<Target>, app: AppInfo) -> (Option<Target>, AppInfo) {
+    let now = foreground::resolve(paste::capture_foreground(), foreground::last().as_ref(), foreground::own_pid());
+    match now {
+        Some(t) if target.as_ref().is_none_or(|o| o.hwnd != t.hwnd) => {
+            let mut a = app_info(Some(&t));
+            if let Some(icon) = appicon::cached(&t, APP_ICON_PX) {
+                a.name = Some(icon.name);
+            }
+            (Some(t), a)
+        }
+        _ => (target, app),
+    }
 }
 
 fn error_title(code: SttErrorCode) -> &'static str {
@@ -247,8 +268,9 @@ impl App {
         self.pill.set_mode(PillMode::Preparing);
         let hotkey_pill = now_ms() - t_trigger;
         // The paste target is the window that had focus when the hotkey went down (the pill never
-        // takes focus, so showing it first does not change the answer).
-        let target = paste::capture_foreground();
+        // takes focus, so showing it first does not change the answer), unless that is the tray or a
+        // shell surface: then the app the user was last in (see `foreground::resolve`).
+        let target = self.front_target();
         let cfg = self.cfg.clone();
         if let Some((title, msg)) = preflight(&cfg) {
             self.machine.step(Input::StartFailed);
@@ -332,6 +354,7 @@ impl App {
             self.pill.show_error("Something went wrong", "OpenTalk could not start recording.", false);
             return;
         }
+        let mut app = app_info(target.as_ref());
         if cfg.show_app_bubble {
             // Bench hook: `OPENTALK_BENCH_APP_EXE=<exe>` looks up that app's icon whatever is in front, or
             // when nothing is (bench/bench.ps1 uses it where no packaged app can be brought to the
@@ -341,20 +364,9 @@ impl App {
                 (Some(p), t) => Some(Target { exe_path: p, pid: 0, ..t.unwrap_or_default() }),
                 (None, t) => t,
             };
-            if let Some(t) = icon_target {
-                let hwnd = self.hwnd;
-                let _ = std::thread::Builder::new().name("app-icon".into()).spawn(move || {
-                    // Off the message loop: packaged apps read their manifest and PNGs from disk.
-                    let started = now_ms();
-                    let exe = t.exe_path.rsplit(['\\', '/']).next().unwrap_or("").to_ascii_lowercase();
-                    match appicon::load(&t, APP_ICON_PX) {
-                        Some(icon) => {
-                            log_debug!("app icon for {exe}: {:?} in {:.0} ms", icon.name, now_ms() - started);
-                            notify(hwnd, Note::Icon { seq, icon });
-                        }
-                        None => log_debug!("app icon for {exe}: none in {:.0} ms", now_ms() - started),
-                    }
-                });
+            foreground::follow_begin(icon_target.clone());
+            if let Some(name) = self.show_app(seq, icon_target) {
+                app.name = Some(name);
             }
         }
         self.set_timer(TIMER_CAP, MAX_RECORDING_MS);
@@ -362,7 +374,7 @@ impl App {
             seq,
             recorder: None,
             stop_pending: false,
-            app: app_info(target.as_ref()),
+            app,
             target,
             feed,
             first_audio,
@@ -372,6 +384,74 @@ impl App {
             mute_audio: cfg.mute_system_audio,
             capped: false,
         });
+    }
+
+    /// Run the foreground tracker exactly while the app bubble is on.
+    pub(super) fn sync_foreground(&self) {
+        let hwnd = self.hwnd;
+        foreground::configure(self.cfg.show_app_bubble, APP_ICON_PX, Box::new(move || notify(hwnd, Note::Foreground)));
+    }
+
+    /// The window a dictation started now would paste into: the one in front, or the last real one
+    /// when the front is the tray or a transient shell surface. With the bubble off nothing is
+    /// tracked and it is simply the front window.
+    fn front_target(&self) -> Option<Target> {
+        let fresh = paste::capture_foreground();
+        if self.cfg.show_app_bubble { foreground::resolve(fresh, foreground::last().as_ref(), foreground::own_pid()) } else { fresh }
+    }
+
+    /// Put the app's icon in the bubble: at once from the cache (the tracker resolved it when the app
+    /// came to the front), else from a helper thread (packaged apps read their manifest and PNGs from
+    /// disk). Returns the app's friendly name when the cache had it.
+    fn show_app(&mut self, seq: u64, target: Option<Target>) -> Option<String> {
+        let t = target?;
+        if let Some(icon) = appicon::cached(&t, APP_ICON_PX) {
+            let name = icon.name.clone();
+            self.pill.set_app(Some(icon));
+            return Some(name);
+        }
+        let hwnd = self.hwnd;
+        let _ = std::thread::Builder::new().name("app-icon".into()).spawn(move || {
+            let started = now_ms();
+            let exe = t.exe_path.rsplit(['\\', '/']).next().unwrap_or("").to_ascii_lowercase();
+            let icon = appicon::load(&t, APP_ICON_PX);
+            match &icon {
+                Some(i) => log_debug!("app icon for {exe}: {:?} in {:.0} ms", i.name, now_ms() - started),
+                None => log_debug!("app icon for {exe}: none in {:.0} ms", now_ms() - started),
+            }
+            notify(hwnd, Note::Icon { seq, path: t.exe_path, icon });
+        });
+        None
+    }
+
+    /// The tracker published another foreground app. While a dictation is recording or being
+    /// transcribed the paste target and the bubble follow it (the text goes to the app the bubble shows).
+    fn on_foreground(&mut self) {
+        if !self.cfg.show_app_bubble {
+            return;
+        }
+        let seq = match (&self.rec, &self.job) {
+            (Some(r), _) => r.seq,
+            (None, Some(j)) => j.id,
+            _ => return,
+        };
+        let Some(seen) = foreground::last() else { return };
+        let change = foreground::follow_observe(&seen);
+        if change == Change::Same {
+            return;
+        }
+        if let Some(rec) = self.rec.as_mut() {
+            rec.target = Some(seen.clone());
+            if change == Change::App {
+                rec.app = app_info(Some(&seen));
+            }
+        }
+        if change == Change::App {
+            let name = self.show_app(seq, Some(seen));
+            if let (Some(rec), Some(name)) = (self.rec.as_mut(), name) {
+                rec.app.name = Some(name);
+            }
+        }
     }
 
     /// Everything the helper threads reported since the last `WM_NOTE`.
@@ -385,15 +465,17 @@ impl App {
                     // The dictation ended before the pause landed: undo it right away.
                     None => media::resume(),
                 },
-                Note::Icon { seq, icon } => {
+                Note::Icon { seq, path, icon } => {
                     let live = self.rec.as_ref().is_some_and(|r| r.seq == seq) || self.job.as_ref().is_some_and(|j| j.id == seq);
-                    if live {
-                        if let Some(rec) = self.rec.as_mut().filter(|r| r.seq == seq) {
-                            rec.app.name = Some(icon.name.clone());
+                    // The app may have changed again while this lookup ran: only the one the bubble is for counts.
+                    if live && foreground::follow_shows(&path) {
+                        if let (Some(rec), Some(i)) = (self.rec.as_mut().filter(|r| r.seq == seq), &icon) {
+                            rec.app.name = Some(i.name.clone());
                         }
-                        self.pill.set_app(Some(icon));
+                        self.pill.set_app(icon);
                     }
                 }
+                Note::Foreground => self.on_foreground(),
                 Note::JobDone { seq, outcome } => self.on_job_done(seq, outcome),
             }
         }
@@ -521,18 +603,25 @@ impl App {
         let Some(failed) = self.last_failed.take() else { return };
         self.machine.step(Input::RetryStart);
         crate::daemon::hotkey::set_esc_capture(true);
-        let target = paste::capture_foreground();
+        let target = self.front_target();
         self.pill.follow_cursor_display();
         self.pill.set_mode(PillMode::Thinking);
         self.seq += 1;
         log_info!("retrying the last failed recording as #{}", self.seq);
         self.capped = false;
+        let mut app = app_info(target.as_ref());
+        if self.cfg.show_app_bubble {
+            foreground::follow_begin(target.clone());
+            if let Some(name) = self.show_app(self.seq, target.clone()) {
+                app.name = Some(name);
+            }
+        }
         self.spawn_job(Job {
             id: self.seq,
             cfg: self.cfg.clone(),
             capture: Capture::Kept { audio: failed.audio, speech_ms: failed.speech_ms },
             stream: None,
-            app: app_info(target.as_ref()),
+            app,
             target,
             cancel: Arc::new(AtomicBool::new(false)),
             t_stop: now_ms(),
@@ -750,6 +839,7 @@ fn run_job(job: Job) -> Outcome {
         return Outcome::Cancelled;
     }
 
+    let (target, app) = if cfg.auto_paste && cfg.show_app_bubble { retarget(target, app) } else { (target, app) };
     let t_paste = now_ms();
     let note = if cfg.auto_paste {
         let opts = PasteOptions { restore_clipboard: restores_clipboard(&cfg), smart_spacing: cfg.smart_spacing };

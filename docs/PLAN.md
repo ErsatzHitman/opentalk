@@ -186,7 +186,7 @@ Every number below comes from `docs/SPEC.md`.
   2. For UWP, resolve `ApplicationFrameHost` to the child `CoreWindow` PID.
   3. Get the icon with `SHGetFileInfoW` or `IShellItemImageFactory` at 32/48 px.
   4. Cache it per exe path.
-- **Timing.** Captured at the hotkey press, which is also the paste target, so it matches the window we will paste into. It fades in with the expansion and fades out after the paste.
+- **Timing.** The icon is resolved ahead of time, when an app comes to the front (one foreground WinEvent hook + one idle-blocked low-priority worker + a 16-entry LRU), so the bubble is there with the pill at the hotkey press. It follows the foreground app during recording and thinking (180 ms cross-fade), and the paste goes to the app it shows when the text is ready; OpenTalk's own pill/tray windows and transient shell surfaces keep the previous target (SPEC "App bubble"). It fades in with the expansion and fades out after the paste.
 - **Hover tooltip.** Shows the app name, e.g. "Windows Explorer", using the friendly name from `FileDescription`.
 
 ---
