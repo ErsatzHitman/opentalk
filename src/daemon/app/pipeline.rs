@@ -48,6 +48,9 @@ pub struct Cleaned {
     /// Final text ("" when nothing but fillers / hallucination remained, or only the phrase).
     pub text: String,
     pub ai_cleaned: bool,
+    /// AI cleanup was asked for and failed (error, timeout or an unusable answer): the on-device
+    /// text of the transcript was pasted instead. The reason, for logs and `--transcribe-file`.
+    pub cleanup_error: Option<String>,
     /// Includes the rewrite call.
     pub cleanup_ms: f64,
     pub rewrite: RewriteState,
@@ -140,6 +143,7 @@ pub fn clean_with_calls(cfg: &Config, transcript: &Transcript, speech_ms: u64, c
     };
     let mut text = cleanup::process_pre_llm(&raw, &ctx);
     let mut ai_cleaned = false;
+    let mut cleanup_error = None;
     let mut state = RewriteState::None;
     let mut original = None;
     let mut rewrite_ms = 0.0;
@@ -152,13 +156,23 @@ pub fn clean_with_calls(cfg: &Config, transcript: &Transcript, speech_ms: u64, c
                 let t = now_ms();
                 let reply = (calls.cleanup)(&text);
                 let ms = now_ms() - t;
-                match &reply {
-                    Ok(_) => log_info!("ai cleanup answered in {ms:.0} ms"),
-                    Err(e) => log_warn!("ai cleanup failed after {ms:.0} ms ({e}); keeping the deterministic text"),
-                }
-                if let Some(polished) = choose_ai_text(&text, reply) {
-                    text = polished;
-                    ai_cleaned = true;
+                let failure = match &reply {
+                    Ok(_) => {
+                        log_info!("ai cleanup answered in {ms:.0} ms");
+                        "the model returned nothing".to_string()
+                    }
+                    Err(e) => {
+                        log_warn!("ai cleanup failed after {ms:.0} ms ({e}); keeping the transcript");
+                        e.to_string()
+                    }
+                };
+                // never fatal: without a usable answer the transcript (after on-device cleanup) is pasted
+                match choose_ai_text(&text, reply) {
+                    Some(polished) => {
+                        text = polished;
+                        ai_cleaned = true;
+                    }
+                    None => cleanup_error = Some(failure),
                 }
             }
         }
@@ -199,7 +213,7 @@ pub fn clean_with_calls(cfg: &Config, transcript: &Transcript, speech_ms: u64, c
     if !text.is_empty() {
         text = dictionary::expand_snippets(&text, &cfg.snippets);
     }
-    Cleaned { raw, text, ai_cleaned, cleanup_ms: now_ms() - t0, rewrite: state, rewrite_ms, original }
+    Cleaned { raw, text, ai_cleaned, cleanup_error, cleanup_ms: now_ms() - t0, rewrite: state, rewrite_ms, original }
 }
 
 /// Look for the rewrite phrase at the end of `text`. The phrase is cleaned like the dictation (same

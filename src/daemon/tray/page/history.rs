@@ -342,6 +342,8 @@ impl HistoryPage {
             r.chips.push(("Rewritten".into(), Tone::Info));
         } else if e.ai_cleaned {
             r.chips.push(("AI".into(), Tone::Info));
+        } else if e.cleanup_failed {
+            r.chips.push(("STT fallback".into(), Tone::Warn));
         }
         r.trailing = if e.status == Status::Ok && !e.text.trim().is_empty() { Trailing::Copy } else { Trailing::Chevron };
         r
@@ -568,6 +570,8 @@ impl PageModel for EntryPage {
             v.push(Item::Banner { tone: Tone::Info, text: "Rewritten by AI: you ended with the rewrite phrase.".into() });
         } else if e.ai_cleaned {
             v.push(Item::Banner { tone: Tone::Info, text: "Cleaned up by AI.".into() });
+        } else if e.cleanup_failed {
+            v.push(Item::Banner { tone: Tone::Warn, text: "Cleanup failed \u{b7} STT fallback".into() });
         }
         // each text has its own copy button on its heading line
         let copy = |id: ItemId, label: &str, tip: &str| Item::Tools { id, label: label.into(), sub: String::new(), tools: vec![Tool::new(Icon::Copy, tip, ToolTone::Plain, true)] };

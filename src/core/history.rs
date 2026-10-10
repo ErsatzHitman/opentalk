@@ -42,6 +42,9 @@ pub struct Entry {
     pub duration_ms: u64,
     pub latency_ms: u64,
     pub ai_cleaned: bool,
+    /// AI cleanup was on but failed, so the transcript was pasted without it.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub cleanup_failed: bool,
     /// The dictation ended with the rewrite phrase and `text` is the concise rewrite.
     pub rewritten: bool,
     /// For a rewritten entry: the deterministic text (trigger removed) before the rewrite.
@@ -539,6 +542,7 @@ mod tests {
             duration_ms: 1234,
             latency_ms: 567,
             ai_cleaned: true,
+            cleanup_failed: false,
             rewritten: true,
             original: Some("hello world, before the rewrite".into()),
         };

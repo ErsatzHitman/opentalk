@@ -256,7 +256,7 @@ All in the tray popup (**Settings** row, or `opentalk.exe --settings`):
 | Preferences | Theme, dictation sounds, pause media while dictating, mute system audio while dictating (on by default), automatic pasting, keep text on the clipboard, floating icon (auto-hide, position, app bubble), language, microphone, launch at login |
 | Hotkeys | Dictation hotkey (modifier-only combos allowed), Tap / Push to talk, Start-menu suppression for Win combos |
 | Speech-to-Text | Provider, model, API key (masked), custom endpoint, streaming preference, **Test** button |
-| Cleanup & AI | AI rewrite (on/off, trigger phrase, reset to default) first, then filler removal (Off / Standard / Aggressive), fuzzy dictionary, spoken line breaks, AI cleanup provider / model / key / prompt, voice rewrite on/off and its trigger phrase |
+| Cleanup & AI | AI rewrite (on/off, trigger phrase) and AI cleanup (on/off, prompt): two independent switches, either, both or neither; then the AI model both use (provider, key, model, test); then on-device cleanup (filler removal Off / Standard / Aggressive, fuzzy dictionary, spoken line breaks). If AI cleanup fails, the transcript is pasted anyway and History marks the entry *STT fallback* |
 | Privacy & Data | History on/off and retention, keep failed audio for Retry, save discarded dictations, clear history |
 | About | Version, data and log folders, reset app data |
 | Dictionary (Home row) | Words that bias recognition and fix casing (add, edit, filter, import from / copy to the clipboard); Snippets (trigger -> replacement) |

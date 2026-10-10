@@ -814,6 +814,7 @@ fn delivered_entry(cfg: &Config, app: &AppInfo, cleaned: &Cleaned, speech_ms: u6
         duration_ms: speech_ms,
         latency_ms,
         ai_cleaned: cleaned.ai_cleaned,
+        cleanup_failed: cleaned.cleanup_error.is_some(),
         rewritten: cleaned.rewrite == RewriteState::Done,
         original: cleaned.original.clone(),
         ..base_entry(cfg, app)

@@ -58,14 +58,14 @@ const OPTIONS: &[ToggleDef] = &[
     ToggleDef {
         id: ID_AI_ENABLE,
         label: "Enable AI cleanup",
-        desc: "Sends the text (never audio) to the model below",
+        desc: "Polishes every dictation with the AI model below",
         get: |c| c.ai_cleanup.enabled,
         set: |c, v| c.ai_cleanup.enabled = v,
     },
     ToggleDef {
         id: ID_RW_TOGGLE,
         label: "Enable AI rewrite",
-        desc: "Uses the AI provider below",
+        desc: "Uses the AI model below",
         get: |c| c.ai_cleanup.rewrite_enabled,
         set: |c, v| c.ai_cleanup.rewrite_enabled = v,
     },
@@ -140,10 +140,6 @@ impl CleanupPage {
         self.result = None;
     }
 
-    fn rewrite_on(cfg: &Config) -> bool {
-        cfg.rewrite_trigger_effective().is_some()
-    }
-
     /// Does the cleanup provider have what it needs to answer a request?
     pub fn ai_ready(&self, cfg: &Config) -> bool {
         let a = &cfg.ai_cleanup;
@@ -166,15 +162,16 @@ impl CleanupPage {
         }
         let keys = self.provider == LlmProviderId::Custom || self.keys.iter().all(KeyField::has_key);
         Some(if keys {
-            "The AI provider below is not fully set up (a model or an address is missing). Finish it, or the rewrite pastes your plain text."
+            "The AI model is not fully set up (a model or an address is missing). Until it is, dictations paste the transcript."
         } else {
-            "No API key is saved for the AI provider below. Add one, or the rewrite pastes your plain text."
+            "No API key is saved for the AI provider. Until there is, dictations paste the transcript."
         })
     }
 
     fn provider_items(&self, cfg: &Config, info: &LlmProviderInfo) -> Vec<Item> {
         let a = &cfg.ai_cleanup;
-        let mut v = vec![group("AI provider")];
+        let mut v = vec![group("AI model")];
+        v.push(note("Used by both AI rewrite and AI cleanup."));
         v.push(choice(ID_AI_PROVIDER, "Provider", info.name));
         for (i, k) in self.keys.iter().enumerate() {
             v.extend(k.items(Self::key_base(i)));
@@ -226,10 +223,9 @@ impl PageModel for CleanupPage {
         let cfg = &*cx.cfg;
         let a = &cfg.ai_cleanup;
         let toggle = |id| OPTIONS.iter().find(|d| d.id == id).expect("known toggle").item(cfg);
-        // The toggle shows the phrase field; the provider and the test matter only while the rewrite
-        // can actually fire (toggle on and a phrase set).
+        // AI rewrite and AI cleanup are independent switches over one shared AI model: either, both
+        // or neither can be on. The model section shows while either is on.
         let rewrite_toggle = a.rewrite_enabled;
-        let rewrite_live = Self::rewrite_on(cfg);
         let mut v = vec![group("AI rewrite")];
         v.push(toggle(ID_RW_TOGGLE));
         if rewrite_toggle {
@@ -245,25 +241,11 @@ impl PageModel for CleanupPage {
                 max_chars: TRIGGER_MAX_CHARS,
             });
             v.push(note("End a dictation with this phrase to paste a concise rewrite."));
-            if rewrite_live && let Some(gap) = self.setup_gap(cfg) {
-                v.push(Item::Banner { tone: crate::daemon::tray::page::Tone::Warn, text: gap.into() });
-            }
         }
-
-        v.push(group("On-device cleanup"));
-        v.push(segmented(ID_FILLER, "Filler words", &["Off", "Standard", "Aggressive"], filler_index(cfg.filler_mode)));
-        v.push(toggle(ID_FUZZY));
-        v.push(toggle(ID_LINEBREAKS));
 
         v.push(group("AI cleanup"));
         v.push(toggle(ID_AI_ENABLE));
-
-        if a.enabled || rewrite_live {
-            let info = registry::provider(self.provider);
-            v.extend(self.provider_items(cfg, info));
-        }
         if a.enabled {
-            v.push(group("Prompt Studio"));
             let custom = !a.custom_prompt.trim().is_empty();
             v.push(Item::Tools {
                 id: ID_PROMPT_RESET,
@@ -281,13 +263,23 @@ impl PageModel for CleanupPage {
                 max_chars: 0,
             });
         }
-        if a.enabled || rewrite_live {
-            v.push(group("Test"));
+
+        if a.enabled || rewrite_toggle {
+            let info = registry::provider(self.provider);
+            v.extend(self.provider_items(cfg, info));
+            if let Some(gap) = self.setup_gap(cfg) {
+                v.push(Item::Banner { tone: crate::daemon::tray::page::Tone::Warn, text: gap.into() });
+            }
             v.push(super::kit::test_line(ID_TEST, "Run on a sample", "Polishes a rough sentence", self.busy, self.ai_ready(cfg)));
             if let Some(r) = &self.result {
                 v.push(Item::Result { ok: r.ok, badge: r.badge.clone(), text: r.text.clone() });
             }
         }
+
+        v.push(group("On-device cleanup"));
+        v.push(segmented(ID_FILLER, "Filler words", &["Off", "Standard", "Aggressive"], filler_index(cfg.filler_mode)));
+        v.push(toggle(ID_FUZZY));
+        v.push(toggle(ID_LINEBREAKS));
         v
     }
 

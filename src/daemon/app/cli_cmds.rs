@@ -59,6 +59,8 @@ pub struct FileResult {
     pub cleanup_ms: f64,
     pub total_ms: f64,
     pub ai_cleaned: bool,
+    /// Why AI cleanup fell back to the transcript.
+    pub cleanup_error: Option<String>,
     /// What the voice rewrite did: `none`, `done`, `skipped`, `failed` or `nothing` (only the phrase).
     pub rewrite: String,
     /// The text was replaced by the AI provider's concise rewrite.
@@ -74,7 +76,7 @@ impl FileResult {
         json!({
             "raw": self.raw, "text": self.text, "provider": self.provider, "model": self.model,
             "stt_ms": round1(self.stt_ms), "cleanup_ms": round1(self.cleanup_ms), "total_ms": round1(self.total_ms),
-            "ai_cleaned": self.ai_cleaned,
+            "ai_cleaned": self.ai_cleaned, "cleanup_error": self.cleanup_error,
             "rewrite": self.rewrite, "rewritten": self.rewritten, "rewrite_error": self.rewrite_error, "original": self.original,
         })
     }
@@ -107,6 +109,7 @@ pub fn transcribe_audio(cfg: &Config, audio: &Audio, opts: &SttOptions, creds: &
         cleanup_ms: t3 - t2,
         total_ms: t3 - t0,
         ai_cleaned: cleaned.ai_cleaned,
+        cleanup_error: cleaned.cleanup_error.clone(),
         rewrite: cleaned.rewrite.label().to_string(),
         rewritten: cleaned.rewrite == pipeline::RewriteState::Done,
         rewrite_error: match &cleaned.rewrite {
@@ -938,6 +941,7 @@ mod tests {
             cleanup_ms: 2.0,
             total_ms: 3.0,
             ai_cleaned: false,
+            cleanup_error: None,
             rewrite: cleaned.rewrite.label().into(),
             rewritten: true,
             rewrite_error: None,
