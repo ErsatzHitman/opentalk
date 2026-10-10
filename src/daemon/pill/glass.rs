@@ -1288,6 +1288,34 @@ mod tests {
     }
 
     #[test]
+    fn animation_frame_glass_matches_the_direct_field() {
+        // frames of the expand (a size seen once is evaluated inline by table lookup) against the same
+        // surface declared as a free shape (the transcribed formula, per pixel): the look is the same
+        let (w, h) = (300usize, 160usize);
+        let raw: Vec<u8> = (0..w * h).flat_map(|i| { let (x, y) = (i % w, i / w); [(x * 255 / w) as u8, ((x / 7 + y / 5) % 2 * 200) as u8, ((x ^ y) & 255) as u8, 255] }).collect();
+        for scale in [1.0f32, 2.0] {
+            let frosted = Arc::new(Cells::from_bgra(&raw, w, h, cell_for(scale)).unwrap().frost(FROST_SIGMA, scale));
+            let b = Backdrop::new(frosted, 0, 0, DEFAULT_PAGE);
+            for width in [43.0f32, 52.5, 61.0, 77.3, 90.0] {
+                let r = Rect::from_xywh(196.0 - width, 72.0, width, 36.0 + (width - 40.0).min(0.0));
+                let sdf = move |x: f32, y: f32| sd_capsule(x, y, r.cx(), r.cy(), r.w(), r.h());
+                let paint_as = |radius: Option<f32>| {
+                    let mut pm = Pixmap::new((208.0 * scale) as u32, (120.0 * scale) as u32).unwrap();
+                    let surf = Surface { field: r, radius, sdf: &sdf };
+                    paint(&mut Canvas::new(&mut pm, scale), &Ctx { backdrop: &b, dark: false }, &surf, &rest_params(false));
+                    pm
+                };
+                let before = bake_count();
+                let table = paint_as(Some(r.h().min(r.w()) * 0.5));
+                assert_eq!(bake_count(), before, "{width}: an animation frame is not baked");
+                let direct = paint_as(None);
+                let worst = table.data().iter().zip(direct.data()).map(|(a, b)| a.abs_diff(*b)).max().unwrap();
+                assert!(worst <= 4, "{scale}x width {width}: table and direct fields differ by {worst}");
+            }
+        }
+    }
+
+    #[test]
     fn glass_is_opaque_inside_with_a_visible_rim() {
         let b = flat_backdrop([128, 128, 128]);
         let pm = paint_capsule(&b, false, 1.0);
