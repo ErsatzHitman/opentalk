@@ -675,12 +675,10 @@ mod tests {
             "# Dictionary",
             "#1 choice Snippets = None",
             "#10 field Add words [text] value=\"\" hint=\"Type a word and press Enter\" max=4000",
-            "#3 button Add [Primary] (disabled)",
-            "note: Names, products and jargon your speech provider gets wrong go here. They are sent along as hints with every dictation.",
+            "#3 tools No words yet |  | [\"Add (disabled)\"]",
+            "note: Names and jargon your speech provider gets wrong. Sent as hints with every dictation.",
             "---",
-            "#6 button Import from clipboard [Outline]",
-            "#7 button Copy as JSON [Outline] (disabled)",
-            "#8 button Clear all [Destructive] (disabled)",
+            "#6 tools Import / export |  | [\"Import from clipboard\", \"Copy as JSON (disabled)\", \"Clear all (disabled)\"]",
         ]
         .join("\n");
         assert_eq!(snap, want);
@@ -692,7 +690,7 @@ mod tests {
         let mut p = page();
         p.event(p.input_id(), Event::Edited("Terraform, kubernetes; Grafana\nOpenTalk".into()), &mut cx(&mut cfg));
         let items = p.items(&cx(&mut cfg));
-        assert!(items.iter().any(|i| matches!(i, Item::Button { id: B_ADD, enabled: true, .. })));
+        assert!(items.iter().any(|i| matches!(i, Item::Tools { id: B_ADD, tools, .. } if tools[0].enabled)));
         let fx = p.event(p.input_id(), Event::Committed("Terraform, kubernetes; Grafana\nOpenTalk".into()), &mut cx(&mut cfg));
         assert_eq!(cfg.dictionary, vec!["Kubernetes", "Terraform", "Grafana", "OpenTalk"], "duplicates (any case) are skipped");
         assert!(saved(&fx));
@@ -747,7 +745,7 @@ mod tests {
         let snap = snapshot(&p, &cx(&mut cfg));
         println!("{snap}");
         assert!(snap.contains("#11 field Edit word [text] value=\"beta\" hint=\"Enter saves. Clear the field to cancel.\""), "{snap}");
-        assert!(snap.contains("#3 button Save word [Primary]") && !snap.contains("Cancel"), "{snap}");
+        assert!(snap.contains("#3 tools") && snap.contains("\"Save word\"") && !snap.contains("Cancel"), "{snap}");
         let fx = p.event(p.input_id(), Event::Committed("Beta Test".into()), &mut cx(&mut cfg));
         assert_eq!(cfg.dictionary, vec!["alpha", "Beta Test", "gamma"]);
         assert_eq!(fx, vec![Effect::Saved]);
@@ -801,11 +799,11 @@ mod tests {
         let mut p = page();
         let snap = snapshot(&p, &cx(&mut cfg));
         println!("{snap}");
-        assert!(snap.contains("#5 field Filter") && snap.contains("note: 12 words \u{b7} 94 characters in the speech prompt"), "{snap}");
+        assert!(snap.contains("#5 field  [search]") && snap.contains("#3 tools 12 words | 94 characters in the speech prompt"), "{snap}");
         assert!(snap.contains("[virtual rows: 12 x 32px]") && snap.contains("#100 row h=32 | word01 |  |  | chips=[] | x"), "{snap}");
         p.event(F_FILTER, Event::Edited("WORD1".into()), &mut cx(&mut cfg));
         assert_eq!(words_in_view(&p, &mut cfg), vec!["word10", "word11", "word12"]);
-        assert!(snapshot(&p, &cx(&mut cfg)).contains("note: 3 of 12 words \u{b7} 94 characters in the speech prompt"));
+        assert!(snapshot(&p, &cx(&mut cfg)).contains("#3 tools 3 of 12 words | 94 characters in the speech prompt"));
         // Row 1 of the filtered list is "word11", whatever its place in the whole list.
         p.row_event(1, Event::Activated, &mut cx(&mut cfg));
         assert_eq!(p.input, "word11");
@@ -914,15 +912,13 @@ mod tests {
         println!("{snap}");
         let want = [
             "# Snippets",
-            "#1 button New snippet [Primary]",
-            "note: 2 snippets. Say a trigger while dictating to paste its text.",
+            "#1 tools 2 snippets |  | [\"New snippet\"]",
+            "note: Say a trigger while dictating to paste its text.",
             "[virtual rows: 2 x 44px]",
             "#100 row h=44 | my email | me@example.com |  | chips=[] | x",
             "#101 row h=44 | sign off | Best regards, Pat (sent by voice) |  | chips=[] | x",
             "---",
-            "#2 button Import from clipboard [Outline]",
-            "#3 button Copy as JSON [Outline]",
-            "#4 button Clear all [Destructive]",
+            "#2 tools Import / export |  | [\"Import from clipboard\", \"Copy as JSON\", \"Clear all\"]",
         ]
         .join("\n");
         assert_eq!(snap, want);
@@ -933,8 +929,8 @@ mod tests {
         let mut cfg = Config::default();
         let p = SnippetsPage { clipboard: no_clip, cache: RefCell::default() };
         let snap = snapshot(&p, &cx(&mut cfg));
-        assert!(snap.contains("note: Say a short trigger while dictating") && !snap.contains("virtual rows"), "{snap}");
-        assert!(snap.contains("#3 button Copy as JSON [Outline] (disabled)") && snap.contains("#4 button Clear all [Destructive] (disabled)"), "{snap}");
+        assert!(snap.contains("#1 tools No snippets yet") && !snap.contains("virtual rows"), "{snap}");
+        assert!(snap.contains("[\"Import from clipboard\", \"Copy as JSON (disabled)\", \"Clear all (disabled)\"]"), "{snap}");
     }
 
     #[test]
@@ -988,8 +984,8 @@ mod tests {
             "# New snippet",
             "#1 field Trigger [text] value=\"\" hint=\"What you say, like \u{201c}my email\u{201d}\" max=120",
             "#2 field Replacement [multiline5] value=\"\" hint=\"The text to paste instead\" max=4000",
-            "note: The trigger is matched as whole words and ignores capitals. A trigger inside a longer phrase is replaced there too.",
-            "#3 button Save [Primary] (disabled)",
+            "note: Matched as whole words, ignoring capitals.",
+            "#3 tools  |  | [\"Save (disabled)\"]",
         ]
         .join("\n");
         assert_eq!(snap, want);
@@ -1010,7 +1006,7 @@ mod tests {
         assert_eq!(p.title(), "Edit snippet");
         let snap = snapshot(&p, &cx(&mut cfg));
         println!("{snap}");
-        assert!(snap.contains("value=\"b\"") && snap.ends_with("#4 button Delete snippet [Destructive]"), "{snap}");
+        assert!(snap.contains("value=\"b\"") && snap.ends_with("#4 tools  |  | [\"Delete snippet\", \"Save\"]"), "{snap}");
         p.event(E_REPLACEMENT, Event::Committed("two".into()), &mut cx(&mut cfg));
         p.event(E_SAVE, Event::Pressed, &mut cx(&mut cfg));
         assert_eq!(cfg.snippets, vec![sn("a", "1"), sn("b", "two")], "its own trigger is not a clash");
@@ -1023,7 +1019,7 @@ mod tests {
         p.event(E_TRIGGER, Event::Edited("My Email".into()), &mut cx(&mut cfg));
         let snap = snapshot(&p, &cx(&mut cfg));
         println!("{snap}");
-        assert!(snap.contains("ERROR=Another snippet already uses this trigger.") && snap.contains("#3 button Save [Primary] (disabled)"), "{snap}");
+        assert!(snap.contains("ERROR=Another snippet already uses this trigger.") && snap.contains("\"Save (disabled)\""), "{snap}");
         assert!(p.event(E_SAVE, Event::Pressed, &mut cx(&mut cfg)).is_empty());
         assert_eq!(cfg.snippets[1], sn("other", "y"));
         p.event(E_TRIGGER, Event::Edited("My Email 2".into()), &mut cx(&mut cfg));

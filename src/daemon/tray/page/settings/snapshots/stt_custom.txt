@@ -1,19 +1,12 @@
 # Speech-to-Text
-
-## Provider
-  choice #1 Speech provider > Custom
-  note: Audio is sent to the provider you choose, using your own API key.
-
-## API key
-  field #100 API key (optional) [secret] = "" (hint "Paste your API key")
-  button #101 Save key <Primary> (disabled)
+  choice #1 Provider > Custom
+  tools #101 API key (optional) [Save key (disabled)]
+  field #100  [secret] = "" (hint "Paste your API key")
 
 ## Custom endpoint
-  note: Any server that implements the OpenAI /audio/transcriptions API, including Azure OpenAI deployments. The path /audio/transcriptions is added to the base URL.
+  note: Any OpenAI-compatible /audio/transcriptions server (Azure OpenAI too).
   field #22 Base URL [text] = "" (hint "https://api.example.com/v1")
   field #23 Model [text] = "whisper-1" (hint "whisper-1")
 
 ## Test
-  note: Transcribes a short built-in sample with the settings above, so you can check the key and measure latency.
-  button #31 Test transcription <Primary> (disabled)
-  note: Enter the base URL first.
+  tools #31 Test transcription -- Enter the base URL first [Run the test (disabled)]

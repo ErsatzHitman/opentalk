@@ -482,8 +482,11 @@ mod tests {
         assert_eq!(h(Item::Divider), H_DIVIDER);
         assert_eq!(h(Item::Space(7.0)), 7.0);
         assert_eq!(h(Item::Row(Row::new(1, "r", 64.0))), 64.0);
-        assert!(h(Item::Radio { id: 1, label: "r".into(), desc: String::new(), on: true }) >= 52.0);
-        assert!(h(Item::Radio { id: 1, label: "r".into(), desc: "d".into(), on: true }) > 52.0);
+        // radios are one line whatever the description
+        assert_eq!(h(Item::Radio { id: 1, label: "r".into(), desc: String::new(), on: true }), H_RADIO);
+        assert_eq!(h(Item::Radio { id: 1, label: "r".into(), desc: "d ".repeat(80), on: true }), H_RADIO);
+        assert_eq!(h(Item::Tools { id: 1, label: "t".into(), sub: String::new(), tools: Vec::new() }), H_TOOLS);
+        assert_eq!(h(Item::Tools { id: 1, label: "t".into(), sub: "s".into(), tools: Vec::new() }), H_TOOLS_SUB);
     }
 
     #[test]

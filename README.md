@@ -207,9 +207,10 @@ merged build:
    the tray). **History**, **Dictionary** and **Settings** open as pages inside the popup (380 px wide); the arrow at the
    top left, Backspace, Alt+Left or Esc go back. Settings lists Preferences, Hotkeys, Speech-to-Text, Cleanup & AI,
    Privacy & Data and About (one icon row each); choices such as the language or provider open a list page;
-   the Dictionary page links to Snippets. Changes apply at once. Actions are small icon buttons that name themselves on
-   hover: edit / delete on a saved API key, play to run a test, copy beside each text of a dictation. History rows show the
-   icon of the app each dictation went to. Launching the exe a second time opens the popup.
+   the Dictionary page links to Snippets. Changes apply at once. Actions are small icon buttons (the Windows 11 icon font,
+   Segoe Fluent Icons; Segoe MDL2 Assets on Windows 10) that name themselves on hover: edit / delete on a saved API key,
+   play to run a test, copy beside each text of a dictation. History rows show the Windows icon of the app each dictation
+   went to. Launching the exe a second time opens the popup.
 6. If a transcription fails (network, quota) the error card offers **Retry** with the audio that was kept in memory.
 7. **Voice rewrite.** Dictate your message and finish with the rewrite phrase, e.g. *"Let's move the meeting to Friday
    afternoon because the client is out on Thursday, rewrite this concisely."* OpenTalk sends the text (without the phrase)

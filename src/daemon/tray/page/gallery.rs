@@ -273,7 +273,7 @@ mod tests {
         let cx = Cx::new(&mut cfg, 0);
         let m = long_list_model();
         let v = m.virtual_rows().unwrap();
-        assert_eq!((v.count, v.row_h), (500, 64.0));
+        assert_eq!((v.count, v.row_h), (500, super::super::ROW_H_HISTORY));
         assert!(matches!((v.row)(499), Item::Row(_)));
         assert_eq!(m.tail_items(&cx).len(), 1);
     }

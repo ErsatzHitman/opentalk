@@ -150,6 +150,59 @@ pub fn load_cheap(path: &str, px: u32) -> Option<AppIcon> {
     Some(icon)
 }
 
+/// Full path of an app known only by its exe file name (History entries saved before paths were
+/// recorded): the App Paths registration (Chrome, Edge, Office...), else a running copy of it.
+pub fn find_exe(exe_name: &str) -> Option<String> {
+    let name = exe_name.trim();
+    if name.is_empty() || name.contains(['\\', '/']) {
+        return None;
+    }
+    app_paths(name).or_else(|| running_exe(name))
+}
+
+fn app_paths(name: &str) -> Option<String> {
+    use windows::Win32::System::Registry::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ, RegGetValueW};
+    let sub: Vec<u16> = format!("Software\\Microsoft\\Windows\\CurrentVersion\\App Paths\\{name}").encode_utf16().chain([0]).collect();
+    for root in [HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE] {
+        let mut buf = [0u16; 520];
+        let mut size = (buf.len() * 2) as u32;
+        // SAFETY: `buf`/`size` describe a writable buffer; the default value is read (null name).
+        let rc = unsafe { RegGetValueW(root, PCWSTR(sub.as_ptr()), PCWSTR::null(), RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ, None, Some(buf.as_mut_ptr() as *mut c_void), Some(&mut size)) };
+        if rc.0 == 0 {
+            let n = (size as usize / 2).min(buf.len());
+            let v = String::from_utf16_lossy(&buf[..n]);
+            let v = v.trim_end_matches('\0').trim().trim_matches('"').to_string();
+            if !v.is_empty() && std::path::Path::new(&v).exists() {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
+fn running_exe(name: &str) -> Option<String> {
+    use windows::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS};
+    // SAFETY: a process snapshot walked with a correctly sized entry, closed before returning.
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0).ok()?;
+        let mut e = PROCESSENTRY32W { dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32, ..Default::default() };
+        let mut found = None;
+        let mut ok = Process32FirstW(snap, &mut e).is_ok();
+        while ok {
+            let len = e.szExeFile.iter().position(|&c| c == 0).unwrap_or(e.szExeFile.len());
+            if String::from_utf16_lossy(&e.szExeFile[..len]).eq_ignore_ascii_case(name)
+                && let Some(p) = super::paste::exe_path_of(e.th32ProcessID)
+            {
+                found = Some(p);
+                break;
+            }
+            ok = Process32NextW(snap, &mut e).is_ok();
+        }
+        let _ = CloseHandle(snap);
+        found
+    }
+}
+
 /// Which extraction strategy a target takes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Route {

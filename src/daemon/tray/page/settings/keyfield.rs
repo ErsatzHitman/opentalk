@@ -273,24 +273,25 @@ pub mod tests {
         let f = KeyField::new(&Fake::default(), "openai", "API key", "https://example.com/keys");
         assert!(!f.has_key());
         let it = f.items(100);
-        assert_eq!(ids(&it), vec![100, 101, 103], "field, save, get-key (no cancel without a stored key)");
-        assert!(matches!(&it[0], Item::Field { kind: FieldKind::Secret, value, .. } if value.is_empty()));
-        assert!(matches!(&it[1], Item::Tools { tools, .. } if !tools.last().unwrap().enabled));
+        assert_eq!(ids(&it), vec![101, 100], "label line with the actions, then the field");
+        assert!(matches!(&it[1], Item::Field { kind: FieldKind::Secret, value, .. } if value.is_empty()));
+        // get key, save (disabled); no cancel without a stored key
+        assert!(matches!(&it[0], Item::Tools { tools, .. } if tools.len() == 2 && tools[0].enabled && !tools[1].enabled));
     }
 
     #[test]
     fn typing_enables_save_and_save_stores_trimmed_key() {
         let mut f = KeyField::new(&Fake::default(), "openai", "API key", "");
         assert!(f.event(100, 100, Event::Edited("  sk-test-1234567890  ".into())).effects.is_empty());
-        assert!(matches!(&f.items(100)[1], Item::Button { enabled: true, .. }));
+        assert!(matches!(&f.items(100)[0], Item::Tools { tools, .. } if tools.iter().all(|t| t.enabled)));
         let out = f.event(100, 101, Event::Pressed);
         assert!(out.changed);
         assert_eq!(out.effects[0], Effect::Do(PopupAction::SetSecret { name: "openai".into(), value: Some("sk-test-1234567890".into()) }));
         assert!(matches!(out.effects[1], Effect::Toast(_)));
         assert!(f.has_key());
         let it = f.items(100);
-        assert!(matches!(&it[0], Item::Row(r) if r.trailing == Trailing::Badge { text: "Saved".into(), tone: Tone::Ok } && !r.secondary.contains("1234567890")));
-        assert_eq!(ids(&it), vec![104, 105, 106]);
+        assert!(matches!(&it[0], Item::Tools { sub, tools, .. } if tools.len() == 2 && !sub.contains("1234567890")));
+        assert_eq!(ids(&it), vec![104]);
     }
 
     #[test]
@@ -305,31 +306,34 @@ pub mod tests {
     fn stored_key_replace_then_cancel_restores_the_masked_view() {
         let mut f = KeyField::new(&Fake::with("groq", "gsk_...abcd"), "groq", "API key", "https://x");
         assert!(f.has_key());
-        assert_eq!(ids(&f.items(10)), vec![14, 15, 16]);
-        let out = f.event(10, 15, Event::Pressed);
+        assert_eq!(ids(&f.items(10)), vec![14]);
+        // the pencil
+        let out = f.event(10, 14, Event::Picked(0));
         assert_eq!(out.effects, vec![Effect::Focus(10)]);
         let it = f.items(10);
-        assert_eq!(ids(&it), vec![10, 11, 12, 13], "input, save, cancel, get key");
+        assert_eq!(ids(&it), vec![11, 10], "actions line (get key, cancel, save), input");
+        assert!(matches!(&it[0], Item::Tools { tools, .. } if tools.len() == 3));
         f.event(10, 10, Event::Edited("half typed".into()));
-        let out = f.event(10, 12, Event::Pressed);
+        // cancel is the second icon
+        let out = f.event(10, 11, Event::Picked(1));
         assert!(!out.changed && out.effects.is_empty());
-        assert_eq!(ids(&f.items(10)), vec![14, 15, 16]);
+        assert_eq!(ids(&f.items(10)), vec![14]);
         // The half-typed text is gone: replacing again starts empty.
         f.event(10, 14, Event::Activated);
-        assert!(matches!(&f.items(10)[0], Item::Field { value, .. } if value.is_empty()));
+        assert!(matches!(&f.items(10)[1], Item::Field { value, .. } if value.is_empty()));
     }
 
     #[test]
     fn remove_asks_first_then_deletes() {
         let mut f = KeyField::new(&Fake::with("groq", "gsk_...abcd"), "groq", "API key", "");
-        let out = f.event(10, 16, Event::Pressed);
+        let out = f.event(10, 14, Event::Picked(1));
         assert!(matches!(&out.effects[0], Effect::Confirm { destructive: true, on_confirm: ConfirmId::RemoveKey(10), .. }));
         assert!(f.has_key(), "nothing is removed before the confirmation");
         let out = f.remove();
         assert!(out.changed);
         assert_eq!(out.effects[0], Effect::Do(PopupAction::SetSecret { name: "groq".into(), value: None }));
         assert!(!f.has_key());
-        assert_eq!(ids(&f.items(10)), vec![10, 11], "back to the empty input");
+        assert_eq!(ids(&f.items(10)), vec![11, 10], "back to the empty input");
     }
 
     #[test]
@@ -353,7 +357,7 @@ pub mod tests {
         store.values.borrow_mut().clear(); // removed elsewhere
         f.refresh(&store);
         assert!(!f.has_key());
-        assert_eq!(ids(&f.items(0)), vec![0, 1]);
+        assert_eq!(ids(&f.items(0)), vec![1, 0]);
     }
 
     #[test]

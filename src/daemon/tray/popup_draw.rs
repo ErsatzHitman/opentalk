@@ -7,7 +7,7 @@
 //! live window.
 
 use super::popup::{self, Content, Kind, Layout, MARGIN, Nav, PAD, Phase, R, RADIUS, ROW_RADIUS, Row, Target};
-use crate::daemon::pill::kit::{Canvas, Font, Palette, Rect, Rgba, content_height, draw_logo, draw_retry_icon, draw_text, sd_round_box, sd_segment, text_mask, text_measure};
+use crate::daemon::pill::kit::{Canvas, Font, Palette, Rect, Rgba, content_height, draw_icon_mask, draw_logo, draw_retry_icon, draw_text, icon_mask, sd_round_box, sd_segment, text_mask, text_measure};
 use tiny_skia::Pixmap;
 
 /// Flat popover tokens (docs/SPEC.md "Pill" and "Settings UI" tables), light | dark.
@@ -328,8 +328,54 @@ fn star(x: f32, y: f32, cx: f32, cy: f32, r: f32) -> f32 {
     (k - r) * 0.55
 }
 
+/// The icon's glyph in the Windows icon font (Segoe Fluent Icons / Segoe MDL2 Assets).
+fn system_glyph(icon: Icon) -> char {
+    match icon {
+        Icon::Mic => '\u{E720}',
+        Icon::Stop => '\u{E71A}',
+        Icon::History => '\u{E81C}',
+        Icon::Book => '\u{E82D}',
+        Icon::Gear => '\u{E713}',
+        Icon::Pill => '\u{E890}',
+        Icon::Retry => '\u{E72C}',
+        Icon::Power => '\u{E7E8}',
+        Icon::Copy => '\u{E8C8}',
+        Icon::Search => '\u{E721}',
+        Icon::Pencil => '\u{E70F}',
+        Icon::Trash => '\u{E74D}',
+        Icon::Play => '\u{E768}',
+        Icon::Sliders => '\u{E9E9}',
+        Icon::Keyboard => '\u{E765}',
+        Icon::Sparkle => '\u{E99A}',
+        Icon::Shield => '\u{EA18}',
+        Icon::Info => '\u{E946}',
+        Icon::Check => '\u{E73E}',
+        Icon::Close => '\u{E711}',
+        Icon::Link => '\u{E8A7}',
+        Icon::Download => '\u{E896}',
+        Icon::Plus => '\u{E710}',
+    }
+}
+
+thread_local! {
+    /// Draw icons from the Windows icon font (on unless a text-free render turned it off).
+    static SYSTEM_ICONS: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Text-free renders (the structural goldens) keep the vector icons, so they match everywhere.
+pub(crate) fn use_system_icons(on: bool) {
+    SYSTEM_ICONS.with(|c| c.set(on));
+}
+
 pub(crate) fn draw_icon(cv: &mut Canvas, icon: Icon, x: f32, cy: f32, color: Rgba, alpha: f32) {
     let top = cy - 8.0;
+    if SYSTEM_ICONS.with(|c| c.get()) {
+        let px = (16.0 * cv.scale).round() as i32;
+        if let Some(m) = icon_mask(system_glyph(icon), px) {
+            draw_icon_mask(cv, &m, x, top, color, alpha);
+            return;
+        }
+    }
     if icon == Icon::Retry {
         let scale = cv.scale;
         draw_retry_icon(cv, Rect::from_xywh(x + 1.0, top + 1.0, 14.0, 14.0), scale, color.with_alpha(alpha));
@@ -345,6 +391,7 @@ pub(crate) fn draw_icon(cv: &mut Canvas, icon: Icon, x: f32, cy: f32, color: Rgb
 
 /// Render the popup window (card plus shadow margin) at `v.scale`.
 pub fn render(v: &View) -> Option<Pixmap> {
+    use_system_icons(v.text);
     let (w, h) = pixel_size(v.layout, v.scale);
     let mut pm = Pixmap::new(w.max(1), h.max(1))?;
     let th = theme(v.dark);

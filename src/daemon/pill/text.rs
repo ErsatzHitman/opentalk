@@ -54,13 +54,17 @@ struct Gdi {
 
 impl Gdi {
     fn new(font: Font) -> Option<Gdi> {
+        Gdi::with_face(font, FONT_FACE)
+    }
+
+    fn with_face(font: Font, face: &str) -> Option<Gdi> {
         // SAFETY: plain GDI object creation; every handle is released in Drop.
         unsafe {
             let dc = CreateCompatibleDC(None);
             if dc.is_invalid() {
                 return None;
             }
-            let face: Vec<u16> = FONT_FACE.encode_utf16().chain(std::iter::once(0)).collect();
+            let face: Vec<u16> = face.encode_utf16().chain(std::iter::once(0)).collect();
             let f = CreateFontW(
                 -font.px,
                 0,
@@ -97,6 +101,105 @@ impl Drop for Gdi {
             let _ = DeleteDC(self.dc);
         }
     }
+}
+
+// --- system icon font ---------------------------------------------------------------------
+
+/// The Windows icon font: Segoe Fluent Icons (Windows 11), else Segoe MDL2 Assets (Windows 10, same
+/// code points for the icons used here); `None` where neither is installed (Wine), and callers draw
+/// their own vector shapes.
+pub fn icon_face() -> Option<&'static str> {
+    static F: std::sync::OnceLock<Option<&'static str>> = std::sync::OnceLock::new();
+    *F.get_or_init(|| ["Segoe Fluent Icons", "Segoe MDL2 Assets"].into_iter().find(|f| face_is_real(f)))
+}
+
+/// GDI substitutes a missing face silently; the face it actually selected says whether it exists.
+fn face_is_real(face: &str) -> bool {
+    let Some(g) = Gdi::with_face(Font { px: 16, weight: 400 }, face) else { return false };
+    let mut buf = [0u16; 64];
+    // SAFETY: valid DC with the font selected; `buf` is large enough for any face name.
+    let n = unsafe { windows::Win32::Graphics::Gdi::GetTextFaceW(g.dc, Some(&mut buf)) };
+    n > 0 && String::from_utf16_lossy(&buf[..(n as usize).saturating_sub(1).min(buf.len())]).trim_end_matches('\0').eq_ignore_ascii_case(face)
+}
+
+type IconCache = Mutex<HashMap<(char, i32), Option<Arc<Mask>>>>;
+
+/// Coverage mask of one icon-font glyph in a `px` x `px` device-pixel square, centred (cached).
+pub fn icon_mask(glyph: char, px: i32) -> Option<Arc<Mask>> {
+    static C: std::sync::OnceLock<IconCache> = std::sync::OnceLock::new();
+    let face = icon_face()?;
+    let c = C.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = (glyph, px);
+    if let Some(m) = c.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+        return m.clone();
+    }
+    let m = rasterize_icon(face, glyph, px).map(Arc::new);
+    c.lock().unwrap_or_else(|e| e.into_inner()).insert(key, m.clone());
+    m
+}
+
+fn rasterize_icon(face: &str, glyph: char, px: i32) -> Option<Mask> {
+    let px = px.max(4);
+    let g = Gdi::with_face(Font { px: px * SS, weight: 400 }, face)?;
+    let b = px * SS;
+    let bmi = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: b,
+            biHeight: -b,
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+    // SAFETY: standard DIB section creation; `bits` points into the section for its lifetime.
+    unsafe {
+        let bmp = CreateDIBSection(Some(g.dc), &bmi, DIB_RGB_COLORS, &mut bits, None, 0).ok()?;
+        if bits.is_null() {
+            let _ = DeleteObject(HGDIOBJ(bmp.0));
+            return None;
+        }
+        let old_bmp = SelectObject(g.dc, HGDIOBJ(bmp.0));
+        std::ptr::write_bytes(bits as *mut u8, 0, (b * b * 4) as usize);
+        SetBkMode(g.dc, TRANSPARENT);
+        SetTextColor(g.dc, COLORREF(0x00ff_ffff));
+        let mut buf = [0u16; 2];
+        let mut wt = glyph.encode_utf16(&mut buf).to_vec();
+        let mut rc = RECT { left: 0, top: 0, right: b, bottom: b };
+        DrawTextW(
+            g.dc,
+            &mut wt,
+            &mut rc,
+            windows::Win32::Graphics::Gdi::DT_CENTER | windows::Win32::Graphics::Gdi::DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_NOCLIP,
+        );
+        let src = std::slice::from_raw_parts(bits as *const u8, (b * b * 4) as usize);
+        let mut data = vec![0u8; (px * px) as usize];
+        let n = (SS * SS) as u32;
+        for y in 0..px {
+            for x in 0..px {
+                let mut sum = 0u32;
+                for sy in 0..SS {
+                    let row = ((y * SS + sy) * b + x * SS) as usize * 4;
+                    for sx in 0..SS as usize {
+                        let p = &src[row + sx * 4..row + sx * 4 + 3];
+                        sum += p[0].max(p[1]).max(p[2]) as u32;
+                    }
+                }
+                data[(y * px + x) as usize] = (sum / n) as u8;
+            }
+        }
+        SelectObject(g.dc, old_bmp);
+        let _ = DeleteObject(HGDIOBJ(bmp.0));
+        Some(Mask { w: px, h: px, data })
+    }
+}
+
+/// Blend an icon mask from [`icon_mask`] with its top-left at logical (x, y); no padding column.
+pub fn draw_icon_mask(canvas: &mut Canvas, m: &Mask, x: f32, y: f32, color: Rgba, alpha: f32) {
+    draw(canvas, m, x + 1.0 / canvas.scale, y, color, alpha);
 }
 
 fn wide(s: &str) -> Vec<u16> {

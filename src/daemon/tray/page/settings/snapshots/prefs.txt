@@ -4,21 +4,21 @@
   seg #1 Theme: Light | Dark | (Auto)
 
 ## Dictation
-  [x] #2 Dictation sounds -- Play a short cue when recording starts and stops.
-  [ ] #3 Pause media while dictating -- Pause music and video when you start, resume afterwards.
-  [x] #4 Mute system audio while dictating -- Silence your speakers while you record so nothing leaks into the microphone.
-  [x] #5 Automatic pasting -- Paste the text into the app you were using. When off, it is only copied.
-  [ ] #6 Keep transcription in clipboard -- Leave the text on the clipboard instead of restoring what you had copied.
-  [x] #7 Smart spacing -- Add a space before the text when it continues a sentence.
+  [x] #2 Dictation sounds -- A short cue on start and stop
+  [ ] #3 Pause media while dictating -- Resumes afterwards
+  [x] #4 Mute system audio while dictating -- Speakers are silent while you record
+  [x] #5 Automatic pasting -- Into the app you were using
+  [ ] #6 Keep transcription in clipboard -- Instead of restoring what you had copied
+  [x] #7 Smart spacing -- Add a space when continuing a sentence
 
 ## Floating icon
-  [ ] #8 Auto-hide when idle -- Show the icon only while recording or transcribing.
+  [ ] #8 Auto-hide when idle -- Only while recording or transcribing
   seg #9 Start position: (Bottom right) | Bottom center | Bottom left
-  [x] #10 Show app bubble -- A round icon of the app you are dictating into, beside the indicator.
+  [x] #10 Show app bubble -- The app you are dictating into
 
 ## Language
   choice #11 Transcription language > Auto-detect
-  note: Auto-detect works for most speech. Pick a language for better accuracy.
+  note: Pick one for better accuracy
 
 ## Startup
   [ ] #12 Launch at login -- Start OpenTalk in the tray when you sign in to Windows.
@@ -26,4 +26,4 @@
 ## Microphone
   choice #13 Input device > System default
   choice #14 Keep microphone warm > Off
-  note: Keeping the stream open after a dictation makes the next start instant, but the Windows microphone indicator stays on.
+  note: Instant next start; the Windows mic indicator stays on

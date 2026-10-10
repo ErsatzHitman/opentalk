@@ -1,14 +1,14 @@
 # Hotkeys
 
 ## Dictation hotkey
-  note: Press it anywhere in Windows to start and stop dictation. Modifier-only combinations such as Ctrl + Win work.
+  note: Works anywhere in Windows
   field #1 Hotkey [hotkey] = "Control+Super" (hint "Click, then press your shortcut (Esc cancels)")
   button #2 Reset to Ctrl + Win <Link> (disabled)
 
 ## Activation
-  (*) #3 Tap to talk -- Press the hotkey once to start recording and again to stop.
-  ( ) #4 Push to talk -- Hold the hotkey while you speak and release to stop. A quick tap cancels.
+  (*) #3 Tap to talk -- Press once to start, again to stop
+  ( ) #4 Push to talk -- Hold while you speak
 
 ## Behaviour
-  [x] #5 Suppress the Start menu -- When the hotkey includes the Windows key, stop Windows from opening the Start menu after you release it.
-  note: Press Esc while recording or transcribing to discard the dictation.
+  [x] #5 Suppress the Start menu -- When the hotkey uses the Windows key
+  note: Esc discards a dictation

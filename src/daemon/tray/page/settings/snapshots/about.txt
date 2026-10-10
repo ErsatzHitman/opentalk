@@ -1,14 +1,11 @@
 # About
 
 ## OpenTalk
-  row #1 Version [v<version>:info] -- Personal dictation for Windows.
+  row #1 Version [v<version>:info]
 
 ## Folders
-  note: Settings, history and logs live in <data folder>
-  button #2 Open data folder <Outline>
-  button #3 Open logs folder <Outline>
-  note: Diagnostic logs never contain API keys or your text.
+  tools #2 Data folder -- C:\users\root\AppData\Roaming\OpenTalk [Open data folder]
+  tools #3 Logs -- Never contain API keys or your text [Open logs folder]
 
 ## Reset
-  note: Delete settings, history and saved API keys, and start fresh.
-  button #4 Reset app data... <Destructive>
+  tools #4 Reset app data -- Settings, history and API keys [Reset app data]

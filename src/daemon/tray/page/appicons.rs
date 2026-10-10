@@ -1,6 +1,6 @@
-//! App icons for History rows: resolved once per app on the popup thread and kept (32 px, 4 KB
-//! each). Only the cheap extraction paths are used ([`appicon::load_cheap`]); an entry recorded
-//! before paths were saved finds its icon only once a newer entry of the same app resolved it.
+//! App icons for History rows: the app's own Windows icon, resolved once per app on the popup thread
+//! and kept (32 px, 4 KB each). Only the cheap extraction paths are used ([`appicon::load_cheap`]).
+//! An entry recorded before paths were saved is resolved by exe name ([`appicon::find_exe`]).
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -32,8 +32,20 @@ pub fn get(path: Option<&str>, exe: Option<&str>) -> Option<Rc<AppPix>> {
         if let Some(hit) = m.borrow().get(&key) {
             return hit.clone();
         }
-        // Without a path there is nothing to load; do not remember the miss, a later row may have one.
-        let path = path.filter(|p| !p.is_empty())?;
+        let found;
+        let path = match path.filter(|p| !p.is_empty()) {
+            Some(p) => p,
+            None => {
+                found = appicon::find_exe(&key);
+                match found.as_deref() {
+                    Some(p) => p,
+                    None => {
+                        m.borrow_mut().insert(key, None);
+                        return None;
+                    }
+                }
+            }
+        };
         let pix = appicon::load_cheap(path, PX).map(|ic| {
             let mut rgba = ic.rgba;
             for px in rgba.chunks_exact_mut(4) {

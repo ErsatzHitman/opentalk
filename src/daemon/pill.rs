@@ -131,7 +131,7 @@ pub(crate) mod kit {
     pub(crate) use super::card::draw_retry_icon;
     pub(crate) use super::raster::{Canvas, DevRect, Rect, sd_round_box, sd_segment};
     pub(crate) use super::render::draw_logo;
-    pub(crate) use super::text::{Font, content_height, draw as draw_text, mask as text_mask, measure as text_measure, prefix_widths as text_prefix_widths};
+    pub(crate) use super::text::{Font, content_height, draw as draw_text, draw_icon_mask, icon_mask, mask as text_mask, measure as text_measure, prefix_widths as text_prefix_widths};
     pub(crate) use super::theme::{Palette, Rgba, resolve_dark};
     pub(crate) use super::window::{Dib, scale_from_dpi};
 }

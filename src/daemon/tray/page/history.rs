@@ -812,15 +812,15 @@ mod tests {
         let want = [
             "# History",
             "note: 3 dictations \u{b7} 11 words \u{b7} avg 840 ms \u{b7} 1 failed",
-            "#1 field Search [text] value=\"\" hint=\"Words from the text, app or provider\" max=200",
-            "#2 toggle Show discarded [off] (Recordings too short or silent to paste)",
-            "[virtual rows: 4 x 64px]",
-            "#100 row h=64 | 11:30 \u{b7} Slack | Ship it on Friday. | 840 ms | chips=[\"AI cleaned/Info\"] | copy",
-            "#101 row h=64 | 09:05 | Groq rejected the key (401). |  | chips=[\"Failed/Err\"] | >",
-            "#102 row h=64 | Oct 2, 08:00 \u{b7} Outlook | Send the report tomorrow. | 840 ms | chips=[\"Rewritten/Info\"] | copy",
-            "#103 row h=64 | Dec 31, 2025, 23:00 | Happy new year | 840 ms | chips=[] | copy",
+            "#1 field  [search] value=\"\" hint=\"Search\" max=200",
+            "#2 toggle Show discarded [off] ()",
+            "[virtual rows: 4 x 58px]",
+            "#100 row h=58 | 11:30 | Ship it on Friday. | 840 ms | chips=[\"AI/Info\"] | copy",
+            "#101 row h=58 | 09:05 | Groq rejected the key (401). |  | chips=[\"Failed/Err\"] | >",
+            "#102 row h=58 | Oct 2, 08:00 | Send the report tomorrow. | 840 ms | chips=[\"Rewritten/Info\"] | copy",
+            "#103 row h=58 | Dec 31, 2025, 23:00 | Happy new year | 840 ms | chips=[] | copy",
             "space 4",
-            "#4 button Clear all [Destructive]",
+            "#4 tools Clear history |  | [\"Clear all\"]",
         ]
         .join("\n");
         assert_eq!(snap, want);
@@ -1140,18 +1140,15 @@ mod tests {
         let want = [
             "note: Oct 2, 2026, 08:00 \u{b7} Outlook",
             "note: Groq \u{b7} whisper-large-v3-turbo \u{b7} 840 ms",
-            "banner[Info]: Rewritten by AI because the dictation ended with the rewrite phrase. The text below is the concise version.",
-            "== Text",
+            "banner[Info]: Rewritten by AI: you ended with the rewrite phrase.",
+            "#1 tools Text |  | [\"Copy text\"]",
             "text: Send the report tomorrow.",
-            "== Before the rewrite",
+            "#3 tools Before the rewrite |  | [\"Copy text before the rewrite\"]",
             "text: send the report tomorrow morning if possible thanks",
-            "== Raw transcript",
+            "#2 tools Raw transcript |  | [\"Copy raw transcript\"]",
             "text: send the report tomorrow morning if possible thanks rewrite this concisely",
-            "space 6",
-            "#1 button Copy text [Primary]",
-            "#2 button Copy raw transcript [Outline]",
-            "#3 button Copy text before the rewrite [Outline]",
-            "#5 button Delete [Destructive]",
+            "---",
+            "#5 tools  |  | [\"Delete\"]",
         ]
         .join("\n");
         assert_eq!(snap, want);
@@ -1178,7 +1175,7 @@ mod tests {
         open(&mut p, &mut cfg);
         let snap = dump(&p.items(&Cx::new(&mut cfg, now())));
         assert!(!snap.contains("Raw transcript") && !snap.contains("Before the rewrite") && !snap.contains("Retry"), "{snap}");
-        assert!(snap.contains("Dec 31, 2025, 23:00") && snap.contains("== Text\ntext: Happy new year"), "{snap}");
+        assert!(snap.contains("Dec 31, 2025, 23:00") && snap.contains("#1 tools Text |  | [\"Copy text\"]\ntext: Happy new year"), "{snap}");
     }
 
     #[test]
@@ -1187,7 +1184,7 @@ mod tests {
         let mut p = detail(5, sample());
         open(&mut p, &mut cfg);
         let snap = dump(&p.items(&Cx::new(&mut cfg, now())));
-        assert!(snap.contains("banner[Info]: Cleaned up by AI.") && snap.contains("== Raw transcript\ntext: uh ship it on friday"), "{snap}");
+        assert!(snap.contains("banner[Info]: Cleaned up by AI.") && snap.contains("tools Raw transcript |  | [\"Copy raw transcript\"]\ntext: uh ship it on friday"), "{snap}");
         assert!(snap.contains("Oct 9, 2026, 11:30 \u{b7} Slack"), "{snap}");
     }
 
@@ -1200,7 +1197,7 @@ mod tests {
         let snap = dump(&p.items(&Cx::new(&mut cfg, now())));
         println!("{snap}");
         assert!(snap.starts_with("banner[Err]: timeout"), "{snap}");
-        assert!(snap.contains("#4 button Retry transcription [Outline]") && !snap.contains("Copy text"), "{snap}");
+        assert!(snap.contains("#4 tools  |  | [\"Retry transcription\", \"Delete\"]") && !snap.contains("Copy text"), "{snap}");
         assert!(snap.contains("note: No transcript was recorded."));
         let fx = p.event(B_RETRY, Event::Pressed, &mut Cx::new(&mut cfg, now()));
         assert_eq!(fx, vec![Effect::Do(PopupAction::Retry), Effect::Toast("Retrying the last dictation".into()), Effect::Back]);

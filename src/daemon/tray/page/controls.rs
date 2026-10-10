@@ -32,6 +32,7 @@ pub struct Painter<'a, 'b> {
 
 impl<'a, 'b> Painter<'a, 'b> {
     pub fn new(cv: Canvas<'a>, th: Theme, text: bool, m: &'b dyn TextMetrics) -> Painter<'a, 'b> {
+        crate::daemon::tray::popup_draw::use_system_icons(text);
         Painter { cv, th, text, m, clip: None }
     }
 

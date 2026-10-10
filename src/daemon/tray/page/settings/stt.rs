@@ -340,7 +340,7 @@ mod tests {
         let mut p = page(&cfg, Fake::default());
         let mut cx = Cx::new(&mut cfg, 0);
         let enabled = |p: &SttPage, cx: &Cx| p.items(cx).iter().find_map(|i| match i {
-            Item::Button { id: ID_TEST, enabled, .. } => Some(*enabled),
+            Item::Tools { id: ID_TEST, tools, .. } => Some(tools[0].enabled),
             _ => None,
         });
         assert_eq!(enabled(&p, &cx), Some(false));

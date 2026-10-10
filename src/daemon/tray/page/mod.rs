@@ -69,6 +69,8 @@ pub type ItemId = u16;
 pub enum Tone {
     Info,
     Warn,
+    /// No page uses it since the saved-key badge became a tools line; the debug gallery does.
+    #[cfg_attr(not(debug_assertions), allow(dead_code))]
     Ok,
     Err,
 }
