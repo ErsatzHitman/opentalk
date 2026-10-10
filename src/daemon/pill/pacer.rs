@@ -189,6 +189,8 @@ impl Vsync {
         // the frame drawn now goes out at the first vblank to come
         let (to_next, period) = self.timing().unwrap_or((0.0, self.period_ms));
         self.period_ms = period;
+        // a display mode change (another refresh rate) is picked up by the next wait
+        self.divisor = vsync_divisor(1000.0 / period);
         Some((to_next, period))
     }
 }

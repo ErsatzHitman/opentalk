@@ -1746,7 +1746,8 @@ mod steady {
         let (f1, s1, p1) = w.with(|i| (i.frames, i.skipped, i.partial));
         let (frames, skipped, partial) = (f1 - f0, s1 - s0, p1 - p0);
         println!("speaking: {frames} frames, {partial} dirty-rect presents, {skipped} skipped");
-        assert!((40..=80).contains(&frames), "~60 fps timer, got {frames}");
+        // 60-75 fps: the timer's 62.5 Hz, or every vblank up to 100 Hz, or every n-th above (pacer)
+        assert!((40..=110).contains(&frames), "60-100 fps cadence, got {frames}");
         assert!(partial >= frames / 2, "most speaking frames are dirty-rect updates ({partial}/{frames})");
         assert!(frames - skipped - partial <= 2, "no full repaints in steady state ({} of {frames})", frames - skipped - partial);
         assert!(w.with(|i| dib_matches_pixmap(i)), "DIB equals the pixmap after dirty-rect uploads");
@@ -1812,6 +1813,46 @@ mod steady {
         let (lane, full) = (cost(false), cost(true));
         println!("present cost: lane update {lane:.3} ms vs full repaint {full:.3} ms");
         assert!(lane < full, "the lane update is the cheaper one");
+    }
+
+    /// The expand and the stop shrink are drawn on a steady beat: the gaps between presented frames stay
+    /// within a refresh or two (no missed vblank runs), whatever the display's rate.
+    #[test]
+    #[ignore]
+    fn desktop_pill_expand_and_shrink_frames_arrive_on_time() {
+        let _serial = crate::daemon::audio::serial_guard();
+        let level = Arc::new(AtomicU32::new(0));
+        let w = make(level.clone());
+        // ms between frames while `f` runs, seen by polling the frame counter every millisecond
+        let gaps = |f: &dyn Fn(), run_ms: u64| -> Vec<f64> {
+            f();
+            let (mut last_count, mut last_t) = (w.with(|i| i.frames), Instant::now());
+            let mut gaps = Vec::new();
+            let t0 = Instant::now();
+            while t0.elapsed() < Duration::from_millis(run_ms) {
+                pump(&level, 1, true);
+                let n = w.with(|i| i.frames);
+                if n != last_count {
+                    gaps.push(last_t.elapsed().as_secs_f64() * 1000.0);
+                    (last_count, last_t) = (n, Instant::now());
+                }
+            }
+            gaps
+        };
+        let report = |what: &str, g: &[f64]| {
+            let mut v = g.to_vec();
+            v.sort_by(|a, b| a.total_cmp(b));
+            let (med, p99, max) = (v[v.len() / 2], v[v.len() * 99 / 100], v[v.len() - 1]);
+            println!("{what}: {} frames, gap median {med:.1} ms, p99 {p99:.1} ms, max {max:.1} ms", g.len());
+            (med, max)
+        };
+        let expand = gaps(&|| w.with(|i| i.set_mode(PillMode::Recording)), 900);
+        let (med, max) = report("expand", &expand);
+        assert!(max < med * 3.0 + 4.0, "a frame of the expand was late: gap {max:.1} ms against a {med:.1} ms beat");
+        pump(&level, 1500, true);
+        let shrink = gaps(&|| w.with(|i| i.set_mode(PillMode::Thinking)), 700);
+        let (med, max) = report("shrink", &shrink);
+        assert!(max < med * 3.0 + 4.0, "a frame of the shrink was late: gap {max:.1} ms against a {med:.1} ms beat");
     }
 
     #[test]
