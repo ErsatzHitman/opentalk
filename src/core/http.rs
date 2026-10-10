@@ -4,12 +4,17 @@
 //! Non-2xx responses are returned as `Ok(HttpResponse)` with the status set — callers classify.
 //! Only transport failures are `Err(HttpError)`.
 use std::io::Read;
-use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 pub const USER_AGENT: &str = concat!("OpenTalk/", env!("CARGO_PKG_VERSION"), " (Windows)");
 
-static AGENT: OnceLock<Result<ureq::Agent, String>> = OnceLock::new();
+/// The schannel-backed agent; set once, on the first successful TLS init. Failures are never
+/// cached here (see [`TlsRetry`]).
+static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+static TLS_RETRY: Mutex<TlsRetry> = Mutex::new(TlsRetry { last_failure: None, logged: false });
+/// Minimum gap between schannel init attempts after a failure.
+const TLS_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 /// Fallback used by [`agent`] when schannel is unavailable: plain HTTP works, HTTPS fails
 /// with a transport error from ureq (no TLS backend configured) instead of panicking.
 static PLAIN_AGENT: OnceLock<ureq::Agent> = OnceLock::new();
@@ -21,25 +26,57 @@ fn builder() -> ureq::AgentBuilder {
         .max_idle_connections_per_host(4)
 }
 
+/// Failure bookkeeping for schannel init: when it last failed and whether that was logged.
+struct TlsRetry {
+    last_failure: Option<Instant>,
+    logged: bool,
+}
+
 /// Shared keep-alive agent over schannel, or `HttpError::Network` if schannel TLS cannot be
-/// created (the failure is logged once, at first use; the message carries no values).
+/// created. Only success is cached: a failure (e.g. schannel not ready early after logon) is
+/// retried on a later call, at most once per 30 s, and only the first failure is logged (the
+/// message carries no values).
 pub fn try_agent() -> Result<&'static ureq::Agent, HttpError> {
-    let slot = AGENT.get_or_init(|| match native_tls::TlsConnector::new() {
-        Ok(tls) => Ok(builder().tls_connector(Arc::new(tls)).build()),
-        Err(e) => {
-            crate::log_err!("schannel TLS unavailable: {e}");
-            Err(tls_unavailable_message())
+    try_agent_in(&AGENT, &TLS_RETRY, Instant::now(), &|| native_tls::TlsConnector::new().map_err(|e| e.to_string()), &|m| {
+        crate::log_err!("schannel TLS unavailable: {m}")
+    })
+}
+
+/// [`try_agent`] with the slot, retry state, clock, connector factory and logger injected.
+fn try_agent_in<'a>(
+    slot: &'a OnceLock<ureq::Agent>,
+    state: &Mutex<TlsRetry>,
+    now: Instant,
+    factory: &dyn Fn() -> Result<native_tls::TlsConnector, String>,
+    log: &dyn Fn(&str),
+) -> Result<&'a ureq::Agent, HttpError> {
+    if let Some(a) = slot.get() {
+        return Ok(a);
+    }
+    let mut st = state.lock().unwrap_or_else(|p| p.into_inner());
+    // Another thread may have initialised it while this one waited for the lock.
+    if let Some(a) = slot.get() {
+        return Ok(a);
+    }
+    if st.last_failure.is_some_and(|t| now.saturating_duration_since(t) < TLS_RETRY_INTERVAL) {
+        return Err(tls_unavailable());
+    }
+    match factory() {
+        Ok(tls) => {
+            st.last_failure = None;
+            Ok(slot.get_or_init(|| builder().tls_connector(Arc::new(tls)).build()))
         }
-    });
-    agent_result(slot)
+        Err(e) => {
+            st.last_failure = Some(now);
+            if !std::mem::replace(&mut st.logged, true) {
+                log(&e);
+            }
+            Err(tls_unavailable())
+        }
+    }
 }
 
-fn tls_unavailable_message() -> String { "TLS (schannel) unavailable".to_string() }
-
-/// Map the cached agent slot to the public result (pure; unit-tested).
-fn agent_result(slot: &'static Result<ureq::Agent, String>) -> Result<&'static ureq::Agent, HttpError> {
-    slot.as_ref().map_err(|m| HttpError::Network(m.clone()))
-}
+fn tls_unavailable() -> HttpError { HttpError::Network("TLS (schannel) unavailable".to_string()) }
 
 /// Shared agent for callers that cannot handle a failure. If schannel is unavailable this
 /// returns a TLS-less agent whose HTTPS requests fail with a transport error (never panics).
@@ -231,10 +268,55 @@ mod tests {
 
     #[test]
     fn agent_failure_maps_to_network_error() {
-        let failed: &'static Result<ureq::Agent, String> = Box::leak(Box::new(Err(tls_unavailable_message())));
-        assert_eq!(agent_result(failed).err(), Some(HttpError::Network("TLS (schannel) unavailable".into())));
-        let ok: &'static Result<ureq::Agent, String> = Box::leak(Box::new(Ok(builder().build())));
-        assert!(agent_result(ok).is_ok());
+        let slot = OnceLock::new();
+        let state = Mutex::new(TlsRetry { last_failure: None, logged: false });
+        let fail = || Err::<native_tls::TlsConnector, String>("boom".into());
+        let err = try_agent_in(&slot, &state, Instant::now(), &fail, &|_| {}).err();
+        assert_eq!(err, Some(HttpError::Network("TLS (schannel) unavailable".into())));
+        assert!(slot.get().is_none(), "failure must not be cached in the agent slot");
+    }
+
+    #[test]
+    fn tls_init_failure_is_retried_rate_limited_and_logged_once() {
+        use std::cell::Cell;
+        let slot = OnceLock::new();
+        let state = Mutex::new(TlsRetry { last_failure: None, logged: false });
+        let (calls, logs, healthy) = (Cell::new(0), Cell::new(0), Cell::new(false));
+        let factory = || {
+            calls.set(calls.get() + 1);
+            if healthy.get() { native_tls::TlsConnector::new().map_err(|e| e.to_string()) } else { Err("early logon".to_string()) }
+        };
+        let log = |_: &str| logs.set(logs.get() + 1);
+        let t0 = Instant::now();
+        assert!(try_agent_in(&slot, &state, t0, &factory, &log).is_err());
+        assert_eq!((calls.get(), logs.get()), (1, 1));
+        // Inside the window: no new attempt, even if schannel has recovered.
+        healthy.set(true);
+        assert!(try_agent_in(&slot, &state, t0 + Duration::from_secs(29), &factory, &log).is_err());
+        assert_eq!(calls.get(), 1);
+        // After the window: retried and cached.
+        assert!(try_agent_in(&slot, &state, t0 + Duration::from_secs(31), &factory, &log).is_ok());
+        assert_eq!(calls.get(), 2);
+        assert!(try_agent_in(&slot, &state, t0 + Duration::from_secs(32), &factory, &log).is_ok());
+        assert_eq!((calls.get(), logs.get()), (2, 1), "success is cached; error logged once");
+    }
+
+    #[test]
+    fn repeated_failures_log_only_the_first() {
+        use std::cell::Cell;
+        let slot = OnceLock::new();
+        let state = Mutex::new(TlsRetry { last_failure: None, logged: false });
+        let (calls, logs) = (Cell::new(0), Cell::new(0));
+        let factory = || {
+            calls.set(calls.get() + 1);
+            Err::<native_tls::TlsConnector, String>("x".into())
+        };
+        let log = |_: &str| logs.set(logs.get() + 1);
+        let t0 = Instant::now();
+        for i in 0..3u64 {
+            assert!(try_agent_in(&slot, &state, t0 + Duration::from_secs(31 * i), &factory, &log).is_err());
+        }
+        assert_eq!((calls.get(), logs.get()), (3, 1));
     }
 
     #[test]
