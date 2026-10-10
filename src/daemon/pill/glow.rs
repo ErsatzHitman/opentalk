@@ -128,7 +128,6 @@ fn gaussian_blur(buf: &mut [f32], w: usize, h: usize, sigma: f32) {
 
 /// Pre-blurred halo and comet for one device scale.
 pub struct Sprites {
-    pub scale: f32,
     pub halo: Pixmap,
     pub comet: Pixmap,
     /// Sprite centre in device px (both sprites share the size).
@@ -136,12 +135,12 @@ pub struct Sprites {
 }
 
 impl Sprites {
-    fn build(scale: f32) -> Sprites {
+    fn build(scale: f32) -> Option<Sprites> {
         let side_logical = GLOW_RADIUS * 2.0 + SPRITE_PAD * 2.0;
-        let side = (side_logical * scale).ceil() as usize;
+        let side = ((side_logical * scale).ceil() as usize).max(1);
         let center = side as f32 * 0.5;
         let r_dev = GLOW_RADIUS * scale;
-        let make = |blur: f32, color: &dyn Fn(f32, f32, f32) -> P| -> Pixmap {
+        let make = |blur: f32, color: &dyn Fn(f32, f32, f32) -> P| -> Option<Pixmap> {
             let mut buf = vec![0.0f32; side * side * 4];
             for y in 0..side {
                 for x in 0..side {
@@ -161,7 +160,7 @@ impl Sprites {
                 }
             }
             gaussian_blur(&mut buf, side, side, blur * scale);
-            let mut pmx = Pixmap::new(side as u32, side as u32).expect("sprite size");
+            let mut pmx = Pixmap::new(side as u32, side as u32)?;
             for (dst, src) in pmx.data_mut().chunks_exact_mut(4).zip(buf.chunks_exact(4)) {
                 let a = src[3].clamp(0.0, 1.0);
                 dst[0] = (src[0].min(a) * 255.0 + 0.5) as u8;
@@ -169,27 +168,28 @@ impl Sprites {
                 dst[2] = (src[2].min(a) * 255.0 + 0.5) as u8;
                 dst[3] = (a * 255.0 + 0.5) as u8;
             }
-            pmx
+            Some(pmx)
         };
-        let halo = make(HALO_BLUR, &|t, _dx, _dy| halo_color(t));
-        let comet = make(COMET_BLUR, &|_t, dx, dy| comet_color(angle_from_top(dx, dy) / 360.0));
-        Sprites { scale, halo, comet, center }
+        let halo = make(HALO_BLUR, &|t, _dx, _dy| halo_color(t))?;
+        let comet = make(COMET_BLUR, &|_t, dx, dy| comet_color(angle_from_top(dx, dy) / 360.0))?;
+        Some(Sprites { halo, comet, center })
     }
 
     /// Cached sprites for `scale` (built once, normally at start-up).
-    pub fn get(scale: f32) -> Arc<Sprites> {
+    /// `None` when no sprite of that size can exist (the glow is then skipped).
+    pub fn get(scale: f32) -> Option<Arc<Sprites>> {
         static C: OnceLock<Mutex<HashMap<u32, Arc<Sprites>>>> = OnceLock::new();
-        let key = (scale * 64.0).round() as u32;
+        let key = (super::model::sane_scale(scale) * 64.0).round() as u32;
         let mut m = C.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap_or_else(|e| e.into_inner());
         if let Some(s) = m.get(&key) {
-            return s.clone();
+            return Some(s.clone());
         }
         if m.len() > 4 {
             m.clear();
         }
-        let s = Arc::new(Sprites::build(key as f32 / 64.0));
+        let s = Arc::new(Sprites::build(key as f32 / 64.0)?);
         m.insert(key, s.clone());
-        s
+        Some(s)
     }
 }
 
@@ -312,8 +312,8 @@ mod tests {
 
     #[test]
     fn sprites_are_blurred_and_cached() {
-        let a = Sprites::get(1.0);
-        let b = Sprites::get(1.0);
+        let a = Sprites::get(1.0).expect("sprites");
+        let b = Sprites::get(1.0).expect("sprites");
         assert!(Arc::ptr_eq(&a, &b));
         // the halo bleeds beyond the unblurred radius
         let c = a.center as u32;

@@ -2,14 +2,17 @@
 //! premultiplied BGRA frame via `UpdateLayeredWindow`; alpha-based hit-testing, hover tracking,
 //! click-vs-drag, the right-click menu, per-monitor DPI and the on-demand 60 fps animation timer.
 
+use super::anim::{QuietRun, SLOW_TICK_MS, TICK_MS, level_band};
 use super::card::CardHover;
 use super::model::{Hit, Pointer, RenderState, TickOutcome};
 use super::raster::DevRect;
-use super::render::{FrameCache, FrameOutcome, pixel_size};
+use super::render::{BAR_EPS, FrameCache, FrameOutcome, pixel_size};
 use super::theme::{Palette, resolve_dark};
 use super::{PillEvent, PillMode, PillOptions};
 use crate::core::config::{PanelPosition, Theme};
 use crate::core::timing::now_ms;
+use crate::daemon::audio::{arm_level_wake, disarm_level_wake};
+use std::sync::atomic::AtomicU64;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -73,59 +76,160 @@ struct SendHandle(isize);
 // SAFETY: Win32 kernel handles may be used from any thread.
 unsafe impl Send for SendHandle {}
 
-/// A thread that owns a high-resolution waitable timer and posts `WM_APP_TICK` at ~62.5 Hz while
-/// started; while stopped it blocks on an event (zero CPU).
+fn handle(raw: isize) -> HANDLE {
+    HANDLE(raw as *mut core::ffi::c_void)
+}
+
+/// State shared by the window, the timer thread and the capture-side wake callback. The event
+/// handles are closed when the last reference goes, so a late wake can never signal a closed handle.
+struct TimerCore {
+    start_evt: isize,
+    stop_evt: isize,
+    quit_evt: isize,
+    /// Signalled whenever `slow` flips; the thread re-arms its timer to match.
+    rate_evt: isize,
+    active: AtomicBool,
+    /// The recording is visually static: tick at `SLOW_TICK_MS` instead of `TICK_MS`.
+    slow: AtomicBool,
+    /// Something asked for full rate since the window last looked (it then restarts its quiet count).
+    woken: AtomicBool,
+    /// Token of the capture-side level wake armed for the current slow spell (0: none).
+    wake_token: AtomicU64,
+}
+
+impl TimerCore {
+    fn signal(evt: isize) {
+        // SAFETY: `evt` is an event handle owned by this core and still open (closed only in `drop`).
+        unsafe {
+            let _ = SetEvent(handle(evt));
+        }
+    }
+
+    /// Back to the full-rate cadence; the timer thread posts a tick right away. Idempotent and cheap
+    /// (two atomic operations) when already at full rate.
+    fn wake(&self) {
+        self.woken.store(true, Ordering::Release);
+        if self.slow.swap(false, Ordering::AcqRel) {
+            let token = self.wake_token.swap(0, Ordering::AcqRel);
+            if token != 0 {
+                disarm_level_wake(token);
+            }
+            Self::signal(self.rate_evt);
+        }
+    }
+}
+
+impl Drop for TimerCore {
+    fn drop(&mut self) {
+        // SAFETY: the last owner closes the handles; the timer thread (an owner) has exited.
+        unsafe {
+            for h in [self.start_evt, self.stop_evt, self.quit_evt, self.rate_evt] {
+                let _ = CloseHandle(handle(h));
+            }
+        }
+    }
+}
+
+/// A thread that owns a high-resolution waitable timer and calls its sink at ~62.5 Hz while started
+/// (window: it posts `WM_APP_TICK`); while stopped it blocks on an event (zero CPU). A static
+/// recording asks for the slow cadence (~15 Hz) and is brought back to full rate within one frame by
+/// [`AnimTimer::wake`] - from the capture thread when the level changes, or from the window.
 pub struct AnimTimer {
-    start_evt: HANDLE,
-    stop_evt: HANDLE,
-    quit_evt: HANDLE,
-    active: Arc<AtomicBool>,
+    core: Arc<TimerCore>,
+    /// Set while a tick message is queued; the window clears it when it consumes one.
     pending: Arc<AtomicBool>,
     join: Option<std::thread::JoinHandle<()>>,
 }
 
 impl AnimTimer {
+    /// Timer that posts `WM_APP_TICK` to `hwnd` (coalescing ticks the window has not consumed yet).
     pub fn new(hwnd: HWND) -> Result<AnimTimer, String> {
-        // SAFETY: plain event creation.
-        let (start_evt, stop_evt, quit_evt) = unsafe {
-            (
-                CreateEventW(None, false, false, None).map_err(|e| e.to_string())?,
-                CreateEventW(None, false, false, None).map_err(|e| e.to_string())?,
-                CreateEventW(None, false, false, None).map_err(|e| e.to_string())?,
-            )
-        };
         let pending = Arc::new(AtomicBool::new(false));
-        let (h, s, st, q) = (SendHandle(hwnd.0 as isize), SendHandle(start_evt.0 as isize), SendHandle(stop_evt.0 as isize), SendHandle(quit_evt.0 as isize));
-        let p = pending.clone();
-        let active = Arc::new(AtomicBool::new(false));
-        let a = active.clone();
-        let join = std::thread::Builder::new()
-            .name("pill-anim".into())
-            .spawn(move || anim_thread(h, s, st, q, p, a))
-            .map_err(|e| e.to_string())?;
-        Ok(AnimTimer { start_evt, stop_evt, quit_evt, active, pending, join: Some(join) })
+        let (h, p) = (SendHandle(hwnd.0 as isize), pending.clone());
+        let sink = move || {
+            if !p.swap(true, Ordering::AcqRel) {
+                let hwnd = HWND(h.0 as *mut core::ffi::c_void);
+                // SAFETY: posting to a window handle is safe from any thread; a stale handle just fails.
+                unsafe {
+                    let _ = PostMessageW(Some(hwnd), WM_APP_TICK, WPARAM(0), LPARAM(0));
+                }
+            }
+        };
+        Self::with_sink(Box::new(sink), pending)
     }
 
+    /// Timer that calls `sink` on every tick (from the timer thread). `pending` is only what
+    /// [`AnimTimer::ack`] clears.
+    fn with_sink(sink: Box<dyn Fn() + Send>, pending: Arc<AtomicBool>) -> Result<AnimTimer, String> {
+        let event = || -> Result<isize, String> {
+            // SAFETY: plain auto-reset event creation.
+            unsafe { CreateEventW(None, false, false, None) }.map(|h| h.0 as isize).map_err(|e| e.to_string())
+        };
+        let core = Arc::new(TimerCore {
+            start_evt: event()?,
+            stop_evt: event()?,
+            quit_evt: event()?,
+            rate_evt: event()?,
+            active: AtomicBool::new(false),
+            slow: AtomicBool::new(false),
+            woken: AtomicBool::new(false),
+            wake_token: AtomicU64::new(0),
+        });
+        let c = core.clone();
+        let join = std::thread::Builder::new().name("pill-anim".into()).spawn(move || anim_thread(c, sink)).map_err(|e| e.to_string())?;
+        Ok(AnimTimer { core, pending, join: Some(join) })
+    }
+
+    /// Run at full rate (also wakes a slowed timer).
     pub fn start(&self) {
-        if !self.active.swap(true, Ordering::AcqRel) {
-            // SAFETY: valid event handle owned by self.
-            unsafe {
-                let _ = SetEvent(self.start_evt);
-            }
+        self.core.wake();
+        if !self.core.active.swap(true, Ordering::AcqRel) {
+            TimerCore::signal(self.core.start_evt);
         }
     }
 
     pub fn stop(&self) {
-        if self.active.swap(false, Ordering::AcqRel) {
-            // SAFETY: valid event handle owned by self.
-            unsafe {
-                let _ = SetEvent(self.stop_evt);
-            }
+        self.core.wake();
+        if self.core.active.swap(false, Ordering::AcqRel) {
+            TimerCore::signal(self.core.stop_evt);
         }
     }
 
+    #[cfg(test)]
     pub fn is_active(&self) -> bool {
-        self.active.load(Ordering::Acquire)
+        self.core.active.load(Ordering::Acquire)
+    }
+
+    pub fn is_slow(&self) -> bool {
+        self.core.slow.load(Ordering::Acquire)
+    }
+
+    /// Switch to the slow cadence. Nothing brings the timer back unless the caller arranges a
+    /// [`AnimTimer::wake`] (see `Inner::go_slow`).
+    fn slow_down(&self) {
+        if !self.core.slow.swap(true, Ordering::AcqRel) {
+            TimerCore::signal(self.core.rate_evt);
+        }
+    }
+
+    /// Back to full rate; the first tick is posted at once.
+    pub fn wake(&self) {
+        self.core.wake();
+    }
+
+    /// Ask the capture thread to wake this timer once the mic level leaves `lo..=hi`.
+    fn wake_on_level_outside(&self, lo: f32, hi: f32) {
+        let core = self.core.clone();
+        let token = arm_level_wake(lo, hi, Box::new(move || core.wake()));
+        let old = self.core.wake_token.swap(token, Ordering::AcqRel);
+        if old != 0 {
+            disarm_level_wake(old);
+        }
+    }
+
+    /// Whether anything asked for full rate since the last call (clears the flag).
+    pub fn take_woken(&self) -> bool {
+        self.core.woken.swap(false, Ordering::AcqRel)
     }
 
     /// Called by the window procedure when it consumed a tick.
@@ -136,29 +240,30 @@ impl AnimTimer {
 
 impl Drop for AnimTimer {
     fn drop(&mut self) {
-        // SAFETY: handles are valid until closed below, after the thread exited.
-        unsafe {
-            let _ = SetEvent(self.quit_evt);
+        let token = self.core.wake_token.swap(0, Ordering::AcqRel);
+        if token != 0 {
+            disarm_level_wake(token);
         }
+        TimerCore::signal(self.core.quit_evt);
         if let Some(j) = self.join.take() {
             let _ = j.join();
-        }
-        unsafe {
-            let _ = CloseHandle(self.start_evt);
-            let _ = CloseHandle(self.stop_evt);
-            let _ = CloseHandle(self.quit_evt);
         }
     }
 }
 
-fn anim_thread(hwnd: SendHandle, start: SendHandle, stop: SendHandle, quit: SendHandle, pending: Arc<AtomicBool>, active: Arc<AtomicBool>) {
-    let hwnd = HWND(hwnd.0 as *mut core::ffi::c_void);
-    let (start, stop, quit) = (HANDLE(start.0 as *mut core::ffi::c_void), HANDLE(stop.0 as *mut core::ffi::c_void), HANDLE(quit.0 as *mut core::ffi::c_void));
-    // SAFETY: handles stay valid until `AnimTimer::drop` joins this thread.
+fn anim_thread(core: Arc<TimerCore>, sink: Box<dyn Fn() + Send>) {
+    let (start, stop, quit, rate) = (handle(core.start_evt), handle(core.stop_evt), handle(core.quit_evt), handle(core.rate_evt));
+    // SAFETY: the handles stay open while `core` is alive, and this thread holds a reference.
     unsafe {
         let timer = CreateWaitableTimerExW(None, PCWSTR::null(), CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS.0)
             .or_else(|_| CreateWaitableTimerExW(None, PCWSTR::null(), Default::default(), TIMER_ALL_ACCESS.0));
         let Ok(timer) = timer else { return };
+        // first tick one period from now, then periodic
+        let arm = |slow: bool| {
+            let ms = if slow { SLOW_TICK_MS } else { TICK_MS };
+            let due = -(ms as i64) * 10_000;
+            SetWaitableTimer(timer, &due, ms as i32, None, None, false).is_ok()
+        };
         loop {
             let r = WaitForMultipleObjects(&[start, quit], false, INFINITE);
             if r.0 != WAIT_OBJECT_0.0 {
@@ -166,31 +271,42 @@ fn anim_thread(hwnd: SendHandle, start: SendHandle, stop: SendHandle, quit: Send
             }
             // Auto-reset events coalesce: a start/stop/start burst leaves a stale start signal, so
             // the shared flag, not the event, decides whether to run.
-            if !active.load(Ordering::Acquire) {
+            if !core.active.load(Ordering::Acquire) {
                 continue;
             }
-            let due: i64 = -160_000; // 16 ms, relative
-            if SetWaitableTimer(timer, &due, 16, None, None, false).is_err() {
+            let mut slow = core.slow.load(Ordering::Acquire);
+            if !arm(slow) {
                 continue;
             }
             loop {
-                let r = WaitForMultipleObjects(&[timer, stop, quit], false, INFINITE);
+                let r = WaitForMultipleObjects(&[timer, stop, quit, rate], false, INFINITE);
                 match r.0.wrapping_sub(WAIT_OBJECT_0.0) {
-                    0 => {
-                        if !pending.swap(true, Ordering::AcqRel) {
-                            let _ = PostMessageW(Some(hwnd), WM_APP_TICK, WPARAM(0), LPARAM(0));
-                        }
-                    }
+                    0 => sink(),
                     1 => {
                         let _ = CancelWaitableTimer(timer);
                         // stop followed by start before this thread ran: keep going
-                        if active.load(Ordering::Acquire) {
-                            let due: i64 = -160_000;
-                            if SetWaitableTimer(timer, &due, 16, None, None, false).is_ok() {
+                        if core.active.load(Ordering::Acquire) {
+                            slow = core.slow.load(Ordering::Acquire);
+                            if arm(slow) {
                                 continue;
                             }
                         }
                         break;
+                    }
+                    3 => {
+                        // the cadence flipped (events coalesce, so compare with what is armed)
+                        let want = core.slow.load(Ordering::Acquire);
+                        if want != slow {
+                            slow = want;
+                            if arm(slow) {
+                                if !slow {
+                                    // woken: the first full-rate frame must not wait a period
+                                    sink();
+                                }
+                            } else {
+                                let _ = CancelWaitableTimer(timer);
+                            }
+                        }
                     }
                     _ => {
                         let _ = CancelWaitableTimer(timer);
@@ -318,6 +434,8 @@ pub(super) struct Inner {
     pub skipped: u64,
     /// Frames that updated only part of the window (the dirty rect).
     pub partial: u64,
+    /// Consecutive recording frames that changed nothing; a long run slows the animation timer.
+    quiet: QuietRun,
 }
 
 /// What the window procedure asks the outer layer to do after the borrow is released.
@@ -425,6 +543,7 @@ impl Inner {
                 self.visible = false;
             }
             self.cache.reset();
+            self.quiet.reset();
             return;
         }
         self.ensure_buffers();
@@ -436,8 +555,14 @@ impl Inner {
         let FrameOutcome::Dirty(dirty) = outcome else {
             // the pixmap and the DIB already show this frame
             self.skipped += 1;
+            self.quiet.frame(true);
             return;
         };
+        // something moved: no slow cadence until the picture is static again
+        self.quiet.frame(false);
+        if let Some(timer) = &self.timer {
+            timer.wake();
+        }
         let Some(dib) = self.dib.as_mut() else {
             self.cache.reset();
             return;
@@ -484,8 +609,29 @@ impl Inner {
         let t = self.now();
         if let Some(timer) = &self.timer {
             if self.st.is_animating(t) {
+                // an outside change (mode, pointer, options) always gets full rate
+                self.quiet.reset();
                 timer.start();
             }
+        }
+    }
+
+    /// The recording is visually static: tick slowly and ask the capture thread to wake the timer
+    /// as soon as the mic level leaves the band that would change a bar. Nothing polls.
+    fn go_slow(&mut self) {
+        let Some(timer) = &self.timer else { return };
+        if timer.is_slow() || timer.take_woken() {
+            return;
+        }
+        let baseline = f32::from_bits(self.level.load(Ordering::Relaxed));
+        let (lo, hi) = level_band(baseline, BAR_EPS);
+        // Order matters: flag first, then arm, then re-check, so a rise at any point in between is
+        // either announced by the capture thread or caught here.
+        timer.slow_down();
+        timer.wake_on_level_outside(lo, hi);
+        let now_level = f32::from_bits(self.level.load(Ordering::Relaxed));
+        if now_level < lo || now_level > hi {
+            timer.wake();
         }
     }
 
@@ -679,6 +825,9 @@ impl Inner {
             WM_APP_TICK => {
                 if let Some(t) = &self.timer {
                     t.ack();
+                    if t.take_woken() {
+                        self.quiet.reset();
+                    }
                 }
                 let now = self.now();
                 let rms = f32::from_bits(self.level.load(Ordering::Relaxed));
@@ -696,6 +845,8 @@ impl Inner {
                     if let Some(t) = &self.timer {
                         t.stop();
                     }
+                } else if self.quiet.is_quiet() && self.st.mode() == PillMode::Recording {
+                    self.go_slow();
                 }
                 out.result = Some(LRESULT(0));
             }
@@ -869,6 +1020,7 @@ impl Window {
                 frames: 0,
                 skipped: 0,
                 partial: 0,
+                quiet: QuietRun::default(),
             };
             let rc = Rc::new(RefCell::new(inner));
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, Rc::into_raw(rc.clone()) as isize);
@@ -887,6 +1039,7 @@ impl Window {
         f(&mut i)
     }
 
+    #[cfg(test)]
     pub fn hwnd(&self) -> isize {
         self.inner.borrow().hwnd.0 as isize
     }
@@ -944,9 +1097,6 @@ impl Inner {
         self.relayout();
     }
 
-    pub fn mode(&self) -> PillMode {
-        self.st.mode()
-    }
 }
 
 impl Drop for Window {
@@ -990,6 +1140,105 @@ mod tests {
         assert_eq!(place_window(work, win, PanelPosition::BottomLeft, 1.5), (-2560 + 6, 1400 - 6 - 180));
     }
 
+    /// Timer whose ticks are only recorded (no window involved).
+    fn recording_timer() -> (AnimTimer, Arc<std::sync::Mutex<Vec<std::time::Instant>>>) {
+        let stamps = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let s = stamps.clone();
+        let sink = move || s.lock().unwrap_or_else(|e| e.into_inner()).push(std::time::Instant::now());
+        (AnimTimer::with_sink(Box::new(sink), Arc::new(AtomicBool::new(false))).expect("timer"), stamps)
+    }
+
+    fn tick_count(stamps: &std::sync::Mutex<Vec<std::time::Instant>>) -> usize {
+        stamps.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
+    /// Wait (spinning, no sleep granularity) until a tick after `before` arrives; its time since `t0`.
+    fn first_tick_after(stamps: &std::sync::Mutex<Vec<std::time::Instant>>, before: usize, t0: std::time::Instant) -> Option<std::time::Duration> {
+        while t0.elapsed() < std::time::Duration::from_millis(250) {
+            if let Some(at) = stamps.lock().unwrap_or_else(|e| e.into_inner()).get(before) {
+                return Some(at.saturating_duration_since(t0));
+            }
+            std::thread::yield_now();
+        }
+        None
+    }
+
+    #[test]
+    fn slow_cadence_wakes_the_thread_under_20_times_a_second() {
+        use std::time::Duration;
+        let (timer, stamps) = recording_timer();
+        timer.start();
+        std::thread::sleep(Duration::from_millis(250));
+        let fast = tick_count(&stamps);
+        assert!(fast >= 6, "full rate ticks ~62 Hz, got {fast} in 250 ms");
+        timer.slow_down();
+        assert!(timer.is_slow());
+        std::thread::sleep(Duration::from_millis(150)); // the thread re-arms; a tick already due may still land
+        let n0 = tick_count(&stamps);
+        std::thread::sleep(Duration::from_millis(1000));
+        let slow = tick_count(&stamps) - n0;
+        assert!((8..20).contains(&slow), "{slow} timer wakeups in one silent second");
+        timer.stop();
+        std::thread::sleep(Duration::from_millis(50));
+        let n1 = tick_count(&stamps);
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(tick_count(&stamps), n1, "a stopped timer is silent");
+    }
+
+    #[test]
+    fn wake_brings_back_a_full_rate_tick_within_one_frame() {
+        use std::time::{Duration, Instant};
+        let (timer, stamps) = recording_timer();
+        timer.start();
+        timer.slow_down();
+        let mut lat = Vec::new();
+        for _ in 0..9 {
+            std::thread::sleep(Duration::from_millis(100)); // settled in slow mode, off any tick boundary
+            let before = tick_count(&stamps);
+            let t0 = Instant::now();
+            timer.wake();
+            lat.push(first_tick_after(&stamps, before, t0).expect("a tick after the wake"));
+            assert!(!timer.is_slow());
+            assert!(timer.take_woken());
+            timer.slow_down();
+        }
+        lat.sort();
+        let median = lat[lat.len() / 2];
+        assert!(median <= Duration::from_millis(17), "median wake-to-tick {median:?} (all: {lat:?})");
+        // and the cadence after a wake is the full one again
+        timer.wake();
+        std::thread::sleep(Duration::from_millis(100));
+        let n0 = tick_count(&stamps);
+        std::thread::sleep(Duration::from_millis(320));
+        let n = tick_count(&stamps) - n0;
+        assert!(n >= 12, "full rate after a wake: {n} ticks in 320 ms");
+    }
+
+    /// The capture side signals the timer: a level outside the armed band wakes it, no polling.
+    #[test]
+    fn capture_level_change_wakes_a_slow_timer() {
+        use crate::daemon::audio::{publish_level, serial_guard};
+        use std::time::{Duration, Instant};
+        let _serial = serial_guard();
+        let level = AtomicU32::new(0);
+        let (timer, stamps) = recording_timer();
+        timer.start();
+        timer.slow_down();
+        let (lo, hi) = level_band(0.0, BAR_EPS);
+        timer.wake_on_level_outside(lo, hi);
+        std::thread::sleep(Duration::from_millis(150));
+        // inside the band (digital silence): the timer stays slow
+        publish_level(&level, 0.0);
+        assert!(timer.is_slow());
+        let before = tick_count(&stamps);
+        let t0 = Instant::now();
+        publish_level(&level, 0.05);
+        let lat = first_tick_after(&stamps, before, t0).expect("a tick after the level rise");
+        assert!(lat <= Duration::from_millis(40), "level rise to tick: {lat:?}");
+        assert!(!timer.is_slow());
+        assert!(timer.take_woken());
+    }
+
     #[test]
     fn pill_sits_16px_from_work_area_edge() {
         // window margin 4 + group inset 12 = 16 logical px from the work-area corner
@@ -1015,7 +1264,8 @@ mod steady {
         let t0 = Instant::now();
         while t0.elapsed() < Duration::from_millis(ms) {
             let rms = if speaking { 0.02 + 0.2 * ((t0.elapsed().as_secs_f32() * 7.3).sin().abs()) } else { 0.0 };
-            level.store(rms.to_bits(), Ordering::Relaxed);
+            // what the capture thread does with each packet (store the level, wake a slowed timer)
+            crate::daemon::audio::publish_level(level, rms);
             // SAFETY: standard message pump on the creating thread.
             unsafe {
                 let mut msg = MSG::default();
@@ -1045,6 +1295,7 @@ mod steady {
     #[test]
     #[ignore]
     fn desktop_pill_steady_recording_presents_only_the_dirty_lane() {
+        let _serial = crate::daemon::audio::serial_guard();
         let level = Arc::new(AtomicU32::new(0));
         let w = make(level.clone());
         w.with(|i| i.set_mode(PillMode::Recording));
@@ -1059,16 +1310,41 @@ mod steady {
         assert!(frames - skipped - partial <= 2, "no full repaints in steady state ({} of {frames})", frames - skipped - partial);
         assert!(w.with(|i| dib_matches_pixmap(i)), "DIB equals the pixmap after dirty-rect uploads");
 
-        // silence: the bars settle at 4 px and every later tick is skipped
+        // silence: the bars settle at 4 px, every later tick is skipped and the timer slows down
         pump(&level, 1300, false); // the 11-sample history (880 ms) flushes out
+        assert!(w.with(|i| i.timer.as_ref().is_some_and(|t| t.is_slow())), "a silent recording runs the slow cadence");
         let (f2, s2, p2) = w.with(|i| (i.frames, i.skipped, i.partial));
-        pump(&level, 600, false);
+        pump(&level, 1000, false);
         let (f3, s3, p3) = w.with(|i| (i.frames, i.skipped, i.partial));
-        println!("silent: {} frames, {} dirty, {} skipped", f3 - f2, p3 - p2, s3 - s2);
-        assert!(f3 - f2 > 30);
+        println!("silent: {} frames/s, {} dirty, {} skipped", f3 - f2, p3 - p2, s3 - s2);
+        assert!(f3 - f2 < 20, "under 20 timer wakeups in a silent second, got {}", f3 - f2);
         assert_eq!(p3 - p2, 0, "silence presents nothing");
         assert_eq!(s3 - s2, f3 - f2, "every silent tick is skipped");
         assert!(w.with(|i| dib_matches_pixmap(i)));
+
+        // speech starts: the capture side wakes the timer and the next tick is a full-rate one
+        let frames_before = w.with(|i| i.frames);
+        let t_rise = Instant::now();
+        crate::daemon::audio::publish_level(&level, 0.2);
+        let mut first_frame = None;
+        while t_rise.elapsed() < Duration::from_millis(200) {
+            // SAFETY: standard message pump on the creating thread.
+            unsafe {
+                let mut msg = MSG::default();
+                while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                    let _ = TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
+            if w.with(|i| i.frames) > frames_before {
+                first_frame = Some(t_rise.elapsed());
+                break;
+            }
+        }
+        let first_frame = first_frame.expect("a frame after the level rise");
+        println!("level rise to first frame: {first_frame:?}");
+        assert!(first_frame <= Duration::from_millis(17), "first full-rate tick {first_frame:?} after the rise");
+        assert!(w.with(|i| i.timer.as_ref().is_some_and(|t| !t.is_slow())), "full rate again");
 
         // cost of one lane present vs a forced full repaint, timed around `present()` alone: stop the
         // timer thread's ticks from interfering by pumping nothing while a bar eases

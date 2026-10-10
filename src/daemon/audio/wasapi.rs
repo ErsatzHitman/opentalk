@@ -99,7 +99,11 @@ fn in_mta() -> bool {
     COM.with(|g| g.uninit)
 }
 
-struct SendEnum(IMMDeviceEnumerator, #[allow(dead_code)] IMMNotificationClient);
+/// The cached enumerator plus the registered notifier it calls (held only to keep it alive).
+struct SendEnum {
+    enumerator: IMMDeviceEnumerator,
+    _notifier: IMMNotificationClient,
+}
 // SAFETY: MMDeviceEnumerator is registered with ThreadingModel "Both"; the in-process object
 // is callable from any apartment without marshalling. The notifier is a plain Rust object.
 unsafe impl Send for SendEnum {}
@@ -150,7 +154,7 @@ fn enumerator() -> Result<IMMDeviceEnumerator, String> {
     }
     let mut slot = ENUMERATOR.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(e) = slot.as_ref() {
-        return Ok(e.0.clone());
+        return Ok(e.enumerator.clone());
     }
     let e = create_enumerator()?;
     let notifier: IMMNotificationClient = Notifier.into();
@@ -158,7 +162,7 @@ fn enumerator() -> Result<IMMDeviceEnumerator, String> {
     if let Err(err) = unsafe { e.RegisterEndpointNotificationCallback(&notifier) } {
         log_warn!("audio: cannot watch for device changes: {err}");
     }
-    *slot = Some(SendEnum(e.clone(), notifier));
+    *slot = Some(SendEnum { enumerator: e.clone(), _notifier: notifier });
     Ok(e)
 }
 
@@ -645,6 +649,7 @@ pub(crate) fn thread_cycles() -> u64 {
 }
 
 /// Cycles per millisecond on this CPU right now, from a 3 ms busy loop on the calling thread.
+#[cfg(test)]
 pub(crate) fn cycles_per_ms() -> f64 {
     let (c0, t0) = (thread_cycles(), Instant::now());
     while t0.elapsed() < std::time::Duration::from_millis(3) {

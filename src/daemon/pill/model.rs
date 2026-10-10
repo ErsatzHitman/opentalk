@@ -15,8 +15,6 @@ pub const WIN_W: f32 = 208.0;
 pub const WIN_H: f32 = 120.0;
 /// Distance of the pill group from the window's docked edge/bottom.
 pub const DOCK: f32 = 12.0;
-/// Window margin to the work area.
-pub const WORK_MARGIN: f32 = 4.0;
 pub const IDLE_SIZE: (f32, f32) = (40.0, 40.0);
 pub const REC_SIZE: (f32, f32) = (98.0, 36.0);
 pub const CANCEL_SIZE: f32 = 28.0;
@@ -133,23 +131,26 @@ impl AppBubble {
             d[3] = s[3];
         }
         let src = Arc::new(src);
-        let icon = Arc::new(resample(&src, (ICON_PX * scale).round().max(1.0) as u32));
+        let icon = Arc::new(resample(&src, (ICON_PX * scale).round().max(1.0) as u32)?);
         Some(AppBubble { name: name.to_string(), src, icon })
     }
 
     /// Re-prepare for a new device scale.
     pub fn rescale(&self, scale: f32) -> AppBubble {
-        AppBubble { name: self.name.clone(), src: self.src.clone(), icon: Arc::new(resample(&self.src, (ICON_PX * scale).round().max(1.0) as u32)) }
+        // an unrepresentable size keeps the icon prepared for the previous scale
+        let icon = resample(&self.src, (ICON_PX * scale).round().max(1.0) as u32).map(Arc::new).unwrap_or_else(|| self.icon.clone());
+        AppBubble { name: self.name.clone(), src: self.src.clone(), icon }
     }
 }
 
 /// Area-average (box) resample of a square premultiplied pixmap.
-pub fn resample(src: &Pixmap, out: u32) -> Pixmap {
+pub fn resample(src: &Pixmap, out: u32) -> Option<Pixmap> {
     let n = src.width();
-    let mut dst = Pixmap::new(out, out).expect("icon size");
+    let out = out.max(1);
+    let mut dst = Pixmap::new(out, out)?;
     if n == out {
         dst.data_mut().copy_from_slice(src.data());
-        return dst;
+        return Some(dst);
     }
     let ratio = n as f32 / out as f32;
     let sd = src.data();
@@ -197,7 +198,13 @@ pub fn resample(src: &Pixmap, out: u32) -> Pixmap {
             }
         }
     }
-    dst
+    Some(dst)
+}
+
+/// A usable device scale: real DPI scales are 0.5..8, so anything outside 0.25..16 (or not finite) is a
+/// failed monitor query and must not size a pixmap to zero or to gigabytes.
+pub fn sane_scale(scale: f32) -> f32 {
+    if scale.is_finite() { scale.clamp(0.25, 16.0) } else { 1.0 }
 }
 
 /// Pointer state derived from hit-testing.
@@ -220,7 +227,6 @@ pub enum Hit {
     Gap,
     Bubble,
     ErrorCard,
-    ErrorClose,
     ErrorRetry,
 }
 
@@ -260,7 +266,6 @@ pub struct RenderState {
     pub hotkey_label: String,
     pub show_app_bubble: bool,
     pub(crate) mode: PillMode,
-    pub(crate) mode_since: f64,
     pub(crate) pointer: Pointer,
     pub(crate) look: Look,
     pub(crate) compact: Track,
@@ -294,13 +299,12 @@ impl RenderState {
     pub fn new(pal: Palette, scale: f32, position: PanelPosition) -> RenderState {
         let look = Look::Idle;
         RenderState {
-            scale,
+            scale: sane_scale(scale),
             pal,
             position,
             hotkey_label: String::new(),
             show_app_bubble: true,
             mode: PillMode::Idle,
-            mode_since: 0.0,
             pointer: Pointer::default(),
             look,
             compact: Track::new(0.0),
@@ -326,9 +330,6 @@ impl RenderState {
 
     pub fn mode(&self) -> PillMode {
         self.mode
-    }
-    pub fn mode_since(&self) -> f64 {
-        self.mode_since
     }
     pub fn pointer(&self) -> Pointer {
         self.pointer
@@ -359,6 +360,7 @@ impl RenderState {
 
     /// DPI change: re-prepare the icon.
     pub fn set_scale(&mut self, scale: f32) {
+        let scale = sane_scale(scale);
         if (self.scale - scale).abs() > f32::EPSILON {
             self.scale = scale;
             if let Some(a) = &self.app {
@@ -508,7 +510,6 @@ impl RenderState {
         }
         let prev = self.mode;
         self.mode = mode;
-        self.mode_since = now;
         if matches!(mode, PillMode::Preparing | PillMode::Recording) {
             // starting a new dictation dismisses a lingering error
             if let Some(e) = self.error.as_mut() {
@@ -547,11 +548,6 @@ impl RenderState {
     pub fn set_app(&mut self, app: Option<AppBubble>, now: f64) {
         self.app = app;
         self.sync(now, false);
-    }
-
-    /// Hide-at-rest request so the window layer knows whether anything is visible.
-    pub fn bubble_visible(&self, t: f64) -> bool {
-        self.app.is_some() && self.bubble.value(t) > 0.01
     }
 
     // --- layout --------------------------------------------------------------------------

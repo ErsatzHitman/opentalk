@@ -3,7 +3,7 @@
 //! The static part (shadow, surface, text, button) is drawn once into a cached layer; each frame only
 //! adds the countdown stroke and composites with the 200 ms entrance/exit.
 
-use super::anim::{LINEAR, TW_EASE_OUT};
+use super::anim::TW_EASE_OUT;
 use super::model::Hit;
 use super::raster::{Canvas, Rect, cov, sd_capsule, sd_round_box};
 use super::text::{self, Font, LEADING_SNUG};
@@ -73,7 +73,6 @@ pub struct ErrorCard {
     paused_at: Option<f64>,
     paused_ms: f64,
     exit_at: Option<f64>,
-    silent: bool,
     pub hover: CardHover,
     layout_cache: Mutex<Option<(u32, Arc<CardLayout>)>>,
 }
@@ -89,14 +88,9 @@ impl ErrorCard {
             paused_at: None,
             paused_ms: 0.0,
             exit_at: None,
-            silent: false,
             hover: CardHover::None,
             layout_cache: Mutex::new(None),
         }
-    }
-
-    pub fn duration_ms(&self) -> f64 {
-        self.duration
     }
 
     /// Milliseconds of countdown consumed (pauses excluded).
@@ -131,31 +125,18 @@ impl ErrorCard {
     pub fn dismiss_now(&mut self, now: f64) {
         if self.exit_at.is_none() {
             self.exit_at = Some(now);
-            self.silent = true;
         }
     }
 
-    /// Start the exit fade; the owner is informed through `update`.
-    pub fn begin_exit(&mut self, now: f64) {
-        if self.exit_at.is_none() {
-            self.exit_at = Some(now);
-            self.silent = false;
-        }
-    }
-
+    #[cfg(test)]
     pub fn is_exiting(&self) -> bool {
         self.exit_at.is_some()
-    }
-
-    pub fn exit_is_silent(&self) -> bool {
-        self.silent
     }
 
     /// Advance the timer. Returns `true` exactly once when the countdown ran out.
     pub fn update(&mut self, now: f64) -> bool {
         if self.exit_at.is_none() && self.paused_at.is_none() && self.elapsed(now) >= self.duration {
             self.exit_at = Some(now);
-            self.silent = false;
             return true;
         }
         false
@@ -309,11 +290,12 @@ fn clamp_lines(mut lines: Vec<String>, max: usize) -> Vec<String> {
 }
 
 /// Static layer: shadow, surface, border, text and the button.
-pub fn draw_base(card: &ErrorCard, scale: f32, pal: &Palette) -> Pixmap {
+/// `None` when the layer's size is not representable (degenerate scale).
+pub fn draw_base(card: &ErrorCard, scale: f32, pal: &Palette) -> Option<Pixmap> {
     let l = card.layout(scale);
     let w = (l.win_w * scale).ceil() as u32;
     let h = (l.win_h * scale).ceil() as u32;
-    let mut pm = Pixmap::new(w.max(1), h.max(1)).expect("card layer");
+    let mut pm = Pixmap::new(w.max(1), h.max(1))?;
     {
         let mut cv = Canvas::new(&mut pm, scale);
         let r = l.card;
@@ -350,7 +332,7 @@ pub fn draw_base(card: &ErrorCard, scale: f32, pal: &Palette) -> Pixmap {
             draw_retry_icon(&mut cv, icon, scale, fg);
         }
     }
-    pm
+    Some(pm)
 }
 
 /// Nucleo `Redo2Outline18` arrow at `rect`, stroke 1.5 in 18-units.
@@ -436,11 +418,6 @@ pub fn draw_countdown(pm: &mut Pixmap, layout: &CardLayout, scale: f32, color: R
     pm.stroke_path(&path, &paint, &stroke, tf, None);
 }
 
-/// Cached composition of base layer + countdown for one frame (owner composites with `presence`).
-pub struct CardFrame {
-    pub layer: Pixmap,
-}
-
 static BASE_CACHE: Mutex<Option<(BaseKey, Arc<Pixmap>)>> = Mutex::new(None);
 
 #[derive(PartialEq, Eq, Clone)]
@@ -454,7 +431,7 @@ struct BaseKey {
 }
 
 /// Static layer, cached across frames.
-pub fn base_layer(card: &ErrorCard, scale: f32, pal: &Palette) -> Arc<Pixmap> {
+pub fn base_layer(card: &ErrorCard, scale: f32, pal: &Palette) -> Option<Arc<Pixmap>> {
     let key = BaseKey {
         title: card.title.clone(),
         desc: card.desc.clone(),
@@ -466,17 +443,12 @@ pub fn base_layer(card: &ErrorCard, scale: f32, pal: &Palette) -> Arc<Pixmap> {
     let mut c = BASE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((k, p)) = c.as_ref() {
         if *k == key {
-            return p.clone();
+            return Some(p.clone());
         }
     }
-    let p = Arc::new(draw_base(card, scale, pal));
+    let p = Arc::new(draw_base(card, scale, pal)?);
     *c = Some((key, p.clone()));
-    p
-}
-
-/// Unused linear helper kept for symmetry with the toast progress (`linear` timing).
-pub fn linear_progress(card: &ErrorCard, now: f64) -> f32 {
-    LINEAR.ease(1.0 - card.remaining_fraction(now))
+    Some(p)
 }
 
 #[cfg(test)]
@@ -520,7 +492,7 @@ mod tests {
         assert!(!c.update(4400.0));
         assert!(c.update(4500.0));
         assert!(!c.update(4600.0), "reported once");
-        assert!(c.is_exiting() && !c.exit_is_silent());
+        assert!(c.is_exiting());
         assert!(!c.finished(4600.0) && c.finished(4700.0));
     }
 

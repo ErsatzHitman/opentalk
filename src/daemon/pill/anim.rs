@@ -81,6 +81,7 @@ pub const TW_EASE_OUT: Bezier = Bezier::new(0.0, 0.0, 0.2, 1.0);
 pub const EASE_IN_OUT: Bezier = Bezier::new(0.42, 0.0, 0.58, 1.0);
 /// Tailwind `animate-pulse` timing function.
 pub const PULSE_EASE: Bezier = Bezier::new(0.4, 0.0, 0.6, 1.0);
+#[cfg(test)]
 pub const LINEAR: Bezier = Bezier::new(0.0, 0.0, 1.0, 1.0);
 
 pub const EXPANSION_MS: f64 = 300.0;
@@ -252,6 +253,51 @@ pub fn bar_height(rms: f32) -> f32 {
     WAVE_MIN_PX + lvl * (WAVE_MAX_PX - WAVE_MIN_PX)
 }
 
+/// RMS band `(lo, hi)` around `baseline` inside which no waveform bar differs from the one drawn for
+/// `baseline` by more than `eps_px`; a level outside it changes the picture. The ends are open where a
+/// bar cannot move further (`lo` is 0 near the floor, `hi` is infinite once the bar is at full height).
+pub fn level_band(baseline: f32, eps_px: f32) -> (f32, f32) {
+    let rms = if baseline.is_finite() { baseline.max(0.0) } else { 0.0 };
+    let span = WAVE_MAX_PX - WAVE_MIN_PX;
+    let x = (rms * 8.0).powf(0.75).min(1.0);
+    let e = eps_px.max(0.0) / span;
+    // inverse of bar_height: rms = x^(4/3) / 8
+    let inv = |x: f32| x.powf(4.0 / 3.0) / 8.0;
+    let lo = if x - e <= 0.0 { 0.0 } else { inv(x - e) };
+    let hi = if x + e >= 1.0 { f32::INFINITY } else { inv(x + e) };
+    (lo, hi)
+}
+
+// --- timer cadence -------------------------------------------------------------------------------
+
+/// Animation timer period while frames change (~62.5 Hz).
+pub const TICK_MS: u32 = 16;
+/// Timer period once a recording has gone quiet (~15 Hz): enough to notice a change the capture
+/// thread did not already announce, and to keep Windows' timer coalescing out of the picture.
+pub const SLOW_TICK_MS: u32 = 66;
+/// Consecutive recording frames in which nothing visible changed before the timer slows down.
+pub const QUIET_FRAMES: u32 = 8;
+
+/// Counts consecutive frames that changed nothing; decides when the animation timer may slow down.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct QuietRun(u32);
+
+impl QuietRun {
+    /// Record one frame (`skipped`: the renderer found nothing to repaint).
+    pub fn frame(&mut self, skipped: bool) {
+        self.0 = if skipped { self.0.saturating_add(1) } else { 0 };
+    }
+
+    pub fn reset(&mut self) {
+        self.0 = 0;
+    }
+
+    /// Long enough without a visible change to run the timer slowly.
+    pub fn is_quiet(&self) -> bool {
+        self.0 >= QUIET_FRAMES
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct Bar {
     from: f32,
@@ -334,6 +380,52 @@ impl Waveform {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quiet_run_needs_consecutive_skipped_frames() {
+        let mut q = QuietRun::default();
+        for _ in 0..QUIET_FRAMES - 1 {
+            q.frame(true);
+        }
+        assert!(!q.is_quiet());
+        q.frame(false);
+        assert!(!q.is_quiet(), "a changed frame starts the count over");
+        for _ in 0..QUIET_FRAMES {
+            q.frame(true);
+        }
+        assert!(q.is_quiet());
+        q.reset();
+        assert!(!q.is_quiet());
+        for _ in 0..1000 {
+            q.frame(true);
+        }
+        assert!(q.is_quiet(), "the counter saturates instead of wrapping");
+    }
+
+    #[test]
+    fn level_band_brackets_the_visible_change() {
+        let eps = 1.0 / 255.0;
+        for baseline in [0.0f32, 0.0005, 0.01, 0.05, 0.1, 0.2, f32::NAN] {
+            let (lo, hi) = level_band(baseline, eps);
+            let base = bar_height(if baseline.is_nan() { 0.0 } else { baseline });
+            assert!(lo <= baseline.max(0.0) || baseline.is_nan(), "{baseline}: lo {lo}");
+            if hi.is_finite() {
+                // just inside: invisible; just outside: more than eps away
+                assert!((bar_height(hi * 0.9999) - base).abs() <= eps * 1.01, "{baseline}: hi inside");
+                assert!((bar_height(hi * 1.01) - base).abs() > eps, "{baseline}: hi outside");
+            }
+            if lo > 0.0 {
+                assert!((bar_height(lo * 1.0001) - base).abs() <= eps * 1.01, "{baseline}: lo inside");
+                assert!((bar_height(lo * 0.99) - base).abs() > eps, "{baseline}: lo outside");
+            }
+        }
+        // digital silence: any real signal is a change, nothing below can be
+        let (lo, hi) = level_band(0.0, eps);
+        assert_eq!(lo, 0.0);
+        assert!(hi > 0.0 && hi < 1e-4, "{hi}");
+        // full-scale bars cannot rise further
+        assert_eq!(level_band(0.5, eps).1, f32::INFINITY);
+    }
 
     #[test]
     fn bezier_endpoints_and_monotonic() {

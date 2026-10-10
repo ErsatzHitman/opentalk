@@ -84,18 +84,17 @@ impl DevRect {
         (self.x1 - self.x0).max(0)
     }
 
+    #[cfg(test)]
     pub fn height(&self) -> i32 {
         (self.y1 - self.y0).max(0)
     }
 
+    #[cfg(test)]
     pub fn area(&self) -> i64 {
         self.width() as i64 * self.height() as i64
     }
 
-    pub fn intersects(&self, o: &DevRect) -> bool {
-        self.x0 < o.x1 && o.x0 < self.x1 && self.y0 < o.y1 && o.y0 < self.y1
-    }
-
+    #[cfg(test)]
     pub fn contains_pixel(&self, x: i32, y: i32) -> bool {
         x >= self.x0 && x < self.x1 && y >= self.y0 && y < self.y1
     }

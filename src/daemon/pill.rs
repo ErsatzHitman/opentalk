@@ -88,10 +88,6 @@ impl Pill {
         self.win.with(|i| i.set_mode(mode));
     }
 
-    pub fn mode(&self) -> PillMode {
-        self.win.with(|i| i.mode())
-    }
-
     /// Active-app bubble content (None hides the bubble).
     pub fn set_app(&mut self, app: Option<AppIcon>) {
         self.win.with(|i| {
@@ -112,10 +108,6 @@ impl Pill {
     /// Move to the display under the cursor (called at every dictation start).
     pub fn follow_cursor_display(&mut self) {
         self.win.with(|i| i.follow_cursor_display());
-    }
-
-    pub fn hwnd(&self) -> isize {
-        self.win.hwnd()
     }
 }
 

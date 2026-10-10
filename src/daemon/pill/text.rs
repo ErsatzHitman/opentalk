@@ -43,8 +43,6 @@ pub struct Mask {
     pub w: i32,
     pub h: i32,
     pub data: Vec<u8>,
-    /// Advance width in device px.
-    pub advance: f32,
 }
 
 /// RAII wrapper around a memory DC with the selected font.
@@ -221,7 +219,7 @@ fn rasterize(text: &str, font: Font) -> Option<Mask> {
         }
         SelectObject(g.dc, old_bmp);
         let _ = DeleteObject(HGDIOBJ(bmp.0));
-        Some(Mask { w: w1, h: h1, data, advance: adv4 as f32 / SS as f32 })
+        Some(Mask { w: w1, h: h1, data })
     }
 }
 
