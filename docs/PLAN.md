@@ -25,7 +25,7 @@ Companion spec with exact pixel and colour values: `docs/SPEC.md`.
 | Recording CPU | ≤1.5% (60 fps pill plus capture) | Same, during a scripted 30 s recording |
 | Daemon RAM | ≤25 MB working set, ≤15 MB private | `Get-Process` WS/PrivateMemorySize, idle and recording |
 | Settings window RAM | ≤80 MB working set, and only while open. **Private bytes: accepted deviation** (audit 2026-10-10, owner may override): the glow (OpenGL) process commits ~265 MB of GPU driver pools reserved at context creation that never enter the working set (WS ~13 MB, private WS ~7 MB). `bench/renderer_probe` measured the alternatives: wgpu DX12 commits ~520 MB and adds ~3.5 MB of exe; a CPU painter commits ~20 MB but redraws a full 2100×1400 window in ~10 ms and lacks eframe's viewport glue. Revisit with a CPU-painter port of `src/ui` (damage-rect redraw) only if commit charge matters on low-RAM machines | Separate process that exits on close; `bench.ps1` reports WS, private bytes and private WS |
-| Disk | Single exe ≤8 MB, where MB is decimal: **8,000,000 bytes** (7.63 MiB). The release exe measured 7,248,896 bytes (7.25 MB) on 2026-10-10 after the Settings/network crates moved to `opt-level = "s"` (`Cargo.toml`), about 751 KB of headroom (it moves with every commit; `bench.ps1` has the current figure). No installer runtime | `bench.ps1` checks the file size against 8,000,000 bytes; history and config are KB-scale |
+| Disk | Single exe ≤8 MB, where MB is decimal: **8,000,000 bytes** (7.63 MiB). The release exe measured 7,248,896 bytes (7.25 MB) on 2026-10-10 after the Settings/network crates moved to `opt-level = "s"` (`Cargo.toml`), about 751 KB of headroom; with the liquid-glass Settings pages and pill merged it measured 7,505,920 bytes (cross-built on Linux, 2026-10-10), about 494 KB of headroom (it moves with every commit; `bench.ps1` has the current figure). No installer runtime | `bench.ps1` checks the file size against 8,000,000 bytes; history and config are KB-scale |
 | Hotkey to pill visible | ≤16 ms | Timestamped debug log (QPC) |
 | Hotkey to mic capturing | ≤50 ms | Log: hook event → first WASAPI packet |
 | Stop to text pasted | Network RTT + ≤40 ms local overhead | Log: stop → request sent → response → paste done |
@@ -86,11 +86,12 @@ src/daemon/hotkey.rs   LL hook, combo matcher, Start-menu mask, Esc cancel, inje
 src/daemon/audio.rs    WASAPI capture, RMS meter, ring buffer, VAD trim
 src/daemon/pill.rs     layered window, layout/animation, hit-testing, drag, menu
 src/daemon/glow.rs     signal-glow (conic ring, halo, comet), pre-blurred sprites
+src/daemon/pill/glass.rs, capture.rs   liquid-glass surface material of the pill (frosted, refracted screen capture; SPEC "Pill surface material")
 src/daemon/appicon.rs  foreground exe → icon (UWP aware), cache
 src/daemon/paste.rs    clipboard snapshot/restore, SendInput, terminal detection
 src/daemon/tray.rs     Shell_NotifyIcon + menu
 src/daemon/sound.rs    synthesized cues → in-memory WAV → PlaySound
-src/ui/…               egui app: shell, theme tokens, widgets, history, dictionary, settings
+src/ui/…               egui app: shell, theme tokens, widgets, history, dictionary, settings; liquid-glass panels in src/ui/glass.rs (docs/GLASS.md)
 `--bench mock-stt`      in-repo mock STT server (Rust, replaces the planned tools/mock_stt.py); per-provider wire-format mocks are in-process test servers
 bench/bench.ps1        CPU/RAM/latency benchmark harness
 ```

@@ -3,8 +3,10 @@
 User request: "use /liquid-glass for the entire UI". Source of truth: the `liquid-glass` skill
 (`~/.claude/skills/liquid-glass`: `SKILL.md`, `assets/liquid-glass.css`, `references/recipes.md`,
 `references/refraction.md`). The skill targets CSS; this is a native port to egui 0.36 (glow) in
-`src/ui`. The design is ported, not the web mechanics. The recording pill and app bubble
-(`src/daemon/pill*`) are a separate task and are not touched.
+`src/ui`. The design is ported, not the web mechanics. The recording pill, cancel bud, app-icon
+bubble, tooltip and error card (`src/daemon/pill*`) have their own port of the same skill in the daemon's
+software renderer, over a captured copy of the screen: see "Pill surface material" in `docs/SPEC.md`
+(`src/daemon/pill/glass.rs`, `capture.rs`). This document covers the Settings process only.
 
 ## How the port maps to the skill
 
@@ -109,7 +111,8 @@ transparent panel / extreme fills, menu-surface window fill, glass border, no eg
 No continuous repaint: nothing here calls `request_repaint`; hover and focus use egui's
 `animate_bool_with_time`, which repaints only while a transition runs. Per frame a surface costs a
 few hundred vertex colours (cached geometry, no allocation of textures). No new crates; the only
-`Cargo.toml` surface used is the existing `windows` features. The daemon is untouched.
+`Cargo.toml` surface used is the existing `windows` features. This port does not touch the daemon
+(the pill's glass is separate; see the top of this document).
 
 ## Checklist (from the skill, with status)
 
@@ -182,8 +185,9 @@ few hundred vertex colours (cached geometry, no allocation of textures). No new 
   15.6 ms scheduler tick in 10 s), no repaint while idle. The migration adds only washes, hairlines
   and a few ring meshes per frame (no textures, no allocation per frame beyond the shape lists), and
   no `request_repaint` calls, so these numbers are expected to hold; re-measure on Windows.
-  Executable (release, cross-built): 7,450,624 bytes, under the 8,000,000 budget (the previous
-  glass-foundation measurement was 7,324,672; the page migration adds about 126 KB of code).
+  Executable (release, cross-built): 7,450,624 bytes on the glass-foundation branch, under the
+  8,000,000 budget (the previous glass-foundation measurement was 7,324,672; the page migration adds
+  about 126 KB of code). Merged with the pill glass on main (2026-10-10): 7,505,920 bytes.
 
 ## Windows notes
 
