@@ -105,6 +105,7 @@ pub struct Credentials {
 }
 
 pub trait BatchProvider: Send + Sync {
+    #[allow(dead_code)] // implemented by every provider and used by tests; dispatch keys on `SttProviderId` directly
     fn id(&self) -> SttProviderId;
     /// URL whose origin should be pre-warmed when recording starts.
     fn prewarm_url(&self, creds: &Credentials) -> Option<String>;
@@ -119,6 +120,7 @@ pub trait StreamingSession: Send {
 }
 
 pub trait StreamingProvider: Send + Sync {
+    #[allow(dead_code)] // implemented by every provider and used by tests; dispatch keys on `SttProviderId` directly
     fn id(&self) -> SttProviderId;
     fn start(&self, opts: &SttOptions, creds: &Credentials) -> Result<Box<dyn StreamingSession>, SttError>;
 }

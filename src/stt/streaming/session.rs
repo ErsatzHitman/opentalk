@@ -40,8 +40,9 @@ const CLOSE_WRITE_TIMEOUT: Duration = Duration::from_millis(500);
 /// While recording the thread sleeps on its command channel (woken by audio), so an idle or
 /// streaming session costs a handful of wakeups per second instead of a polling loop.
 const IDLE_WAIT: Duration = Duration::from_millis(250);
-/// While recording, server messages are drained this often (partials are not surfaced, so
-/// they only have to be read before socket buffers matter or an error goes unnoticed).
+/// While recording, server messages are read whenever the socket is readable just before a
+/// write (see [`Loop::read_if_readable`]), and otherwise at least this often (partials are not
+/// surfaced, so this only has to catch errors in a stalled session).
 const DRAIN_EVERY: Duration = Duration::from_millis(250);
 /// Socket read timeout for those drains.
 const DRAIN_POLL: Duration = Duration::from_millis(2);
@@ -66,6 +67,12 @@ pub trait Protocol: Send + 'static {
     fn name(&self) -> &'static str;
     /// Resolve the URL and headers. May block (AssemblyAI mints a token over HTTP).
     fn connect_spec(&mut self) -> Result<ConnectSpec, SttError>;
+    /// Credentials that must never reach an error text, beyond those the session finds in the
+    /// [`ConnectSpec`] (an `Authorization` value, a `key=` / `token=` query value). AssemblyAI
+    /// lists its account API key, which only the token mint request carries.
+    fn credentials(&self) -> Vec<String> {
+        Vec::new()
+    }
     /// Messages to send as soon as the WebSocket is up.
     fn on_open(&mut self) -> Vec<Message> {
         Vec::new()
@@ -284,8 +291,8 @@ fn tls_connector() -> Result<native_tls::TlsConnector, native_tls::Error> {
     native_tls::TlsConnector::new()
 }
 
-fn open(name: &str, spec: &ConnectSpec, shared: &Shared, secret: &str) -> Result<WebSocket<Stream>, SttError> {
-    let bad = |what: &str| util::err(SttErrorCode::Other, format!("{name} streaming URL is invalid."), what.to_string());
+fn open(name: &str, spec: &ConnectSpec, shared: &Shared, secrets: &[String]) -> Result<WebSocket<Stream>, SttError> {
+    let bad = |what: &str| util::err(SttErrorCode::Other, format!("{name} streaming URL is invalid."), util::scrub(what, secrets));
     let mut request = spec.url.as_str().into_client_request().map_err(|e| bad(&e.to_string()))?;
     for (k, v) in &spec.headers {
         let k = HeaderName::from_bytes(k.as_bytes()).map_err(|_| bad("bad header name"))?;
@@ -301,7 +308,7 @@ fn open(name: &str, spec: &ConnectSpec, shared: &Shared, secret: &str) -> Result
     let host = uri.host().ok_or_else(|| bad("missing host"))?.trim_matches(['[', ']']).to_string();
     let port = uri.port_u16().unwrap_or(if tls { 443 } else { 80 });
 
-    let unreachable = |e: &dyn std::fmt::Display| util::err(SttErrorCode::Unreachable, format!("Could not reach {name}."), util::scrub(&e.to_string(), secret));
+    let unreachable = |e: &dyn std::fmt::Display| util::err(SttErrorCode::Unreachable, format!("Could not reach {name}."), util::scrub(&e.to_string(), secrets));
     let addrs: Vec<_> = (host.as_str(), port).to_socket_addrs().map_err(|e| unreachable(&e))?.collect();
     let mut tcp = None;
     let mut last_err = None;
@@ -347,7 +354,7 @@ fn open(name: &str, spec: &ConnectSpec, shared: &Shared, secret: &str) -> Result
     match tungstenite::client(request, stream) {
         Ok((ws, _resp)) => Ok(ws),
         Err(tungstenite::HandshakeError::Failure(e)) => {
-            Err(if shared.is_cancelled() { util::cancelled() } else { util::ws_error(name, &e, secret) })
+            Err(if shared.is_cancelled() { util::cancelled() } else { util::ws_error(name, &e, secrets) })
         }
         Err(tungstenite::HandshakeError::Interrupted(_)) => {
             Err(util::err(SttErrorCode::Timeout, format!("{name} did not answer the connection request."), "handshake interrupted"))
@@ -364,24 +371,47 @@ fn run(proto: &mut dyn Protocol, rx: &mpsc::Receiver<Cmd>, shared: &Shared) -> R
     if shared.is_cancelled() {
         return Err(util::cancelled());
     }
-    let key = spec_secret(&spec);
-    let mut ws = open(proto.name(), &spec, shared, &key)?;
+    let mut secrets = spec_secrets(&spec);
+    for c in proto.credentials() {
+        push_secret(&mut secrets, c);
+    }
+    let mut ws = open(proto.name(), &spec, shared, &secrets)?;
     crate::log_debug!("{} stream: socket up after {:.0} ms", proto.name(), t0.elapsed().as_secs_f64() * 1000.0);
 
-    let mut sess = Loop { ws: &mut ws, proto, shared, rx, key, pending: Vec::new(), finish: false, lost: false, conn_err: None };
+    let mut sess = Loop { ws: &mut ws, proto, shared, rx, secrets, pending: Vec::new(), finish: false, lost: false, conn_err: None };
     let r = sess.drive();
     sess.shutdown();
     r
 }
 
-/// The credential-bearing parts of the spec, for scrubbing error details.
-fn spec_secret(spec: &ConnectSpec) -> String {
-    // Deepgram/OpenAI/AssemblyAI keep the secret in a header value; Gemini/AssemblyAI in the query.
-    if let Some((_, v)) = spec.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("authorization")) {
-        return v.rsplit(' ').next().unwrap_or(v).to_string();
+fn push_secret(into: &mut Vec<String>, s: String) {
+    if !s.trim().is_empty() && !into.contains(&s) {
+        into.push(s);
     }
-    // The query value is percent-encoded; the server echoes the decoded credential.
-    spec.url.split(['?', '&']).filter_map(|kv| kv.strip_prefix("key=").or_else(|| kv.strip_prefix("token="))).next().map(util::percent_decode).unwrap_or_default()
+}
+
+/// The credential-bearing parts of the spec, for scrubbing error details: the raw and decoded
+/// forms of every `key=` / `token=` query value, and the credential of every auth-like header
+/// (the whole value and its last word, so `Bearer abc` yields `abc`). Percent-encoded variants
+/// of each are added by the redactor itself.
+fn spec_secrets(spec: &ConnectSpec) -> Vec<String> {
+    let mut out = Vec::new();
+    for (k, v) in &spec.headers {
+        let k = k.to_ascii_lowercase();
+        if k.contains("auth") || k.contains("key") || k.contains("token") {
+            push_secret(&mut out, v.rsplit(' ').next().unwrap_or(v).to_string());
+            push_secret(&mut out, v.clone());
+        }
+    }
+    let query = spec.url.split_once('?').map_or("", |(_, q)| q);
+    for kv in query.split('&') {
+        if let Some(raw) = kv.strip_prefix("key=").or_else(|| kv.strip_prefix("token=")) {
+            // The URL carries it percent-encoded; the server echoes the decoded credential.
+            push_secret(&mut out, util::percent_decode(raw));
+            push_secret(&mut out, raw.to_string());
+        }
+    }
+    out
 }
 
 struct Loop<'a> {
@@ -389,7 +419,8 @@ struct Loop<'a> {
     proto: &'a mut dyn Protocol,
     shared: &'a Shared,
     rx: &'a mpsc::Receiver<Cmd>,
-    key: String,
+    /// Credentials to scrub from error texts (see [`spec_secrets`], [`Protocol::credentials`]).
+    secrets: Vec<String>,
     pending: Vec<i16>,
     finish: bool,
     lost: bool,
@@ -418,7 +449,7 @@ impl Loop<'_> {
 
     fn fail(&mut self, e: tungstenite::Error) {
         if !matches!(e, tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed) {
-            self.conn_err.get_or_insert_with(|| util::ws_error(self.proto.name(), &e, &self.key));
+            self.conn_err.get_or_insert_with(|| util::ws_error(self.proto.name(), &e, &self.secrets));
         }
         self.lost = true;
     }
@@ -467,6 +498,43 @@ impl Loop<'_> {
                 None
             }
         }
+    }
+
+    /// True when the socket has bytes (or an EOF/error) waiting, without consuming anything.
+    /// A non-blocking `peek`: no read timeout to wait out, no extra thread.
+    fn socket_readable(&self) -> bool {
+        let tcp = self.ws.get_ref().tcp();
+        if tcp.set_nonblocking(true).is_err() {
+            return true; // cannot tell: read normally
+        }
+        let mut probe = [0u8; 1];
+        let readable = match tcp.peek(&mut probe) {
+            Ok(_) => true,
+            Err(e) => !util::is_timeout(&e),
+        };
+        let _ = tcp.set_nonblocking(false);
+        readable
+    }
+
+    /// Read what the server already sent, if anything, before the next write. A peer that has
+    /// closed answers our next write with an RST, and Windows then throws away whatever it had
+    /// sent that we had not read yet, so the text received so far must be read first. Returns
+    /// whether anything was handled.
+    fn read_if_readable(&mut self, poll: &mut Duration) -> bool {
+        if self.lost || !self.socket_readable() {
+            return false;
+        }
+        if *poll != DRAIN_POLL {
+            self.set_poll(DRAIN_POLL);
+            *poll = DRAIN_POLL;
+        }
+        // Bounded so a chatty server cannot starve the audio path.
+        for _ in 0..64 {
+            if self.lost || self.read_one().is_none() {
+                break;
+            }
+        }
+        true
     }
 
     fn handle_text(&mut self, text: &str) -> bool {
@@ -520,6 +588,9 @@ impl Loop<'_> {
                 was_ready = true;
                 self.shared.ready.store(true, Ordering::Release);
                 crate::log_debug!("{} stream: ready, {} samples queued", self.proto.name(), self.pending.len());
+            }
+            if was_ready && finalizing.is_none() && self.read_if_readable(&mut poll) {
+                last_read = Instant::now();
             }
             if self.lost {
                 break;
@@ -636,10 +707,12 @@ mod secret_tests {
     use super::*;
 
     #[test]
-    fn spec_secret_decodes_query_credentials() {
+    fn spec_secrets_cover_query_and_header_credentials() {
         let q = ConnectSpec { url: "wss://h/ws?sample_rate=16000&token=tok%2B%2F%3D".into(), headers: vec![] };
-        assert_eq!(spec_secret(&q), "tok+/=");
-        let h = ConnectSpec { url: "wss://h/ws".into(), headers: vec![("Authorization".into(), "Token abc+def".into())] };
-        assert_eq!(spec_secret(&h), "abc+def");
+        assert_eq!(spec_secrets(&q), vec!["tok+/=".to_string(), "tok%2B%2F%3D".to_string()]);
+        let h = ConnectSpec { url: "wss://h/ws".into(), headers: vec![("Authorization".into(), "Token abc+def".into()), ("User-Agent".into(), "x".into())] };
+        assert_eq!(spec_secrets(&h), vec!["abc+def".to_string(), "Token abc+def".to_string()]);
+        let g = ConnectSpec { url: "wss://h/ws?key=k%20k".into(), headers: vec![("x-goog-api-key".into(), "gk".into())] };
+        assert!(spec_secrets(&g).contains(&"k k".to_string()) && spec_secrets(&g).contains(&"gk".to_string()));
     }
 }
