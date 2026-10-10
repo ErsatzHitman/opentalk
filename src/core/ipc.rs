@@ -1,11 +1,13 @@
 //! Daemon <-> settings-process signalling via window messages to the daemon's hidden
 //! message window (class `DAEMON_WINDOW_CLASS`). Config/history live in files; messages only notify.
 //! TASK core-data implements `notify_daemon` (FindWindowW + PostMessageW) and `daemon_running`.
+use std::sync::OnceLock;
 use windows::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HWND, LPARAM, WPARAM};
 use windows::Win32::System::Threading::CreateMutexW;
-use windows::Win32::UI::WindowsAndMessaging::{FindWindowExW, FindWindowW, HWND_MESSAGE, PostMessageW};
+use windows::Win32::UI::WindowsAndMessaging::{FindWindowExW, FindWindowW, HWND_MESSAGE, PostMessageW, RegisterWindowMessageW};
 use windows::core::{HSTRING, PCWSTR};
 
+use crate::ui::{Launch, Page, Section};
 
 pub const DAEMON_WINDOW_CLASS: &str = "OpenTalkDaemon";
 pub const SINGLE_INSTANCE_MUTEX: &str = "Local\\OpenTalk.Daemon";
@@ -37,6 +39,61 @@ impl IpcMsg {
             IpcMsg::Quit => (WM_OT_QUIT, 0),
         }
     }
+}
+
+/// Name of the registered window message that asks a running Settings window to show a page.
+pub const SETTINGS_PAGE_MESSAGE: &str = "OpenTalk.SettingsPage";
+
+/// Message id of [`SETTINGS_PAGE_MESSAGE`] (0 if Windows refuses to register it). Both sides
+/// get the same id from the system, so it needs no coordination.
+pub fn settings_page_message() -> u32 {
+    static ID: OnceLock<u32> = OnceLock::new();
+    *ID.get_or_init(|| {
+        // SAFETY: the HSTRING outlives the call.
+        unsafe { RegisterWindowMessageW(&HSTRING::from(SETTINGS_PAGE_MESSAGE)) }
+    })
+}
+
+/// Marks a wparam as a page code, so a stray message with wparam 0 is not read as "History".
+const PAGE_CODE_VALID: usize = 1 << 16;
+
+/// Compact wparam for a Settings page request: bit 16 = valid, bits 8..16 = section (0 = none,
+/// else index in `Section::ALL` + 1), bits 0..8 = page (0 History, 1 Dictionary). Covers
+/// everything `ui::parse_page` can return.
+pub fn encode_settings_page(launch: Launch) -> usize {
+    let page = match launch.page {
+        Page::History => 0,
+        Page::Dictionary => 1,
+    };
+    let section = launch.settings.and_then(|s| Section::ALL.iter().position(|x| *x == s)).map_or(0, |i| i + 1);
+    PAGE_CODE_VALID | section << 8 | page
+}
+
+/// Inverse of [`encode_settings_page`]; `None` for anything that is not a valid code.
+pub fn decode_settings_page(wparam: usize) -> Option<Launch> {
+    if wparam & !(PAGE_CODE_VALID | 0xFFFF) != 0 || wparam & PAGE_CODE_VALID == 0 {
+        return None;
+    }
+    let page = match wparam & 0xFF {
+        0 => Page::History,
+        1 => Page::Dictionary,
+        _ => return None,
+    };
+    let settings = match (wparam >> 8) & 0xFF {
+        0 => None,
+        n => Some(*Section::ALL.get(n - 1)?),
+    };
+    Some(Launch { page, settings })
+}
+
+/// Ask the Settings window `hwnd` to show `launch`. False if the post failed.
+pub fn post_settings_page(hwnd: HWND, launch: Launch) -> bool {
+    let id = settings_page_message();
+    if id == 0 {
+        return false;
+    }
+    // SAFETY: plain PostMessageW; a stale handle just makes the call fail.
+    unsafe { PostMessageW(Some(hwnd), id, WPARAM(encode_settings_page(launch)), LPARAM(0)).is_ok() }
 }
 
 /// Post `msg` to the running daemon. Returns false if no daemon window exists.
@@ -138,6 +195,74 @@ mod tests {
         assert_eq!(IpcMsg::RetryLast.encode().0, WM_APP + 6);
         assert_eq!(IpcMsg::Quit.encode().0, WM_APP + 7);
         assert!(WM_OT_QUIT < WM_OT_INTERNAL_BASE);
+    }
+
+    #[test]
+    fn settings_page_code_round_trips_every_page() {
+        let mut all = vec![];
+        for page in [Page::History, Page::Dictionary] {
+            all.push(Launch { page, settings: None });
+            for s in Section::ALL {
+                all.push(Launch { page, settings: Some(s) });
+            }
+        }
+        let mut codes = std::collections::HashSet::new();
+        for l in all {
+            let c = encode_settings_page(l);
+            assert_eq!(decode_settings_page(c), Some(l), "{l:?}");
+            assert!(codes.insert(c), "duplicate code for {l:?}");
+        }
+    }
+
+    #[test]
+    fn settings_page_code_covers_everything_parse_page_accepts() {
+        use crate::ui::parse_page;
+        let mut inputs = vec!["", "history", "home", "dictionary", "snippets", "dict", "settings", "garbage", "--page=dictionary", "settings:bogus"];
+        let sections = ["preferences", "prefs", "general", "hotkeys", "hotkey", "speech-to-text", "stt", "speechtotext", "transcription", "cleanup", "intelligence", "llm", "privacy", "privacy-data", "privacydata", "system"];
+        let owned: Vec<String> = sections.iter().flat_map(|s| [format!("settings:{s}"), format!("settings/{s}"), s.to_string()]).collect();
+        inputs.extend(owned.iter().map(String::as_str));
+        for i in inputs {
+            let l = parse_page(Some(i));
+            assert_eq!(decode_settings_page(encode_settings_page(l)), Some(l), "{i}");
+        }
+    }
+
+    #[test]
+    fn settings_page_code_rejects_junk() {
+        assert_eq!(decode_settings_page(0), None, "no valid bit");
+        assert_eq!(decode_settings_page(1), None);
+        assert_eq!(decode_settings_page(PAGE_CODE_VALID | 2), None, "unknown page");
+        assert_eq!(decode_settings_page(PAGE_CODE_VALID | (Section::ALL.len() + 1) << 8), None, "unknown section");
+        assert_eq!(decode_settings_page(PAGE_CODE_VALID | 1 << 24), None, "stray high bits");
+        assert_eq!(decode_settings_page(usize::MAX), None);
+    }
+
+    #[test]
+    fn settings_page_message_is_a_registered_id() {
+        let id = settings_page_message();
+        assert!((0xC000..=0xFFFF).contains(&id), "{id:#x}");
+        assert_eq!(id, settings_page_message());
+    }
+
+    #[test]
+    #[ignore = "desktop: creates a hidden window"]
+    fn desktop_settings_page_post_reaches_window() {
+        // SAFETY: STATIC is a system class; the window is destroyed below on this thread.
+        let hwnd = unsafe {
+            CreateWindowExW(WINDOW_EX_STYLE(0), windows::core::w!("STATIC"), None, WS_POPUP, 0, 0, 0, 0, Some(HWND_MESSAGE), None, None, None)
+        }
+        .expect("message window");
+        let want = Launch { page: Page::Dictionary, settings: Some(Section::Hotkeys) };
+        assert!(post_settings_page(hwnd, want));
+        let mut m = MSG::default();
+        // SAFETY: plain message peek on this thread's queue.
+        let got = unsafe { PeekMessageW(&mut m, Some(hwnd), settings_page_message(), settings_page_message(), PM_REMOVE) }.as_bool();
+        // SAFETY: our own window.
+        unsafe {
+            let _ = DestroyWindow(hwnd);
+        }
+        assert!(got);
+        assert_eq!(decode_settings_page(m.wParam.0), Some(want));
     }
 
     #[test]
