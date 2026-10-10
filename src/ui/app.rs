@@ -214,6 +214,16 @@ impl App {
     }
 
     #[cfg(test)]
+    pub(super) fn hist_mut(&mut self) -> &mut HistoryState {
+        &mut self.hist
+    }
+
+    #[cfg(test)]
+    pub(super) fn dict_mut(&mut self) -> &mut DictState {
+        &mut self.dict
+    }
+
+    #[cfg(test)]
     pub(super) fn open_palette(&mut self) {
         self.palette.toggle();
     }
