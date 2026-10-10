@@ -7,19 +7,33 @@ use std::sync::Arc;
 pub const SEMIBOLD: &str = "semibold";
 pub const ICONS: &str = "icons";
 
-fn read_first(names: &[&str]) -> Option<Vec<u8>> {
-    let dir = std::env::var_os("WINDIR").map(std::path::PathBuf::from).unwrap_or_else(|| r"C:\Windows".into()).join("Fonts");
-    names.iter().find_map(|n| std::fs::read(dir.join(n)).ok())
+/// The system font directory (`%WINDIR%\Fonts`).
+pub fn system_dir() -> std::path::PathBuf {
+    std::env::var_os("WINDIR").map(std::path::PathBuf::from).unwrap_or_else(|| r"C:\Windows".into()).join("Fonts")
+}
+
+/// First file in `names` found in any of `dirs`, searching the directories in order.
+fn read_first(dirs: &[std::path::PathBuf], names: &[&str]) -> Option<Vec<u8>> {
+    dirs.iter().find_map(|dir| names.iter().find_map(|n| std::fs::read(dir.join(n)).ok()))
 }
 
 /// Install the Windows fonts. Missing files degrade to egui's built-in fallback metrics
 /// (egui requires at least one font, so with none found text would not render at all).
 pub fn install(ctx: &egui::Context) {
+    install_from(ctx, &[system_dir()]);
+}
+
+/// [`install`] searching `dirs` in order. Segoe UI is looked for in every directory first; the free
+/// Liberation / DejaVu faces are accepted only when it is nowhere, which is how the headless renderer
+/// gets readable text under Wine (no Segoe UI in its `C:\Windows\Fonts`).
+pub fn install_from(ctx: &egui::Context, dirs: &[std::path::PathBuf]) {
     let mut defs = FontDefinitions::empty();
-    let regular = read_first(&["segoeui.ttf", "SegUIVar.ttf"]);
-    let semibold = read_first(&["seguisb.ttf", "segoeuib.ttf"]).or_else(|| regular.clone());
-    let icons = read_first(&["SegoeIcons.ttf", "segmdl2.ttf"]);
-    let symbols = read_first(&["seguisym.ttf"]);
+    let regular = read_first(dirs, &["segoeui.ttf", "SegUIVar.ttf"]).or_else(|| read_first(dirs, &["LiberationSans-Regular.ttf", "DejaVuSans.ttf"]));
+    let semibold = read_first(dirs, &["seguisb.ttf", "segoeuib.ttf"])
+        .or_else(|| read_first(dirs, &["LiberationSans-Bold.ttf", "DejaVuSans-Bold.ttf"]))
+        .or_else(|| regular.clone());
+    let icons = read_first(dirs, &["SegoeIcons.ttf", "segmdl2.ttf"]);
+    let symbols = read_first(dirs, &["seguisym.ttf"]);
 
     let mut prop: Vec<String> = Vec::new();
     if let Some(b) = regular {

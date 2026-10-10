@@ -10,9 +10,12 @@ mod app;
 mod dictionary;
 mod filedialog;
 mod fonts;
+mod glass;
 mod history;
 mod hotkey_capture;
 mod icons;
+#[cfg(test)]
+mod offscreen;
 mod palette;
 mod settings;
 mod theme;

@@ -149,6 +149,8 @@ pub struct Config {
     pub version: u32,
     // ---- Preferences ----
     pub theme: Theme,
+    /// Paint an opaque window background instead of the translucent Windows backdrop (Settings).
+    pub reduce_transparency: bool,
     pub audio_cues: bool,
     pub pause_media: bool,
     pub auto_paste: bool,
@@ -194,6 +196,7 @@ impl Default for Config {
         Self {
             version: CONFIG_VERSION,
             theme: Theme::Auto,
+            reduce_transparency: false,
             audio_cues: true,
             pause_media: false,
             auto_paste: true,

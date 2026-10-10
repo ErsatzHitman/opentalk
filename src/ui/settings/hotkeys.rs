@@ -7,7 +7,7 @@ use crate::ui::hotkey_capture::{self as hk, Capture, Captured};
 use crate::ui::theme::{Palette, mix};
 use crate::ui::widgets::{self as w, Btn, Variant, cr};
 use crate::ui::{Cmd, Env, icons};
-use eframe::egui::{self, Align2, Sense, Stroke, StrokeKind, Ui, pos2, vec2};
+use eframe::egui::{self, Align2, Sense, Stroke, Ui, pos2, vec2};
 
 pub const DEFAULT_HOTKEY: &str = "Control+Super";
 
@@ -53,12 +53,12 @@ pub fn show(ui: &mut Ui, env: &mut Env, st: &mut SettingsState) -> bool {
     crate::ui::settings::group(ui, &p, "Activation", "");
     w::panel(ui, &p, |ui| {
         let mode = env.cfg.activation_mode;
-        if mode_card(ui, &p, "Tap to talk", "Press the hotkey once to start recording and again to stop.", mode == ActivationMode::Tap) && mode != ActivationMode::Tap {
+        if mode_card(ui, &p, "Tap to talk", "Press the hotkey once to start recording and again to stop.", mode == ActivationMode::Tap, true, false) && mode != ActivationMode::Tap {
             env.cfg.activation_mode = ActivationMode::Tap;
             changed = true;
         }
         w::divider(ui, &p);
-        if mode_card(ui, &p, "Push to talk", "Hold the hotkey while you speak and release to stop. A quick tap cancels.", mode == ActivationMode::Hold) && mode != ActivationMode::Hold {
+        if mode_card(ui, &p, "Push to talk", "Hold the hotkey while you speak and release to stop. A quick tap cancels.", mode == ActivationMode::Hold, false, true) && mode != ActivationMode::Hold {
             env.cfg.activation_mode = ActivationMode::Hold;
             changed = true;
         }
@@ -75,26 +75,27 @@ pub fn show(ui: &mut Ui, env: &mut Env, st: &mut SettingsState) -> bool {
         );
         w::divider(ui, &p);
         w::row(ui, &p, "Cancel", "Press Esc while recording or transcribing to discard the dictation.", 60.0, |ui| {
-            crate::ui::history::keycap(ui, &p, "Esc");
+            w::keycap(ui, &p, "Esc");
         });
     });
     changed
 }
 
-/// Selectable radio card (`ActivationModeSelector`). Returns true when clicked.
-fn mode_card(ui: &mut Ui, p: &Palette, title: &str, desc: &str, active: bool) -> bool {
+/// Selectable radio card (`ActivationModeSelector`) as a row of its panel: a wash on hover and a
+/// primary wash when selected. Returns true when clicked.
+fn mode_card(ui: &mut Ui, p: &Palette, title: &str, desc: &str, active: bool, first: bool, last: bool) -> bool {
     let w_ = ui.available_width();
     let top = ui.cursor().min;
     let h = 58.0;
     let (rect, resp) = ui.allocate_exact_size(vec2(w_, h), Sense::click());
     w::pointer(&resp);
     let hov = w::hover_anim(ui, resp.id.with("h"), resp.hovered());
+    let t = ui.ctx().animate_bool_with_time(resp.id.with("a"), active, 0.15);
     let painter = ui.painter();
-    if hov > 0.0 {
-        painter.rect_filled(rect, cr(0.0), mix(egui::Color32::TRANSPARENT, p.overlay(3), hov));
-    }
+    let rounding = w::edge_rounding(first, last);
+    painter.rect_filled(rect, rounding, mix(mix(egui::Color32::TRANSPARENT, p.wash(0), hov), p.primary_wash(0), t));
     let c = pos2(top.x + 16.0 + 8.0, rect.center().y);
-    painter.circle_stroke(c, 8.0, Stroke::new(2.0, if active { p.primary } else { p.border_hover }));
+    painter.circle_stroke(c, 8.0, Stroke::new(2.0, mix(p.muted_a(55), p.primary, t)));
     if active {
         painter.circle_filled(c, 4.0, p.primary);
     }
@@ -150,11 +151,9 @@ fn hotkey_box(ui: &mut Ui, env: &mut Env, st: &mut SettingsState) -> bool {
     let t = ctx.animate_bool_with_time(resp.id.with("cap"), capturing, 0.15);
     {
         let painter = ui.painter();
-        painter.rect_filled(rect, cr(8.0), p.input_fill());
-        if t > 0.0 {
-            painter.rect_stroke(rect.expand(1.5 * t), cr(9.5), Stroke::new(2.0, p.primary_a(15)), StrokeKind::Outside);
-        }
-        painter.rect_stroke(rect, cr(8.0), Stroke::new(1.0, mix(mix(p.input_border(), p.border_hover, hov), p.primary, t)), StrokeKind::Inside);
+        painter.rect_filled(rect, cr(8.0), p.wash(0));
+        // The capture box is an input: hairline, hover wash, primary line + ring while capturing.
+        w::input_chrome(ui, &p, rect, t, hov, false);
     }
     if capturing {
         let label = if st.hotkeys.preview.is_empty() { "Press your shortcut...".to_string() } else { st.hotkeys.preview.clone() };
@@ -173,9 +172,7 @@ fn hotkey_box(ui: &mut Ui, env: &mut Env, st: &mut SettingsState) -> bool {
             let font = fonts::semibold(12.0);
             let tw = w::measure(ui, k, font.clone()).x;
             let cap = egui::Rect::from_min_size(pos2(x, rect.center().y - 14.0), vec2(tw + 20.0, 28.0));
-            ui.painter().rect_filled(cap, cr(6.0), if p.dark { p.surface3 } else { egui::Color32::WHITE });
-            ui.painter().rect_stroke(cap, cr(6.0), Stroke::new(1.0, p.border_hover), StrokeKind::Inside);
-            ui.painter().text(cap.center(), Align2::CENTER_CENTER, k, font, p.foreground);
+            w::paint_keycap(ui, &p, cap, k, font);
             x += tw + 20.0;
         }
         ui.painter().text(pos2(rect.max.x - 16.0, rect.center().y), Align2::RIGHT_CENTER, "Click to change", fonts::regular(11.5), p.muted_a(65));
