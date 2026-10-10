@@ -358,6 +358,8 @@ if (-not $SkipPackaged) {
         $h = New-TempHome 'ot-bench-pkg'
         $extra = $baseEnv.Clone()
         if ($synthetic) { $extra['OPENTALK_BENCH_APP_EXE'] = $appExe }
+        # The icon lookup is logged at debug level only (it names the app being dictated into).
+        $extra['OPENTALK_LOG'] = 'debug'
         $e = New-Env $h $extra
         Write-Config $h @{ audio_cues = $false; auto_paste = $false; keep_in_clipboard = $true; show_app_bubble = $true; stt = @{ provider = 'openai' } }
         $daemon = Start-Daemon $Exe $e

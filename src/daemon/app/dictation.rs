@@ -25,7 +25,7 @@ use crate::daemon::paste::{self, PasteOptions, PasteOutcome, Target};
 use crate::daemon::pill::PillMode;
 use crate::daemon::{media, sound};
 use crate::stt::{self, Audio, StreamingSession, SttError, SttErrorCode};
-use crate::{log_info, log_warn};
+use crate::{log_debug, log_info, log_warn};
 
 /// Shared slot for the streaming session: the capture thread feeds it, `stop` takes it.
 type Feed = Arc<Mutex<Option<Box<dyn StreamingSession>>>>;
@@ -340,10 +340,10 @@ impl App {
                     let exe = t.exe_path.rsplit(['\\', '/']).next().unwrap_or("").to_ascii_lowercase();
                     match appicon::load(&t, APP_ICON_PX) {
                         Some(icon) => {
-                            log_info!("app icon for {exe}: {:?} in {:.0} ms", icon.name, now_ms() - started);
+                            log_debug!("app icon for {exe}: {:?} in {:.0} ms", icon.name, now_ms() - started);
                             notify(hwnd, Note::Icon { seq, icon });
                         }
-                        None => log_info!("app icon for {exe}: none in {:.0} ms", now_ms() - started),
+                        None => log_debug!("app icon for {exe}: none in {:.0} ms", now_ms() - started),
                     }
                 });
             }

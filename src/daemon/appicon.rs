@@ -8,7 +8,7 @@
 //! the rest of its life (about +17 MB working set), so packaged (UWP / MSIX) apps never use it. They
 //! read the logo the package declares instead: the install folder (from the executable's path or the
 //! process's package identity), `AppxManifest.xml`'s `Square44x44Logo`, the nearest `targetsize-N` /
-//! `scale-N` PNG next to it, decoded by tiny-skia's PNG decoder. No COM and no shell DLLs; callers run
+//! `scale-N` PNG next to it, decoded with the `png` crate. No COM and no shell DLLs; callers run
 //! this on a helper thread and the result stays in the per-exe cache.
 //! Icons from `HICON`s are rasterised on black and white to recover their alpha channel.
 use std::collections::HashMap;
@@ -419,6 +419,11 @@ fn decode_png_rgba(bytes: &[u8], px: u32) -> Option<Vec<u8>> {
     let mut dec = png::Decoder::new(std::io::Cursor::new(bytes));
     dec.set_transformations(png::Transformations::normalize_to_color8());
     let mut reader = dec.read_info().ok()?;
+    // Check the header's size before allocating the frame buffer for it.
+    let (hw, hh) = (reader.info().width, reader.info().height);
+    if hw == 0 || hh == 0 || hw > 4096 || hh > 4096 {
+        return None;
+    }
     let mut buf = vec![0u8; reader.output_buffer_size()?];
     let info = reader.next_frame(&mut buf).ok()?;
     let (w, h) = (info.width, info.height);
