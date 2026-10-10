@@ -87,7 +87,6 @@ const C_SNIPPETS: ItemId = 1;
 const F_INPUT: ItemId = 10;
 const INPUT_IDS: ItemId = 80;
 const B_ADD: ItemId = 3;
-const B_CANCEL: ItemId = 4;
 const F_FILTER: ItemId = 5;
 const B_IMPORT: ItemId = 6;
 const B_COPY: ItemId = 7;
@@ -233,16 +232,13 @@ impl PageModel for DictionaryPage {
         v.push(Item::Field {
             id: self.input_id(),
             label: if editing { "Edit word".into() } else { "Add words".into() },
-            hint: if editing { "Press Enter to save".into() } else { "Type a word and press Enter".into() },
+            hint: if editing { "Enter saves. Clear the field to cancel.".into() } else { "Type a word and press Enter".into() },
             value: self.input.clone(),
             kind: FieldKind::Text,
             error: self.error.clone(),
             max_chars: MAX_FIELD_CHARS,
         });
         v.push(Item::Button { id: B_ADD, label: if editing { "Save word".into() } else { "Add".into() }, style: BtnStyle::Primary, enabled: !parse_words(&self.input).is_empty() });
-        if editing {
-            v.push(Item::Button { id: B_CANCEL, label: "Cancel".into(), style: BtnStyle::Link, enabled: true });
-        }
         v.push(Item::Note(self.count_note(cx.cfg, shown)));
         if n > FILTER_MIN_WORDS || !self.filter.is_empty() {
             v.push(Item::Field {
@@ -303,10 +299,6 @@ impl PageModel for DictionaryPage {
                 self.apply_input(cx)
             }
             (B_ADD, Event::Pressed) => self.apply_input(cx),
-            (B_CANCEL, Event::Pressed) => {
-                self.cancel_edit();
-                Vec::new()
-            }
             (F_FILTER, Event::Edited(t) | Event::Committed(t)) => {
                 self.filter = t;
                 Vec::new()
@@ -733,8 +725,8 @@ mod tests {
         assert_eq!(fx, vec![Effect::Focus(p.input_id())]);
         let snap = snapshot(&p, &cx(&mut cfg));
         println!("{snap}");
-        assert!(snap.contains("#11 field Edit word [text] value=\"beta\" hint=\"Press Enter to save\""), "{snap}");
-        assert!(snap.contains("#3 button Save word [Primary]") && snap.contains("#4 button Cancel [Link]"), "{snap}");
+        assert!(snap.contains("#11 field Edit word [text] value=\"beta\" hint=\"Enter saves. Clear the field to cancel.\""), "{snap}");
+        assert!(snap.contains("#3 button Save word [Primary]") && !snap.contains("Cancel"), "{snap}");
         let fx = p.event(p.input_id(), Event::Committed("Beta Test".into()), &mut cx(&mut cfg));
         assert_eq!(cfg.dictionary, vec!["alpha", "Beta Test", "gamma"]);
         assert_eq!(fx, vec![Effect::Saved]);
@@ -757,12 +749,11 @@ mod tests {
     }
 
     #[test]
-    fn cancelling_an_edit_or_emptying_the_field_leaves_the_word_alone() {
+    fn emptying_the_field_cancels_an_edit_and_leaves_the_word_alone() {
+        // No Cancel button: the renderer commits a changed field when the pointer goes down on
+        // any other control, so a Cancel press would arrive after the edit had already been saved.
         let mut cfg = cfg_with(&["alpha"]);
         let mut p = page();
-        p.row_event(0, Event::Activated, &mut cx(&mut cfg));
-        p.event(B_CANCEL, Event::Pressed, &mut cx(&mut cfg));
-        assert!(p.editing.is_none() && p.input.is_empty() && cfg.dictionary == vec!["alpha"]);
         p.row_event(0, Event::Activated, &mut cx(&mut cfg));
         assert!(p.event(p.input_id(), Event::Committed(String::new()), &mut cx(&mut cfg)).is_empty());
         assert!(p.editing.is_none() && cfg.dictionary == vec!["alpha"]);

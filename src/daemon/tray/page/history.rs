@@ -28,7 +28,7 @@ use crate::core::timefmt;
 /// Entries read when the page opens and per "Load older" step.
 const PAGE: usize = 200;
 /// Most entries held in memory (older ones stay reachable through search).
-const MAX_LOADED: usize = 5000;
+const MAX_LOADED: usize = 2000;
 /// Longest text kept in a list row (the renderer cuts it to the row width anyway).
 const ROW_TEXT_CHARS: usize = 240;
 
@@ -48,8 +48,8 @@ trait Store: Send + Sync {
     /// The newest `n` entries (any status) and whether older ones exist.
     fn load_recent(&self, n: usize) -> history::Recent;
     fn find(&self, id: i64) -> Option<Entry>;
-    /// Whole-file search (worker thread).
-    fn search(&self, query: &str) -> Vec<Entry>;
+    /// The newest `cap` matches of a whole-file search (worker thread).
+    fn search(&self, query: &str, cap: usize) -> history::Recent;
     /// Whole-file totals (worker thread).
     fn summary(&self) -> Stats;
 }
@@ -63,8 +63,8 @@ impl Store for DiskStore {
     fn find(&self, id: i64) -> Option<Entry> {
         history::find(id)
     }
-    fn search(&self, query: &str) -> Vec<Entry> {
-        history::search_view(query)
+    fn search(&self, query: &str, cap: usize) -> history::Recent {
+        history::search_view(query, cap)
     }
     fn summary(&self) -> Stats {
         history::summary()
@@ -150,7 +150,7 @@ fn clipboard_toast() -> Effect {
 #[derive(Default)]
 struct Slot {
     /// `(token, query, matches)` of a finished search.
-    search: Option<(u64, String, Vec<Entry>)>,
+    search: Option<(u64, String, history::Recent)>,
     summary: Option<Stats>,
 }
 
@@ -158,13 +158,15 @@ struct Hits {
     /// The trimmed query these entries answer.
     query: String,
     entries: Vec<Entry>,
+    /// Older matches exist than `entries` holds.
+    more: bool,
 }
 
 struct HistoryPage {
     env: Env,
     /// Newest first; at most `MAX_LOADED`.
     pool: Vec<Entry>,
-    /// Older entries exist on disk than the pool holds.
+    /// Older entries exist on disk than the pool holds (also once the pool is full).
     more: bool,
     /// Live text of the search field.
     query: String,
@@ -219,7 +221,12 @@ impl HistoryPage {
     fn reload(&mut self, keep: usize) {
         let r = self.env.store.load_recent(keep.clamp(PAGE, MAX_LOADED));
         self.pool = self.env.alive(r.entries);
-        self.more = r.more && self.pool.len() < MAX_LOADED;
+        self.more = r.more;
+    }
+
+    /// "Load older" has something to read and room to hold it.
+    fn can_load_more(&self) -> bool {
+        self.more && self.pool.len() < MAX_LOADED
     }
 
     /// Take what the workers delivered.
@@ -228,16 +235,17 @@ impl HistoryPage {
             let mut s = self.slot.lock().unwrap_or_else(|e| e.into_inner());
             (s.search.take(), s.summary.take())
         };
-        if let Some(s) = summary {
+        // Whole-file totals only matter while the pool holds part of the file; a finished worker
+        // must not overwrite the exact numbers of a complete pool (e.g. after "Clear all").
+        if let Some(s) = summary.filter(|_| self.more) {
             self.summary = Some(s);
         }
-        if let Some((token, query, mut entries)) = search
+        if let Some((token, query, found)) = search
             && self.pending.as_ref().is_some_and(|(t, q)| *t == token && *q == query)
         {
             self.pending = None;
             if self.q() == query {
-                entries.truncate(MAX_LOADED);
-                self.hits = Some(Hits { query, entries: self.env.alive(entries) });
+                self.hits = Some(Hits { query, entries: self.env.alive(found.entries), more: found.more });
             }
         }
         self.refresh_view();
@@ -253,13 +261,16 @@ impl HistoryPage {
         self.pending = Some((token, q.clone()));
         let (store, slot, waker) = (self.env.store.clone(), self.slot.clone(), cx.waker.clone());
         (self.env.spawn)(Box::new(move || {
-            let found = store.search(&q);
+            let found = store.search(&q, MAX_LOADED);
             slot.lock().unwrap_or_else(|e| e.into_inner()).search = Some((token, q, found));
             waker();
         }));
     }
 
     fn start_summary(&self, cx: &Cx) {
+        if !self.more {
+            return;
+        }
         let (store, slot, waker) = (self.env.store.clone(), self.slot.clone(), cx.waker.clone());
         (self.env.spawn)(Box::new(move || {
             let s = store.summary();
@@ -273,8 +284,8 @@ impl HistoryPage {
             return None;
         }
         Some(match (&self.summary, self.more) {
-            (Some(s), _) => histview::stats_line(s),
-            (None, false) => histview::stats_line(&histview::stats(&self.pool)),
+            (Some(s), true) => histview::stats_line(s),
+            (_, false) => histview::stats_line(&histview::stats(&self.pool)),
             (None, true) => format!("Latest {}: {}", histview::thousands(self.pool.len()), histview::stats_line(&histview::stats(&self.pool))),
         })
     }
@@ -366,8 +377,13 @@ impl PageModel for HistoryPage {
         if self.pending.is_some() {
             v.push(Item::Note("Searching all history\u{2026}".into()));
         }
-        if self.more && self.q().is_empty() {
+        if let Some(h) = self.hits.as_ref().filter(|h| h.more && h.query == self.q()) {
+            v.push(Item::Note(format!("Showing the newest {} matches. Narrow the search to see older ones.", histview::thousands(h.entries.len()))));
+        }
+        if self.can_load_more() && self.q().is_empty() {
             v.push(Item::Button { id: B_MORE, label: "Load older".into(), style: BtnStyle::Outline, enabled: true });
+        } else if self.more && self.q().is_empty() {
+            v.push(Item::Note(format!("Showing the newest {}. Search to find older dictations.", histview::thousands(MAX_LOADED))));
         }
         v.push(Item::Space(4.0));
         v.push(Item::Button { id: B_CLEAR, label: "Clear all".into(), style: BtnStyle::Destructive, enabled: !self.pool.is_empty() || self.more });
@@ -407,7 +423,7 @@ impl PageModel for HistoryPage {
                 self.show_discarded = on;
                 self.refresh_view();
             }
-            (B_MORE, Event::Pressed) => {
+            (B_MORE, Event::Pressed) if self.can_load_more() => {
                 let keep = self.pool.len() + PAGE;
                 self.reload(keep);
                 self.refresh_view();
@@ -444,7 +460,7 @@ impl PageModel for HistoryPage {
         self.more = false;
         self.hits = None;
         self.pending = None;
-        self.summary = Some(Stats::default());
+        self.summary = None;
         self.refresh_view();
         vec![Effect::Do(PopupAction::HistoryClear), Effect::Toast("History cleared".into())]
     }
@@ -708,10 +724,11 @@ mod tests {
         fn find(&self, id: i64) -> Option<Entry> {
             self.entries.lock().unwrap().iter().find(|e| e.id == id).cloned()
         }
-        fn search(&self, query: &str) -> Vec<Entry> {
+        fn search(&self, query: &str, cap: usize) -> history::Recent {
             self.searches.lock().unwrap().push(query.to_string());
             let all = self.entries.lock().unwrap();
-            histview::visible(&all, query, true).into_iter().map(|i| all[i].clone()).collect()
+            let hits: Vec<Entry> = histview::visible(&all, query, true).into_iter().map(|i| all[i].clone()).collect();
+            history::Recent { more: hits.len() > cap, entries: hits.into_iter().take(cap).collect() }
         }
         fn summary(&self) -> Stats {
             histview::stats(&self.entries.lock().unwrap())
@@ -843,6 +860,66 @@ mod tests {
         assert!(!p.tail_items(&cx).iter().any(|i| matches!(i, Item::Button { id: B_MORE, .. })), "nothing older left");
         assert_eq!(p.entry_at(0).unwrap().id, 450);
         assert_eq!(p.entry_at(449).unwrap().id, 1);
+    }
+
+    #[test]
+    fn a_full_pool_stops_loading_but_search_still_reaches_the_rest_of_the_file() {
+        let mut cfg = Config::default();
+        let fake = Fake::new(many(MAX_LOADED as i64 + 300));
+        let mut p = entered(fake.clone(), &mut cfg);
+        let mut cx = Cx::new(&mut cfg, false, now());
+        while p.can_load_more() {
+            p.event(B_MORE, Event::Pressed, &mut cx);
+        }
+        assert_eq!(p.pool.len(), MAX_LOADED);
+        assert!(p.more, "older entries are still on disk");
+        let tail = p.tail_items(&cx);
+        assert!(!tail.iter().any(|i| matches!(i, Item::Button { id: B_MORE, .. })));
+        assert!(tail.iter().any(|i| matches!(i, Item::Note(n) if n.starts_with("Showing the newest 2,000"))));
+        assert!(p.event(B_MORE, Event::Pressed, &mut cx).is_empty() && p.pool.len() == MAX_LOADED, "a stray press does nothing");
+        // The oldest entries are outside the pool; a committed search finds them on the worker.
+        p.event(F_SEARCH, Event::Committed("note0005".into()), &mut cx);
+        p.wake(&mut cx);
+        assert_eq!(*fake.searches.lock().unwrap(), vec!["note0005"]);
+        assert_eq!(rows(&p), vec![5]);
+    }
+
+    #[test]
+    fn a_search_with_more_matches_than_the_cap_says_so() {
+        let mut cfg = Config::default();
+        let mut p = entered(Fake::new(many(MAX_LOADED as i64 + 50)), &mut cfg);
+        let mut cx = Cx::new(&mut cfg, false, now());
+        p.event(F_SEARCH, Event::Committed("body".into()), &mut cx);
+        p.wake(&mut cx);
+        assert_eq!(p.view.len(), MAX_LOADED);
+        assert!(p.tail_items(&cx).iter().any(|i| matches!(i, Item::Note(n) if n.starts_with("Showing the newest 2,000 matches"))));
+    }
+
+    #[test]
+    fn a_whole_file_total_arriving_after_clear_all_does_not_resurrect_the_numbers() {
+        let mut cfg = Config::default();
+        let mut p = new_page(Fake::new(many(300)));
+        static JOBS: Mutex<Vec<Box<dyn FnOnce() + Send>>> = Mutex::new(Vec::new());
+        p.env.spawn = |job| JOBS.lock().unwrap().push(job);
+        let mut cx = Cx::new(&mut cfg, false, now());
+        p.enter(&mut cx);
+        assert_eq!(JOBS.lock().unwrap().len(), 1, "300 entries: part of the file is loaded, the totals need a scan");
+        p.confirmed(ConfirmId::HistoryClear, &mut cx);
+        let jobs: Vec<_> = JOBS.lock().unwrap().drain(..).collect();
+        jobs.into_iter().for_each(|j| j());
+        p.wake(&mut cx);
+        assert_eq!(p.stats_note(), None, "the cleared page stays empty");
+    }
+
+    #[test]
+    fn a_complete_pool_needs_no_totals_scan() {
+        let mut cfg = Config::default();
+        let mut p = new_page(Fake::new(sample()));
+        static RAN: Mutex<usize> = Mutex::new(0);
+        p.env.spawn = |_job| *RAN.lock().unwrap() += 1;
+        p.enter(&mut Cx::new(&mut cfg, false, now()));
+        assert_eq!(*RAN.lock().unwrap(), 0);
+        assert!(p.stats_note().is_some());
     }
 
     #[test]

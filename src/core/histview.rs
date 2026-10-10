@@ -10,32 +10,26 @@ pub struct Group {
     pub items: Vec<usize>,
 }
 
+/// Lower-cased words of a search query.
+pub fn query_words(query: &str) -> Vec<String> {
+    query.split_whitespace().map(|s| s.to_lowercase()).collect()
+}
+
+/// Whether `e` contains every one of `words` (from [`query_words`]) in its text, raw transcript,
+/// app, provider, model or error, ignoring case. No words match everything.
+pub fn matches(e: &Entry, words: &[String]) -> bool {
+    if words.is_empty() {
+        return true;
+    }
+    let hay = format!("{} {} {} {} {} {}", e.text, e.raw, e.app_name.as_deref().unwrap_or(""), e.provider, e.model, e.error.as_deref().unwrap_or("")).to_lowercase();
+    words.iter().all(|w| hay.contains(w))
+}
+
 /// Indices of entries to show: discarded rows only when asked for; the query matches text, raw
 /// transcript, app, provider, model and error (case-insensitive substring over all words).
 pub fn visible(entries: &[Entry], query: &str, show_discarded: bool) -> Vec<usize> {
-    let words: Vec<String> = query.split_whitespace().map(|s| s.to_lowercase()).collect();
-    entries
-        .iter()
-        .enumerate()
-        .filter(|(_, e)| show_discarded || e.status != Status::Discarded)
-        .filter(|(_, e)| {
-            if words.is_empty() {
-                return true;
-            }
-            let hay = format!(
-                "{} {} {} {} {} {}",
-                e.text,
-                e.raw,
-                e.app_name.as_deref().unwrap_or(""),
-                e.provider,
-                e.model,
-                e.error.as_deref().unwrap_or("")
-            )
-            .to_lowercase();
-            words.iter().all(|w| hay.contains(w))
-        })
-        .map(|(i, _)| i)
-        .collect()
+    let words = query_words(query);
+    entries.iter().enumerate().filter(|(_, e)| show_discarded || e.status != Status::Discarded).filter(|(_, e)| matches(e, &words)).map(|(i, _)| i).collect()
 }
 
 /// Group consecutive visible rows (newest first) by local calendar day.
@@ -66,13 +60,38 @@ pub fn word_count(s: &str) -> usize {
 }
 
 pub fn stats(entries: &[Entry]) -> Stats {
-    let ok: Vec<&Entry> = entries.iter().filter(|e| e.status == Status::Ok).collect();
-    let lat: Vec<u64> = ok.iter().map(|e| e.latency_ms).filter(|&l| l > 0).collect();
-    Stats {
-        dictations: ok.len(),
-        failed: entries.iter().filter(|e| e.status == Status::Failed).count(),
-        words: ok.iter().map(|e| word_count(&e.text)).sum(),
-        avg_latency_ms: if lat.is_empty() { None } else { Some(lat.iter().sum::<u64>() / lat.len() as u64) },
+    let mut acc = StatsAcc::default();
+    entries.iter().for_each(|e| acc.add(e));
+    acc.finish()
+}
+
+/// [`stats`] one entry at a time, for scans that must not hold the whole history in memory.
+#[derive(Default)]
+pub struct StatsAcc {
+    stats: Stats,
+    latency_sum: u64,
+    latency_n: u64,
+}
+
+impl StatsAcc {
+    pub fn add(&mut self, e: &Entry) {
+        match e.status {
+            Status::Ok => {
+                self.stats.dictations += 1;
+                self.stats.words += word_count(&e.text);
+                if e.latency_ms > 0 {
+                    self.latency_sum += e.latency_ms;
+                    self.latency_n += 1;
+                }
+            }
+            Status::Failed => self.stats.failed += 1,
+            Status::Discarded => {}
+        }
+    }
+
+    pub fn finish(mut self) -> Stats {
+        self.stats.avg_latency_ms = (self.latency_n > 0).then(|| self.latency_sum / self.latency_n);
+        self.stats
     }
 }
 
