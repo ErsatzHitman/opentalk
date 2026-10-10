@@ -220,13 +220,6 @@ fn require_input_desktop(test: &str) -> bool {
     ok
 }
 
-/// Process ids of every running `image` (e.g. `notepad.exe`).
-fn pids_of(image: &str) -> std::collections::HashSet<u32> {
-    let out = Command::new("tasklist").args(["/FO", "CSV", "/NH", "/FI", &format!("IMAGENAME eq {image}")]).output();
-    let text = out.map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
-    text.lines().filter_map(|l| l.split("\",\"").nth(1)?.parse().ok()).collect()
-}
-
 /// One row of a process snapshot.
 struct ProcRow {
     pid: u32,
@@ -273,10 +266,16 @@ fn descendants(table: &[ProcRow], root: u32) -> std::collections::HashSet<u32> {
 /// daemons behind: on timeout the process tree is killed and so is every descendant of the child
 /// (found through a snapshot taken before the kill) whose image is in `sweep` (e.g. Notepad).
 /// Processes the user or another test started are never touched, even when they match `sweep`.
-fn run_limited(mut cmd: Command, limit: std::time::Duration, sweep: &[&str]) -> bool {
+fn run_limited(cmd: Command, limit: std::time::Duration, sweep: &[&str]) -> bool {
+    run_limited_family(cmd, limit, sweep).0
+}
+
+/// `run_limited`, also returning the pids the child had started when the limit hit (empty when
+/// it finished in time), so a test can check those very processes are gone.
+fn run_limited_family(mut cmd: Command, limit: std::time::Duration, sweep: &[&str]) -> (bool, std::collections::HashSet<u32>) {
     let mut child = cmd.spawn().expect("spawn");
     match child.wait_timeout_ms(limit.as_millis() as u64) {
-        Some(status) => status.success(),
+        Some(status) => (status.success(), Default::default()),
         None => {
             eprintln!("{cmd:?} exceeded {limit:?}; killing it and what it opened");
             let table = process_table();
@@ -288,7 +287,7 @@ fn run_limited(mut cmd: Command, limit: std::time::Duration, sweep: &[&str]) -> 
                     let _ = Command::new("taskkill").args(["/F", "/T", "/PID", &row.pid.to_string()]).output();
                 }
             }
-            false
+            (false, family)
         }
     }
 }
@@ -324,13 +323,16 @@ fn hung_ping_cmd() -> Command {
 #[test]
 fn a_hung_child_is_killed_with_what_it_started() {
     let _serial = PING_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let before = pids_of("PING.EXE");
     let t0 = std::time::Instant::now();
-    assert!(!run_limited(hung_ping_cmd(), std::time::Duration::from_millis(1500), &["PING.EXE"]));
+    let (ok, family) = run_limited_family(hung_ping_cmd(), std::time::Duration::from_millis(1500), &["PING.EXE"]);
+    assert!(!ok);
     assert!(t0.elapsed() < std::time::Duration::from_secs(10), "the limit was not enforced");
+    // Judge the child's own descendants (cmd's ping), not every PING.EXE on the machine: other
+    // test runs and the user start pings of their own.
+    assert!(!family.is_empty(), "the hung child had started nothing, so the test proves nothing");
     std::thread::sleep(std::time::Duration::from_millis(300));
-    let leftovers: Vec<_> = pids_of("PING.EXE").difference(&before).copied().collect();
-    assert!(leftovers.is_empty(), "the hung child's ping outlived the limit: {leftovers:?}");
+    let alive: Vec<_> = process_table().into_iter().filter(|r| family.contains(&r.pid) && r.image.eq_ignore_ascii_case("PING.EXE")).map(|r| r.pid).collect();
+    assert!(alive.is_empty(), "the hung child's ping outlived the limit: {alive:?}");
 }
 
 #[test]
