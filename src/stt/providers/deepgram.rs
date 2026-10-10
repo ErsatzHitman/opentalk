@@ -32,11 +32,12 @@ impl BatchProvider for Deepgram {
 
         let auth = format!("Token {key}");
         let res = http::post(&url, &[("Authorization", &auth)], "audio/wav", &wav, timeout(opts));
-        let resp = errors::check_response("Deepgram", Some(model), false, res)?;
-        let v = resp.json().map_err(|e| errors::bad_response("Deepgram", false, &format!("invalid JSON ({e})"), &resp.body))?;
+        let secrets = [key];
+        let resp = errors::check_response_with("Deepgram", Some(model), false, res, &secrets)?;
+        let v = resp.json().map_err(|e| errors::bad_response_with("Deepgram", false, &format!("invalid JSON ({e})"), &resp.body, &secrets))?;
         let channel = v.pointer("/results/channels/0");
         let Some(text) = channel.and_then(|c| c.pointer("/alternatives/0/transcript")).and_then(|t| t.as_str()) else {
-            return Err(errors::bad_response("Deepgram", false, "no transcript", &resp.body));
+            return Err(errors::bad_response_with("Deepgram", false, "no transcript", &resp.body, &secrets));
         };
         let detected_language = channel.and_then(|c| c.get("detected_language")).and_then(|l| l.as_str()).map(String::from);
         Ok(Transcript { text: text.to_string(), detected_language })
@@ -117,5 +118,22 @@ mod tests {
         assert_eq!((e.code, e.message.as_str()), (SttErrorCode::AuthFailed, "Deepgram rejected your API key."));
         let e = Deepgram.transcribe(&audio(), &opts(""), &Credentials::default()).unwrap_err();
         assert_eq!(e.code, SttErrorCode::NotConfigured);
+    }
+
+    #[test]
+    fn configured_key_echoed_by_the_provider_is_redacted() {
+        const KEY: &str = "dg3f9a1c77b25e0d84aa6c1e";
+        let mock = serve(vec![Resp::json(401, &format!(r#"{{"err_code":"INVALID_AUTH","err_msg":"Invalid credentials. Token {KEY}"}}"#))]);
+        let e = Deepgram.transcribe(&audio(), &opts(""), &creds(&mock, KEY)).unwrap_err();
+        assert_eq!(e.code, SttErrorCode::AuthFailed);
+        assert!(e.detail.starts_with("HTTP 401: "), "{}", e.detail);
+        assert_no_leak(&e, KEY);
+        // an unusable 2xx body echoing the key goes through bad_response
+        let mock = serve(vec![Resp::json(200, &format!(r#"{{"echo":"{KEY}"}}"#))]);
+        let e = Deepgram.transcribe(&audio(), &opts(""), &creds(&mock, KEY)).unwrap_err();
+        assert_no_leak(&e, KEY);
+        // and the dispatcher path (`providers::get`) agrees
+        let mock = serve(vec![Resp::json(401, &format!("bad {KEY}"))]);
+        assert_no_leak(&crate::stt::providers::get(SttProviderId::Deepgram).transcribe(&audio(), &opts(""), &creds(&mock, KEY)).unwrap_err(), KEY);
     }
 }

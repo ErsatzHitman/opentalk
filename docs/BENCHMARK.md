@@ -46,6 +46,49 @@ The paste stage here only writes the clipboard (the benchmark runs with `auto_pa
 10 ms clipboard settle plus `SendInput`. The desktop was **locked** during this run (LogonUI active), where Windows denies clipboard access, so the clipboard write retries and fails; its time is not representative. Re-run on an unlocked desktop for the real figure.
 
 
+## FLAC upload experiment (PLAN 9.5, Phase 8)
+
+**Decision: not adopted; uploads stay 16 kHz mono PCM WAV.** The bar was "saves at least 30 ms on a median connection".
+
+Method: a throwaway program (not part of the repo) encodes the fixture clips with `flacenc` 0.5.1 (pure Rust, `default-features = false`, default config, fixed 4096-sample blocks, release build with fat LTO) and times 21 encodes per clip. The clean clip's FLAC was decoded with ffmpeg and is bit-exact with the source WAV. Upload time was measured on a paced 127.0.0.1 TCP transfer (1460-byte writes, deadline-paced to the simulated uplink, wall time until the receiver has all bytes and replies; median of 5). Two inputs bracket real audio: the TTS fixture as is (the best case for FLAC, digital silence between words) and the same clip with +-30 LSB uniform noise added (about -60 dBFS, a typical quiet-room mic floor; real mics are often noisier, which compresses worse).
+
+| Clip (16 kHz mono) | WAV bytes | FLAC bytes | FLAC / WAV | Encode median / p95 (ms) |
+|---|---|---|---|---|
+| tts_clean.wav, 6.03 s | 193,004 | 83,207 | 0.431 | 9.6 / 12.1 |
+| tts_fillers.wav, 8.47 s | 271,244 | 128,297 | 0.473 | 14.9 / 32.7 |
+| tts_clean.wav + noise 30 | 193,004 | 109,206 | 0.566 | 11.2 / 24.3 |
+| tts_fillers.wav + noise 30 | 271,244 | 158,109 | 0.583 | 16.5 / 29.1 |
+| tts_fillers.wav + noise 100 (about -50 dBFS) | 271,244 | 171,025 | 0.631 | 15.7 / 36.4 |
+
+Measured paced upload of the 8.47 s clip (milliseconds, WAV vs FLAC, before encode time):
+
+| Uplink | Clean: WAV / FLAC / saved | Noise 30: WAV / FLAC / saved |
+|---|---|---|
+| 2 Mbps | 1087 / 585 / 502 | 1086 / 665 / 421 |
+| 5 Mbps | 437 / 211 / 226 | 436 / 257 / 179 |
+| 10 Mbps | 217 / 103 / 114 | 220 / 130 / 90 |
+
+The 20 and 50 Mbps rows of the paced test were not usable: Windows timer granularity (about 1 ms sleeps against 0.5 ms packet intervals) made the runs bounce (for example 362 ms against an expected 108 ms), so those rows come from the arithmetic that the 2/5/10 Mbps measurements confirm to within 1%: `bytes * 8 / rate`.
+
+Net saving (upload time saved minus encode time, ms; encode cost taken as 1.76 ms per audio second clean, 1.94 noisy). Format: saved before encode / net after encode.
+
+| Dictation, content | 2 Mbps | 5 Mbps | 10 Mbps | 20 Mbps | 50 Mbps |
+|---|---|---|---|---|---|
+| 5 s, clean | 337 / 328 | 135 / 126 | 67 / 59 | 34 / 25 | 13 / 5 |
+| 5 s, mic noise | 267 / 257 | 107 / 97 | 53 / 44 | 27 / 17 | 11 / 1 |
+| 8.5 s, clean | 571 / 556 | 229 / 214 | 114 / 99 | 57 / 42 | 23 / 8 |
+| 8.5 s, mic noise | 452 / 436 | 181 / 164 | 90 / 74 | 45 / 29 | 18 / 2 |
+
+Reading:
+
+- FLAC clears 30 ms net only on slow uplinks: below roughly 13 Mbps for a 5 s dictation and below roughly 20 Mbps for an 8.5 s one (noisy input; 17 Mbps for 5 s clean). On a 20-50 Mbps uplink, which is a conservative stand-in for a median fixed connection (mobile is lower, broadband usually higher), a typical 5-8.5 s dictation nets 1-42 ms, and only the clean (best-case) 8.5 s clip at 20 Mbps clears 30 ms; every mic-noise case is under the bar.
+- The model ignores TCP slow start and TLS record overhead. With a pre-warmed keep-alive socket (PLAN 9.3) the 130-270 KB body spans several round trips either way, so the real saving at high bandwidth is bounded by the bandwidth term above plus at most about one RTT, and no measurement here supports counting on that.
+- Cost: `flacenc` adds 248,320 bytes to a release binary (526,336 against 278,016 bytes for the same program without it), about 242 KB. That is 3.2% of the 7.51 MB executable and about half of the 0.49 MB left under the 8 MB budget, for no win at the target connection speed.
+- Compatibility risk the WAV path does not have: every provider needs a verified FLAC accept path (content type, file name, extension sniffing; Gemini inline data and the Realtime/streaming providers differ), and each would need a WAV fallback on rejection.
+- The encode is also on the stop-to-text path (about 15 ms for 8.5 s) unless it is moved into the recording thread, which spends CPU while the 1.5% recording target is tight on small laptops (see the 4-core projection above).
+
+Revisit only as an opt-in for slow uplinks (for example when a measured upload rate stays below about 10 Mbps), not as the default format. Until then the PLAN section 1 upload row stays "silence-trimmed 16 kHz mono PCM WAV", logged in bytes per request (249,964 bytes in the benchmark above).
+
 ## Binary size
 
 Release executable, measured by rebuilding the same commit with parts of the cleanup LLM code stubbed out (`bench/out/size.json`):

@@ -34,9 +34,9 @@ impl BatchProvider for Gemini {
 
         let url = format!("{}/interactions", base_url(creds, DEFAULT_BASE));
         let res = http::post_json(&url, &[("x-goog-api-key", key)], &body, timeout(opts));
-        let resp = errors::check_response("Gemini", Some(model), false, res)?;
-        let data: Value = resp.json().map_err(|e| errors::bad_response("Gemini", false, &format!("invalid JSON ({e})"), &resp.body))?;
-        parse_response(&data)
+        let resp = errors::check_response_with("Gemini", Some(model), false, res, &[key])?;
+        let data: Value = resp.json().map_err(|e| errors::bad_response_with("Gemini", false, &format!("invalid JSON ({e})"), &resp.body, &[key]))?;
+        parse_response(&data, &[key])
     }
 }
 
@@ -61,14 +61,14 @@ fn request_body(model: &str, wav: &[u8], opts: &SttOptions) -> Value {
 
 /// `output_text`, else the joined text parts of `steps[].content[]`. Anything but a
 /// `completed` status is a failure, never a (possibly truncated) transcript.
-fn parse_response(data: &Value) -> Result<Transcript, SttError> {
+fn parse_response(data: &Value, secrets: &[&str]) -> Result<Transcript, SttError> {
     if let Some(status) = data.get("status").and_then(|s| s.as_str()).filter(|s| !s.is_empty() && *s != "completed") {
         let detail = data.pointer("/error/message").and_then(|m| m.as_str());
         let message = match detail {
             Some(d) => format!("Gemini transcription failed: {d}"),
             None => format!("Gemini transcription did not complete (status: {status})"),
         };
-        return Err(SttError::new(SttErrorCode::Other, errors::redact(&message)).with_detail(format!("status {status}")));
+        return Err(SttError::new(SttErrorCode::Other, errors::redact_with(&message, secrets)).with_detail(format!("status {status}")));
     }
     let text = match data.get("output_text").and_then(|t| t.as_str()).filter(|t| !t.trim().is_empty()) {
         Some(t) => t.to_string(),
@@ -137,16 +137,16 @@ mod tests {
         assert_eq!(t.text, "Hello world.");
         // A blank output_text also falls through to the steps.
         let v: Value = serde_json::from_str(r#"{"output_text":"  ","steps":[{"content":[{"type":"text","text":"ok"}]}]}"#).unwrap();
-        assert_eq!(parse_response(&v).unwrap().text, "ok");
+        assert_eq!(parse_response(&v, &[]).unwrap().text, "ok");
     }
 
     #[test]
     fn non_completed_status_is_an_error() {
         let v: Value = serde_json::from_str(r#"{"status":"failed","error":{"message":"quota blew up"},"output_text":"partial"}"#).unwrap();
-        let e = parse_response(&v).unwrap_err();
+        let e = parse_response(&v, &[]).unwrap_err();
         assert_eq!(e.message, "Gemini transcription failed: quota blew up");
         let v: Value = serde_json::from_str(r#"{"status":"budget_exceeded"}"#).unwrap();
-        assert_eq!(parse_response(&v).unwrap_err().message, "Gemini transcription did not complete (status: budget_exceeded)");
+        assert_eq!(parse_response(&v, &[]).unwrap_err().message, "Gemini transcription did not complete (status: budget_exceeded)");
     }
 
     #[test]
@@ -167,5 +167,18 @@ mod tests {
         let big = Audio { samples: vec![0; 8 * 1024 * 1024], sample_rate: 16_000 }; // 16 MB of PCM
         let c = Credentials { api_key: Some("AIzaSy-test-key".into()), base_url: Some("http://127.0.0.1:1".into()), extra: vec![] };
         assert_eq!(Gemini.transcribe(&big, &opts("g"), &c).unwrap_err().code, SttErrorCode::PayloadTooLarge);
+    }
+
+    #[test]
+    fn configured_key_echoed_by_the_provider_is_redacted() {
+        const KEY: &str = "gm8Hq2Wz6Ne1Vt5Rb9Xc3Lk7Pd4Sf0Jy";
+        let mock = serve(vec![Resp::json(400, &format!(r#"{{"error":{{"message":"API key not valid: {KEY}"}}}}"#))]);
+        let e = Gemini.transcribe(&audio(), &opts("g"), &creds(&mock, KEY)).unwrap_err();
+        assert_no_leak(&e, KEY);
+        // a failed interaction reports its provider text in the user-facing message
+        let mock = serve(vec![Resp::json(200, &format!(r#"{{"status":"failed","error":{{"message":"rejected {KEY}"}}}}"#))]);
+        let e = Gemini.transcribe(&audio(), &opts("g"), &creds(&mock, KEY)).unwrap_err();
+        assert!(e.message.starts_with("Gemini transcription failed"), "{}", e.message);
+        assert_no_leak(&e, KEY);
     }
 }

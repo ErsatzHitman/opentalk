@@ -29,7 +29,7 @@ Companion spec with exact pixel and colour values: `docs/SPEC.md`.
 | Hotkey to pill visible | ≤16 ms | Timestamped debug log (QPC) |
 | Hotkey to mic capturing | ≤50 ms | Log: hook event → first WASAPI packet |
 | Stop to text pasted | Network RTT + ≤40 ms local overhead | Log: stop → request sent → response → paste done |
-| Upload size | Silence-trimmed 16 kHz mono (FLAC optional, see Phase 7) | Bytes logged per request |
+| Upload size | Silence-trimmed 16 kHz mono PCM WAV (FLAC measured and not adopted, see §9.5) | Bytes logged per request |
 
 ---
 
@@ -285,7 +285,7 @@ OpenWhispr already has History (its Home page) and a Dictionary page with Snippe
 2. **Pre-built capture.** Keep `IMMDeviceEnumerator` and the device resolved at start-up, and re-resolve on `IMMNotificationClient` default-device change. The `IAudioClient` is created at the hotkey press, which is about 10–20 ms. An optional "keep mic warm" setting is offered, mirroring `micWarmHoldSeconds`, default off, because Windows shows the mic indicator while it is warm.
 3. **TLS pre-warm at hotkey press.** A background `HEAD`/`GET` opens the TLS connection to the provider host while you speak, so the upload reuses a warm keep-alive socket. That saves about 50–150 ms.
 4. **Trim leading and trailing silence** (energy VAD with 150 ms padding) before upload. Smaller body, fewer hallucinations.
-5. **Upload format.** 16 kHz mono PCM WAV. Phase 7 measures FLAC (`flacenc`, pure Rust): adopt it if it saves at least 30 ms on a median connection.
+5. **Upload format.** 16 kHz mono PCM WAV. **Decision (Phase 8 experiment, 2026-10-10): keep WAV, do not adopt FLAC.** `flacenc` 0.5.1 (pure Rust) shrinks the upload by 37-57% (a clean TTS clip 271,244 -> 128,297 bytes; the same clip with a mic-like noise floor -> 158,109 bytes) and encodes in about 1.8-1.9 ms per second of audio (~15 ms for 8.5 s). Net of that encode time, the saving is below the 30 ms bar at a 20 Mbps uplink for a typical 5 s dictation (17-25 ms) and falls to 1-8 ms at 50 Mbps; it only clears 30 ms below roughly 13 Mbps (5 s) or 20 Mbps (8.5 s). The price is +242 KB in the executable (3% of the 7.51 MB build, about half of the remaining 0.49 MB under the 8 MB budget), a per-provider format-acceptance matrix, and extra CPU on the hot path. Full numbers: `BENCHMARK.md`, section "FLAC upload experiment". Revisit only as an opt-in for slow uplinks (below about 10 Mbps), not as the default.
 6. **Streaming providers** (Deepgram, AssemblyAI, Realtime) send audio during recording, so stop-to-text is roughly the finalize time (about 150–300 ms).
 7. **Local post-processing:** deterministic cleanup under 1 ms. Paste is about 10 ms delay plus `SendInput`.
 8. **History write** happens after the paste, on the worker thread.
@@ -298,7 +298,7 @@ OpenWhispr already has History (its Home page) and a Dictionary page with Snippe
 |---|---|
 | Unit | `cargo test`: cleanup pipeline (all ported OpenWhispr fixtures plus new ones), snippets, dictionary prompt caps, echo filter, hotkey parser and matcher, provider request builders (golden multipart bodies), response parsers, error classifier, config migration. |
 | Provider contracts | `tools/mock_stt.py` replays each provider's documented request and response shape (OpenAI SSE, xAI, Mistral, Gemini JSON, Deepgram REST and WS, AssemblyAI WS, Corti flow). Every provider's request is asserted byte-for-byte against OpenWhispr's format. No real keys are needed. |
-| Live STT | OpenRouter audio-input free models (`thinkingmachines/inkling-small:free`, `inkling:free`) through the OpenRouter provider, fed Windows-TTS WAVs. Expect free-tier rate limits (429 seen on Gemma); the harness retries and backs off. |
+| Live STT | **Best effort, reported honestly; not an exit gate.** OpenRouter lists exactly three `:free` models with audio input (re-checked 2026-10-10): `thinkingmachines/inkling-small:free` and `inkling:free` (403 "only available on agentic harnesses") and `nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free`. The last mostly answers 502 ResourceExhausted; when it answers, `usage.prompt_tokens_details.audio_tokens` is 0 and the model says it needs the audio file, so the free NVIDIA endpoint discards the audio (our `input_audio`/wav request shape is correct). No free model currently yields a transcript, so live STT is **UNVERIFIED** and STT correctness rests on the mock contract tests. The `live_*` tests print `VERIFIED` (a transcript with the spoken words), `UNVERIFIED` (limits, gated model, audio dropped) or `FAILED` (bad key or request, always a failure). `OPENTALK_LIVE_REQUIRE=1` turns `UNVERIFIED` into a failure, for runs that have a model able to verify. Retries and backoff on 429/5xx. |
 | Live cleanup LLM | OpenRouter `:free` text models (`nvidia/nemotron-3.5-lightning:free`, `google/gemma-4-31b-it:free`, `liquid/lfm-2.5-2.6b:free`). Check output validation and the 4 s timeout fallback. |
 | End-to-end | `opentalk.exe --transcribe-file x.wav` runs the full pipeline headless. A scripted dictation sends `SendInput` of the hotkey, plays TTS into the mic (or uses `--inject-wav` to bypass the mic), and pastes into Notepad. Assert the Notepad text. |
 | Visual | Golden PNGs per pill state and time sample, plus a screenshot of the real layered window. Compare against OpenWhispr reference captures. |
@@ -329,24 +329,26 @@ OpenWhispr already has History (its Home page) and a Dictionary page with Snippe
 | # | Phase | Deliverable | Exit check |
 |---|---|---|---|
 | 1 | Core skeleton | Daemon loop, config/secrets/history, tray, single instance, logging, `--transcribe-file` | Builds; tray works; config round-trips; DPAPI works |
-| 2 | STT batch providers | OpenAI, Groq, xAI, Mistral, Gemini, Deepgram REST, Custom/Azure, OpenRouter; error classifier | Mock contract tests pass; live OpenRouter free transcription passes |
+| 2 | STT batch providers | OpenAI, Groq, xAI, Mistral, Gemini, Deepgram REST, Custom/Azure, OpenRouter; error classifier | Mock contract tests pass; live OpenRouter transcription is reported VERIFIED/UNVERIFIED (see decision below), never a gate |
 | 3 | Capture, hotkey, paste | WASAPI capture plus VAD trim, LL hook (Tap/Hold/Esc/Start mask), paste plus clipboard restore, sounds | Scripted dictation lands in Notepad; latency logged |
 | 4 | Pill and app bubble | Exact pill states and animations, glow, tooltip, error card, cancel, drag, menu, app-icon bubble | Golden images match SPEC; recording CPU ≤1.5% |
 | 5 | Cleanup | Deterministic pipeline, LLM cleanup (OpenAI, Anthropic, Gemini, Groq, OpenRouter, Custom), validation, snippets, dictionary fixes | Fixture suite green; OpenRouter free-model cleanup works with fallback |
 | 6 | Streaming and remaining BYOK | Deepgram WS, AssemblyAI WS, OpenAI Realtime, Gemini Live, Corti, Tinfoil per decision | Mock WS tests pass |
 | 7 | Settings UI | egui shell, History, Dictionary/Snippets, Settings modal, hotkey capture, provider Test button | Every setting persists and the daemon applies it live |
-| 8 | Hardening and bench | Enterprise (Bedrock/Vertex), FLAC experiment, DPI and multi-monitor, UIPI, bench report, polish | `BENCHMARK.md` meets the §1 targets |
+| 8 | Hardening and bench | Enterprise (Bedrock/Vertex), FLAC experiment (done: not adopted, §9.5), DPI and multi-monitor, UIPI, bench report, polish | `BENCHMARK.md` meets the §1 targets |
 
 ---
 
 ## 12a. Risks
 
 - **egui fidelity.** Tailwind subtleties (blur, gradients, shadows) need custom painting. The plan is to paint shadows and gradients by hand where they matter (cards, buttons) and accept minor differences elsewhere.
-- **No real keys for most providers.** Correctness rests on the contract tests against OpenWhispr's exact wire formats. Live verification is limited to OpenRouter.
+- **No real keys for most providers.** Correctness rests on the contract tests against OpenWhispr's exact wire formats. Live verification is limited to OpenRouter, and its free tier currently cannot verify STT at all (see §12b decision 0).
 - **OpenRouter free tier is rate-limited** (Gemma returned 429). Live tests retry with backoff and rotate across free models.
 - **Start-menu mask key** can interact with other hook tools such as AutoHotkey. It is behind a setting, default on.
 
 ## 12b. Open decisions (for the user)
+
+0. **Live STT verification (provisional default, owner may override).** No free OpenRouter model delivers audio to its model, so a live STT transcript is unobtainable at zero cost. Options were: (a) allow one paid OpenRouter audio model or another provider key for a single live run, or (b) accept mock-only STT verification. **Recorded default: (b), pending the owner's confirmation (nothing paid is spent without it).** §10 and the Phase 2 exit check are amended accordingly: Phase 2 passes on the mock contract tests; the live tests stay in the suite and report `UNVERIFIED` rather than green. The strict policy (OpenRouter, `:free` only) is unchanged. If the owner later supplies a paid key and approves one run, that run is made with `OPENTALK_LIVE_REQUIRE=1` and a model override, the `:free` assertion in the live tests is relaxed for that run only, and this entry is updated to record the verified model and date.
 
 1. **Tinfoil.** OpenWhispr uses an attested enclave client. Choose one: (a) plain HTTPS without attestation, (b) skip Tinfoil, or (c) port attestation later. Recommendation: (b), unless you use it.
 2. **Corti and enterprise clouds** (Bedrock SigV4, Vertex). Keep in Phase 6/8, or drop for a personal build?
