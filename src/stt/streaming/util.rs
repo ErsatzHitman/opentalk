@@ -79,6 +79,27 @@ pub fn percent_encode(s: &str) -> String {
     out
 }
 
+/// Inverse of [`percent_encode`]; malformed escapes pass through unchanged.
+pub fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let hex = |c: u8| (c as char).to_digit(16);
+        match (b[i], b.get(i + 1).and_then(|c| hex(*c)), b.get(i + 2).and_then(|c| hex(*c))) {
+            (b'%', Some(h), Some(l)) => {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+            }
+            (c, ..) => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// `None` for unset/"auto"/blank, otherwise the trimmed code.
 pub fn explicit_language(lang: Option<&str>) -> Option<&str> {
     lang.map(str::trim).filter(|l| !l.is_empty() && !l.eq_ignore_ascii_case("auto"))
@@ -227,6 +248,14 @@ mod tests {
         assert_eq!(e.code, SttErrorCode::Other);
         assert!(e.detail.contains("[redacted]"), "{}", e.detail);
         assert_clean(&e);
+    }
+
+    #[test]
+    fn percent_decode_round_trips() {
+        for s in ["tok+/=abc", "ünï cödé", "plain-_.~", "100%"] {
+            assert_eq!(percent_decode(&percent_encode(s)), s);
+        }
+        assert_eq!(percent_decode("%zz%4"), "%zz%4");
     }
 
     #[test]
