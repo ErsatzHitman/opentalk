@@ -148,7 +148,15 @@ fn extract_with(
                     }
                 }
             }
-            tile.or_else(|| shell(path, px)).or_else(|| cheap(path, px))
+            if tile.is_some() {
+                tile
+            } else if exe_name == "applicationframehost.exe" {
+                // No AUMID tile: the frame host's own shell icon is a generic window and costs ~35 shell
+                // DLLs (+17 MB WS), so try the cheap extractors first and the factory only as a last resort.
+                cheap(path, px).or_else(|| shell(path, px))
+            } else {
+                shell(path, px).or_else(|| cheap(path, px))
+            }
         }
     }?;
 
@@ -712,6 +720,38 @@ mod tests {
         let pkg = r"C:\Program Files\WindowsApps\X_1.0_x64__abc\x.exe";
         assert!(extract_with(pkg, 0, 32, &none, &shell).is_some());
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// `ApplicationFrameHost.exe` with no resolvable AUMID (pid 0, unresolved child window) takes the
+    /// cheap extractors; the shell factory is only the last resort when they find nothing.
+    #[test]
+    fn frame_host_without_aumid_prefers_cheap_backend() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let frame_host = r"C:\Windows\System32\ApplicationFrameHost.exe";
+        let shell_calls = AtomicUsize::new(0);
+        let shell = |_: &str, px: u32| {
+            shell_calls.fetch_add(1, Ordering::SeqCst);
+            Some(vec![9u8; (px * px * 4) as usize])
+        };
+        let cheap_calls = AtomicUsize::new(0);
+        let cheap = |_: &str, px: u32| {
+            cheap_calls.fetch_add(1, Ordering::SeqCst);
+            Some(vec![7u8; (px * px * 4) as usize])
+        };
+        let icon = extract_with(frame_host, 0, 32, &cheap, &shell).expect("cheap icon");
+        assert_eq!(shell_calls.load(Ordering::SeqCst), 0, "the shell factory must not be asked");
+        assert_eq!(cheap_calls.load(Ordering::SeqCst), 1);
+        assert!(icon.rgba.iter().all(|&b| b == 7));
+        // Cheap finds nothing: the factory is still the last resort.
+        let none = |_: &str, _: u32| None;
+        assert!(extract_with(frame_host, 0, 32, &none, &shell).is_some());
+        assert_eq!(shell_calls.load(Ordering::SeqCst), 1);
+        // A WindowsApps exe keeps asking the factory first.
+        shell_calls.store(0, Ordering::SeqCst);
+        cheap_calls.store(0, Ordering::SeqCst);
+        let pkg = r"C:\Program Files\WindowsApps\X_1.0_x64__abc\x.exe";
+        assert!(extract_with(pkg, 0, 32, &cheap, &shell).is_some());
+        assert_eq!((shell_calls.load(Ordering::SeqCst), cheap_calls.load(Ordering::SeqCst)), (1, 0));
     }
 
     #[test]
