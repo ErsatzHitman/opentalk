@@ -364,7 +364,11 @@ fn anim_thread(core: Arc<TimerCore>, sink: Box<dyn Fn() + Send>) {
                         }
                         continue;
                     }
-                    r.0.wrapping_sub(WAIT_OBJECT_0.0) + 1
+                    // a failed wait (not 0..=2) counts as quit, like in the timer branch
+                    match r.0.wrapping_sub(WAIT_OBJECT_0.0) {
+                        k @ 0..=2 => k + 1,
+                        _ => u32::MAX,
+                    }
                 } else {
                     WaitForMultipleObjects(&[timer, stop, quit, rate], false, INFINITE).0.wrapping_sub(WAIT_OBJECT_0.0)
                 };
@@ -1624,6 +1628,34 @@ mod tests {
         let n1 = tick_count(&stamps);
         std::thread::sleep(Duration::from_millis(150));
         assert_eq!(tick_count(&stamps), n1, "a stopped timer is silent");
+    }
+
+    /// Full-rate ticks keep a steady beat whichever clock paces them (the compositor on a desktop, the
+    /// fixed timer where it does not block), a forecast is never in the past, and a stopped timer is
+    /// silent: the idle pill runs nothing (PLAN section 1).
+    #[test]
+    fn full_rate_ticks_are_steady_forecast_forward_and_silent_when_stopped() {
+        use std::time::Duration;
+        let (timer, stamps) = recording_timer();
+        timer.start();
+        std::thread::sleep(Duration::from_millis(700));
+        let at: Vec<_> = stamps.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert!(at.len() >= 20, "{} ticks in 700 ms", at.len());
+        let mut gaps: Vec<f64> = at.windows(2).map(|w| (w[1] - w[0]).as_secs_f64() * 1000.0).collect();
+        gaps.sort_by(|a, b| a.total_cmp(b));
+        let median = gaps[gaps.len() / 2];
+        // 62.5 Hz timer, or one tick per 1-5 vblanks of a 60-360 Hz display; a failed flush that returns
+        // at once is caught by the guard and falls back to the timer
+        assert!((2.0..=35.0).contains(&median), "median gap {median:.2} ms (gaps {gaps:?})");
+        let now = crate::core::timing::now_ms();
+        let t = timer.present_time(now);
+        assert!(t >= now && t <= now + 70.0, "forecast {t} for {now}");
+        timer.stop();
+        std::thread::sleep(Duration::from_millis(80));
+        let n = tick_count(&stamps);
+        std::thread::sleep(Duration::from_millis(250));
+        assert_eq!(tick_count(&stamps), n, "a stopped timer is silent");
+        assert_eq!(timer.present_time(now), now, "no forecast while stopped");
     }
 
     #[test]

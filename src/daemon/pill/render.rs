@@ -1511,7 +1511,10 @@ mod tests {
             assert_eq!(shrink_bakes, 0, "{scale}x: a frame of the shrink baked a displacement map");
             let (e, h, k) = (median(expand.clone()), median(hold), median(shrink.clone()));
             let worst = expand.iter().chain(&shrink).cloned().fold(0.0, f64::max);
-            println!("transition frames {scale}x: expand median {e:.3} ms, hold {h:.3} ms, shrink median {k:.3} ms, worst {worst:.3} ms");
+            let mut all: Vec<f64> = expand.iter().chain(&shrink).cloned().collect();
+            all.sort_by(|a, b| a.total_cmp(b));
+            let p95 = all[all.len() * 95 / 100];
+            println!("transition frames {scale}x: expand median {e:.3} ms, hold {h:.3} ms, shrink median {k:.3} ms, p95 {p95:.3} ms, worst {worst:.3} ms");
             assert!(e < 60.0 && k < 60.0, "{scale}x: expand {e:.1} ms, shrink {k:.1} ms");
         }
     }
