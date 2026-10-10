@@ -22,6 +22,7 @@ the one-core figure (100% = one fully busy core) is given in brackets.
 | Daemon working set while recording, real mic, app bubble off (peak / private WS) | 19.5 / n/a | <= 25 MB | ~110 MB | meets |
 | Settings window working set (mean / peak) | 13 / 13.1 MB | <= 80 MB, only while open | n/a | meets |
 | Settings window CPU while idle | 0.006% | ~0 | n/a | - |
+| Settings window private bytes (commit, only while open) | 266.6 / 266.7 MB (private working set: see note) | <= 80 MB as private working set | n/a | documented deviation: GL driver commit, see the Settings private bytes note |
 | Executable size | 7.51 MB | <= 8 MB | n/a | meets |
 | Startup (process start -> daemon window, median of 5) | 27 ms (daemon reports ready at 20 ms) | - | - | - |
 | Daemon threads / handles (idle) | 8 / 276 | - | - | - |
@@ -136,3 +137,26 @@ network path, not a latency reference; the table above is measured against a loc
   (`SHGetFileInfoW`/`PrivateExtractIconsW`) is an open follow-up for the app-icon module.
 - Clipboard and paste timings are only meaningful on an unlocked desktop: Windows refuses clipboard access while the
   workstation is locked, so `copy_to_clipboard` exhausts its retries (~95 ms) and real-paste e2e runs are skipped.
+- **Settings private bytes (266 MB commit vs the 80 MB target)**: the PLAN section 1 figure is taken as working set / private
+  working set (what Task Manager's "Memory" column shows), not as `PrivateMemorySize64` (committed virtual memory). The Settings
+  process measures 13 MB working set (up to ~44 MB after navigating pages) but commits ~266 MB private bytes with 28 threads.
+  That commit is almost entirely the OpenGL driver, not OpenTalk's heap: the process maps `nvoglv64.dll` / `nvwgf2umx.dll`
+  (NVIDIA) plus `RTSSHooks64.dll` (the RivaTuner/MSI Afterburner overlay hook, loaded into every GL process on this machine), and
+  the driver reserves and commits its command and shader pools at context creation, mostly never touched, so they do not enter
+  the working set. Experiment (release build, Settings idle for 6 s, `OPENTALK_HOME` temp dir, WS / private bytes):
+
+  | `NativeOptions` | WS | Private bytes |
+  |---|---|---|
+  | defaults (depth 0, stencil 0, MSAA 0, hardware acceleration Preferred, vsync on) | 13.4 MB | 322.9 MB (first run, cold shader cache) |
+  | same, re-run | 40.5 MB | 266.4 MB |
+  | `hardware_acceleration: Required` | 12.8 MB | 269.5 MB |
+  | vsync off | 39.5 MB | 266.8 MB |
+  | explicit depth/stencil/MSAA 0 + Preferred + vsync on (shipped) | 12.8 MB | 269.7 MB |
+  | `hardware_acceleration: Off` | does not start | `egui_glow requires opengl 2.0+` (Windows' software GL is 1.1) |
+
+  eframe's defaults already ask for no depth, stencil or multisampling, so spelling them out in `ui/app.rs::native_options` changes
+  nothing measurable; the commit is the driver's. Only the Settings process pays it, and only while the window is open (the
+  daemon never loads `opengl32.dll`, see the delay-load note above, and stays at ~5 MB private). A software-rendering or
+  non-GL backend (wgpu, or a CPU painter) would avoid the commit but costs binary size and per-frame CPU and is out of scope.
+  Verdict: justified deviation; the working-set figure (13 MB) is the one that meets the 80 MB target. `bench/bench.ps1` still
+  prints the private-bytes column and reports the working set against the 80 MB target.
