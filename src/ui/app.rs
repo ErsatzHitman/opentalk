@@ -1,10 +1,12 @@
-//! The eframe application: frameless window shell, sidebar, top bar, page routing, toasts.
+//! The eframe application: a frameless, translucent window (Windows acrylic behind our ambient mesh)
+//! with a glass top bar, a glass sidebar, page routing and toasts. See docs/GLASS.md.
 use super::dictionary::{self, DictState};
 use super::history::{self, HistoryState};
 use super::palette::{self, Item};
 use super::settings::{self, Section, SettingsState};
 use super::theme::{self, Palette, mix};
 use super::widgets::{self as w, cr};
+use super::glass::{self, Gl};
 use super::{Cmd, Env, Launch, Page, fonts, icons};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -12,11 +14,13 @@ use windows::Win32::UI::WindowsAndMessaging::{ChangeWindowMessageFilter, MSG, MS
 use crate::core::config::Config;
 use crate::core::ipc::{self, IpcMsg};
 use eframe::egui::{
-    self, Align2, Color32, CursorIcon, Id, Key, Modifiers, Rect, ResizeDirection, Sense, Stroke, StrokeKind, Ui, UiBuilder, ViewportCommand, pos2, vec2,
+    self, Align2, Color32, CursorIcon, Id, Key, Modifiers, Rect, ResizeDirection, Sense, Stroke, Ui, UiBuilder, ViewportCommand, pos2, vec2,
 };
 
 pub const SIDEBAR_W: f32 = 192.0;
 pub const TOPBAR_H: f32 = 48.0;
+/// Gap between the window edge and the glass surfaces, and between the surfaces.
+const GAP: f32 = 8.0;
 const RESIZE_BORDER: f32 = 6.0;
 
 pub fn native_options() -> eframe::NativeOptions {
@@ -26,6 +30,8 @@ pub fn native_options() -> eframe::NativeOptions {
         .with_inner_size([1200.0, 800.0])
         .with_min_inner_size([760.0, 520.0])
         .with_decorations(false)
+        // Per-pixel alpha: the Windows acrylic backdrop shows through where our mesh is thin.
+        .with_transparent(true)
         .with_icon(std::sync::Arc::new(app_icon()));
     // egui needs no depth/stencil buffer or MSAA; asking for none keeps the pixel format minimal.
     // These are eframe's defaults, spelled out so the GL config is explicit and cannot drift.
@@ -132,6 +138,14 @@ pub struct App {
     /// Time (egui seconds) of the next idle working-set trim, if one is pending.
     trim_at: Option<f64>,
     support_open_id: Id,
+    /// Raw HWND (0 when unavailable), for the DWM backdrop calls.
+    hwnd: isize,
+    /// DWM accepted the acrylic system backdrop.
+    acrylic_ok: bool,
+    /// Windows' "Transparency effects" setting.
+    effects_on: bool,
+    /// Theme last pushed to DWM's immersive-dark-mode attribute.
+    backdrop_dark: Option<bool>,
 }
 
 impl App {
@@ -139,6 +153,15 @@ impl App {
         fonts::install(&cc.egui_ctx);
         let _ = REPAINT_CTX.set(cc.egui_ctx.clone());
         let cfg = Config::load();
+        let hwnd = window_handle(cc);
+        let dark0 = match cfg.theme {
+            crate::core::config::Theme::Auto => !theme::system_apps_use_light_theme(),
+            t => theme::resolve_dark(t),
+        };
+        let acrylic_ok = glass::sys::enable_acrylic(hwnd, dark0);
+        if !acrylic_ok {
+            crate::log_info!("settings: no acrylic backdrop (build {}), using the opaque page", glass::sys::os_build());
+        }
         let mut app = App {
             cfg,
             page: launch.page,
@@ -154,6 +177,10 @@ impl App {
             was_focused: true,
             trim_at: Some(1.5),
             support_open_id: Id::new("support-menu"),
+            hwnd,
+            acrylic_ok,
+            effects_on: glass::sys::transparency_effects_enabled(),
+            backdrop_dark: Some(dark0),
         };
         if let Some(s) = launch.settings {
             app.settings.section = s;
@@ -207,9 +234,10 @@ impl App {
 }
 
 impl eframe::App for App {
+    /// Fully transparent: our own backdrop layer paints the page colour (partial alpha over the
+    /// acrylic, or opaque in the fallback), so the clear must not.
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        let c = Palette::for_dark(self.dark()).window;
-        [c.r() as f32 / 255.0, c.g() as f32 / 255.0, c.b() as f32 / 255.0, 1.0]
+        [0.0, 0.0, 0.0, 0.0]
     }
 
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
@@ -219,6 +247,7 @@ impl eframe::App for App {
         let focused = ctx.input(|i| i.viewport().focused).unwrap_or(true);
         if focused && !self.was_focused {
             self.sys_dark = !theme::system_apps_use_light_theme();
+            self.effects_on = glass::sys::transparency_effects_enabled();
             self.hist.reload();
         }
         if !focused && self.was_focused {
@@ -268,15 +297,25 @@ impl eframe::App for App {
             self.settings_open = true;
         }
 
+        // Backdrop first (skill rule 1): opaque page colour, or a partial-alpha page over the Windows
+        // acrylic when that is available and not switched off.
+        glass::set_opaque(self.cfg.reduce_transparency || !self.acrylic_ok || !self.effects_on);
+        if self.backdrop_dark != Some(dark) {
+            glass::sys::set_dark(self.hwnd, dark);
+            self.backdrop_dark = Some(dark);
+        }
         let screen = ui.max_rect();
-        ui.painter().rect_filled(screen, 0.0, p.window);
+        let g = Gl::new(&ctx, dark);
+        ui.painter().extend(glass::backdrop_shapes(&g, screen));
         let maximized = ctx.input(|i| i.viewport().maximized).unwrap_or(false);
         self.window_resize_handles(&ctx, screen, maximized);
 
-        let side = Rect::from_min_max(screen.min, pos2(screen.min.x + SIDEBAR_W, screen.max.y));
-        let main = Rect::from_min_max(pos2(screen.min.x + SIDEBAR_W, screen.min.y), screen.max).shrink(8.0);
-        self.sidebar(ui, &p, side);
-        self.main_card(ui, &ctx, &p, main, maximized);
+        let top = Rect::from_min_size(screen.min + vec2(GAP, GAP), vec2(screen.width() - 2.0 * GAP, TOPBAR_H));
+        let side = Rect::from_min_max(pos2(screen.min.x + GAP, top.max.y + GAP), pos2(screen.min.x + SIDEBAR_W, screen.max.y - GAP));
+        let main = Rect::from_min_max(pos2(side.max.x + GAP, top.max.y + GAP), screen.max - vec2(GAP, GAP));
+        self.topbar(ui, &ctx, &p, &g, top, maximized);
+        self.sidebar(ui, &p, &g, side);
+        self.page_area(ui, &p, main, screen);
 
         // Overlays: settings modal, palette, toasts.
         let now_ms = crate::core::timing::unix_ms();
@@ -365,9 +404,11 @@ impl App {
 
     // ------------------------------------------------------------ sidebar
 
-    fn sidebar(&mut self, ui: &mut Ui, p: &Palette, rect: Rect) {
-        self.drag_region(ui, Rect::from_min_size(rect.min, vec2(rect.width(), 40.0)), "sidebar-drag");
-        let mut y = rect.min.y + 40.0 + 8.0;
+    /// One glass panel holding the page links (and Settings / Support / identity at the bottom).
+    fn sidebar(&mut self, ui: &mut Ui, p: &Palette, g: &Gl, rect: Rect) {
+        glass::panel(ui.painter(), g, rect, glass::RADIUS, 0.0);
+        let prev = w::set_in_glass(ui.ctx(), true);
+        let mut y = rect.min.y + 12.0;
         let items = [(Page::History, "History", icons::HISTORY), (Page::Dictionary, "Dictionary", icons::BOOK)];
         for (page, label, glyph) in items {
             let r = Rect::from_min_size(pos2(rect.min.x + 8.0, y), vec2(rect.width() - 16.0, 32.0));
@@ -388,11 +429,12 @@ impl App {
         }
         let sup_resp = nav_row_resp(ui, p, support, icons::HELP, "Support", false);
         self.support_menu(&sup_resp, p);
-        ui.painter().line_segment([pos2(rect.min.x + 12.0, div_y), pos2(rect.max.x - 12.0, div_y)], Stroke::new(1.0, if p.dark { Color32::from_white_alpha(15) } else { p.border_a(60) }));
+        ui.painter().line_segment([pos2(rect.min.x + 16.0, div_y), pos2(rect.max.x - 16.0, div_y)], Stroke::new(1.0, p.divider()));
         // Identity.
         draw_logo(ui, pos2(ident.min.x + 22.0, ident.center().y), 11.0, p);
         ui.painter().text(pos2(ident.min.x + 42.0, ident.center().y - 7.0), Align2::LEFT_CENTER, "OpenTalk", fonts::semibold(12.5), p.fg_a(85));
         ui.painter().text(pos2(ident.min.x + 42.0, ident.center().y + 8.0), Align2::LEFT_CENTER, format!("v{}", env!("CARGO_PKG_VERSION")), fonts::regular(11.0), p.fg_a(50));
+        w::set_in_glass(ui.ctx(), prev);
     }
 
     fn support_menu(&mut self, anchor: &egui::Response, p: &Palette) {
@@ -404,22 +446,24 @@ impl App {
             .close_behavior(egui::PopupCloseBehavior::CloseOnClick)
             .align(egui::RectAlign::TOP_START)
             .gap(6.0)
-            .frame(w::popup_frame(p))
+            .frame(egui::Frame::NONE)
             .show(|ui| {
-                ui.set_min_width(210.0);
-                ui.spacing_mut().item_spacing = vec2(0.0, 1.0);
-                if w::menu_item(ui, p, "Keyboard shortcuts", false, false, Some(icons::KEYBOARD)).clicked() {
-                    open_settings = Some(Section::Hotkeys);
-                }
-                if w::menu_item(ui, p, "Speech provider setup", false, false, Some(icons::MIC)).clicked() {
-                    open_settings = Some(Section::SpeechToText);
-                }
-                if w::menu_item(ui, p, "Open logs folder", false, false, Some(icons::FOLDER)).clicked() {
-                    folder = Some(crate::core::paths::log_dir());
-                }
-                if w::menu_item(ui, p, "About OpenTalk", false, false, Some(icons::INFO)).clicked() {
-                    open_settings = Some(Section::System);
-                }
+                w::menu_surface(ui, p, |ui| {
+                    ui.set_min_width(210.0);
+                    ui.spacing_mut().item_spacing = vec2(0.0, 1.0);
+                    if w::menu_item(ui, p, "Keyboard shortcuts", false, false, Some(icons::KEYBOARD)).clicked() {
+                        open_settings = Some(Section::Hotkeys);
+                    }
+                    if w::menu_item(ui, p, "Speech provider setup", false, false, Some(icons::MIC)).clicked() {
+                        open_settings = Some(Section::SpeechToText);
+                    }
+                    if w::menu_item(ui, p, "Open logs folder", false, false, Some(icons::FOLDER)).clicked() {
+                        folder = Some(crate::core::paths::log_dir());
+                    }
+                    if w::menu_item(ui, p, "About OpenTalk", false, false, Some(icons::INFO)).clicked() {
+                        open_settings = Some(Section::System);
+                    }
+                });
             });
         if let Some(s) = open_settings {
             self.cmds.push(Cmd::OpenSettings(s));
@@ -429,53 +473,52 @@ impl App {
         }
     }
 
-    // ------------------------------------------------------------ main card
+    // ------------------------------------------------------------ top bar and page area
 
-    fn main_card(&mut self, ui: &mut Ui, ctx: &egui::Context, p: &Palette, rect: Rect, maximized: bool) {
-        let radius = 12.0;
-        let painter = ui.painter();
-        painter.rect_filled(rect, cr(radius), p.background);
-        let top = Rect::from_min_size(rect.min, vec2(rect.width(), TOPBAR_H));
-        let body = Rect::from_min_max(pos2(rect.min.x, rect.min.y + TOPBAR_H), rect.max);
-
-        // Top bar: drag region first so the controls on top win the hit test.
+    /// The glass top bar: logo and page title on the left, the search pill in the middle, the
+    /// window controls on the right. It is also the window's drag region.
+    fn topbar(&mut self, ui: &mut Ui, ctx: &egui::Context, p: &Palette, g: &Gl, top: Rect, maximized: bool) {
+        glass::panel(ui.painter(), g, top, 14.0, 0.0);
+        let prev = w::set_in_glass(ui.ctx(), true);
+        // Drag region first so the controls on top win the hit test.
         self.drag_region(ui, top, "topbar-drag");
-        ui.painter().line_segment(
-            [pos2(top.min.x, top.max.y - 0.5), pos2(top.max.x, top.max.y - 0.5)],
-            Stroke::new(1.0, if p.dark { Color32::from_white_alpha(25) } else { p.border }),
-        );
+        draw_logo(ui, pos2(top.min.x + 26.0, top.center().y), 10.0, p);
         let title = match self.page {
             Page::History => "History",
             Page::Dictionary => "Dictionary",
         };
-        ui.painter().text(pos2(top.min.x + 16.0, top.center().y), Align2::LEFT_CENTER, title, fonts::semibold(14.0), p.foreground);
-        // Search pill, centred in the bar.
+        ui.painter().text(pos2(top.min.x + 46.0, top.center().y), Align2::LEFT_CENTER, title, fonts::semibold(14.0), p.foreground);
+        // Search pill, centred in the bar: a wash on the bar's glass, no border of its own.
         let pill_w = 340.0f32.min((top.width() - 2.0 * 190.0).max(180.0));
         let pill = Rect::from_center_size(pos2(top.center().x, top.center().y), vec2(pill_w, 32.0));
         let sresp = ui.interact(pill, Id::new("topbar-search"), Sense::click());
         w::pointer(&sresp);
         let hov = w::hover_anim(ui, sresp.id.with("h"), sresp.hovered());
-        ui.painter().rect_filled(pill, cr(16.0), mix(if p.dark { Color32::from_white_alpha(13) } else { p.fg_a(4) }, if p.dark { Color32::from_white_alpha(20) } else { p.fg_a(6) }, hov));
-        ui.painter().rect_stroke(pill, cr(16.0), Stroke::new(1.0, if p.dark { Color32::from_white_alpha(25) } else { p.border }), StrokeKind::Inside);
-        w::paint_icon(ui, Rect::from_center_size(pos2(pill.min.x + 20.0, pill.center().y), vec2(16.0, 16.0)), icons::SEARCH, 13.0, p.muted_a(70));
-        ui.painter().text(pos2(pill.min.x + 36.0, pill.center().y), Align2::LEFT_CENTER, "Search", fonts::regular(13.0), p.muted_a(70));
+        ui.painter().rect_filled(pill, cr(16.0), mix(p.wash(0), p.wash(1), hov));
+        w::paint_icon(ui, Rect::from_center_size(pos2(pill.min.x + 20.0, pill.center().y), vec2(16.0, 16.0)), icons::SEARCH, 13.0, p.muted_a(75));
+        ui.painter().text(pos2(pill.min.x + 36.0, pill.center().y), Align2::LEFT_CENTER, "Search", fonts::regular(13.0), p.muted_a(75));
         {
             let font = fonts::semibold(10.0);
             let label = "Ctrl + K";
             let tw = w::measure(ui, label, font.clone()).x;
             let kr = Rect::from_center_size(pos2(pill.max.x - 14.0 - (tw + 12.0) / 2.0, pill.center().y), vec2(tw + 12.0, 18.0));
-            ui.painter().rect_filled(kr, cr(9.0), if p.dark { Color32::from_white_alpha(20) } else { p.fg_a(6) });
-            ui.painter().text(kr.center(), Align2::CENTER_CENTER, label, font, p.muted_a(70));
+            ui.painter().rect_filled(kr, cr(9.0), p.wash(1));
+            ui.painter().text(kr.center(), Align2::CENTER_CENTER, label, font, p.muted_a(80));
         }
         if sresp.clicked() {
             self.palette.toggle();
         }
-        // Window controls.
         self.window_controls(ui, ctx, p, top, maximized);
+        w::set_in_glass(ui.ctx(), prev);
+    }
 
-        // Body (clipped to the rounded card).
-        let mut body_ui = ui.new_child(UiBuilder::new().max_rect(body).layout(egui::Layout::top_down(egui::Align::Min)));
-        body_ui.set_clip_rect(body.intersect(ui.clip_rect()));
+    /// The page body. It has no surface of its own: the pages put their glass panels straight on
+    /// the backdrop.
+    fn page_area(&mut self, ui: &mut Ui, p: &Palette, main: Rect, screen: Rect) {
+        let mut body_ui = ui.new_child(UiBuilder::new().max_rect(main).layout(egui::Layout::top_down(egui::Align::Min)));
+        // Let panel shadows spill into the gaps around the page, but not under the other surfaces.
+        let clip = Rect::from_min_max(pos2(main.min.x - GAP, main.min.y - GAP + 2.0), screen.max);
+        body_ui.set_clip_rect(clip.intersect(ui.clip_rect()));
         let now_ms = crate::core::timing::unix_ms();
         let mut cmds = std::mem::take(&mut self.cmds);
         let mut changed = false;
@@ -487,8 +530,6 @@ impl App {
             }
         }
         self.cmds = cmds;
-        // Card border on top so scrolled content never covers it.
-        ui.painter().rect_stroke(rect, cr(radius), Stroke::new(1.0, if p.dark { Color32::from_white_alpha(25) } else { p.border }), StrokeKind::Inside);
         if changed {
             self.save();
         }
@@ -505,8 +546,8 @@ impl App {
             w::pointer(&resp);
             let hov = w::hover_anim(ui, resp.id.with("h"), resp.hovered());
             let close = i == 2;
-            let bg = if close { mix(Color32::TRANSPARENT, Color32::from_rgb(0xe8, 0x11, 0x23), hov) } else { mix(Color32::TRANSPARENT, p.overlay(8), hov) };
-            ui.painter().rect_filled(r, cr(if close { 8.0 } else { 6.0 }), bg);
+            let bg = if close { mix(Color32::TRANSPARENT, Color32::from_rgb(0xe8, 0x11, 0x23), hov) } else { mix(Color32::TRANSPARENT, p.wash(1), hov) };
+            ui.painter().rect_filled(r, cr(if close { 10.0 } else { 8.0 }), bg);
             let fg = if close { mix(p.muted_a(85), Color32::WHITE, hov) } else { mix(p.muted_a(85), p.foreground, hov) };
             w::paint_icon(ui, r, glyph, 10.0, fg);
             if resp.clicked() {
@@ -539,15 +580,12 @@ impl App {
                 .pivot(Align2::CENTER_BOTTOM)
                 .show(ctx, |ui| {
                     ui.set_opacity(a);
-                    egui::Frame::new()
-                        .fill(if p.dark { p.raised } else { Color32::from_rgb(0x1f, 0x1f, 0x1f) })
-                        .stroke(Stroke::new(1.0, if p.dark { Color32::from_white_alpha(25) } else { Color32::TRANSPARENT }))
-                        .corner_radius(cr(18.0))
-                        .inner_margin(egui::Margin::symmetric(16, 9))
-                        .shadow(egui::Shadow { offset: [0, 6], blur: 18, spread: 0, color: Color32::from_black_alpha(70) })
-                        .show(ui, |ui| {
-                            ui.label(egui::RichText::new(msg).font(fonts::regular(13.0)).color(if p.dark { p.foreground } else { Color32::WHITE }));
-                        });
+                    let g = Gl::new(ctx, p.dark);
+                    let slot = ui.painter().add(egui::Shape::Noop);
+                    let out = egui::Frame::new().inner_margin(egui::Margin::symmetric(18, 10)).show(ui, |ui| {
+                        ui.label(egui::RichText::new(msg).font(fonts::regular(13.0)).color(p.foreground));
+                    });
+                    ui.painter().set(slot, egui::Shape::Vec(glass::menu_shapes(&g, out.response.rect, 20.0)));
                 });
             y -= 44.0;
         }
@@ -566,14 +604,22 @@ fn nav_row_resp(ui: &mut Ui, p: &Palette, rect: Rect, glyph: char, label: &str, 
     let hov = w::hover_anim(ui, resp.id.with("h"), resp.hovered() && !active);
     let t = ui.ctx().animate_bool_with_time(resp.id.with("a"), active, 0.12);
     let painter = ui.painter();
-    let hover_bg = if p.dark { Color32::from_white_alpha(10) } else { p.fg_a(4) };
-    painter.rect_filled(rect, cr(6.0), mix(mix(Color32::TRANSPARENT, hover_bg, hov), p.primary_a(if p.dark { 10 } else { 8 }), t));
+    painter.rect_filled(rect, cr(8.0), mix(mix(Color32::TRANSPARENT, p.wash(1), hov), p.primary_wash(1), t));
     let ic = mix(mix(p.fg_a(70), p.fg_a(90), hov), p.primary, t);
     painter.text(pos2(rect.min.x + 10.0 + 8.0, rect.center().y), Align2::CENTER_CENTER, glyph.to_string(), fonts::icon(15.0), ic);
     let font = if active { fonts::semibold(13.0) } else { fonts::regular(13.0) };
     let col = mix(mix(p.fg_a(88), p.foreground, hov), p.foreground, t);
     painter.text(pos2(rect.min.x + 10.0 + 16.0 + 10.0, rect.center().y), Align2::LEFT_CENTER, label, font, col);
     resp
+}
+
+/// The raw `HWND` of the window being created (0 if the platform handle is not a Win32 one).
+fn window_handle(cc: &eframe::CreationContext<'_>) -> isize {
+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    match cc.window_handle().map(|h| h.as_raw()) {
+        Ok(RawWindowHandle::Win32(h)) => h.hwnd.get(),
+        _ => 0,
+    }
 }
 
 /// The OpenTalk mark: ring with three waveform bars, drawn at `center` with radius `r`.

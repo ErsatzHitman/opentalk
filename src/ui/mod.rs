@@ -10,6 +10,7 @@ mod app;
 mod dictionary;
 mod filedialog;
 mod fonts;
+mod glass;
 mod history;
 mod hotkey_capture;
 mod icons;
