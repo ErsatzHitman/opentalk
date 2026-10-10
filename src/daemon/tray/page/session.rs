@@ -208,6 +208,12 @@ impl Session {
         self.refresh_hover();
     }
 
+    /// A pointer drag is in progress (scrollbar thumb or text selection): the pager keeps feeding
+    /// it positions clamped to the body while the button stays down.
+    pub fn dragging(&self) -> bool {
+        self.scroll.dragging() || self.edit.as_ref().is_some_and(|fe| fe.dragging)
+    }
+
     pub fn set_view_h(&mut self, h: f32) {
         self.scroll.resize(h, self.layout.content_h);
         self.refresh_hover();
@@ -446,9 +452,16 @@ impl Session {
         if self.on_bar(x, y) {
             return Resp { redraw: self.scroll.bar_press(y), ..Resp::default() };
         }
-        let Some((foc, part)) = self.hit(x, y).filter(|_| y >= 0.0 && y < self.scroll.view_h) else {
+        let target = self.hit(x, y).filter(|_| y >= 0.0 && y < self.scroll.view_h);
+        // A click anywhere but the hotkey box being captured ends the capture: the hook swallows
+        // the whole keyboard while it runs, so it must not outlive the user's attention.
+        let end_capture = self.capture.as_ref().is_some_and(|(cid, _)| target.map(|t| t.0) != Some(Foc::Item(*cid)));
+        let Some((foc, part)) = target else {
             // A click on nothing: leave the field.
-            let fx = self.set_focus(None, false, env.cx);
+            let mut fx = self.set_focus(None, false, env.cx);
+            if end_capture {
+                fx.push(Effect::EndHotkeyCapture);
+            }
             self.press = None;
             self.rebuild(env.cx, env.m);
             return Resp { redraw: true, effects: fx, ..Resp::default() };
@@ -469,6 +482,9 @@ impl Session {
             self.press = None;
         } else {
             self.press = Some(Press { foc, part });
+        }
+        if end_capture {
+            fx.push(Effect::EndHotkeyCapture);
         }
         if !fx.is_empty() {
             self.rebuild(env.cx, env.m);
@@ -589,6 +605,14 @@ impl Session {
             }
             K::Enter | K::Space => {
                 let Some(f) = self.focus else { return handled };
+                // Enter on a text field that was left with Esc starts editing it again (Space is
+                // left alone: its WM_CHAR would replace the selected text).
+                if let (K::Enter, Foc::Item(id), Some(Item::Field { kind, .. })) = (ev.k, f, self.item_of(f))
+                    && !matches!(kind, FieldKind::Hotkey)
+                {
+                    self.begin_edit(id, true);
+                    return Resp { redraw: true, ..handled };
+                }
                 let fx = self.activate(f, Part::Body, env);
                 Resp { redraw: true, effects: fx, ..handled }
             }
@@ -691,6 +715,10 @@ impl Session {
 
     pub fn capture_done(&mut self, accel: String, env: &mut Env) -> Vec<Effect> {
         let Some((id, _)) = self.capture.take() else { return Vec::new() };
+        if accel.is_empty() {
+            // The capture was cancelled (Esc alone): nothing to validate or save.
+            return Vec::new();
+        }
         let fx = self.model.event(id, Event::CaptureDone(accel), env.cx);
         self.rebuild(env.cx, env.m);
         fx
@@ -1080,6 +1108,50 @@ mod tests {
         t.env(|s, e| s.capture_done("Control+Super".into(), e));
         assert_eq!(t.events().last().unwrap(), &(1, Event::CaptureDone("Control+Super".into())));
         assert!(t.s.capture.is_none());
+    }
+
+    #[test]
+    fn enter_on_a_field_left_with_esc_edits_it_again() {
+        let mut t = setup(vec![field(1, "abc", FieldKind::Text)], 0);
+        t.click_item(1);
+        assert!(t.s.edit.is_some());
+        t.key(K::Esc);
+        assert!(t.s.edit.is_none() && t.s.focus == Some(Foc::Item(1)), "a clean Esc leaves the field, focus stays");
+        let r = t.key(K::Enter);
+        assert!(r.handled && r.effects.is_empty());
+        let fe = t.s.edit.as_ref().expect("editing again");
+        assert_eq!(fe.ed.selection(), Some((0, 3)), "like arriving with Tab: everything selected");
+    }
+
+    #[test]
+    fn dragging_reports_the_thumb_and_the_selection_drag() {
+        let mut t = setup(vec![field(1, "abc def", FieldKind::Text)], 0);
+        assert!(!t.s.dragging());
+        let c = t.s.layout.placed_of(&t.s.items, 1).unwrap().ctl;
+        t.env(|s, e| s.press(c.l + 30.0, c.cy(), false, e));
+        assert!(t.s.dragging(), "a press in a text field starts a selection drag");
+        t.env(|s, e| s.release(c.l + 30.0, c.cy(), e));
+        assert!(!t.s.dragging());
+    }
+
+    #[test]
+    fn a_cancelled_capture_ends_quietly_and_a_click_elsewhere_ends_it() {
+        let mut t = setup(vec![field(1, "Control+Super", FieldKind::Hotkey), field(2, "x", FieldKind::Text)], 0);
+        let before = t.events().len();
+        t.s.capture = Some((1, "Control".into()));
+        // Esc alone arrives as an empty accelerator: the capture ends, the model hears nothing.
+        let fx = t.env(|s, e| s.capture_done(String::new(), e));
+        assert!(fx.is_empty() && t.s.capture.is_none());
+        assert_eq!(t.events().len(), before);
+        // Clicking another item while capturing asks the pager to end the capture.
+        t.s.capture = Some((1, String::new()));
+        let p = t.s.layout.placed_of(&t.s.items, 2).unwrap().ctl;
+        let r = t.env(|s, e| s.press(p.cx(), p.cy(), false, e));
+        assert!(r.effects.contains(&Effect::EndHotkeyCapture));
+        t.s.capture = Some((1, String::new()));
+        let h = t.s.layout.placed_of(&t.s.items, 1).unwrap().ctl;
+        let r = t.env(|s, e| s.press(h.cx(), h.cy(), false, e));
+        assert!(!r.effects.contains(&Effect::EndHotkeyCapture), "pressing the captured box itself keeps it");
     }
 
     #[test]

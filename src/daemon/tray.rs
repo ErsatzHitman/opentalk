@@ -166,7 +166,8 @@ pub fn popup_capture_update(text: String) {
     popup_win::capture_update(text);
 }
 
-/// The hotkey capture finished with this accelerator, on the UI thread.
+/// The hotkey capture finished with this accelerator, on the UI thread. An empty string means the
+/// capture was cancelled (Esc alone): the popup just ends it and shows the old value.
 #[allow(dead_code)] // called by the host once it is wired (merge step)
 pub fn popup_capture_done(accel: String) {
     popup_win::capture_done(accel);

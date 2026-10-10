@@ -410,6 +410,8 @@ impl Pager {
         self.back_hover = back_hover;
         let body = match p {
             Some((x, y)) if !in_header && (0.0..CARD_W_PAGE).contains(&x) && y < self.card_h => Some((x, y - PAGE_HEADER_H)),
+            // Dragging the thumb or a selection past the edge of the body keeps following the pointer.
+            Some((x, y)) if buttons && self.top().is_some_and(Session::dragging) => Some((x.clamp(0.0, CARD_W_PAGE), (y - PAGE_HEADER_H).clamp(0.0, (self.body_h() - 1.0).max(0.0)))),
             _ => None,
         };
         let sr = self.with_session(m, clip, |s, e| s.pointer(body, buttons, e));

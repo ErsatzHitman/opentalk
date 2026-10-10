@@ -283,6 +283,8 @@ pub fn close() {
             capture_hook(false);
         }
         LAST_CLOSED.with(|c| c.set(Some(tick())));
+        // A closed popup holds no bitmaps: the cached card and body pixmaps go with the window.
+        page_draw::release_caches();
         // SAFETY: the window belongs to this thread; the state is already out of the cell, so the
         // messages DestroyWindow sends find no popup.
         unsafe {
@@ -804,9 +806,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     } else if p.nav.press(&p.layout, (x, y)) {
                         present(p);
                     }
-                    // SAFETY: our window; capture makes sure the button-up comes back to us.
+                    // SAFETY: our window; capture makes sure the button-up comes back to us. When the
+                    // system refused to activate the popup at open (opened from IPC), the click is
+                    // the user input that lets it take the foreground, so text fields get keys.
                     unsafe {
                         let _ = SetCapture(p.hwnd);
+                        if GetForegroundWindow() != p.hwnd {
+                            let _ = SetForegroundWindow(p.hwnd);
+                        }
                     }
                 }
                 !inside
@@ -848,6 +855,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let k = key_from_vk(vk, ctrl).or_else(|| (alt && vk == 0x25).then_some(K::Left));
                 if let Some(k) = k {
                     on_pager(|pg, m, clip| pg.key(KeyEv { k, shift, ctrl, alt }, m, clip));
+                } else if msg == WM_SYSKEYDOWN {
+                    // An Alt combination the page does not use keeps its system meaning (Alt+F4).
+                    // SAFETY: default handling of a message for our own window.
+                    return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
                 }
                 return LRESULT(0);
             }

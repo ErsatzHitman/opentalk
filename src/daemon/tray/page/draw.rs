@@ -53,6 +53,13 @@ thread_local! {
     static BODY: RefCell<Option<Pixmap>> = const { RefCell::new(None) };
 }
 
+/// Drop the cached card chrome and the body pixmap. The popup calls this when it closes: a closed
+/// popup must hold no bitmaps (they are 1 to 8 MB at common DPI scales), PLAN section 1.
+pub fn release_caches() {
+    CHROME.with(|c| *c.borrow_mut() = None);
+    BODY.with(|b| *b.borrow_mut() = None);
+}
+
 /// The static card (shadow, border, surface, header rule) for a size / scale / theme: built once,
 /// cloned per frame (the shadow and the big rounded fills are the expensive part of a frame).
 fn chrome(card_h: f32, scale: f32, dark: bool) -> Option<Pixmap> {
