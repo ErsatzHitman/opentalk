@@ -24,8 +24,8 @@ Companion spec with exact pixel and colour values: `docs/SPEC.md`.
 | Idle CPU (daemon) | ≈0.0% (no timers, no polling) | `bench.ps1` samples `TotalProcessorTime` over 60 s |
 | Recording CPU | ≤1.5% (60 fps pill plus capture) | Same, during a scripted 30 s recording |
 | Daemon RAM | ≤25 MB working set, ≤15 MB private | `Get-Process` WS/PrivateMemorySize, idle and recording |
-| Settings window RAM | ≤80 MB working set, and only while open. **Private bytes: accepted deviation** (audit 2026-10-10, owner may override): the glow (OpenGL) process commits ~265 MB of GPU driver pools reserved at context creation that never enter the working set (WS ~13 MB, private WS ~7 MB). `bench/renderer_probe` measured the alternatives: wgpu DX12 commits ~520 MB and adds ~3.5 MB of exe; a CPU painter commits ~20 MB but redraws a full 2100×1400 window in ~10 ms and lacks eframe's viewport glue. Revisit with a CPU-painter port of `src/ui` (damage-rect redraw) only if commit charge matters on low-RAM machines | Separate process that exits on close; `bench.ps1` reports WS, private bytes and private WS |
-| Disk | Single exe ≤8 MB, where MB is decimal: **8,000,000 bytes** (7.63 MiB). The release exe measured 7,248,896 bytes (7.25 MB) on 2026-10-10 after the Settings/network crates moved to `opt-level = "s"` (`Cargo.toml`), about 751 KB of headroom; with the liquid-glass Settings pages and pill merged it measured 7,505,920 bytes (cross-built on Linux, 2026-10-10), about 494 KB of headroom; after the flat Settings window, tray popup, live app bubble, mute, detached cancel button and paced animation were merged it measured 7,578,624 bytes (cross-built on Linux, 2026-10-10), about 421 KB of headroom (it moves with every commit; `bench.ps1` has the current figure). No installer runtime | `bench.ps1` checks the file size against 8,000,000 bytes; history and config are KB-scale |
+| Settings UI RAM | Only while the tray popup is open: one layered window on the daemon's UI thread (the egui Settings process and its ~265 MB GL driver commit are gone since round 3). A closed popup holds no window, bitmap or timer; an open page adds its card bitmap (about 1 MB at 1x, 4 MB at 2x) and the page models, freed on close. Counts toward the daemon's budget above | `bench.ps1` daemon WS / private bytes with a page open |
+| Disk | Single exe ≤8 MB, where MB is decimal: **8,000,000 bytes** (7.63 MiB). The release exe measured 7,248,896 bytes (7.25 MB) on 2026-10-10 after the Settings/network crates moved to `opt-level = "s"` (`Cargo.toml`), about 751 KB of headroom; with the liquid-glass Settings pages and pill merged it measured 7,505,920 bytes (cross-built on Linux, 2026-10-10), about 494 KB of headroom; after the flat Settings window, tray popup, live app bubble, mute, detached cancel button and paced animation were merged it measured 7,578,624 bytes (cross-built on Linux, 2026-10-10), about 421 KB of headroom; after round 3 removed the egui Settings window (eframe, egui, winit, glow) it measured 4,177,408 bytes (cross-built on Linux, 2026-10-10), about 3.8 MB of headroom (it moves with every commit; `bench.ps1` has the current figure). No installer runtime | `bench.ps1` checks the file size against 8,000,000 bytes; history and config are KB-scale |
 | Hotkey to pill visible | ≤16 ms | Timestamped debug log (QPC) |
 | Hotkey to mic capturing | ≤50 ms | Log: hook event → first WASAPI packet |
 | Stop to text pasted | Network RTT + ≤40 ms local overhead | Log: stop → request sent → response → paste done |
@@ -43,16 +43,15 @@ opentalk.exe            (daemon, default: Win32 only, no GPU, no WebView)
  ├─ anim thread         compositor-paced (DwmFlush) at full rate, waitable timer for the slow cadence and as fallback; posts WM_APP_TICK only while animating
  └─ worker thread(s)    HTTP: prewarm, transcribe, cleanup
 
-opentalk.exe --settings [--page history|dictionary|settings]
-                        (egui/eframe glow process, spawned on demand, exits on close)
+opentalk.exe --settings [page]
+                        (not a window of its own: posts OpenPage to the running daemon, or starts the daemon at that page)
 ```
 
-- **Daemon and settings talk through files plus window messages.**
+- **One process, one UI thread.** Settings, History, Dictionary and Snippets are pages of the tray popup, a layered window on the daemon's UI thread drawn with the pill's software rasteriser and GDI text (no GPU, no egui; round 3 removed the separate egui/OpenGL Settings process).
   - `%APPDATA%\OpenTalk\config.json` holds settings. Secrets are DPAPI-encrypted with `CryptProtectData`, matching OpenWhispr's safeStorage.
   - `history.jsonl` is append-only.
-  - The settings process posts `WM_APP_RELOAD` and `WM_APP_SUSPEND_HOTKEYS` to the daemon window (`FindWindowW("OpenTalkDaemon")`).
-- **Single instance.** Named mutex `Local\OpenTalk.Daemon`. A second launch tells the daemon to open Settings, then exits.
-- **Why two processes.** The egui/OpenGL stack, which costs about 40–70 MB, is never resident while you dictate. The daemon touches only Win32, WASAPI, schannel and tiny-skia.
+  - A page edits a working copy of the config; its changes reach the daemon through an in-process mailbox (`WM_TRAY_POPUP_ACT`), which applies them live (`apply_config`) and saves the file.
+- **Single instance.** Named mutex `Local\OpenTalk.Daemon`. A second launch (or `--settings [page]`) posts `WM_OT_OPEN_PAGE` to the daemon window (`FindWindowW("OpenTalkDaemon")`), which opens the popup, then exits. A login launch (`--hidden`) opens nothing; the first run opens Settings > Speech-to-Text; any other interactive launch opens the Home popup.
 
 ### Crates (all pure Rust, so they build with the GNU toolchain and need no C compiler)
 
@@ -64,7 +63,7 @@ opentalk.exe --settings [--page history|dictionary|settings]
 | HTTP | `ureq` 2 + `native-tls` (schannel) | Persistent agent, keep-alive, own User-Agent (Cloudflare blocks default UAs) |
 | WebSocket (streaming providers) | `tungstenite` + native-tls | Phase 6 only |
 | JSON | `serde`, `serde_json` | |
-| Settings UI | `eframe` 0.36 (glow, default fonts off) | Fonts load from `C:\Windows\Fonts` (Segoe UI Variable plus Segoe Fluent Icons for glyphs) |
+| Settings UI | none (tray popup pages: `tiny-skia` + GDI text, custom text editor) | Same rasteriser and fonts as the pill |
 | Resources | `embed-resource` (windres from mingw) | Icon plus PerMonitorV2 DPI manifest |
 
 ---
@@ -72,7 +71,7 @@ opentalk.exe --settings [--page history|dictionary|settings]
 ## 3. Module layout
 
 ```
-src/main.rs            arg dispatch (daemon | --settings | --bench | --transcribe-file)
+src/main.rs            arg dispatch (daemon | --settings | --bench | --transcribe-file | --render-pill | --render-tray-popup)
 src/core/config.rs     schema, defaults, migration, load/save, change notify
 src/core/secrets.rs    DPAPI encrypt/decrypt for API keys
 src/core/history.rs    jsonl append, read, delete, retention prune
@@ -91,7 +90,8 @@ src/daemon/appicon.rs  foreground exe → icon (UWP aware), cache
 src/daemon/paste.rs    clipboard snapshot/restore, SendInput, terminal detection
 src/daemon/tray.rs     Shell_NotifyIcon; tray/popup*.rs: the flat tray popup (model + placement, software rendering, window)
 src/daemon/sound.rs    synthesized cues → in-memory WAV → PlaySound
-src/ui/…               egui app: shell, theme tokens, widgets, history, dictionary, settings; flat solid surfaces, no glass (the pill keeps its glass, SPEC "Pill surface material")
+src/daemon/tray/page/… popup pages: renderer (layout, draw, controls, text editor, scroll, session, pager) and page models (settings/*, history, dictionary); flat solid surfaces, no glass
+src/core/{nav,settings_logic,dictview,histview,timefmt}.rs   pure page logic: routes, choice tables, provider tests, view helpers
 `--bench mock-stt`      in-repo mock STT server (Rust, replaces the planned tools/mock_stt.py); per-provider wire-format mocks are in-process test servers
 bench/bench.ps1        CPU/RAM/latency benchmark harness
 ```
@@ -221,7 +221,9 @@ OpenWhispr has **no deterministic filler removal**. It relies entirely on the LL
 
 ## 7. Settings, History and Dictionary
 
-OpenWhispr already has History (its Home page) and a Dictionary page with Snippets. We keep both as dedicated pages, plus the Settings modal. All are built in egui with OpenWhispr's tokens.
+> **Round 3 (owner decision: "Remove the massive application window entirely"):** the egui window described below is gone. Every feature is a 380 px page of the tray popup with back navigation (Settings index and its six pages, list pickers instead of dropdowns, History with a detail page, Dictionary, Snippets and the snippet editor), the hotkey is captured by the daemon's own hook, and the Test buttons run on a worker. Layout and tokens: docs/SPEC.md "Tray popup". The section is kept for the feature inventory, which the pages still cover.
+
+OpenWhispr already has History (its Home page) and a Dictionary page with Snippets. We keep both as dedicated pages, plus the Settings modal. (Originally built in egui with OpenWhispr's tokens.)
 
 - **Shell.**
   - Window 1200×800, frameless, with custom title controls.
@@ -247,7 +249,7 @@ OpenWhispr already has History (its Home page) and a Dictionary page with Snippe
   - **Privacy & Data:** history on/off, transcript retention, audio retention (default off, to save disk), Save discarded dictations.
   - **System:** version, open logs folder, reset app data.
   - Account, billing, notes, meetings, agent, connectors and local models are dropped.
-- **Hotkey capture.** The settings process installs a temporary LL hook while capturing and tells the daemon to suspend its hook.
+- **Hotkey capture.** The daemon's own LL hook switches to a capture mode while a hotkey field is active (allocation-free, swallows the keys, times out after 2 minutes); the popup ends or re-arms it.
 
 ---
 
@@ -347,14 +349,14 @@ OpenWhispr already has History (its Home page) and a Dictionary page with Snippe
 | 4 | Pill and app bubble | Exact pill states and animations, glow, tooltip, error card, cancel, drag, menu, app-icon bubble | Golden images match SPEC; recording CPU ≤1.5% |
 | 5 | Cleanup | Deterministic pipeline, LLM cleanup (OpenAI, Anthropic, Gemini, Groq, OpenRouter, Custom), validation, snippets, dictionary fixes | Fixture suite green; OpenRouter free-model cleanup works with fallback |
 | 6 | Streaming and remaining BYOK | Deepgram WS, AssemblyAI WS, OpenAI Realtime, Gemini Live, Corti, Tinfoil per decision | Mock WS tests pass |
-| 7 | Settings UI | egui shell, History, Dictionary/Snippets, Settings modal, hotkey capture, provider Test button | Every setting persists and the daemon applies it live |
+| 7 | Settings UI | Tray popup pages (round 3; the egui shell is removed), History, Dictionary/Snippets, Settings, hotkey capture, provider Test button | Every setting persists and the daemon applies it live |
 | 8 | Hardening and bench | Enterprise (Bedrock/Vertex), FLAC experiment (done: not adopted, §9.5), DPI and multi-monitor, UIPI, bench report, polish | `BENCHMARK.md` meets the §1 targets |
 
 ---
 
 ## 12a. Risks
 
-- **egui fidelity.** Tailwind subtleties (blur, gradients, shadows) need custom painting. The plan is to paint shadows and gradients by hand where they matter (cards, buttons) and accept minor differences elsewhere.
+- **Popup fidelity.** The pages are custom-drawn (no toolkit): text fields, IME placement, focus and DPI are ours to get right and need a real Windows desktop to confirm.
 - **No real keys for most providers.** Correctness rests on the contract tests against OpenWhispr's exact wire formats. Live verification is limited to OpenRouter, and its free tier currently cannot verify STT at all (see §12b decision 0).
 - **OpenRouter free tier is rate-limited** (Gemma returned 429). Live tests retry with backoff and rotate across free models.
 - **Start-menu mask key** can interact with other hook tools such as AutoHotkey. It is behind a setting, default on.

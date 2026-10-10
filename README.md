@@ -10,20 +10,22 @@ the same floating recording pill, and adds a deterministic filler-word cleaner, 
 ## Highlights
 
 - **Tiny and idle.** The daemon is plain Win32 + WASAPI. No GPU, no web view, no polling: ~0% CPU when idle (see
-  [docs/BENCHMARK.md](docs/BENCHMARK.md)). The settings window is a separate process that only exists while it is open.
+  [docs/BENCHMARK.md](docs/BENCHMARK.md)). There is no app window: everything lives in the tray popup, which exists only
+  while it is open.
 - **The OpenWhispr pill.** A 40 px circle that grows into a capsule with a live 11-bar waveform, a signal glow while it
   transcribes, tooltip and error card, plus a round bubble showing the app you are dictating into and, while you hover
   the pill, a round cancel button that detaches beside it (the bubble's twin, on the right). The bubble is ready the instant you press the hotkey (the app's icon is looked up when it comes to the front, with no polling) and follows you if you switch apps while dictating: **the text is pasted into the app the bubble shows when it is ready**. The taskbar, Start, tray flyouts, Alt-Tab and OpenTalk's own pill and tray menu never count as a target; they keep the previous app. (With the bubble turned off nothing is tracked and the paste goes to the window the hotkey went down in.)
   The surfaces are **liquid glass**: they frost and refract the screen behind them. Because that needs a clean copy of the
   screen, the pill is excluded from screen capture, so it does **not appear in screenshots, screen recordings or screen
   sharing** (Windows 10 2004 or newer; on older builds, or when a capture fails, it falls back to neutral frosted glass).
-  The capture only runs while the pill is visible: a small copy of the screen around it, about 4 times a second while
-  recording. While it rests there is no timer at all: the circle's glass is refreshed only when something happens (it
-  appears, moves or changes state, you hover it, or another window is activated, moved, minimised or restored), so its
-  frost can lag a little behind the screen (see "Pill surface material" in [docs/SPEC.md](docs/SPEC.md)).
-- **Minimal control panel and tray popup.** History, Dictionary and Settings are a plain flat window (solid surfaces, 1 px
-  borders, light / dark / system theme); the glass is only on the pill. Clicking the tray icon opens a small popup
-  next to the tray with Dictation, History, Dictionary, Settings and a few shortcuts (see "Using it").
+  The capture only runs while the pill is visible, and only on events: a small copy of the screen around it when the pill
+  appears, moves or changes state, while you hover it, or when another window is activated, moved, minimised or restored
+  (while recording nothing is captured periodically, so the waveform never waits for it; transcribing and animations
+  refresh it a few times a second). The frost can therefore lag a little behind the screen (see "Pill surface material" in [docs/SPEC.md](docs/SPEC.md)).
+- **Everything in the tray popup.** Clicking the tray icon opens a small flat popup next to the tray (solid surfaces, 1 px
+  borders, light / dark / system theme; the glass is only on the pill) with Dictation, History, Dictionary, Settings and a
+  few shortcuts. History, Dictionary, Snippets and every Settings page open inside the same popup, with a back button
+  (see "Using it"). There is no separate window or process.
 - **Fast.** Mic stream prepared in advance, TLS connection pre-warmed at key press, silence trimmed before upload, streaming
   transport for Deepgram / AssemblyAI / OpenAI Realtime / Gemini Live. Local post-processing is a few milliseconds.
 - **Clean text.** Deterministic filler removal (um, uh, "you know", stutters, loops, hallucinated "Thanks for watching"),
@@ -46,7 +48,7 @@ see below). Windows 10/11 x64.
 
 ## Build
 
-Requirements: Windows 10/11 x64, Rust stable with the **GNU** target, and mingw-w64 (for `dlltool` and `windres`).
+Requirements: Windows 10/11 x64, Rust stable with the **GNU** target, and mingw-w64 (for `windres` and the linker).
 No MSVC and no C runtime install are needed.
 
 ```powershell
@@ -61,11 +63,7 @@ cargo test                     # unit and headless end-to-end tests (no network,
 
 `build.rs` embeds the icon (`assets/opentalk.ico`), the manifest (per-monitor-v2 DPI, `asInvoker`, Windows 10/11,
 long paths, UTF-8 code page) and version info with `windres`. Set `OPENTALK_NO_RESOURCES=1` to skip that step.
-It also turns `opengl32.dll` into a delay-loaded import with `dlltool`, so the daemon never loads OpenGL (only the
-Settings window draws with it); `OPENTALK_NO_DELAYLOAD=1` keeps the normal import.
 `cargo run --example make_icon` regenerates the icon from the OpenWhispr logo geometry.
-`build.rs` looks for dlltool as `$DLLTOOL`, then (when the host is not Windows) `x86_64-w64-mingw32-dlltool`, then plain
-`dlltool`; if none works it warns "dlltool unavailable" and keeps the load-time import.
 
 Desktop and live tests are `#[ignore]`d and named `desktop_*` / `live_*`:
 
@@ -83,17 +81,15 @@ under Wine with a virtual X display. This is how the work is merged and audited;
 Windows desktop for the checks in [Run on Windows](#run-on-windows).
 
 ```sh
-sudo apt install mingw-w64 wine64 xvfb          # mingw-w64 provides x86_64-w64-mingw32-{gcc,dlltool,windres}
+sudo apt install mingw-w64 wine64 xvfb          # mingw-w64 provides x86_64-w64-mingw32-{gcc,windres}
 rustup target add x86_64-pc-windows-gnu
-Xvfb :99 -screen 0 1920x1080x24 &               # any X server works; the pill and egui tests need a display
+Xvfb :99 -screen 0 1920x1080x24 &               # any X server works; the pill and popup tests need a display
 export CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUNNER=wine WINEDEBUG=-all DISPLAY=:99
 
 cargo build --release --target x86_64-pc-windows-gnu    # target/x86_64-pc-windows-gnu/release/opentalk.exe
 cargo test --target x86_64-pc-windows-gnu               # unit + headless end-to-end tests, run under Wine
 cargo clippy --target x86_64-pc-windows-gnu --all-targets
 ```
-
-No dlltool wrapper is needed: `build.rs` finds `x86_64-w64-mingw32-dlltool` itself (see Build).
 
 Wine differs from Windows in two places, and the affected tests say so instead of failing. They detect Wine precisely
 (`ntdll!wine_get_version`, `src/testenv.rs`), so on Windows they run unchanged:
@@ -116,13 +112,14 @@ wine $EXE --render-pill error 400 err.png --dark --backdrop gradient --composite
 # backdrops: white black gradient busy-text (or a PNG path)
 ```
 
-Headless screenshots of every Settings / History / Dictionary page (egui rendered on the CPU; icon glyphs show as `?`
-because Segoe Fluent Icons has no free stand-in, and the text uses Liberation Sans in place of Segoe UI), and of the
-tray popup:
+Headless screenshots of the tray popup: Home, and every page with `--page` (Wine has no Segoe UI, so the text uses
+its fallback face). Set `OPENTALK_HOME` to a data directory to render its history, dictionary and snippets:
 
 ```sh
-OPENTALK_SHOT_DIR=docs/screenshots/ui cargo test --target x86_64-pc-windows-gnu --bin opentalk offscreen_shots
 wine $EXE --render-tray-popup popup.png [--dark] [--recording|--transcribing] [--recent] [--retry] [--hover History] [--focus]
+wine $EXE --render-tray-popup page.png --page settings:cleanup [--dark] [--scroll px] [--hover id] [--edit id] [--toast text]
+# pages: settings, settings:<preferences|hotkeys|stt|cleanup|privacy|about>, history, entry:<id>, dictionary, snippets,
+#        snippet:new, snippet:<index>, picker:<language|inputdevice|micwarm|retention|sttprovider|llmprovider|llmmodel>
 ```
 
 What does **not** work under Wine: the tray popup's real window (`Shell_NotifyIconGetRect`, `ABM_GETTASKBARPOS`),
@@ -139,8 +136,7 @@ merged build:
 - **Every `desktop_*` test** (`cargo test -- --ignored --test-threads=1 desktop_`; list them with
   `cargo test -- --list --ignored | findstr desktop_`):
   - autostart: `desktop_real_key_round_trip_restores_state`, `desktop_scratch_enable_disable_cycle`
-  - IPC: `desktop_post_reaches_message_only_window`, `desktop_post_reaches_top_level_window`,
-    `desktop_settings_page_post_reaches_window`
+  - IPC: `desktop_post_reaches_message_only_window`, `desktop_post_reaches_top_level_window`
   - app icon: `desktop_foreground_app_icon`, `desktop_packaged_icons_load_no_shell_dlls`,
     `desktop_win32_icon_loads_no_shell_dlls`
   - audio: `desktop_record_1s`, `desktop_list_devices_from_sta_and_mta_threads`
@@ -158,24 +154,29 @@ merged build:
     `desktop_pill_falls_back_to_neutral_glass_when_capture_is_unavailable`, `desktop_pill_frame_cost`,
     `desktop_pill_lifecycle_and_idle_is_silent`, `desktop_pill_real_app_icon_bubble`,
     `desktop_pill_resting_circle_runs_no_timer_and_refreshes_on_events`,
-    `desktop_pill_steady_recording_presents_only_the_dirty_lane`, `desktop_pill_thinking_glow_presents_partial_frames`
+    `desktop_pill_steady_recording_presents_only_the_dirty_lane`, `desktop_pill_thinking_glow_presents_partial_frames`,
+    `desktop_pill_waveform_diagnostics_with_the_real_microphone`
   - app bubble tracker: `desktop_tracker_prefetches_publishes_and_ignores_the_taskbar`
-  - sound / tray: `desktop_sound_plays`, `desktop_tray_add_remove`, `desktop_tray_popup_opens_and_closes`
+  - sound / tray: `desktop_sound_plays`, `desktop_tray_add_remove`, `desktop_tray_popup_opens_and_closes`,
+    `desktop_popup_opens_a_page_navigates_and_closes`
   - streaming: `desktop_session_cpu_budget`, `desktop_tls_loopback_roundtrip`
-  - Settings hotkey capture: `desktop_capture_ctrl_win`, `desktop_capture_escape_cancels_and_f8_works`
-  - end to end (`tests/e2e.rs`): `desktop_cancel_while_the_mic_starts_drops_the_dictation`, `desktop_e2e_notepad`,
-    `desktop_e2e_notepad_streaming`
+  - hotkey capture in the popup: `desktop_matcher_capture_ctrl_win_and_f8`
+  - end to end (`tests/e2e.rs`): `desktop_cancel_while_the_mic_starts_drops_the_dictation`, `desktop_cancel_during_rewrite`,
+    `desktop_e2e_notepad`, `desktop_e2e_notepad_streaming`
 - `powershell -File bench\bench.ps1`: re-measure every PLAN section 1 budget (idle CPU with the
-  resting glass circle on screen, recording CPU with the 4 Hz backdrop capture, daemon working set / private bytes with
-  the capture buffers, Settings working set, startup, latency, and the executable size now that the Settings glass is gone) and regenerate
+  resting glass circle on screen, recording CPU with the glass captured on events only while recording, daemon working
+  set / private bytes with the capture buffers and with a popup page open, startup, latency, and the executable size now
+  that the egui window is gone) and regenerate
   [docs/BENCHMARK.md](docs/BENCHMARK.md).
 - `powershell -File tests\e2e.ps1` (`-Stt mock` and `-Stt mock-stream`): the real paste into Notepad.
 - The tray popup on a real desktop (the `docs/screenshots/tray-popup/` pictures come from `--render-tray-popup`): left
   click, right click and Enter on the icon, also with the icon in the hidden-icons overflow; the position with the
   taskbar at the bottom, top, left and right, on a second monitor, and at 125 / 150 / 200 % DPI; Esc, arrow keys, Enter,
   click outside and Alt+Tab close or drive it; the second click on the icon closes it instead of reopening; the
-  open time and that the closed popup costs nothing (no window, no timer). Settings in light and dark on the real
-  window (Segoe UI, Segoe Fluent Icons).
+  open time and that the closed popup costs nothing (no window, no timer). Every page in light and dark with Segoe UI;
+  typing, IME composition and clipboard paste in the text fields; hotkey capture on the Hotkeys page; the popup taking
+  the keyboard when opened by `--settings`, a second launch or the first run (otherwise a click on it does); the window
+  resize when a page opens and closes.
 - The GDI-text goldens (error cards, tooltips) in `goldens_match`, with Segoe UI installed.
 - The pill's capture exclusion: `desktop_pill_capture_excludes_the_pill`, and a manual check that the pill, bubble,
   tooltip and error card are absent from a screenshot / screen share while the glass still shows the screen behind.
@@ -203,7 +204,10 @@ merged build:
    you pick a row, press Esc or click anywhere else; clicking the tray icon again closes it too. While it is open it follows
    the dictation (a hotkey press or a finished transcription updates the Start / Stop row in place). **Start dictation**
    here is the same as the hotkey: same sounds, mute, app bubble and paste target (the app you were in before you clicked
-   the tray). Launching the exe a second time opens History.
+   the tray). **History**, **Dictionary** and **Settings** open as pages inside the popup (380 px wide); the arrow at the
+   top left, Backspace, Alt+Left or Esc go back. Settings lists Preferences, Hotkeys, Speech-to-Text, Cleanup & AI,
+   Privacy & Data and About, plus an *AI rewrite* shortcut; choices such as the language or provider open a list page;
+   the Dictionary page links to Snippets. Changes apply at once. Launching the exe a second time opens the popup.
 6. If a transcription fails (network, quota) the error card offers **Retry** with the audio that was kept in memory.
 7. **Voice rewrite.** Dictate your message and finish with the rewrite phrase, e.g. *"Let's move the meeting to Friday
    afternoon because the client is out on Thursday, rewrite this concisely."* OpenTalk sends the text (without the phrase)
@@ -228,31 +232,37 @@ Command line (the exe is a GUI-subsystem program, so run these from a terminal a
 | Command | What it does |
 |---|---|
 | `opentalk.exe --hidden` | Start straight into the tray (what launch-at-login uses) |
-| `opentalk.exe --settings [history\|dictionary\|settings[:section]]` | Open the control panel |
+| `opentalk.exe --settings [page]` | Open the tray popup at a page: `settings` (default), `settings:<preferences\|hotkeys\|stt\|cleanup\|privacy\|about>`, `history`, `dictionary`, `snippets` or `home`. A running daemon shows it; otherwise this starts the daemon and opens it |
 | `opentalk.exe --transcribe-file x.wav [--provider id] [--model m] [--llm\|--no-llm] [--rewrite-trigger "phrase"\|--no-rewrite]` | Run the full pipeline headless, print JSON `{raw, text, provider, model, stt_ms, cleanup_ms, total_ms, ai_cleaned, rewrite, rewritten, rewrite_error, original}` |
 | `opentalk.exe --render-pill <state> <t_ms> out.png [--dark] [--backdrop white\|black\|gradient\|busy-text [--composite]] [--upscale N]` | Render a pill state to PNG (visual goldens), optionally over a backdrop fixture (`--composite` shows the window over the fixture it sits on) |
-| `opentalk.exe --render-tray-popup out.png [--dark] [--recording\|--transcribing] [--recent] [--retry] [--hover <row>] [--focus]` | Render the tray popup to PNG (screenshots, structural goldens) |
-| `opentalk.exe --bench ...` | Benchmark helpers: `toggle`, `dictate <n> <wav>`, `latency`, `mock-stt`, `info` (see `bench/bench.ps1`) |
+| `opentalk.exe --render-tray-popup out.png [--dark] [--recording\|--transcribing] [--recent] [--retry] [--hover <row>] [--focus] [--page <page>]` | Render the tray popup (Home, or a page) to PNG (screenshots, structural goldens) |
+| `opentalk.exe --bench ...` | Benchmark helpers: `toggle`, `start`, `stop`, `cancel`, `retry`, `reload`, `quit`, `settings [page]`, `dictate <n> <wav>`, `latency`, `mock-stt`, `info` (see `bench/bench.ps1`) |
 
 Automation hooks: `OPENTALK_HOME` (data directory), `OPENTALK_INJECT_WAV` (play a WAV instead of the microphone),
 `OPENTALK_STT_BASE_URL` (point every STT provider at a local server), `OPENTALK_LLM_BASE_URL` (the same for the cleanup /
 rewrite LLM; `--bench mock-stt` also answers `/chat/completions`, see `--llm-text`, `--llm-status`, `--llm-delay-ms`),
-`OPENTALK_SECRET_<NAME>` (API key without touching the secret store), `OPENTALK_LOG=debug`.
+`OPENTALK_SECRET_<NAME>` (API key without touching the secret store), `OPENTALK_LOG=debug`,
+`OPENTALK_NO_GLASS_CAPTURE=1` (no screen capture for the pill's glass, for A/B timing).
 
 ## Settings
 
-| Section | What you can change |
+All in the tray popup (**Settings** row, or `opentalk.exe --settings`):
+
+| Page | What you can change |
 |---|---|
 | Preferences | Theme, dictation sounds, pause media while dictating, mute system audio while dictating (on by default), automatic pasting, keep text on the clipboard, floating icon (auto-hide, position, app bubble), language, microphone, launch at login |
 | Hotkeys | Dictation hotkey (modifier-only combos allowed), Tap / Push to talk, Start-menu suppression for Win combos |
 | Speech-to-Text | Provider, model, API key (masked), custom endpoint, streaming preference, **Test** button |
-| Cleanup | Filler removal (Off / Standard / Aggressive), fuzzy dictionary, spoken line breaks, AI cleanup provider / model / key / prompt, voice rewrite on/off and its trigger phrase |
-| Dictionary | Words that bias recognition and fix casing; snippets (trigger -> replacement) |
-| History | Searchable, with app, provider and latency per entry; copy, delete, retry |
-| Privacy & Data | History on/off and retention, keep failed audio for Retry, save discarded dictations |
+| Cleanup & AI | AI rewrite (on/off, trigger phrase, reset to default) first, then filler removal (Off / Standard / Aggressive), fuzzy dictionary, spoken line breaks, AI cleanup provider / model / key / prompt, voice rewrite on/off and its trigger phrase |
+| Privacy & Data | History on/off and retention, keep failed audio for Retry, save discarded dictations, clear history |
+| About | Version, data and log folders, reset app data |
+| Dictionary (Home row) | Words that bias recognition and fix casing (add, edit, filter, import from / copy to the clipboard); Snippets (trigger -> replacement) |
+| History (Home row) | Searchable, with app, provider and latency per entry; detail page with the text, the text before a rewrite and the raw transcript; copy, delete, retry |
 
-Changes are written to `%APPDATA%\OpenTalk\config.json` and the running daemon re-applies them immediately (hotkey, pill,
-theme, cleanup, microphone) without a restart.
+Changes are applied by the daemon at once (hotkey, pill, theme, cleanup, microphone) and saved to
+`%APPDATA%\OpenTalk\config.json`; an external edit of that file is picked up with `opentalk.exe --bench reload`.
+Dictating into a popup text field is not supported: the popup is OpenTalk's own window, so the text goes to the app you
+were in before.
 
 ## Privacy
 
@@ -275,12 +285,12 @@ theme, cleanup, microphone) without a restart.
 ## Layout
 
 ```
-src/main.rs            mode dispatch (daemon | --settings | --transcribe-file | --render-pill | --bench)
+src/main.rs            mode dispatch (daemon | --settings | --transcribe-file | --render-pill | --render-tray-popup | --bench)
 src/daemon/app/        state machine, message window, dictation worker, pipeline, latency log, CLI modes
-src/daemon/            hotkey hook, WASAPI capture + VAD, paste, tray, pill, sounds, media pause
+src/daemon/            hotkey hook, WASAPI capture + VAD, paste, pill, sounds, media pause
+src/daemon/tray/       tray icon and popup: Home menu, page renderer (layout, text editor, scrolling), page models
 src/stt/ src/llm/      cloud providers (batch + streaming), error classification, cleanup LLMs
 src/core/              config, DPAPI secrets, history, deterministic cleanup, dictionary, HTTP
-src/ui/                egui control panel (separate process)
 bench/ tests/          benchmark and end-to-end scripts, fixtures
 docs/                  PLAN, SPEC, BENCHMARK
 ```
@@ -291,7 +301,8 @@ Measured with `bench/bench.ps1` on an i7-14650HX (24 logical cores), release bui
 enter the numbers. Full report: [docs/BENCHMARK.md](docs/BENCHMARK.md).
 
 **These Windows figures predate the liquid glass** (pill backdrop capture), **the flat Settings / tray popup rework, the live
-app bubble (foreground tracker), mute-while-dictating, the detached cancel button and the vsync-paced animation**. The rows marked
+app bubble (foreground tracker), mute-while-dictating, the detached cancel button, the vsync-paced animation, the
+real-time waveform and the tray-only UI (the egui window is gone)**. The rows marked
 *stale* must be re-measured with `bench.ps1` on Windows (see [Run on Windows](#run-on-windows)); the executable size is
 from the merged tree, cross-built on Linux.
 
@@ -301,8 +312,7 @@ from the merged tree, cross-built on Linux.
 | Recording CPU (30 s, real mic) *stale* | 0.03% of all cores (0.78% of one core; ~0.2% projected on 4 cores) | <= 1.5% | ~3% |
 | Daemon memory, idle *stale* | 17.9 MB working set, 4.4 MB private bytes | <= 25 MB | ~110 MB |
 | Daemon memory, recording / 10 dictations (peak) *stale* | 19.1 MB WS (app bubble off), 23.2-23.4 MB WS with the app bubble and no foreground app; **37-40 MB WS with a packaged app such as Windows Terminal in front** (misses, see below) | <= 25 MB | ~110 MB |
-| Settings window *stale* | 12.4 MB working set, separate process, ~0% CPU idle (commits ~267 MB of GL driver pools, documented) | <= 80 MB | - |
-| Executable | 7.58 MB (7,578,624 bytes), one file (cross-built on Linux, 2026-10-10, after the tray popup / app bubble / mute / cancel / animation round; was 7,505,920 bytes) | <= 8 MB (8,000,000 bytes) | - |
+| Executable | 4.18 MB (4,177,408 bytes), one file (cross-built on Linux, 2026-10-10, after round 3 removed the egui window; was 7,578,624 bytes) | <= 8 MB (8,000,000 bytes) | - |
 | Start-up | daemon ready in ~21 ms | - | - |
 | Hotkey -> pill / -> first mic packet | 1.6 ms / 20.5 ms (median) | <= 16 / <= 50 ms | - |
 | Local overhead stop -> paste (excluding STT) | ~1 ms before paste; ~18 ms including a real `SendInput` paste (earlier unlocked-desktop run) | <= 40 ms | - |
@@ -313,6 +323,6 @@ audio model returned a transcript during these runs (gated to "agentic harnesses
 **Not yet verified.** Every benchmark run so far had the workstation locked, where Windows denies clipboard access and
 `SendInput`. Still to run on an unlocked desktop: the real paste into Notepad (`tests/e2e.ps1`), the `desktop_*` hotkey and
 paste tests (including Excel stop-to-paste and clipboard restore, and delay-rendered clipboard owners), the daemon memory
-with Notepad or Explorer in front, and Settings private bytes with RTSS exited. Live speech-to-text stays UNVERIFIED: no free
+with Notepad or Explorer in front. Live speech-to-text stays UNVERIFIED: no free
 OpenRouter model delivers the audio, and a paid run needs the owner's decision (PLAN section 12b). Details:
 [docs/BENCHMARK.md, "Not yet verified"](docs/BENCHMARK.md).

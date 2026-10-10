@@ -153,6 +153,33 @@ Per-recording diagnostics (one `INFO` line each, in `%APPDATA%\OpenTalk\logs\dae
 - Acceptance on a real machine (ignored desktop tests `desktop_pill_*`): p95 frame gap <= 1.5 x refresh period, ULW p95 < 2 ms, silent recording < 20 wakeups per second.
 <!-- keep:end round3-waveform -->
 
+<!-- keep:begin round3-tray-only -->
+## Tray-only UI, voice rewrite and real-time waveform merged (round 3, 2026-10-10)
+
+The egui Settings window is gone: Settings, History, Dictionary and Snippets are pages of the daemon's tray popup
+(`src/daemon/tray/page/`), so the separate `--settings` process, its GL driver commit and the eframe / egui / winit / glow
+crates are no longer built in. Built, tested and audited on the Linux host (Wine on Xvfb, 4 cores); **no Windows figure was
+re-measured**.
+
+**Stale until `bench.ps1` runs on Windows:**
+
+| Row | Why it is stale |
+|---|---|
+| Settings window working set / CPU / private bytes (Summary) | the window no longer exists; `bench.ps1` now reports the daemon with a Settings page open in the popup instead (budget: the daemon's 25 MB) |
+| Daemon working set / private bytes | an open page adds its card bitmap (about 1 MB at 1x, 4 MB at 2x) and the page models, freed when the popup closes; a closed popup holds nothing; not measured |
+| Recording CPU | the waveform's envelope delay line and no periodic glass capture while recording (see the waveform section); not measured |
+| Executable size in the Summary | superseded below |
+
+**Measured here** (Linux host; not Windows numbers):
+
+| What | Result |
+|---|---|
+| Release executable (`cargo build --release --locked --target x86_64-pc-windows-gnu`) | **4,177,408 bytes** (4.18 MB decimal, 3.98 MiB), budget 8,000,000 bytes: **meets**, 3,822,592 bytes of headroom (-3,401,216 bytes against the 7,578,624-byte previous merge: the egui / GL stack is gone) |
+| Load-time imports | no `opengl32.dll` (nothing draws with OpenGL any more, so the delay-load step in `build.rs` is gone too); `imm32.dll` is new (IME placement in popup text fields) |
+| Unit tests (`cargo test --target x86_64-pc-windows-gnu`, Wine) | 1314 passed, 0 failed, 55 ignored |
+| Headless end-to-end tests (`tests/e2e.rs`, Wine) | 23 passed, 0 failed, 6 ignored |
+<!-- keep:end round3-tray-only -->
+
 <!-- keep:begin unverified -->
 ## Not yet verified (audit 2026-10-10)
 
@@ -246,6 +273,8 @@ Release executable, measured by rebuilding the same commit with parts of the cle
 Vertex (rsa for the RS256 service-account JWT) costs 208,384 bytes (~204 KiB) and Azure + Bedrock another 44,032 bytes (~43 KiB): 252 KiB in all, about 3% of the executable. Vertex is above the ~150 KB threshold set in the review, so a cargo feature for it is a reasonable follow-up; everything stays within the 8 MB budget either way.
 
 Units: the MiB column is 2^20 bytes (so 7,877,632 bytes = 7.51 MiB = 7.88 MB decimal). The budget (PLAN section 1) is 8 MB **decimal**, i.e. 8,000,000 bytes (7.63 MiB); the release executable measured 7,967,744 bytes (about 32 KB of headroom) on 2026-10-10 before, and 7,248,896 bytes (7.25 MB, about 751 KB of headroom) after, the Settings window stack, fonts, RSA and network/JSON crates moved to `opt-level = "s"` in `Cargo.toml` (tiny-skia, `windows` and the crate itself stay at 3; a bench run showed no CPU, memory or latency change, Settings opening in 633 ms). `bench.ps1` checks it against that number.
+
+Round 3 (2026-10-10): with the egui Settings window removed (no eframe, egui, winit, glow and the crates they pulled in) the release executable is **4,177,408 bytes** (3.98 MiB, 4.18 MB decimal), about 3.8 MB under the budget. The table above predates that and keeps its relative figures (Vertex / enterprise LLM cost).
 <!-- keep:end binary-size -->
 
 <!-- keep:begin unlocked-desktop -->
@@ -347,17 +376,8 @@ need a run with `OPENTALK_SECRET_OPENROUTER` set. The contract tests use in-proc
 
 ## Notes
 
-- **opengl32.dll is delay-loaded** (`build.rs`). Only the Settings window draws with OpenGL, but a load-time import put
-  `opengl32.dll` into the daemon too, and overlay injectors that hook GL processes (RivaTuner/MSI Afterburner, which runs on
-  this machine) then treated the daemon as a 3D app: its private commit jumped from ~2 MB to ~58 MB at the first STA
-  `CoInitializeEx`. With the delay-load import the daemon never loads the DLL; Settings loads it on its first WGL call.
-  The Settings process's large private-bytes figure is that same injector inside a real GL process; its working set is small.
-- **Settings private bytes**: the PLAN section 1 Settings figure (80 MB) is read as working set, not as `PrivateMemorySize64`.
-  The Settings process commits ~265 MB, almost all of it the OpenGL driver's command and shader pools reserved at context
-  creation (plus any overlay hook such as `RTSSHooks64.dll`); it is mostly untouched, so it never enters the working set.
-  `ui/app.rs::native_options` already asks for no depth, stencil or MSAA (eframe's defaults), and vsync or
-  `hardware_acceleration` do not change it; software GL is 1.1, which `egui_glow` rejects. Only a non-GL renderer would
-  avoid it. Documented deviation; the daemon never loads `opengl32.dll` and does not pay it.
+- **No Settings process** (round 3): the egui/OpenGL Settings window and its ~265 MB GL driver commit are gone; every page is
+  drawn by the daemon's tray popup with the pill's software rasteriser, and a closed popup keeps no window, bitmap or timer.
 - **Recording CPU is the pill, kept to the lane**: once the entrance has settled the pill caches its static layer (shadow,
   body, logo) and each frame redraws only the 52x24 waveform lane, uploads only that rectangle and presents it with
   `UpdateLayeredWindowIndirect` (`prcDirty`). A frame whose bars all moved by <= 1/255 px is skipped, which is every

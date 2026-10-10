@@ -17,7 +17,7 @@
 #   packaged     the dictations scenario again with a packaged app (new Notepad, Windows Terminal, ...) in front,
 #                app bubble on: the daemon must stay within the working-set budget and find the app icon
 #   recording    30 s continuous recording: injected WAV, and the real microphone (cancelled, no upload)
-#   settings     Settings window open and idle (child process) + daemon after it closes
+#   settings     a Settings page open in the tray popup (the daemon itself; there is no separate window)
 #   e2e          one dictation pasted for real (SendInput) into a scratch text box, batch and streaming
 #                (tests\e2e.ps1 -Target form; skipped on a locked desktop)
 #   live         3 dictations through OpenRouter, ":free" model only (best effort: free tiers rate-limit)
@@ -67,7 +67,7 @@ New-Item -ItemType Directory -Force -Path $outDir | Out-Null
 $R = @{}
 $mock = $null   # set by the idle section; the trap below reads it under strict mode
 # Optional scenarios leave their key null (the report reads them under strict mode).
-foreach ($k in 'recording_mic', 'settings', 'settings_open_ms', 'daemon_with_settings', 'daemon_after_settings') { $R[$k] = $null }
+foreach ($k in 'recording_mic', 'settings') { $R[$k] = $null }
 
 function Section([string]$t) { Write-Host ("`n== {0}" -f $t) -ForegroundColor Cyan }
 
@@ -280,29 +280,15 @@ try {
     Wait-History $h ($before + 1) 30 | Out-Null
     Write-Host ("recording (injected): {0}% of all cores ({1}% of one core), WS peak {2} MB, private peak {3} MB; busiest threads: {4}" -f $R.recording_injected.CpuPctAll, $R.recording_injected.CpuPctCore, $R.recording_injected.WsPeakMB, $R.recording_injected.PrivPeakMB, ($R.recording_injected.top_threads -join ', '))
 
-    # ---- settings window --------------------------------------------------------------
-    Section "settings window open ($SettingsSec s)"
+    # ---- a Settings page in the tray popup ---------------------------------------------
+    Section "settings page open in the popup ($SettingsSec s)"
     Start-Sleep -Seconds 2
-    Invoke-Ot $Exe @('--bench', 'settings') $e 15 | Out-Null
-    $child = $null
-    $sw = [Diagnostics.Stopwatch]::StartNew()
-    while (-not $child -and $sw.Elapsed.TotalSeconds -lt 15) {
-        Start-Sleep -Milliseconds 300
-        $c = Get-CimInstance Win32_Process -Filter "ParentProcessId=$($daemon.Id) AND Name='opentalk.exe'" | Select-Object -First 1
-        if ($c) { $child = Get-Process -Id $c.ProcessId -ErrorAction SilentlyContinue }
-    }
-    if ($child) {
-        $R['settings_open_ms'] = [int]$sw.Elapsed.TotalMilliseconds
-        Start-Sleep -Seconds 4   # let the first frames settle
-        $R['settings'] = Measure-Process $child $SettingsSec
-        $R.settings | Add-Member private_ws_mb (Get-PrivateWsMB $child.Id)
-        $R['daemon_with_settings'] = Measure-Process $daemon 3
-        Write-Host ("settings: {0}% of all cores, WS {1} MB (peak {2}), private {3} MB, {4} threads" -f $R.settings.CpuPctAll, $R.settings.WsMeanMB, $R.settings.WsPeakMB, $R.settings.PrivMeanMB, $R.settings.Threads)
-        $child.CloseMainWindow() | Out-Null
-        if (-not $child.WaitForExit(4000)) { $child.Kill() }
-        Start-Sleep -Seconds 2
-        $R['daemon_after_settings'] = Measure-Process $daemon 3
-    } else { Write-Host 'settings window did not start' -ForegroundColor Yellow; $R['settings'] = $null }
+    if ((Invoke-Ot $Exe @('--bench', 'settings', 'settings:stt') $e 15).Code -eq 0) {
+        Start-Sleep -Seconds 2   # the page renders once, then the popup is idle
+        $R['settings'] = Measure-Process $daemon $SettingsSec
+        $R.settings | Add-Member private_ws_mb (Get-PrivateWsMB $daemon.Id)
+        Write-Host ("daemon with a page open: {0}% of all cores, WS {1} MB (peak {2}), private {3} MB" -f $R.settings.CpuPctAll, $R.settings.WsMeanMB, $R.settings.WsPeakMB, $R.settings.PrivMeanMB)
+    } else { Write-Host 'could not open the Settings page' -ForegroundColor Yellow }
 }
 finally {
     Stop-Daemon $Exe $daemon $e
@@ -563,9 +549,8 @@ $(if ($R.recording_mic -and $R.recording_mic.top_threads) { "| Busiest daemon th
 $(if ($R.packaged) { "| Daemon working set during $Dictations dictations, packaged app in front ($($R.packaged.app)), app bubble on (peak / private WS) | $($R.packaged.WsPeakMB) / $(Fmt $R.packaged.private_ws_mb ' MB'); icon found in $($R.packaged.icon_found) of $($R.packaged.icon_lines) lookups | <= 25 MB | ~110 MB | $(Verdict ($R.packaged.WsPeakMB -le 25 -and $R.packaged.icon_found -gt 0)) |" })
 | Daemon working set while recording, app bubble on (peak / private WS) | $($R.recording_injected.WsPeakMB) / $(Fmt $R.recording_injected.private_ws_mb ' MB') | <= 25 MB | ~110 MB | $(Verdict ($R.recording_injected.WsPeakMB -le 25)) |
 $(if ($R.recording_mic) { "| Daemon working set while recording, real mic, app bubble off (peak / private WS) | $($R.recording_mic.WsPeakMB) / $(Fmt $R.recording_mic.private_ws_mb ' MB') | <= 25 MB | ~110 MB | $(Verdict ($R.recording_mic.WsPeakMB -le 25)) |" })
-| Settings window working set (mean / peak) | $(if ($R.settings) { "$($R.settings.WsMeanMB) / $($R.settings.WsPeakMB) MB" } else { 'n/a' }) | <= 80 MB, only while open | n/a | $(if ($R.settings) { Verdict ($R.settings.WsPeakMB -le 80) } else { '-' }) |
-| Settings window CPU while idle | $(if ($R.settings) { "$($R.settings.CpuPctAll)%" } else { 'n/a' }) | ~0 | n/a | - |
-| Settings window private bytes (commit, only while open; mean / peak / private WS) | $(if ($R.settings) { "$($R.settings.PrivMeanMB) / $($R.settings.PrivPeakMB) / $(Fmt $R.settings.private_ws_mb ' MB')" } else { 'n/a' }) | <= 80 MB as working set | n/a | $(if ($R.settings) { 'documented deviation: GL driver commit, see the Settings private bytes note' } else { '-' }) |
+| Daemon working set with a Settings page open in the popup (mean / peak / private WS) | $(if ($R.settings) { "$($R.settings.WsMeanMB) / $($R.settings.WsPeakMB) / $(Fmt $R.settings.private_ws_mb ' MB')" } else { 'n/a' }) | <= 25 MB | n/a | $(if ($R.settings) { Verdict ($R.settings.WsPeakMB -le 25) } else { '-' }) |
+| Daemon CPU with a Settings page open, idle | $(if ($R.settings) { "$($R.settings.CpuPctAll)%" } else { 'n/a' }) | ~0 | n/a | - |
 | Executable size | $exeSizeText | <= $(Format-Bytes $SizeBudgetBytes) bytes | n/a | $(Verdict $sizeOk) |
 | Startup (process start -> daemon window, median of 5) | $($R.startup.process_to_window_ms_median) ms (daemon reports ready at $(Fmt $R.startup.daemon_ready_log_ms_median ' ms')) | - | - | - |
 | Daemon threads / handles (idle) | $($R.idle.Threads) / $($R.idle.Handles) | - | - | - |
@@ -623,11 +608,7 @@ $(if (Test-Path (Join-Path $outDir 'extra.md')) { (Get-Content -Raw -Encoding UT
 | Idle again after the dictations | $($R.after_dictations.Seconds) s | $($R.after_dictations.CpuPctAll)% | $($R.after_dictations.CpuPctCore)% | $($R.after_dictations.WsMeanMB) / $($R.after_dictations.WsPeakMB) | $($R.after_dictations.PrivMeanMB) / $($R.after_dictations.PrivPeakMB) | $($R.after_dictations.Threads) | $($R.after_dictations.Handles) |
 | Recording (injected WAV) | $($R.recording_injected.Seconds) s | $($R.recording_injected.CpuPctAll)% | $($R.recording_injected.CpuPctCore)% | $($R.recording_injected.WsMeanMB) / $($R.recording_injected.WsPeakMB) | $($R.recording_injected.PrivMeanMB) / $($R.recording_injected.PrivPeakMB) | $($R.recording_injected.Threads) | $($R.recording_injected.Handles) |
 $(if ($R.recording_mic) { "| Recording (real microphone) | $($R.recording_mic.Seconds) s | $($R.recording_mic.CpuPctAll)% | $($R.recording_mic.CpuPctCore)% | $($R.recording_mic.WsMeanMB) / $($R.recording_mic.WsPeakMB) | $($R.recording_mic.PrivMeanMB) / $($R.recording_mic.PrivPeakMB) | $($R.recording_mic.Threads) | $($R.recording_mic.Handles) |" })
-$(if ($R.settings) { "| Settings window open (separate process) | $($R.settings.Seconds) s | $($R.settings.CpuPctAll)% | $($R.settings.CpuPctCore)% | $($R.settings.WsMeanMB) / $($R.settings.WsPeakMB) | $($R.settings.PrivMeanMB) / $($R.settings.PrivPeakMB) | $($R.settings.Threads) | $($R.settings.Handles) |" })
-$(if ($R.daemon_with_settings) { "| Daemon while Settings is open | $($R.daemon_with_settings.Seconds) s | $($R.daemon_with_settings.CpuPctAll)% | $($R.daemon_with_settings.CpuPctCore)% | $($R.daemon_with_settings.WsMeanMB) / $($R.daemon_with_settings.WsPeakMB) | $($R.daemon_with_settings.PrivMeanMB) / $($R.daemon_with_settings.PrivPeakMB) | $($R.daemon_with_settings.Threads) | $($R.daemon_with_settings.Handles) |" })
-$(if ($R.daemon_after_settings) { "| Daemon after Settings closed | $($R.daemon_after_settings.Seconds) s | $($R.daemon_after_settings.CpuPctAll)% | $($R.daemon_after_settings.CpuPctCore)% | $($R.daemon_after_settings.WsMeanMB) / $($R.daemon_after_settings.WsPeakMB) | $($R.daemon_after_settings.PrivMeanMB) / $($R.daemon_after_settings.PrivPeakMB) | $($R.daemon_after_settings.Threads) | $($R.daemon_after_settings.Handles) |" })
-
-$(if ($R.settings) { "Settings window: opened in $($R.settings_open_ms) ms; private working set $(Fmt $R.settings.private_ws_mb ' MB'). It is a separate process that exits when closed, so the daemon never carries the GL/egui stack." })
+$(if ($R.settings) { "| Settings page open in the tray popup (daemon) | $($R.settings.Seconds) s | $($R.settings.CpuPctAll)% | $($R.settings.CpuPctCore)% | $($R.settings.WsMeanMB) / $($R.settings.WsPeakMB) | $($R.settings.PrivMeanMB) / $($R.settings.PrivPeakMB) | $($R.settings.Threads) | $($R.settings.Handles) |" })
 
 ## Live check (OpenRouter, ``:free`` models only)
 
@@ -638,7 +619,7 @@ network path, not a latency reference; the table above is measured against a loc
 
 ## Method
 
-- Release build, GNU toolchain, ``opt-level = 3``, fat LTO, stripped. One executable; Settings is the same exe started as ``--settings``.
+- Release build, GNU toolchain, ``opt-level = 3``, fat LTO, stripped. One executable; Settings, History and Dictionary are pages of the daemon's tray popup (no second process).
 - Each scenario starts a fresh daemon with its own ``OPENTALK_HOME``. Dictations are driven by explicit start / stop messages
   (``--bench start`` / ``--bench stop`` / ``--bench dictate``; a toggle would flip for good on one stray press, and the bench
   daemons use the hotkey ``Control+Alt+Shift+F24`` so nobody's real Ctrl+Win reaches them). Before each round ``--bench dictate``
@@ -653,17 +634,8 @@ network path, not a latency reference; the table above is measured against a loc
 
 ## Notes
 
-- **opengl32.dll is delay-loaded** (``build.rs``). Only the Settings window draws with OpenGL, but a load-time import put
-  ``opengl32.dll`` into the daemon too, and overlay injectors that hook GL processes (RivaTuner/MSI Afterburner, which runs on
-  this machine) then treated the daemon as a 3D app: its private commit jumped from ~2 MB to ~58 MB at the first STA
-  ``CoInitializeEx``. With the delay-load import the daemon never loads the DLL; Settings loads it on its first WGL call.
-  The Settings process's large private-bytes figure is that same injector inside a real GL process; its working set is small.
-- **Settings private bytes**: the PLAN section 1 Settings figure (80 MB) is read as working set, not as ``PrivateMemorySize64``.
-  The Settings process commits ~265 MB, almost all of it the OpenGL driver's command and shader pools reserved at context
-  creation (plus any overlay hook such as ``RTSSHooks64.dll``); it is mostly untouched, so it never enters the working set.
-  ``ui/app.rs::native_options`` already asks for no depth, stencil or MSAA (eframe's defaults), and vsync or
-  ``hardware_acceleration`` do not change it; software GL is 1.1, which ``egui_glow`` rejects. Only a non-GL renderer would
-  avoid it. Documented deviation; the daemon never loads ``opengl32.dll`` and does not pay it.
+- **No Settings process** (round 3): the egui/OpenGL Settings window and its ~265 MB GL driver commit are gone; every page is
+  drawn by the daemon's tray popup with the pill's software rasteriser, and a closed popup keeps no window, bitmap or timer.
 - **Recording CPU is the pill, kept to the lane**: once the entrance has settled the pill caches its static layer (shadow,
   body, logo) and each frame redraws only the 52x24 waveform lane, uploads only that rectangle and presents it with
   ``UpdateLayeredWindowIndirect`` (``prcDirty``). A frame whose bars all moved by <= 1/255 px is skipped, which is every
