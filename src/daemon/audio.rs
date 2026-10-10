@@ -9,7 +9,7 @@
 //!   (e2e tests and benchmarks), see [`inject_wav`].
 mod resample;
 pub mod vad;
-mod wasapi;
+pub(crate) mod wasapi;
 
 use crate::stt::Audio;
 use crate::{log_info, log_warn};

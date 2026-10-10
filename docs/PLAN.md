@@ -237,7 +237,7 @@ OpenWhispr already has History (its Home page) and a Dictionary page with Snippe
   - Warning when the prompt exceeds the provider budget.
   - Snippets: trigger → replacement, with a create panel and an edit dialog.
 - **Settings modal**, 896 px × 85vh, with a 208 px grouped sidebar. Sections:
-  - **Preferences:** Theme (Light/Dark/Auto), Dictation sounds, Pause media, Automatic pasting, Keep transcription in clipboard, Floating icon (auto-hide, start position), Transcription language, Launch at login, Start minimized, Microphone (device and keep-warm).
+  - **Preferences:** Theme (Light/Dark/Auto), Dictation sounds, Pause media, Mute system audio, Automatic pasting, Keep transcription in clipboard, Floating icon (auto-hide, start position), Transcription language, Launch at login, Start minimized, Microphone (device and keep-warm).
   - **Hotkeys:** Dictation hotkey (default `Ctrl+Win`, modifier-only combos allowed), Tap/Hold, cancel key.
   - **Speech-to-Text:** provider pill tabs, API key field with a "Get key →" link and masked display, model card list, custom endpoint fields, and a Test button (new) that sends a 1 s TTS sample.
   - **Cleanup:** filler mode, "Enable AI cleanup", LLM provider/model/key, Prompt Studio (view, edit and reset the prompt).
@@ -277,6 +277,10 @@ OpenWhispr already has History (its Home page) and a Dictionary page with Snippe
   - Start: C5→E5. Stop: D5→A4.
   - Each note 90 ms with a 25 ms gap; gain 0.2.
   - Played with `PlaySoundW(SND_MEMORY|SND_ASYNC)`.
+- **Mute system audio.** `src/daemon/muteaudio.rs`.
+  - One lazily started worker thread (MTA) owns a pure state machine; the UI thread only sends `Begin`/`End` messages. The default playback endpoint comes from the shared `IMMDeviceEnumerator` (`eRender`/`eConsole`), `IAudioEndpointVolume::SetMute` does the work. No timer while idle; the only wait is a `recv_timeout` for the length of the start cue (about 0.22 s + 60 ms) during a dictation.
+  - Restore rules: only mute what was not muted, restore that device id, leave it alone when the user already unmuted it. The unmute runs before the stop cue and before media resumes; the UI thread waits at most 100 ms (800 ms on quit).
+  - Crash safety: `muted-device.txt` (device id) is written before the mute and removed after the restore; at start-up, if it exists and the device is still muted, it is unmuted.
 
 ---
 

@@ -514,6 +514,10 @@ impl App {
         if self.cfg.audio_cues && !old.audio_cues {
             sound::init();
         }
+        if !self.cfg.mute_system_audio && old.mute_system_audio {
+            // Turned off while recording: give the speakers back now.
+            self.release_mute();
+        }
         if !self.cfg.keep_failed_audio && self.last_failed.take().is_some() {
             log_info!("keep failed audio turned off: dropped the recording kept for Retry");
         }
@@ -833,6 +837,8 @@ pub fn run(hidden: bool) -> i32 {
         media::warm();
     }
     let warm = std::thread::Builder::new().name("startup-warm".into()).spawn(move || {
+        // A previous run that died while muting must not leave the speakers muted.
+        crate::daemon::muteaudio::recover();
         micpolicy::prepare_now(mic.as_deref(), warm_hold);
         if audio_cues {
             sound::init();

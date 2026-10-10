@@ -6,6 +6,7 @@ pub mod audio;
 pub mod cli;
 pub mod hotkey;
 pub mod media;
+pub mod muteaudio;
 pub mod paste;
 pub mod pill;
 pub mod sound;

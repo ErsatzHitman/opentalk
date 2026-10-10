@@ -45,6 +45,13 @@ pub fn init() {
     WARMED.call_once(|| play(&c.warmup));
 }
 
+/// How long the start cue sounds: the lead, the notes (one pitch apart) and the last note's tail.
+/// "Mute system audio" waits this long before muting so the cue is still heard.
+pub fn start_cue_duration() -> std::time::Duration {
+    let pitch = NOTE_DURATION + NOTE_GAP;
+    std::time::Duration::from_secs_f64(LEAD + (START_NOTES.len() - 1) as f64 * pitch + NOTE_DURATION + NOTE_TAIL)
+}
+
 pub fn play_start() {
     play(&cues().start);
 }
@@ -160,6 +167,13 @@ mod tests {
         assert!((secs(s.len()) - expect).abs() < 0.001, "{} vs {expect}", secs(s.len()));
         let one = synth(&[440.0], SAMPLE_RATE);
         assert!((secs(one.len()) - 0.105).abs() < 0.001);
+    }
+
+    #[test]
+    fn start_cue_duration_matches_the_rendered_cue() {
+        let rendered = secs(synth(&START_NOTES, SAMPLE_RATE).len());
+        let d = start_cue_duration().as_secs_f64();
+        assert!((d - rendered).abs() < 0.001, "{d} vs {rendered}");
     }
 
     #[test]
