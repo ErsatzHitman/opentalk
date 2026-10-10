@@ -314,6 +314,85 @@ fn recent_ok_in(path: &Path, n: usize) -> Vec<Entry> {
     v
 }
 
+/// The newest entries of the file plus whether older ones exist (see [`load_recent`]).
+#[derive(Debug, Default, PartialEq)]
+pub struct Recent {
+    /// Newest first, any status.
+    pub entries: Vec<Entry>,
+    /// The file holds entries older than the ones returned.
+    pub more: bool,
+}
+
+/// The newest `n` entries of any status, newest first, reading only as much of the end of the
+/// file as that takes (the History page's first screen and its "Load older" steps). Whole-file
+/// scans belong on a worker: [`search_view`], [`summary`].
+pub fn load_recent(n: usize) -> Recent {
+    load_recent_in(&paths::history_file(), n)
+}
+
+fn load_recent_in(path: &Path, n: usize) -> Recent {
+    let _g = lock();
+    let Ok(mut f) = std::fs::File::open(path) else { return Recent::default() };
+    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    // ~1 KB per entry is generous; grow the window until it holds more than `n` whole lines.
+    let mut window = (n as u64).saturating_mul(1024).max(RECENT_TAIL_BYTES);
+    loop {
+        let start = len.saturating_sub(window);
+        let mut buf = Vec::new();
+        if f.seek(SeekFrom::Start(start)).is_err() || (&mut f).take(len - start).read_to_end(&mut buf).is_err() {
+            return Recent::default();
+        }
+        // A cut start lands mid-line: drop the partial first line.
+        let body = if start > 0 { buf.iter().position(|&b| b == b'\n').map_or(&buf[..0], |i| &buf[i + 1..]) } else { &buf[..] };
+        let mut v: Vec<Entry> = body.split(|&b| b == b'\n').filter_map(parse_line).collect();
+        if start == 0 || v.len() > n {
+            let more = v.len() > n || start > 0;
+            // File order is append order: the newest are at the end. Keep the last `n`, then order by time.
+            if v.len() > n {
+                v.drain(..v.len() - n);
+            }
+            v.reverse();
+            v.sort_by(|a, b| b.ts.cmp(&a.ts).then(b.id.cmp(&a.id)));
+            return Recent { entries: v, more };
+        }
+        window = window.saturating_mul(2);
+    }
+}
+
+/// The entry with this id, if it is still in the file.
+pub fn find(id: i64) -> Option<Entry> {
+    find_in(&paths::history_file(), id)
+}
+
+fn find_in(path: &Path, id: i64) -> Option<Entry> {
+    let _g = lock();
+    let needle = format!("\"id\":{id}");
+    let needle = needle.as_bytes();
+    // Newest entries are at the end of the file; scan backwards and parse only candidate lines.
+    read_bytes(path)
+        .rsplit(|&b| b == b'\n')
+        .filter(|l| l.windows(needle.len()).any(|w| w == needle))
+        .filter_map(parse_line)
+        .find(|e| e.id == id)
+}
+
+/// Every entry matching `query` by the History page's rules (all words, case-insensitive, over
+/// text, raw transcript, app, provider, model and error), any status, newest first. Reads the
+/// whole file: call it from a worker thread.
+pub fn search_view(query: &str) -> Vec<Entry> {
+    search_view_in(&paths::history_file(), query)
+}
+
+fn search_view_in(path: &Path, query: &str) -> Vec<Entry> {
+    let all = load_from(path);
+    super::histview::visible(&all, query, true).into_iter().map(|i| all[i].clone()).collect()
+}
+
+/// Whole-file totals for the History page's stats line. Reads the whole file: worker thread only.
+pub fn summary() -> super::histview::Stats {
+    super::histview::stats(&load_all())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -627,5 +706,69 @@ mod tests {
         let back = &load_from(&p)[0];
         assert_eq!(back, &e);
         assert!(back.rewritten && back.original.as_deref() == Some("ship it on friday"));
+    }
+
+    #[test]
+    fn load_recent_returns_the_newest_any_status_and_reports_older_entries() {
+        let p = temp_file("load-recent");
+        assert_eq!(load_recent_in(&p, 3), Recent::default(), "missing file");
+        for i in 1..=10 {
+            let status = if i % 4 == 0 { Status::Failed } else { Status::Ok };
+            append_to(&p, &Entry { status, ..entry(i, 1000 + i, &format!("t{i}")) }).unwrap();
+        }
+        let r = load_recent_in(&p, 3);
+        assert_eq!(r.entries.iter().map(|e| e.id).collect::<Vec<_>>(), vec![10, 9, 8]);
+        assert!(r.more);
+        let r = load_recent_in(&p, 4);
+        assert_eq!(r.entries.iter().map(|e| e.id).collect::<Vec<_>>(), vec![10, 9, 8, 7]);
+        let all = load_recent_in(&p, 10);
+        assert_eq!(all.entries.len(), 10);
+        assert!(!all.more, "exactly everything is not 'more'");
+        assert_eq!(load_recent_in(&p, 50).entries.len(), 10);
+        assert!(load_recent_in(&p, 8).entries.iter().any(|e| e.status == Status::Failed));
+    }
+
+    #[test]
+    fn load_recent_grows_its_window_over_a_long_file() {
+        let p = temp_file("load-recent-long");
+        let filler = "x".repeat(2000);
+        for i in 1..=120 {
+            append_to(&p, &entry(i, 1000 + i, &filler)).unwrap();
+        }
+        assert!(std::fs::metadata(&p).unwrap().len() > 2 * RECENT_TAIL_BYTES);
+        let r = load_recent_in(&p, 100);
+        assert_eq!(r.entries.len(), 100);
+        assert_eq!(r.entries[0].id, 120);
+        assert_eq!(r.entries[99].id, 21);
+        assert!(r.more);
+        let r = load_recent_in(&p, 500);
+        assert_eq!(r.entries.len(), 120);
+        assert!(!r.more);
+    }
+
+    #[test]
+    fn find_locates_an_entry_by_id_and_misses_cleanly() {
+        let p = temp_file("find");
+        for i in [5, 12, 123] {
+            append_to(&p, &entry(i, 1000 + i, &format!("t{i}"))).unwrap();
+        }
+        assert_eq!(find_in(&p, 12).map(|e| e.text), Some("t12".into()));
+        assert_eq!(find_in(&p, 123).map(|e| e.text), Some("t123".into()));
+        assert!(find_in(&p, 1).is_none(), "'id':1 is a prefix of other ids");
+        assert!(find_in(&p, 999).is_none());
+    }
+
+    #[test]
+    fn search_view_matches_every_field_the_page_shows() {
+        let p = temp_file("search-view");
+        append_to(&p, &Entry { app_name: Some("Slack".into()), ..entry(1, 10, "hello world") }).unwrap();
+        append_to(&p, &Entry { status: Status::Failed, error: Some("quota exceeded".into()), ..entry(2, 20, "") }).unwrap();
+        append_to(&p, &Entry { status: Status::Discarded, ..entry(3, 30, "maybe") }).unwrap();
+        let ids = |q: &str| search_view_in(&p, q).into_iter().map(|e| e.id).collect::<Vec<_>>();
+        assert_eq!(ids("slack hello"), vec![1]);
+        assert_eq!(ids("QUOTA"), vec![2], "error text is searchable");
+        assert_eq!(ids("groq"), vec![3, 2, 1], "provider; discarded rows are returned, the page filters them");
+        assert_eq!(ids("").len(), 3);
+        assert!(ids("nothing like this").is_empty());
     }
 }

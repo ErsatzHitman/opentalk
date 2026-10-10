@@ -317,7 +317,7 @@ fn result(ui: &mut Ui, p: &crate::ui::theme::Palette, ok: bool, badge: &str, bod
 /// Deterministic pass, then the configured LLM (what the daemon does), timed.
 pub fn run_sample(cfg: &crate::core::config::Config, text: &str) -> CleanOutcome {
     let started = Instant::now();
-    let hints = super::super::dictionary::hint_words(&cfg.dictionary, &cfg.snippets);
+    let hints = crate::core::dictview::hint_words(&cfg.dictionary, &cfg.snippets);
     match crate::ui::safe(|| crate::llm::cleanup(cfg, text, &hints)) {
         Some(Ok(t)) => CleanOutcome::Ok { text: t, latency_ms: started.elapsed().as_millis() as u64 },
         Some(Err(e)) => CleanOutcome::Err(match e {
