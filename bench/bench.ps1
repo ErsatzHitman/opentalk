@@ -341,6 +341,7 @@ the one-core figure (100% = one fully busy core) is given in brackets.
 $(if ($R.recording_mic) { "| Daemon working set while recording, real mic, app bubble off (peak / private WS) | $($R.recording_mic.WsPeakMB) / $(Fmt $R.recording_mic.private_ws_mb ' MB') | <= 25 MB | ~110 MB | $(Verdict ($R.recording_mic.WsPeakMB -le 25)) |" })
 | Settings window working set (mean / peak) | $(if ($R.settings) { "$($R.settings.WsMeanMB) / $($R.settings.WsPeakMB) MB" } else { 'n/a' }) | <= 80 MB, only while open | n/a | $(if ($R.settings) { Verdict ($R.settings.WsPeakMB -le 80) } else { '-' }) |
 | Settings window CPU while idle | $(if ($R.settings) { "$($R.settings.CpuPctAll)%" } else { 'n/a' }) | ~0 | n/a | - |
+| Settings window private bytes (commit, only while open; mean / peak / private WS) | $(if ($R.settings) { "$($R.settings.PrivMeanMB) / $($R.settings.PrivPeakMB) / $(Fmt $R.settings.private_ws_mb ' MB')" } else { 'n/a' }) | <= 80 MB as working set | n/a | $(if ($R.settings) { 'documented deviation: GL driver commit, see the Settings private bytes note' } else { '-' }) |
 | Executable size | $($R.env.exe_mb) MB | <= 8 MB | n/a | $(Verdict ($R.env.exe_mb -le 8)) |
 | Startup (process start -> daemon window, median of 5) | $($R.startup.process_to_window_ms_median) ms (daemon reports ready at $(Fmt $R.startup.daemon_ready_log_ms_median ' ms')) | - | - | - |
 | Daemon threads / handles (idle) | $($R.idle.Threads) / $($R.idle.Handles) | - | - | - |
@@ -430,6 +431,12 @@ network path, not a latency reference; the table above is measured against a loc
   this machine) then treated the daemon as a 3D app: its private commit jumped from ~2 MB to ~58 MB at the first STA
   ``CoInitializeEx``. With the delay-load import the daemon never loads the DLL; Settings loads it on its first WGL call.
   The Settings process's large private-bytes figure is that same injector inside a real GL process; its working set is small.
+- **Settings private bytes**: the PLAN section 1 Settings figure (80 MB) is read as working set, not as ``PrivateMemorySize64``.
+  The Settings process commits ~265 MB, almost all of it the OpenGL driver's command and shader pools reserved at context
+  creation (plus any overlay hook such as ``RTSSHooks64.dll``); it is mostly untouched, so it never enters the working set.
+  ``ui/app.rs::native_options`` already asks for no depth, stencil or MSAA (eframe's defaults), and vsync or
+  ``hardware_acceleration`` do not change it; software GL is 1.1, which ``egui_glow`` rejects. Only a non-GL renderer would
+  avoid it. Documented deviation; the daemon never loads ``opengl32.dll`` and does not pay it.
 - **Recording CPU is dominated by the pill**: the ``main`` thread renders and uploads the 60 fps capsule animation
   (~0.7 ms per frame); WASAPI capture and the VAD/level meter stay well under 1% of one core. On this 24-core machine that is far
   below the 1.5% target; the 4-core projection above is the number to watch (the pill could drop to 30 fps once its

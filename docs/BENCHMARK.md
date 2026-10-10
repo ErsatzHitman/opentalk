@@ -22,7 +22,7 @@ the one-core figure (100% = one fully busy core) is given in brackets.
 | Daemon working set while recording, real mic, app bubble off (peak / private WS) | 19.5 / n/a | <= 25 MB | ~110 MB | meets |
 | Settings window working set (mean / peak) | 13 / 13.1 MB | <= 80 MB, only while open | n/a | meets |
 | Settings window CPU while idle | 0.006% | ~0 | n/a | - |
-| Settings window private bytes (commit, only while open) | 266.6 / 266.7 MB (private working set: see note) | <= 80 MB as private working set | n/a | documented deviation: GL driver commit, see the Settings private bytes note |
+| Settings window private bytes (commit, only while open; mean / peak / private WS) | 266.6 / 266.7 / n/a | <= 80 MB as working set | n/a | documented deviation: GL driver commit, see the Settings private bytes note |
 | Executable size | 7.51 MB | <= 8 MB | n/a | meets |
 | Startup (process start -> daemon window, median of 5) | 27 ms (daemon reports ready at 20 ms) | - | - | - |
 | Daemon threads / handles (idle) | 8 / 276 | - | - | - |
