@@ -1085,7 +1085,8 @@ impl Prefetch {
 fn prepare_with(prefetch: &'static Prefetch, src: Arc<dyn ClipSource>) -> Option<JoinHandle<()>> {
     let epoch = prefetch.begin(&*src)?;
     let spawned = thread::Builder::new().name("clipboard-prefetch".into()).spawn(move || {
-        let result = src.snapshot();
+        // A panic must still end the `Running` state, or the paste would wait out PREFETCH_WAIT.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| src.snapshot())).ok().flatten();
         prefetch.finish(epoch, result);
     });
     match spawned {
@@ -1104,8 +1105,15 @@ fn prepare_with(prefetch: &'static Prefetch, src: Arc<dyn ClipSource>) -> Option
 /// `GetClipboardSequenceNumber` is unchanged and otherwise reads the clipboard itself. Returns
 /// at once.
 pub fn prepare_clipboard_snapshot() {
-    // While an earlier paste has not restored yet, the clipboard holds its dictation text.
-    if PENDING.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
+    // While an earlier paste has not restored yet, the clipboard holds its dictation text. A
+    // paste holding the lock (it may wait for a prefetch) means the same: never block here, this
+    // runs on the recording start path.
+    let busy = match PENDING.try_lock() {
+        Ok(g) => g.is_some(),
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner().is_some(),
+        Err(std::sync::TryLockError::WouldBlock) => true,
+    };
+    if busy {
         return;
     }
     let _ = prepare_with(&PREFETCH, Arc::new(SystemClip));
