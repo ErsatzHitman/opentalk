@@ -3,7 +3,7 @@
 //! click-vs-drag, the right-click menu, per-monitor DPI and the on-demand 60 fps animation timer.
 
 use super::anim::{QuietRun, SLOW_TICK_MS, TICK_MS, level_band};
-use super::capture::{GlassHost, Refresh};
+use super::capture::{GlassHost, Refresh, WM_APP_GLASS};
 use super::card::CardHover;
 use super::model::{Hit, Pointer, RenderState, TickOutcome};
 use super::raster::DevRect;
@@ -585,35 +585,67 @@ impl Inner {
         (((self.mon.2 - self.mon.0) as f32 / s).max(1.0), ((self.mon.3 - self.mon.1) as f32 / s).max(1.0))
     }
 
-    /// Capture the screen under the window, frost it and install it. Returns whether the picture the
-    /// glass shows changed (an unchanged hash recomposes nothing).
-    fn refresh_backdrop(&mut self, now: f64) -> bool {
+    /// Ask the worker for the screen under the window (no-op while one request is in flight; the
+    /// result arrives as `WM_APP_GLASS`).
+    fn request_backdrop(&mut self, now: f64) -> bool {
         let (win, page) = (self.win_rect(), self.page());
+        self.glass.request(win, self.mon, self.st.scale, page, now)
+    }
+
+    /// Install the kept picture for the window's current origin; returns whether the glass changed.
+    fn place_backdrop(&mut self) -> bool {
         self.bd_origin = self.pos;
-        match self.glass.refresh(win, self.mon, self.st.scale, page, now) {
+        let b = self.glass.backdrop((self.pos.0, self.pos.1), self.page());
+        self.st.set_backdrop(b)
+    }
+
+    /// `WM_APP_GLASS`: the worker finished. Install the picture and repaint only when it changed,
+    /// then chain the next capture if something asked for one meanwhile.
+    fn glass_done(&mut self) {
+        let Some(result) = self.glass.take() else { return };
+        if !self.visible {
+            // hid while the capture ran: the next show places the kept picture and asks again
+            return;
+        }
+        let changed = match result {
             Refresh::Unavailable => self.st.set_backdrop(None),
-            Refresh::Unchanged => false,
-            Refresh::Changed => {
-                let b = self.glass.backdrop((win.0, win.1), page);
-                self.st.set_backdrop(b)
-            }
+            Refresh::Unchanged => self.bd_origin != self.pos && self.place_backdrop(),
+            Refresh::Changed => self.place_backdrop(),
+        };
+        if !self.glass.covers(self.win_rect(), self.mon) {
+            self.glass.dirty = true;
+        }
+        let now = self.now();
+        if self.glass.dirty && now - self.glass.last_ms >= GLASS_MIN_GAP_MS {
+            self.request_backdrop(now);
+        }
+        if changed {
+            self.present();
         }
     }
 
-    /// Before a frame: capture when the window is about to appear, outgrew the kept picture, or
-    /// something marked the backdrop dirty and the rate limit allows it; just re-place the kept
-    /// picture when the window only moved.
+    /// Before a frame: place the kept picture when the window is about to appear and ask for a fresh
+    /// one; when the window outgrew the picture or something marked it dirty (rate-limited), ask
+    /// again; just re-place the kept picture when the window only moved.
     fn glass_before_frame(&mut self, was_visible: bool, now: f64) {
         if !self.glass.available() {
             return;
         }
         let due = now - self.glass.last_ms >= GLASS_MIN_GAP_MS;
-        if !was_visible || !self.glass.covers(self.win_rect(), self.mon) || (self.glass.dirty && due) {
-            self.refresh_backdrop(now);
+        if !was_visible {
+            if self.glass.covers(self.win_rect(), self.mon) {
+                self.place_backdrop();
+            } else {
+                self.st.set_backdrop(None);
+            }
+            self.request_backdrop(now);
+        } else if !self.glass.covers(self.win_rect(), self.mon) || (self.glass.dirty && due) {
+            if self.bd_origin != self.pos {
+                self.place_backdrop();
+            }
+            self.request_backdrop(now);
         } else if self.bd_origin != self.pos {
-            self.bd_origin = self.pos;
-            let b = self.glass.backdrop((self.pos.0, self.pos.1), self.page());
-            self.st.set_backdrop(b);
+            self.place_backdrop();
         }
     }
 
@@ -662,14 +694,13 @@ impl Inner {
         self.st.set_backdrop(None);
     }
 
-    /// `WM_TIMER`: recapture, and repaint only when the picture under the glass changed.
+    /// `WM_TIMER`: ask for a new capture when the rate limit allows; the answer repaints.
     fn glass_tick(&mut self) {
         let now = self.now();
-        if self.visible && self.glass.available() && now - self.glass.last_ms >= GLASS_MIN_GAP_MS && self.refresh_backdrop(now) {
-            self.present();
-        } else {
-            self.glass_retune();
+        if self.visible && self.glass.available() && now - self.glass.last_ms >= GLASS_MIN_GAP_MS {
+            self.request_backdrop(now);
         }
+        self.glass_retune();
     }
 
     fn present_frame(&mut self) {
@@ -997,6 +1028,10 @@ impl Inner {
                 } else if self.quiet.is_quiet() && self.st.mode() == PillMode::Recording {
                     self.go_slow();
                 }
+                out.result = Some(LRESULT(0));
+            }
+            WM_APP_GLASS => {
+                self.glass_done();
                 out.result = Some(LRESULT(0));
             }
             WM_TIMER if wp.0 == GLASS_TIMER_ID => {
