@@ -22,7 +22,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use tiny_skia::Pixmap;
-use windows::Win32::Foundation::{COLORREF, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WAIT_OBJECT_0, WPARAM, CloseHandle};
+use windows::Win32::Foundation::{COLORREF, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, SIZE, WAIT_OBJECT_0, WPARAM, CloseHandle};
 use windows::Win32::Graphics::Gdi::{
     AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS, DeleteDC,
     DeleteObject, GetMonitorInfoW, HBITMAP, HDC, HGDIOBJ, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint,
@@ -39,8 +39,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow, GWLP_USERDATA, GetCursorPos, GetWindowLongPtrW, HMENU,
     HTCLIENT, HTTRANSPARENT, HWND_TOPMOST, IDC_ARROW, IDC_HAND, IDC_NO, IDC_SIZEALL, LoadCursorW, MF_GRAYED, MF_STRING, MA_NOACTIVATE, PostMessageW,
     RegisterClassExW, SPI_SETWORKAREA, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SetCursor, SetForegroundWindow,
-    SetWindowLongPtrW, SetWindowPos, ShowWindow, TPM_BOTTOMALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, ULW_ALPHA, UPDATELAYEREDWINDOWINFO,
-    UpdateLayeredWindow, UpdateLayeredWindowIndirect, KillTimer, SetTimer, WM_TIMER,
+    SetWindowLongPtrW, SetWindowPos, ShowWindow, TPM_BOTTOMALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, ULW_ALPHA,
+    UpdateLayeredWindow, KillTimer, SetTimer, WM_TIMER,
     WM_APP, WM_DESTROY, WM_DISPLAYCHANGE, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_NCHITTEST, WM_NULL,
     WM_RBUTTONUP, WM_SETCURSOR, WM_SETTINGCHANGE, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
@@ -1023,26 +1023,14 @@ impl Inner {
                     self.screen_events = ScreenEvents::watch(self.hwnd);
                 }
             }
-            let mut pushed = false;
+            // Always the whole bitmap: a dirty-rect update (UpdateLayeredWindowIndirect + prcDirty)
+            // reports success on real desktops without the new bars ever reaching the screen, so the
+            // waveform only moved when something else forced a full update (hovering the pill). The
+            // pill is a few hundred pixels across; a full push costs next to nothing.
             if !full {
-                // only `prcDirty` is recomposited; position and size stay as they are (a drag moves the
-                // window with SetWindowPos)
-                let rc = RECT { left: dirty.x0, top: dirty.y0, right: dirty.x1, bottom: dirty.y1 };
-                let info = UPDATELAYEREDWINDOWINFO {
-                    cbSize: std::mem::size_of::<UPDATELAYEREDWINDOWINFO>() as u32,
-                    hdcSrc: dib.dc,
-                    pptSrc: &src,
-                    pblend: &blend,
-                    dwFlags: ULW_ALPHA,
-                    prcDirty: &rc,
-                    ..Default::default()
-                };
-                pushed = UpdateLayeredWindowIndirect(self.hwnd, &info).as_bool();
-                if pushed {
-                    self.partial += 1;
-                }
+                self.partial += 1;
             }
-            if !pushed {
+            {
                 let _ = UpdateLayeredWindow(self.hwnd, None, Some(&pos), Some(&size), Some(dib.dc), Some(&src), COLORREF(0), Some(&blend), ULW_ALPHA);
             }
         }
