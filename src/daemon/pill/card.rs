@@ -4,8 +4,9 @@
 //! adds the countdown stroke and composites with the 200 ms entrance/exit.
 
 use super::anim::TW_EASE_OUT;
+use super::glass::{self, Backdrop, Ctx, Params, Surface};
 use super::model::Hit;
-use super::raster::{Canvas, Rect, cov, sd_capsule, sd_round_box};
+use super::raster::{Canvas, Rect, sd_capsule, sd_round_box};
 use super::text::{self, Font, LEADING_SNUG};
 use super::theme::{Palette, Rgba};
 use std::sync::{Arc, Mutex};
@@ -289,9 +290,9 @@ fn clamp_lines(mut lines: Vec<String>, max: usize) -> Vec<String> {
     lines
 }
 
-/// Static layer: shadow, surface, border, text and the button.
-/// `None` when the layer's size is not representable (degenerate scale).
-pub fn draw_base(card: &ErrorCard, scale: f32, pal: &Palette) -> Option<Pixmap> {
+/// Static layer: shadow, glass surface (the skill's modal tier, refracting `backdrop`), border, text
+/// and the button. `None` when the layer's size is not representable (degenerate scale).
+pub fn draw_base(card: &ErrorCard, scale: f32, pal: &Palette, backdrop: &Backdrop) -> Option<Pixmap> {
     let l = card.layout(scale);
     let w = (l.win_w * scale).ceil() as u32;
     let h = (l.win_h * scale).ceil() as u32;
@@ -299,19 +300,11 @@ pub fn draw_base(card: &ErrorCard, scale: f32, pal: &Palette) -> Option<Pixmap> 
     {
         let mut cv = Canvas::new(&mut pm, scale);
         let r = l.card;
-        let s = scale;
-        if pal.dark {
-            // --shadow-modal: 0 24px 48px -12px rgba(0,0,0,.4)
-            cv.shadow_rect(r, CARD_RADIUS, (0.0, 24.0), 48.0, -12.0, Rgba::new(0.0, 0.0, 0.0, 0.4), 1.0);
-        }
         let outer = |x: f32, y: f32| sd_round_box(x, y, r.cx(), r.cy(), r.w() * 0.5, r.h() * 0.5, CARD_RADIUS);
-        let inner = |x: f32, y: f32| sd_round_box(x, y, r.cx(), r.cy(), r.w() * 0.5 - 1.0, r.h() * 0.5 - 1.0, CARD_RADIUS - 1.0);
-        cv.fill_sdf(r.inflate(1.0), pal.surface0, 1.0, outer);
-        let border = pal.border.with_alpha(0.5);
-        cv.shade_sdf(r.inflate(1.0), outer, |x, y, c| {
-            let k = (c - cov(inner(x, y) * s)).max(0.0) * border.a;
-            [border.r * k, border.g * k, border.b * k, k]
-        });
+        let surf = Surface { field: r, radius: Some(CARD_RADIUS), sdf: &outer };
+        let ctx = Ctx { backdrop, dark: pal.dark };
+        let shadow = glass::tokens(pal.dark).card_shadow;
+        glass::paint(&mut cv, &ctx, &surf, &Params { alpha: 1.0, shadow, shadow_alpha: 1.0, lift: 0.0, edge: 1.0, frost: Some(glass::tokens(pal.dark).card_frost_alpha) });
         for t in &l.title {
             if let Some(m) = text::mask(&t.text, t.font) {
                 text::draw(&mut cv, &m, t.x, t.y, pal.fg, 1.0);
@@ -428,10 +421,11 @@ struct BaseKey {
     hover_retry: bool,
     scale: u32,
     dark: bool,
+    backdrop: u64,
 }
 
 /// Static layer, cached across frames.
-pub fn base_layer(card: &ErrorCard, scale: f32, pal: &Palette) -> Option<Arc<Pixmap>> {
+pub fn base_layer(card: &ErrorCard, scale: f32, pal: &Palette, backdrop: &Backdrop) -> Option<Arc<Pixmap>> {
     let key = BaseKey {
         title: card.title.clone(),
         desc: card.desc.clone(),
@@ -439,6 +433,7 @@ pub fn base_layer(card: &ErrorCard, scale: f32, pal: &Palette) -> Option<Arc<Pix
         hover_retry: card.hover == CardHover::Retry,
         scale: (scale * 64.0).round() as u32,
         dark: pal.dark,
+        backdrop: backdrop.id,
     };
     let mut c = BASE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((k, p)) = c.as_ref() {
@@ -446,7 +441,7 @@ pub fn base_layer(card: &ErrorCard, scale: f32, pal: &Palette) -> Option<Arc<Pix
             return Some(p.clone());
         }
     }
-    let p = Arc::new(draw_base(card, scale, pal)?);
+    let p = Arc::new(draw_base(card, scale, pal, backdrop)?);
     *c = Some((key, p.clone()));
     Some(p)
 }

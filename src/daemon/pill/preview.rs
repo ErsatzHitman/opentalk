@@ -3,12 +3,22 @@
 //! Scenes are built exactly like the live daemon would drive the model (mode changes, 60 fps ticks
 //! with a synthetic microphone level), so a golden at `t_ms` is what the window shows `t_ms` after
 //! the state was entered.
+//!
+//! The glass needs something behind it. A scene renders over the neutral flat backdrop unless it
+//! names a *backdrop fixture* (`--backdrop white|black|gradient|busy-text` or a PNG path): a 640x360
+//! picture of the bottom-right corner of a 1920x1080 screen (`tests/fixtures/pill_backdrops/`). The
+//! window is placed in it exactly as the daemon would place it on that screen, so the refraction sees
+//! the same surroundings as on a real desktop.
 
 use super::PillMode;
+use super::glass::{self, Backdrop, Cells};
 use super::model::{AppBubble, Pointer, RenderState};
 use super::render::{pixel_size, render_frame, render_into};
 use super::theme::Palette;
+use super::window::place_window;
 use crate::core::config::PanelPosition;
+use std::path::PathBuf;
+use std::sync::Arc;
 use tiny_skia::Pixmap;
 
 /// Frame interval of the simulated animation clock.
@@ -43,12 +53,73 @@ pub struct Scene {
     /// Constant microphone RMS, or a synthetic speech-like signal when `None`.
     pub level: Option<f32>,
     pub position: PanelPosition,
+    /// Backdrop fixture name (`white`, `black`, `gradient`, `busy-text`) or PNG path; `None` renders
+    /// the glass over the neutral flat backdrop.
+    pub backdrop: Option<String>,
 }
 
 impl Scene {
     pub fn new(state: &str, t_ms: f64) -> Scene {
-        Scene { state: state.to_string(), t_ms, dark: false, scale: 1.0, icon: None, level: None, position: PanelPosition::BottomRight }
+        Scene { state: state.to_string(), t_ms, dark: false, scale: 1.0, icon: None, level: None, position: PanelPosition::BottomRight, backdrop: None }
     }
+}
+
+/// The fixtures directory (`tests/fixtures/pill_backdrops`).
+pub fn backdrop_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests").join("fixtures").join("pill_backdrops")
+}
+
+/// Resolve a `--backdrop` argument: a bare name is a fixture, anything else is a path.
+pub fn backdrop_path(arg: &str) -> PathBuf {
+    if arg.contains(['/', '\\', '.']) { PathBuf::from(arg) } else { backdrop_dir().join(format!("{arg}.png")) }
+}
+
+/// Window device px of the fixture's top-left corner, relative to the scene's window (negative: the
+/// fixture starts above/left of it).
+fn fixture_origin(st: &RenderState, fw: usize, fh: usize) -> (i32, i32) {
+    const SCREEN: (f32, f32) = glass::DEFAULT_PAGE;
+    const TASKBAR: f32 = 40.0;
+    let s = st.scale;
+    let work = (0, 0, (SCREEN.0 * s).round() as i32, ((SCREEN.1 - TASKBAR) * s).round() as i32);
+    let (w, h) = pixel_size(st);
+    let win = place_window(work, (w as i32, h as i32), st.position, s);
+    let crop = (((SCREEN.0 - fw as f32) * s).round() as i32, ((SCREEN.1 - fh as f32) * s).round() as i32);
+    (crop.0 - win.0, crop.1 - win.1)
+}
+
+/// The fixture's frosted picture placed behind the scene's window. The fixture is the bottom-right
+/// `fw x fh` corner of a 1920x1080 screen with a 40 px taskbar; the window sits where the daemon would
+/// dock it, so the glass sees the same surroundings as on a real desktop. Samples beyond the fixture
+/// clamp to its edge.
+pub fn fixture_backdrop(st: &RenderState, png: &Pixmap) -> Option<Arc<Backdrop>> {
+    let s = st.scale;
+    let (fw, fh) = (png.width() as usize, png.height() as usize);
+    let cells = Cells::from_rgba(&png.clone().take_demultiplied(), fw, fh, glass::CELL_LOGICAL as u32)?;
+    let frosted = Arc::new(cells.with_device_cell(glass::cell_for(s)).frost(glass::FROST_SIGMA, s));
+    let (ox, oy) = fixture_origin(st, fw, fh);
+    Some(Arc::new(Backdrop::new(frosted, ox, oy, glass::DEFAULT_PAGE)))
+}
+
+/// The rendered window composited over the (unfrosted) fixture it sits on: what the user sees.
+pub fn composite_over_fixture(st: &RenderState, window: &Pixmap, png: &Pixmap) -> Option<Pixmap> {
+    let s = st.scale;
+    let (ox, oy) = fixture_origin(st, png.width() as usize, png.height() as usize);
+    let mut out = Pixmap::new(window.width(), window.height())?;
+    let (src, bg) = (window.data(), png.data());
+    let dst = out.data_mut();
+    for y in 0..window.height() as i32 {
+        for x in 0..window.width() as i32 {
+            let fx = (((x - ox) as f32 / s) as i32).clamp(0, png.width() as i32 - 1);
+            let fy = (((y - oy) as f32 / s) as i32).clamp(0, png.height() as i32 - 1);
+            let (i, b) = (((y * window.width() as i32 + x) * 4) as usize, ((fy * png.width() as i32 + fx) * 4) as usize);
+            let inv = 255 - src[i + 3] as u32;
+            for c in 0..3 {
+                dst[i + c] = (src[i + c] as u32 + (bg[b + c] as u32 * inv + 127) / 255).min(255) as u8;
+            }
+            dst[i + 3] = 255;
+        }
+    }
+    Some(out)
 }
 
 /// Deterministic speech-like RMS signal (syllable bursts with pauses).
@@ -139,8 +210,20 @@ pub fn build(scene: &Scene) -> Result<(RenderState, f64), String> {
     Ok((st, t))
 }
 
+/// `--composite`: the rendered window over the fixture it sits on (for eyeballing).
+fn composite_scene(scene: &Scene, pm: &Pixmap) -> Option<Pixmap> {
+    let png = Pixmap::load_png(backdrop_path(scene.backdrop.as_ref()?)).ok()?;
+    let (st, _) = build(scene).ok()?;
+    composite_over_fixture(&st, pm, &png)
+}
+
 pub fn render_scene(scene: &Scene) -> Result<Pixmap, String> {
-    let (st, t) = build(scene)?;
+    let (mut st, t) = build(scene)?;
+    if let Some(name) = &scene.backdrop {
+        let path = backdrop_path(name);
+        let png = Pixmap::load_png(&path).map_err(|e| format!("cannot read backdrop {}: {e}", path.display()))?;
+        st.set_backdrop(fixture_backdrop(&st, &png));
+    }
     render_frame(&st, t).ok_or_else(|| "pill window size is not representable".to_string())
 }
 
@@ -276,7 +359,8 @@ fn composite_preview(pm: &Pixmap, up: u32, bg: Option<u32>) -> Pixmap {
 }
 
 /// `--render-pill <state> <t_ms> <out.png> [--dark] [--scale s] [--app-icon path] [--level 0..1]
-///   [--position bottom-right|bottom-left|center] [--upscale N] [--bg RRGGBB] [--dump-icon out.png]`
+///   [--position bottom-right|bottom-left|center] [--upscale N] [--bg RRGGBB] [--dump-icon out.png]
+///   [--backdrop white|black|gradient|busy-text|path.png [--composite]]`
 /// `--render-pill bench 0 -` prints render timings.
 pub fn cli_render(args: &[String]) -> i32 {
     if args.len() < 3 {
@@ -299,6 +383,7 @@ pub fn cli_render(args: &[String]) -> i32 {
     scene.dark = rest.iter().any(|a| a == "--dark");
     scene.scale = parse_f32(rest, "--scale").unwrap_or(1.0).clamp(0.5, 8.0);
     scene.level = parse_f32(rest, "--level").map(|v| v.clamp(0.0, 1.0));
+    scene.backdrop = parse_str(rest, "--backdrop").map(String::from);
     scene.position = match parse_str(rest, "--position") {
         Some("bottom-left") => PanelPosition::BottomLeft,
         Some("center") | Some("bottom-center") => PanelPosition::BottomCenter,
@@ -337,6 +422,7 @@ pub fn cli_render(args: &[String]) -> i32 {
             return 2;
         }
     };
+    let pm = if rest.iter().any(|a| a == "--composite") { composite_scene(&scene, &pm).unwrap_or(pm) } else { pm };
     let pm = match parse_str(rest, "--crop") {
         Some(c) => {
             let v: Vec<f32> = c.split(',').filter_map(|p| p.trim().parse().ok()).collect();
@@ -446,10 +532,17 @@ mod golden {
         icon: bool,
         /// Contains GDI text, so allow rasteriser differences.
         text: bool,
+        /// Backdrop fixture the glass is rendered over (`None`: the neutral flat backdrop).
+        backdrop: Option<&'static str>,
     }
 
     const fn g(name: &'static str, state: &'static str, t: f64, dark: bool, icon: bool, text: bool) -> G {
-        G { name, state, t, dark, scale: 1.0, icon, text }
+        G { name, state, t, dark, scale: 1.0, icon, text, backdrop: None }
+    }
+
+    /// A golden over a backdrop fixture.
+    const fn gb(name: &'static str, state: &'static str, t: f64, dark: bool, icon: bool, text: bool, backdrop: &'static str) -> G {
+        G { name, state, t, dark, scale: 1.0, icon, text, backdrop: Some(backdrop) }
     }
 
     fn goldens() -> Vec<G> {
@@ -490,6 +583,23 @@ mod golden {
                 v.push(g(name, "thinking", t, dark, false, false));
             }
         }
+        // over the backdrop fixtures (white, black, a colour gradient, busy text), light and dark
+        let leak = |s: String| -> &'static str { Box::leak(s.into_boxed_str()) };
+        for bd in ["white", "black", "gradient", "busy-text"] {
+            for (suffix, dark) in [("light", false), ("dark", true)] {
+                v.push(gb(leak(format!("over_{bd}_idle_{suffix}")), "idle", 0.0, dark, false, false, bd));
+                v.push(gb(leak(format!("over_{bd}_recording_{suffix}")), "recording", 1500.0, dark, true, false, bd));
+            }
+        }
+        for bd in ["gradient", "busy-text"] {
+            for (suffix, dark) in [("light", false), ("dark", true)] {
+                v.push(gb(leak(format!("over_{bd}_thinking_{suffix}")), "thinking", 800.0, dark, true, false, bd));
+                v.push(gb(leak(format!("over_{bd}_cancel_{suffix}")), "cancel", 600.0, dark, true, false, bd));
+                v.push(gb(leak(format!("over_{bd}_hover_{suffix}")), "hover", 0.0, dark, false, false, bd));
+                v.push(gb(leak(format!("over_{bd}_tooltip_{suffix}")), "recording-tooltip", 0.0, dark, false, true, bd));
+                v.push(gb(leak(format!("over_{bd}_error_{suffix}")), "error", 400.0, dark, false, true, bd));
+            }
+        }
         v
     }
 
@@ -515,6 +625,7 @@ mod golden {
             let mut scene = Scene::new(g.state, g.t);
             scene.dark = g.dark;
             scene.scale = g.scale;
+            scene.backdrop = g.backdrop.map(String::from);
             if g.icon {
                 let Some(ic) = icon.clone() else {
                     eprintln!("skipping {} (icon fixture missing)", g.name);
@@ -556,5 +667,106 @@ mod golden {
     #[test]
     fn unknown_state_is_an_error() {
         assert!(render_scene(&Scene::new("nope", 0.0)).is_err());
+    }
+}
+
+/// Generator for the backdrop fixtures (`tests/fixtures/pill_backdrops/*.png`). They are committed;
+/// run `cargo test gen_pill_backdrops -- --ignored` only to regenerate them.
+#[cfg(test)]
+mod fixtures {
+    use super::*;
+    use crate::daemon::pill::raster::{Canvas, Rect, sd_round_box};
+    use crate::daemon::pill::text::{self, Font};
+    use crate::daemon::pill::theme::Rgba;
+
+    const W: u32 = 640;
+    const H: u32 = 360;
+
+    fn lerp3(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
+        [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t]
+    }
+
+    fn fill(rgb: [u8; 3]) -> Pixmap {
+        let mut pm = Pixmap::new(W, H).unwrap();
+        for p in pm.data_mut().chunks_exact_mut(4) {
+            p.copy_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
+        }
+        pm
+    }
+
+    /// Violet -> pink -> cyan -> amber left to right, dark navy at the top, soft light and dark blobs.
+    fn gradient() -> Pixmap {
+        let stops: [[f32; 3]; 4] = [[124.0, 58.0, 237.0], [236.0, 72.0, 153.0], [6.0, 182.0, 212.0], [245.0, 158.0, 11.0]];
+        let navy = [15.0, 23.0, 42.0];
+        let mut pm = Pixmap::new(W, H).unwrap();
+        for y in 0..H {
+            for x in 0..W {
+                let u = x as f32 / (W - 1) as f32 * 3.0;
+                let i = (u.floor() as usize).min(2);
+                let mut c = lerp3(stops[i], stops[i + 1], u - i as f32);
+                let v = y as f32 / (H - 1) as f32;
+                c = lerp3(navy, c, (v * 1.6).min(1.0).powf(0.8));
+                let blob = |cx: f32, cy: f32, r: f32| (1.0 - ((x as f32 - cx).hypot(y as f32 - cy) / r)).clamp(0.0, 1.0).powi(2);
+                c = lerp3(c, [255.0, 255.0, 255.0], 0.6 * blob(440.0, 205.0, 150.0));
+                c = lerp3(c, [10.0, 12.0, 24.0], 0.55 * blob(585.0, 300.0, 110.0));
+                let i = ((y * W + x) * 4) as usize;
+                pm.data_mut()[i..i + 4].copy_from_slice(&[c[0] as u8, c[1] as u8, c[2] as u8, 255]);
+            }
+        }
+        pm
+    }
+
+    /// A document-like page: dense text in three sizes, inverted bands, colour blocks, a bar chart and
+    /// a checkerboard - the worst case for text on glass.
+    fn busy_text() -> Pixmap {
+        let mut pm = fill([244, 245, 247]);
+        let mut cv = Canvas::new(&mut pm, 1.0);
+        let line = "The quick brown fox jumps over the lazy dog 0123456789 - pack my box with five dozen liquor jugs. ";
+        let ink = Rgba::hex(0x111827);
+        let paper = Rgba::hex(0xf4f5f7);
+        let mut y = 4.0;
+        let mut row = 0;
+        while y < H as f32 - 8.0 {
+            let (px, lh) = match row % 3 {
+                0 => (11.0, 15.0),
+                1 => (13.0, 18.0),
+                _ => (16.0, 22.0),
+            };
+            let inverted = row % 5 == 4;
+            if inverted {
+                cv.fill_sdf(Rect::new(0.0, y - 1.0, W as f32, y + lh), Rgba::hex(0x172554), 1.0, |_, _| -1.0);
+            }
+            let text_line: String = line.repeat(3).chars().skip((row * 7) % 40).collect();
+            if let Some(m) = text::mask(&text_line, Font::new(px, 1.0, if row % 4 == 0 { 700 } else { 400 })) {
+                text::draw(&mut cv, &m, 4.0 - (row % 7) as f32 * 3.0, y, if inverted { paper } else { ink }, 1.0);
+            }
+            y += lh;
+            row += 1;
+        }
+        // colour blocks and a bar chart around the dock corner
+        for (i, c) in [0xdc2626u32, 0x16a34a, 0x2563eb, 0xf59e0b, 0x7c3aed].into_iter().enumerate() {
+            let h = 60.0 + 34.0 * ((i * 37) % 5) as f32;
+            let r = Rect::from_xywh(420.0 + i as f32 * 42.0, 330.0 - h, 30.0, h);
+            cv.fill_sdf(r.inflate(1.0), Rgba::hex(c), 1.0, |x, y| sd_round_box(x, y, r.cx(), r.cy(), r.w() * 0.5, r.h() * 0.5, 3.0));
+        }
+        for cy in 0..8 {
+            for cx in 0..8 {
+                if (cx + cy) % 2 == 0 {
+                    let r = Rect::from_xywh(440.0 + cx as f32 * 8.0, 170.0 + cy as f32 * 8.0, 8.0, 8.0);
+                    cv.fill_sdf(r.inflate(0.5), Rgba::hex(0x000000), 1.0, |_, _| -1.0);
+                }
+            }
+        }
+        pm
+    }
+
+    #[test]
+    #[ignore]
+    fn gen_pill_backdrops() {
+        let dir = backdrop_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, pm) in [("white", fill([255, 255, 255])), ("black", fill([0, 0, 0])), ("gradient", gradient()), ("busy-text", busy_text())] {
+            pm.save_png(dir.join(format!("{name}.png"))).unwrap();
+        }
     }
 }

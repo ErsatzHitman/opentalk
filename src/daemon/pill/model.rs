@@ -5,6 +5,7 @@
 use super::PillMode;
 use super::anim::*;
 use super::card::ErrorCard;
+use super::glass::{self, Backdrop};
 use super::raster::{Rect, sd_capsule};
 use super::theme::{Palette, Rgba};
 use crate::core::config::PanelPosition;
@@ -47,42 +48,38 @@ pub struct Shadow {
 }
 
 impl Shadow {
-    pub const NONE: Shadow = Shadow { dy: 0.0, blur: 0.0, spread: 0.0, alpha: 0.0 };
     pub fn lerp(self, to: Shadow, t: f32) -> Shadow {
         let l = |a: f32, b: f32| a + (b - a) * t;
         Shadow { dy: l(self.dy, to.dy), blur: l(self.blur, to.blur), spread: l(self.spread, to.spread), alpha: l(self.alpha, to.alpha) }
     }
 }
 
+/// The glass surface's state-dependent look: the drop shadow, how far the tint is lifted (hover) and
+/// the border strength (the `/60` processing states). The material itself lives in `glass.rs`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Appearance {
-    pub bg: Rgba,
-    pub border: Rgba,
     pub shadow: Shadow,
+    /// 0 at rest, 1 hovered (`liquid-glass--hover`: tint 6 % -> 11 %).
+    pub lift: f32,
+    /// Border alpha multiplier (1, or 0.6 for processing / thinking / unavailable).
+    pub edge: f32,
 }
 
 impl Appearance {
     pub fn lerp(self, to: Appearance, t: f32) -> Appearance {
-        Appearance { bg: self.bg.lerp(to.bg, t), border: self.border.lerp(to.border, t), shadow: self.shadow.lerp(to.shadow, t) }
+        let l = |a: f32, b: f32| a + (b - a) * t;
+        Appearance { shadow: self.shadow.lerp(to.shadow, t), lift: l(self.lift, to.lift), edge: l(self.edge, to.edge) }
     }
 }
 
-/// `STATE_APPEARANCE` + the dark-only `--shadow-card` and the hover `--shadow-card-hover-subtle`.
+/// `STATE_APPEARANCE` on the glass material: hover lifts the tint and the shadow, the processing
+/// states fade the border to 60 %.
 pub fn appearance(look: Look, pal: &Palette) -> Appearance {
-    let base_shadow = if pal.dark { Shadow { dy: 1.0, blur: 3.0, spread: 0.0, alpha: 0.2 } } else { Shadow::NONE };
-    let hover_shadow = Shadow { dy: 2.0, blur: 8.0, spread: -2.0, alpha: if pal.dark { 0.12 } else { 0.1 } };
+    let tk = glass::tokens(pal.dark);
     match look {
-        Look::Idle => Appearance {
-            bg: pal.surface1,
-            // light: border-border-hover; dark: dark:border-border/50
-            border: if pal.dark { pal.border.with_alpha(0.5) } else { pal.border_hover },
-            shadow: base_shadow,
-        },
-        Look::Hover => Appearance { bg: pal.surface3, border: pal.border_hover, shadow: hover_shadow },
-        Look::Recording => Appearance { bg: pal.surface1, border: pal.border_hover, shadow: base_shadow },
-        Look::Processing | Look::Thinking | Look::Unavailable => {
-            Appearance { bg: pal.surface1, border: pal.border.with_alpha(0.6), shadow: base_shadow }
-        }
+        Look::Idle | Look::Recording => Appearance { shadow: tk.shadow, lift: 0.0, edge: 1.0 },
+        Look::Hover => Appearance { shadow: tk.shadow_lift, lift: 1.0, edge: 1.0 },
+        Look::Processing | Look::Thinking | Look::Unavailable => Appearance { shadow: tk.shadow, lift: 0.0, edge: 0.6 },
     }
 }
 
@@ -287,6 +284,8 @@ pub struct RenderState {
     pub(crate) app: Option<AppBubble>,
     pub(crate) error: Option<ErrorCard>,
     pub(crate) dragging: bool,
+    /// The frosted screen under the window; `None` renders the glass over a flat neutral backdrop.
+    pub(crate) backdrop: Option<Arc<Backdrop>>,
 }
 
 fn retarget(track: &mut Track, now: f64, to: f32, dur: f64, ease: Bezier) {
@@ -325,7 +324,20 @@ impl RenderState {
             app: None,
             error: None,
             dragging: false,
+            backdrop: None,
         }
+    }
+
+    /// Install (or clear) the captured backdrop. Returns whether the picture changed.
+    pub fn set_backdrop(&mut self, b: Option<Arc<Backdrop>>) -> bool {
+        let changed = self.backdrop.as_ref().map(|b| b.id) != b.as_ref().map(|b| b.id);
+        self.backdrop = b;
+        changed
+    }
+
+    /// The backdrop the glass is painted over: the capture, else the neutral one for the theme.
+    pub fn backdrop_or_neutral(&self) -> Arc<Backdrop> {
+        self.backdrop.clone().unwrap_or_else(|| Backdrop::neutral(self.pal.dark))
     }
 
     pub fn mode(&self) -> PillMode {
@@ -869,16 +881,22 @@ mod tests {
     #[test]
     fn appearance_tokens() {
         let l = appearance(Look::Idle, &Palette::LIGHT);
-        assert_eq!(l.bg, Rgba::hex(0xfafafa));
-        assert_eq!(l.border, Rgba::hex(0xd4d4d4));
-        assert_eq!(l.shadow, Shadow::NONE);
-        let d = appearance(Look::Idle, &Palette::DARK);
-        assert!((d.border.a - 0.5).abs() < 1e-6);
-        assert_eq!(d.shadow.blur, 3.0);
+        let tk = glass::tokens(false);
+        assert_eq!(l.shadow, tk.shadow);
+        assert_eq!((l.lift, l.edge), (0.0, 1.0));
+        // dark mode shadows are stronger than light mode's
+        assert!(appearance(Look::Idle, &Palette::DARK).shadow.alpha > l.shadow.alpha);
+        // hover lifts the tint and the shadow; recording looks like idle
         let h = appearance(Look::Hover, &Palette::LIGHT);
-        assert_eq!(h.bg, Rgba::hex(0xf5f5f5));
-        assert_eq!(h.shadow.spread, -2.0);
-        let t = appearance(Look::Thinking, &Palette::DARK);
-        assert!((t.border.a - 0.6).abs() < 1e-6);
+        assert_eq!(h.lift, 1.0);
+        assert_eq!(h.shadow, tk.shadow_lift);
+        assert_eq!(appearance(Look::Recording, &Palette::LIGHT), l);
+        // processing / thinking / unavailable fade the border to 60 %
+        for look in [Look::Processing, Look::Thinking, Look::Unavailable] {
+            assert!((appearance(look, &Palette::DARK).edge - 0.6).abs() < 1e-6);
+        }
+        // transitions interpolate every field
+        let mid = l.lerp(h, 0.5);
+        assert!((mid.lift - 0.5).abs() < 1e-6 && mid.shadow.dy > l.shadow.dy && mid.shadow.dy < h.shadow.dy);
     }
 }
