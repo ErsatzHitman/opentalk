@@ -542,7 +542,9 @@ fn private_extract(path: &str, px: u32) -> Option<Vec<u8>> {
     }
 }
 
+/// `SHGetFileInfoW(SHGFI_ICON)`; its docs require COM on the calling thread, so it gets its own apartment.
 fn shgetfileinfo(path: &str, px: u32) -> Option<Vec<u8>> {
+    let _com = Com::init();
     let w = wide(path);
     let mut info = SHFILEINFOW::default();
     // SAFETY: `info` is a valid out struct; its HICON is destroyed after drawing.
