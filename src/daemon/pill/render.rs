@@ -1,15 +1,30 @@
 //! Pure renderer: `render(state, t_ms)` -> premultiplied RGBA pixmap of the whole pill window.
 //! No Win32 is touched except the (cached) GDI text masks used by the tooltip and the error card, so
 //! the output is deterministic for goldens.
+//!
+//! A frame is drawn in four layer groups, always in this order: the signal glow ([`L_GLOW`]), the
+//! static chrome ([`L_UNDER`]: app bubble, shadow, skin, body, logo, divider), the waveform bars
+//! ([`L_BARS`]) and the overlays ([`L_OVER`]: unavailable ring, cancel glyph, tooltip).
+//! [`FrameCache`] exploits that split so a steady frame redraws only what moves (see its docs).
 
 use super::anim::*;
 use super::card;
-use super::glow::{self, GlowFrame, Sprites};
+use super::glow::{self, GLOW_RADIUS, GlowFrame, Sprites};
 use super::model::*;
-use super::raster::{Canvas, Rect, cov, sd_capsule, sd_round_box, sd_segment};
+use super::PillMode;
+use super::raster::{Canvas, DevRect, Rect, any_alpha, clear_rect, copy_rect, cov, over_in_place, over_rect, sd_capsule, sd_round_box, sd_segment};
 use super::text::{self, Font};
 use super::theme::Rgba;
+use std::hash::Hasher;
+use std::sync::Arc;
 use tiny_skia::{FilterQuality, Pixmap, PixmapPaint, Transform};
+
+/// Layer groups (bit mask for [`render_layers`]).
+pub const L_GLOW: u8 = 1;
+pub const L_UNDER: u8 = 2;
+pub const L_BARS: u8 = 4;
+pub const L_OVER: u8 = 8;
+pub const L_ALL: u8 = L_GLOW | L_UNDER | L_BARS | L_OVER;
 
 /// Device-pixel size of the window for the current content.
 pub fn pixel_size(st: &RenderState) -> (u32, u32) {
@@ -27,30 +42,54 @@ pub fn render(st: &RenderState, t: f64) -> Pixmap {
 
 /// Render into an existing pixmap of exactly `pixel_size(st)`; the pixmap is cleared first.
 pub fn render_into(st: &RenderState, t: f64, pm: &mut Pixmap) {
+    render_layers(st, t, pm, L_ALL);
+}
+
+/// Like [`render_into`] but draws only the layer groups in `mask` (the error card ignores it).
+pub fn render_layers(st: &RenderState, t: f64, pm: &mut Pixmap, mask: u8) {
     pm.data_mut().fill(0);
     if let Some(e) = st.error() {
         render_error(st, e, t, pm);
         return;
     }
-    let scale = st.scale;
     let g = st.geometry(t);
+    let mut cv = Canvas::new(pm, st.scale);
+    if mask & L_GLOW != 0 {
+        draw_glow(&mut cv, st, &g, t);
+    }
+    if mask & L_UNDER != 0 {
+        draw_under(&mut cv, st, &g, t);
+    }
+    if mask & L_BARS != 0 {
+        draw_bars(&mut cv, st, &g, t, &st.waveform().heights(t));
+    }
+    if mask & L_OVER != 0 {
+        draw_over(&mut cv, st, &g, t);
+    }
+}
+
+/// 1. Signal glow sits behind everything.
+fn draw_glow(cv: &mut Canvas, st: &RenderState, g: &Geometry, t: f64) {
+    let glow_op = st.glow.value(t);
+    if glow_op > 0.002 {
+        let sprites = Sprites::get(st.scale);
+        glow::draw(cv, &st.pal, &GlowFrame { pill: g.pill, opacity: glow_op, elapsed: st.glow_since.map(|s| t - s) }, &sprites);
+    }
+}
+
+/// 2-5. App bubble, pill shadow, fused cancel skin, pill body and hover gradient; then the logo and
+/// the divider.
+fn draw_under(cv: &mut Canvas, st: &RenderState, g: &Geometry, t: f64) {
+    let scale = st.scale;
     let pal = st.pal;
     let app = st.appearance_at(t);
     let fused = st.fused.value(t).clamp(0.0, 1.0);
     let chrome_alpha = 1.0 - fused;
-    let mut cv = Canvas::new(pm, scale);
-
-    // 1. Signal glow sits behind everything
-    let glow_op = st.glow.value(t);
-    if glow_op > 0.002 {
-        let sprites = Sprites::get(scale);
-        glow::draw(&mut cv, &pal, &GlowFrame { pill: g.pill, opacity: glow_op, elapsed: st.glow_since.map(|s| t - s) }, &sprites);
-    }
 
     // 2. app bubble
     if g.bubble_t > 0.003 {
         if let Some(a) = st.app() {
-            draw_bubble(&mut cv, st, &g, &app, a);
+            draw_bubble(cv, st, g, &app, a);
         }
     }
 
@@ -64,27 +103,35 @@ pub fn render_into(st: &RenderState, t: f64, pm: &mut Pixmap) {
 
     // 4. fused cancel skin
     if g.cancel_t > 0.0 || fused > 0.002 {
-        draw_skin(&mut cv, st, &g, &app);
+        draw_skin(cv, st, g, &app);
     }
 
     // 5. pill body
     if chrome_alpha > 0.002 {
-        draw_chrome(&mut cv, p, &app, chrome_alpha, scale);
+        draw_chrome(cv, p, &app, chrome_alpha, scale);
     }
     let grad = st.grad.value(t);
     if grad > 0.002 {
-        draw_hover_gradient(&mut cv, p, pal.fg, grad);
+        draw_hover_gradient(cv, p, pal.fg, grad);
     }
 
-    // 6. contents
-    draw_contents(&mut cv, st, &g, t);
+    // 6. contents that sit under the bars
+    draw_logo_and_divider(cv, st, g, t);
+}
+
+/// Everything drawn after the waveform: unavailable ring, cancel glyph, tooltip.
+fn draw_over(cv: &mut Canvas, st: &RenderState, g: &Geometry, t: f64) {
+    let pal = st.pal;
+    let p = g.pill;
+
+    draw_unavailable_ring(cv, st, g, t);
 
     // 7. cancel glyph
     if g.cancel_t > 0.35 {
         let a = ((g.cancel_t - 0.35) / 0.65).clamp(0.0, 1.0);
         let hot = st.cancel_hot.value(t);
         let col = pal.muted_fg.lerp(pal.fg, hot);
-        draw_x_glyph(&mut cv, g.cancel.0, g.cancel.1, col, a);
+        draw_x_glyph(cv, g.cancel.0, g.cancel.1, col, a);
     }
 
     // 8. tooltip
@@ -96,7 +143,7 @@ pub fn render_into(st: &RenderState, t: f64, pm: &mut Pixmap) {
             } else {
                 (p, align_for(st.position))
             };
-            draw_tooltip(&mut cv, st, &txt, anchor.0, anchor.1);
+            draw_tooltip(cv, st, &txt, anchor.0, anchor.1);
         }
     }
 }
@@ -175,14 +222,13 @@ fn contents_layout(g: &Geometry, divider: f32) -> Contents {
     }
 }
 
-fn draw_contents(cv: &mut Canvas, st: &RenderState, g: &Geometry, t: f64) {
+fn draw_logo_and_divider(cv: &mut Canvas, st: &RenderState, g: &Geometry, t: f64) {
     let pal = st.pal;
     let divider = st.divider.value(t).clamp(0.0, 1.0);
     let ct = contents_layout(g, divider);
-    let look = st.look();
 
     // logo
-    let logo_col = logo_color(look, &pal);
+    let logo_col = logo_color(st.look(), &pal);
     let op = st.pulse_opacity_at(t);
     draw_logo(cv, ct.logo_x, ct.cy, logo_col, op);
 
@@ -191,8 +237,12 @@ fn draw_contents(cv: &mut Canvas, st: &RenderState, g: &Geometry, t: f64) {
         let r = Rect::from_xywh(ct.div_x, ct.cy - 8.0, ct.div_w, 16.0);
         cv.fill_sdf(r.inflate(1.0), pal.border, 0.6 * divider, |x, y| sd_round_box(x, y, r.cx(), r.cy(), r.w() * 0.5, r.h() * 0.5, 0.0));
     }
+}
 
-    // waveform lane
+/// The waveform lane: `hs` are the live bar heights (see [`Waveform::heights`]).
+fn draw_bars(cv: &mut Canvas, st: &RenderState, g: &Geometry, t: f64, hs: &[f32; WAVE_BARS]) {
+    let pal = st.pal;
+    let ct = contents_layout(g, st.divider.value(t).clamp(0.0, 1.0));
     if ct.lane_w > 0.5 {
         let lane = Rect::from_xywh(ct.lane_x, ct.cy - LANE_H * 0.5, ct.lane_w, LANE_H);
         let bars_left = lane.cx() - LANE_W * 0.5;
@@ -200,7 +250,6 @@ fn draw_contents(cv: &mut Canvas, st: &RenderState, g: &Geometry, t: f64) {
         let live = st.wave_live.value(t);
         let rest = st.wave_rest.value(t);
         if live > 0.003 {
-            let hs = st.waveform().heights(t);
             for (i, &h) in hs.iter().enumerate() {
                 draw_bar(cv, bars_left + i as f32 * 5.0 + 1.0, ct.cy, h, pal.fg, live, clip.then_some(lane));
             }
@@ -211,23 +260,28 @@ fn draw_contents(cv: &mut Canvas, st: &RenderState, g: &Geometry, t: f64) {
             }
         }
     }
+}
 
-    // unavailable: pulsing 2 px ring just inside the border
-    if look == Look::Unavailable {
-        let p = g.pill;
-        let (cx, cy) = (p.cx(), p.cy());
-        let (ow, oh) = (p.w() - 2.0, p.h() - 2.0);
-        let s = cv.scale;
-        cv.shade_sdf(
-            p,
-            |x, y| sd_capsule(x, y, cx, cy, ow, oh),
-            |x, y, c| {
-                let hole = cov(sd_capsule(x, y, cx, cy, ow - 4.0, oh - 4.0) * s);
-                let a = (c - hole).max(0.0) * 0.3 * op;
-                [pal.fg.r * a, pal.fg.g * a, pal.fg.b * a, a]
-            },
-        );
+/// Unavailable: pulsing 2 px ring just inside the border.
+fn draw_unavailable_ring(cv: &mut Canvas, st: &RenderState, g: &Geometry, t: f64) {
+    if st.look() != Look::Unavailable {
+        return;
     }
+    let pal = st.pal;
+    let op = st.pulse_opacity_at(t);
+    let p = g.pill;
+    let (cx, cy) = (p.cx(), p.cy());
+    let (ow, oh) = (p.w() - 2.0, p.h() - 2.0);
+    let s = cv.scale;
+    cv.shade_sdf(
+        p,
+        |x, y| sd_capsule(x, y, cx, cy, ow, oh),
+        |x, y, c| {
+            let hole = cov(sd_capsule(x, y, cx, cy, ow - 4.0, oh - 4.0) * s);
+            let a = (c - hole).max(0.0) * 0.3 * op;
+            [pal.fg.r * a, pal.fg.g * a, pal.fg.b * a, a]
+        },
+    );
 }
 
 fn draw_bar(cv: &mut Canvas, cx: f32, cy: f32, h: f32, color: Rgba, alpha: f32, clip: Option<Rect>) {
@@ -434,6 +488,293 @@ fn render_error(st: &RenderState, e: &card::ErrorCard, t: f64, pm: &mut Pixmap) 
     pm.draw_pixmap(0, 0, layer.as_ref(), &PixmapPaint { opacity: op.clamp(0.0, 1.0), blend_mode: tiny_skia::BlendMode::SourceOver, quality: FilterQuality::Bilinear }, tf, None);
 }
 
+// --- steady-state frame cache ---------------------------------------------------------------
+
+/// What [`FrameCache::render`] did to the pixmap.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameOutcome {
+    /// The pixmap already shows this frame; nothing needs uploading.
+    Skip,
+    /// Only this rect of the pixmap changed (the whole pixmap for a full repaint).
+    Dirty(DevRect),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kind {
+    /// Recording with every non-waveform animation settled: only the 52x24 lane moves.
+    Lane,
+    /// Thinking with the entrance settled: only the glow (a disc around the pill) moves.
+    Glow,
+}
+
+/// Bars are redrawn only when one moved by more than this many pixels (1/255 of a pixel is below
+/// what an 8-bit coverage value can show).
+const BAR_EPS: f32 = 1.0 / 255.0;
+
+/// 64-bit FNV-1a, for the cheap per-frame "did anything static change" signature.
+struct Fnv(u64);
+
+impl Hasher for Fnv {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0 ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+}
+
+impl Fnv {
+    fn new() -> Fnv {
+        Fnv(0xcbf2_9ce4_8422_2325)
+    }
+    fn f(&mut self, v: f32) {
+        self.write_u32(v.to_bits());
+    }
+    fn c(&mut self, c: Rgba) {
+        self.f(c.r);
+        self.f(c.g);
+        self.f(c.b);
+        self.f(c.a);
+    }
+}
+
+/// Is the frame at `t` one of the two steady shapes? Everything except the lane (resp. the glow) is a
+/// pure function of the state, not of `t`: no track is moving, nothing pulses, no error card.
+fn classify(st: &RenderState, t: f64) -> Option<Kind> {
+    if st.error().is_some() || st.pulse_since.is_some() {
+        return None;
+    }
+    let tracks = [&st.compact, &st.grad, &st.wave_live, &st.wave_rest, &st.divider, &st.glow, &st.cancel, &st.fused, &st.bubble, &st.cancel_hot];
+    if tracks.iter().any(|tr| tr.is_active(t)) || st.appearance.is_active(t) {
+        return None;
+    }
+    let (live, rest, glow) = (st.wave_live.value(t), st.wave_rest.value(t), st.glow.value(t));
+    match (st.mode(), st.look()) {
+        (PillMode::Recording, Look::Recording) => {
+            // a clipped lane is never steady; with `compact` settled this is only a guard
+            let full_lane = contents_layout(&st.geometry(t), st.divider.value(t).clamp(0.0, 1.0)).lane_w >= LANE_W - 0.01;
+            (glow <= 0.002 && live > 0.003 && rest <= 0.003 && full_lane).then_some(Kind::Lane)
+        }
+        (PillMode::Thinking, Look::Thinking) => (glow > 0.002 && live <= 0.003 && rest <= 0.003).then_some(Kind::Glow),
+        _ => None,
+    }
+}
+
+/// Is there anything in the overlay group (ring, cancel glyph, tooltip) at this instant?
+fn has_overlay(st: &RenderState, g: &Geometry) -> bool {
+    st.look() == Look::Unavailable || g.cancel_t > 0.35 || ((st.pointer().pill || st.pointer().bubble) && tooltip_for(st).is_some())
+}
+
+/// Hash of everything that decides the static pixels of a steady frame.
+fn signature(st: &RenderState, t: f64, g: &Geometry, size: (u32, u32), kind: Kind) -> u64 {
+    let mut h = Fnv::new();
+    h.write_u8(kind as u8);
+    h.write_u32(size.0);
+    h.write_u32(size.1);
+    h.f(st.scale);
+    let p = &st.pal;
+    h.write_u8(p.dark as u8);
+    for c in [p.fg, p.muted_fg, p.border, p.border_hover, p.surface0, p.surface1, p.surface3, p.popover] {
+        h.c(c);
+    }
+    h.f(p.halo_opacity);
+    h.f(p.comet_opacity);
+    h.write_u8(st.position as u8);
+    h.write_u8(st.show_app_bubble as u8);
+    h.write(st.hotkey_label.as_bytes());
+    h.write_u8(st.mode() as u8);
+    h.write_u8(st.look() as u8);
+    let ptr = st.pointer();
+    h.write_u8(ptr.group as u8 | (ptr.pill as u8) << 1 | (ptr.bubble as u8) << 2 | (ptr.cancel as u8) << 3);
+    let geom = [g.compact, g.pill.l, g.pill.t, g.pill.r, g.pill.b, g.cancel_t, g.bubble_t, g.cancel.0, g.cancel.1, g.cancel.2, g.bubble.0, g.bubble.1, g.bubble.2];
+    for v in geom {
+        h.f(v);
+    }
+    let a = st.appearance_at(t);
+    h.c(a.bg);
+    h.c(a.border);
+    for v in [a.shadow.dy, a.shadow.blur, a.shadow.spread, a.shadow.alpha] {
+        h.f(v);
+    }
+    for v in [st.fused.value(t), st.grad.value(t), st.cancel_hot.value(t), st.divider.value(t), st.wave_live.value(t), st.wave_rest.value(t)] {
+        h.f(v);
+    }
+    // the icon's address identifies its pixels; the cache keeps the Arc alive so it cannot be reused
+    h.write_usize(st.app().map_or(0, |a| Arc::as_ptr(&a.icon) as usize));
+    h.finish()
+}
+
+/// Device rect covering every pixel the waveform bars can touch (the 52x24 lane plus AA slack).
+fn lane_rect(st: &RenderState, g: &Geometry, t: f64, w: i32, h: i32) -> DevRect {
+    let ct = contents_layout(g, st.divider.value(t).clamp(0.0, 1.0));
+    let lane = Rect::from_xywh(ct.lane_x, ct.cy - LANE_H * 0.5, ct.lane_w, LANE_H);
+    DevRect::of(lane.inflate(2.0), st.scale, w, h)
+}
+
+/// Device rect covering the halo, ring and comet. The sprites reach `GLOW_RADIUS + 16` logical px
+/// from the pill's centre (scaled by its glow box, which breathes up to 1.05x); a test sweeps the
+/// orbit to guard the margin.
+fn glow_rect(g: &Geometry, scale: f32, w: i32, h: i32) -> DevRect {
+    let box_s = (g.pill.w() + 8.0).max(g.pill.h() + 8.0) / (GLOW_RADIUS * 2.0);
+    let half = (GLOW_RADIUS + 16.0) * box_s * 1.05 + 3.0;
+    DevRect::of(Rect::new(g.pill.cx() - half, g.pill.cy() - half, g.pill.cx() + half, g.pill.cy() + half), scale, w, h)
+}
+
+fn ensure(slot: &mut Option<Pixmap>, w: u32, h: u32) -> Option<&mut Pixmap> {
+    if slot.as_ref().is_none_or(|p| p.width() != w || p.height() != h) {
+        *slot = Pixmap::new(w, h);
+    }
+    slot.as_mut()
+}
+
+/// Incremental renderer for the window: [`FrameCache::render`] has the same result as
+/// [`render_into`] but, once an animation has settled into one of two steady shapes, it redraws only
+/// what moves and says which rect changed.
+///
+/// - Recording: everything but the bars (shadow, body, logo, bubble) is cached in `base`. Each frame
+///   restores the 52x24 lane from `base` and redraws the bars over it; an overlay that reaches into
+///   the lane (the tooltip's soft shadow) is laid back over them. A frame whose bars all moved by
+///   <= 1/255 px is skipped outright.
+/// - Thinking: the glow is the only moving layer. The rest of the frame is cached in `base`; each
+///   frame draws the glow alone into `scratch`, then composites `base` over it inside the glow's
+///   bounding rect (the same as drawing in order, up to 8-bit rounding on partly covered edges).
+///
+/// Any change to the static inputs changes [`signature`] and any animation still running fails
+/// [`classify`]; both end in a full repaint. After the target pixmap is replaced, or its content
+/// stops matching the last frame (window hidden), call [`FrameCache::reset`].
+pub struct FrameCache {
+    kind: Option<Kind>,
+    sig: u64,
+    base: Option<Pixmap>,
+    /// Glow layer (Glow) or the overlay layer (Lane, used only when it overlaps the lane).
+    scratch: Option<Pixmap>,
+    over_in_lane: bool,
+    lane: DevRect,
+    glow: DevRect,
+    last_h: [f32; WAVE_BARS],
+    /// Keeps the app icon alive so its address stays a valid signature input.
+    icon: Option<Arc<Pixmap>>,
+}
+
+impl Default for FrameCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FrameCache {
+    pub fn new() -> FrameCache {
+        let zero = DevRect::full(0, 0);
+        FrameCache { kind: None, sig: 0, base: None, scratch: None, over_in_lane: false, lane: zero, glow: zero, last_h: [0.0; WAVE_BARS], icon: None }
+    }
+
+    /// Forget everything: the next frame is a full repaint.
+    pub fn reset(&mut self) {
+        self.kind = None;
+        self.icon = None;
+    }
+
+    /// Draw the frame at `t` into `pm` (exactly `pixel_size(st)`); returns what changed in it.
+    pub fn render(&mut self, st: &RenderState, t: f64, pm: &mut Pixmap) -> FrameOutcome {
+        let (w, h) = (pm.width() as i32, pm.height() as i32);
+        let full = FrameOutcome::Dirty(DevRect::full(w, h));
+        let Some(kind) = classify(st, t) else {
+            self.kind = None;
+            render_into(st, t, pm);
+            return full;
+        };
+        let g = st.geometry(t);
+        let sig = signature(st, t, &g, (pm.width(), pm.height()), kind);
+        if self.kind == Some(kind) && self.sig == sig {
+            return match kind {
+                Kind::Lane => self.update_lane(st, &g, t, pm),
+                Kind::Glow => self.update_glow(st, &g, t, pm),
+            };
+        }
+        self.rebuild(st, &g, t, pm, kind, sig);
+        full
+    }
+
+    fn rebuild(&mut self, st: &RenderState, g: &Geometry, t: f64, pm: &mut Pixmap, kind: Kind, sig: u64) {
+        let (w, h) = (pm.width(), pm.height());
+        self.kind = None;
+        self.icon = st.app().map(|a| a.icon.clone());
+        let (Some(base), Some(scratch)) = (ensure(&mut self.base, w, h), ensure(&mut self.scratch, w, h)) else {
+            render_into(st, t, pm);
+            return;
+        };
+        base.data_mut().fill(0);
+        scratch.data_mut().fill(0);
+        let scale = st.scale;
+        match kind {
+            Kind::Lane => {
+                draw_under(&mut Canvas::new(base, scale), st, g, t);
+                // the same operations, in the same order, on the same pixels as `render_into`
+                pm.data_mut().copy_from_slice(base.data());
+                let hs = st.waveform().heights(t);
+                {
+                    let mut cv = Canvas::new(pm, scale);
+                    draw_bars(&mut cv, st, g, t, &hs);
+                    draw_over(&mut cv, st, g, t);
+                }
+                self.lane = lane_rect(st, g, t, w as i32, h as i32);
+                self.last_h = hs;
+                self.over_in_lane = false;
+                if has_overlay(st, g) {
+                    draw_over(&mut Canvas::new(scratch, scale), st, g, t);
+                    self.over_in_lane = any_alpha(scratch.data(), w as i32, self.lane);
+                }
+            }
+            Kind::Glow => {
+                {
+                    let mut cv = Canvas::new(base, scale);
+                    draw_under(&mut cv, st, g, t);
+                    draw_bars(&mut cv, st, g, t, &st.waveform().heights(t));
+                    draw_over(&mut cv, st, g, t);
+                }
+                draw_glow(&mut Canvas::new(scratch, scale), st, g, t);
+                over_rect(pm.data_mut(), base.data(), scratch.data(), w as i32, DevRect::full(w as i32, h as i32));
+                self.glow = glow_rect(g, scale, w as i32, h as i32);
+            }
+        }
+        self.sig = sig;
+        self.kind = Some(kind);
+    }
+
+    fn update_lane(&mut self, st: &RenderState, g: &Geometry, t: f64, pm: &mut Pixmap) -> FrameOutcome {
+        let hs = st.waveform().heights(t);
+        if hs.iter().zip(&self.last_h).all(|(a, b)| (a - b).abs() <= BAR_EPS) {
+            return FrameOutcome::Skip;
+        }
+        let (Some(base), Some(scratch)) = (self.base.as_ref(), self.scratch.as_ref()) else { return self.fallback(st, t, pm) };
+        let (w, r) = (pm.width() as i32, self.lane);
+        copy_rect(pm.data_mut(), base.data(), w, r);
+        draw_bars(&mut Canvas::new(pm, st.scale), st, g, t, &hs);
+        if self.over_in_lane {
+            over_in_place(pm.data_mut(), scratch.data(), w, r);
+        }
+        self.last_h = hs;
+        FrameOutcome::Dirty(r)
+    }
+
+    fn update_glow(&mut self, st: &RenderState, g: &Geometry, t: f64, pm: &mut Pixmap) -> FrameOutcome {
+        let (Some(base), Some(scratch)) = (self.base.as_ref(), self.scratch.as_mut()) else { return self.fallback(st, t, pm) };
+        let (w, r) = (pm.width() as i32, self.glow);
+        clear_rect(scratch.data_mut(), w, r);
+        draw_glow(&mut Canvas::new(scratch, st.scale), st, g, t);
+        over_rect(pm.data_mut(), base.data(), scratch.data(), w, r);
+        FrameOutcome::Dirty(r)
+    }
+
+    fn fallback(&mut self, st: &RenderState, t: f64, pm: &mut Pixmap) -> FrameOutcome {
+        self.kind = None;
+        render_into(st, t, pm);
+        FrameOutcome::Dirty(DevRect::full(pm.width() as i32, pm.height() as i32))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -567,5 +908,336 @@ mod tests {
         let pm = render(&s, 0.0);
         assert_eq!((pm.width(), pm.height()), (416, 240));
         assert_eq!(alpha_at(&pm, 352, 176), 255);
+    }
+
+    // --- FrameCache ----------------------------------------------------------------------------
+
+    const FRAME: f64 = 1000.0 / 60.0;
+
+    /// Tick a state at 60 fps from `*t` up to (and including) `until`; `level` is the mic RMS.
+    fn run(s: &mut RenderState, t: &mut f64, until: f64, level: &dyn Fn(f64) -> f32) {
+        while *t <= until {
+            s.tick(*t, level(*t));
+            *t += FRAME;
+        }
+    }
+
+    fn speech(t: f64) -> f32 {
+        0.02 + 0.2 * (t / 137.0).sin().abs() as f32
+    }
+
+    fn new_pm(s: &RenderState) -> Pixmap {
+        let (w, h) = pixel_size(s);
+        Pixmap::new(w, h).unwrap()
+    }
+
+    fn max_diff(a: &Pixmap, b: &Pixmap) -> u8 {
+        a.data().iter().zip(b.data()).map(|(x, y)| x.abs_diff(*y)).max().unwrap_or(0)
+    }
+
+    /// Bytes that differ between two same-size pixmaps outside `r`.
+    fn changed_outside(a: &[u8], b: &Pixmap, r: DevRect) -> usize {
+        let w = b.width() as usize;
+        (0..a.len() / 4).filter(|i| !r.contains_pixel((i % w) as i32, (i / w) as i32) && a[i * 4..i * 4 + 4] != b.data()[i * 4..i * 4 + 4]).count()
+    }
+
+    fn full_rect(pm: &Pixmap) -> DevRect {
+        DevRect::full(pm.width() as i32, pm.height() as i32)
+    }
+
+    /// Logical lane box of the settled recording capsule at bottom-right: x 132..184, y 78..102.
+    fn lane_dev(scale: f32, pm: &Pixmap) -> DevRect {
+        DevRect::of(Rect::new(132.0 - 3.0, 78.0 - 3.0, 184.0 + 3.0, 102.0 + 3.0), scale, pm.width() as i32, pm.height() as i32)
+    }
+
+    #[test]
+    fn steady_recording_frame_touches_only_the_lane_rect() {
+        for (scale, dark) in [(1.0f32, false), (1.0, true), (1.25, false), (2.0, true)] {
+            let mut s = RenderState::new(Palette::get(dark), scale, PanelPosition::BottomRight);
+            s.set_mode(PillMode::Recording, 0.0);
+            let mut t = 0.0;
+            run(&mut s, &mut t, 1500.0, &speech);
+            let mut pm = new_pm(&s);
+            let mut cache = FrameCache::new();
+            // the first steady frame paints everything and is the golden path byte for byte
+            assert_eq!(cache.render(&s, t, &mut pm), FrameOutcome::Dirty(full_rect(&pm)));
+            assert_eq!(pm.data(), render(&s, t).data(), "scale {scale} dark {dark}: first frame");
+            let lane = lane_dev(scale, &pm);
+            let (mut dirty, mut skipped) = (0, 0);
+            for _ in 0..180 {
+                s.tick(t, speech(t));
+                let before = pm.data().to_vec();
+                match cache.render(&s, t, &mut pm) {
+                    FrameOutcome::Skip => {
+                        skipped += 1;
+                        assert_eq!(before, pm.data());
+                        // a skipped frame is within rounding of the true frame
+                        assert!(max_diff(&pm, &render(&s, t)) <= 2, "skipped frame drifted at {t}");
+                    }
+                    FrameOutcome::Dirty(r) => {
+                        dirty += 1;
+                        assert!(!r.is_empty() && r.x0 >= lane.x0 && r.y0 >= lane.y0 && r.x1 <= lane.x1 && r.y1 <= lane.y1, "{r:?} outside the lane {lane:?}");
+                        assert!(r.area() * 10 < full_rect(&pm).area(), "dirty rect {r:?} is not small");
+                        assert_eq!(changed_outside(&before, &pm, r), 0, "pixels outside {r:?} changed");
+                        assert_eq!(pm.data(), render(&s, t).data(), "lane update differs from a full render at {t}");
+                    }
+                }
+                t += FRAME;
+            }
+            assert!(dirty > 100, "bars moved on most frames ({dirty} dirty, {skipped} skipped)");
+        }
+    }
+
+    #[test]
+    fn silent_recording_frames_are_skipped() {
+        let mut s = rec_state(true);
+        let mut t = 0.0;
+        run(&mut s, &mut t, 1500.0, &|_| 0.0);
+        let mut pm = new_pm(&s);
+        let mut cache = FrameCache::new();
+        assert!(matches!(cache.render(&s, t, &mut pm), FrameOutcome::Dirty(_)));
+        for _ in 0..120 {
+            t += FRAME;
+            s.tick(t, 0.0);
+            assert_eq!(cache.render(&s, t, &mut pm), FrameOutcome::Skip, "silent input needs no repaint at {t}");
+        }
+        assert_eq!(pm.data(), render(&s, t).data());
+        // speech wakes the lane again
+        let mut woke = false;
+        for _ in 0..30 {
+            t += FRAME;
+            s.tick(t, 0.2);
+            woke |= matches!(cache.render(&s, t, &mut pm), FrameOutcome::Dirty(_));
+        }
+        assert!(woke);
+        assert_eq!(pm.data(), render(&s, t).data());
+    }
+
+    #[test]
+    fn frames_that_are_not_steady_repaint_everything() {
+        let mut s = rec_state(false);
+        let mut pm = new_pm(&s);
+        let mut cache = FrameCache::new();
+        // entrance: the capsule is still growing
+        for ms in [0.0, 100.0, 300.0, 450.0] {
+            s.tick(ms, 0.1);
+            assert_eq!(cache.render(&s, ms, &mut pm), FrameOutcome::Dirty(full_rect(&pm)));
+            assert_eq!(pm.data(), render(&s, ms).data());
+        }
+        // an error card is never cached
+        let mut e = rec_state(false);
+        e.error = Some(card::ErrorCard::new("Title", "Description", true, 0.0));
+        let mut pm = new_pm(&e);
+        for t in [0.0, 400.0, 800.0] {
+            assert_eq!(cache.render(&e, t, &mut pm), FrameOutcome::Dirty(full_rect(&pm)));
+        }
+    }
+
+    #[test]
+    fn static_input_changes_force_a_full_repaint() {
+        // ticks frames until one is incremental (a skip or a sub-rect), proving the cache is primed
+        fn settle_incrementally(cache: &mut FrameCache, s: &mut RenderState, t: &mut f64, pm: &mut Pixmap) {
+            for _ in 0..30 {
+                *t += FRAME;
+                s.tick(*t, speech(*t));
+                match cache.render(s, *t, pm) {
+                    FrameOutcome::Dirty(r) if r == full_rect(pm) => {}
+                    _ => return,
+                }
+            }
+            panic!("never became incremental");
+        }
+        let mut s = rec_state(false);
+        let mut t = 0.0;
+        run(&mut s, &mut t, 1500.0, &speech);
+        let mut pm = new_pm(&s);
+        let mut cache = FrameCache::new();
+        cache.render(&s, t, &mut pm);
+        settle_incrementally(&mut cache, &mut s, &mut t, &mut pm);
+        // palette switch snaps the chrome
+        s.set_palette(Palette::DARK, t);
+        assert_eq!(cache.render(&s, t, &mut pm), FrameOutcome::Dirty(full_rect(&pm)));
+        assert_eq!(pm.data(), render(&s, t).data());
+        // a new tooltip label, an app bubble appearing and a pointer move are static-input changes too
+        settle_incrementally(&mut cache, &mut s, &mut t, &mut pm);
+        s.hotkey_label = "Ctrl + Alt".into();
+        assert_eq!(cache.render(&s, t, &mut pm), FrameOutcome::Dirty(full_rect(&pm)));
+        settle_incrementally(&mut cache, &mut s, &mut t, &mut pm);
+        s.set_pointer(Pointer { group: true, pill: true, bubble: false, cancel: false }, t);
+        assert_eq!(cache.render(&s, t, &mut pm), FrameOutcome::Dirty(full_rect(&pm)));
+        assert_eq!(pm.data(), render(&s, t).data());
+        // an explicit reset repaints too
+        let mut quiet = rec_state(false);
+        let mut tq = 0.0;
+        run(&mut quiet, &mut tq, 1500.0, &speech);
+        let mut pmq = new_pm(&quiet);
+        cache.render(&quiet, tq, &mut pmq);
+        settle_incrementally(&mut cache, &mut quiet, &mut tq, &mut pmq);
+        cache.reset();
+        assert_eq!(cache.render(&quiet, tq, &mut pmq), FrameOutcome::Dirty(full_rect(&pmq)));
+        assert_eq!(pmq.data(), render(&quiet, tq).data());
+        // new pixmap size (scale change) rebuilds the layers too
+        quiet.set_scale(2.0);
+        let mut pm2 = new_pm(&quiet);
+        assert_eq!(cache.render(&quiet, tq, &mut pm2), FrameOutcome::Dirty(full_rect(&pm2)));
+        assert_eq!(pm2.data(), render(&quiet, tq).data());
+    }
+
+    #[test]
+    fn hovered_recording_with_cancel_bud_and_tooltip_matches_the_full_render() {
+        for with_bubble in [false, true] {
+            let mut s = rec_state(false);
+            if with_bubble {
+                let icon = AppBubble::new("Explorer", &[200u8; 16 * 16 * 4], 16, 1.0).unwrap();
+                s.set_app(Some(icon), 0.0);
+            }
+            let mut t = 0.0;
+            run(&mut s, &mut t, 1500.0, &speech);
+            let over_pill = Pointer { group: true, pill: true, bubble: false, cancel: false };
+            s.set_pointer(over_pill, t);
+            let until = t + 800.0;
+            run(&mut s, &mut t, until, &speech);
+            let mut pm = new_pm(&s);
+            let mut cache = FrameCache::new();
+            assert!(matches!(cache.render(&s, t, &mut pm), FrameOutcome::Dirty(_)));
+            let mut partial = 0;
+            for _ in 0..90 {
+                s.tick(t, speech(t));
+                if let FrameOutcome::Dirty(r) = cache.render(&s, t, &mut pm) {
+                    partial += (r != full_rect(&pm)) as u32;
+                }
+                // the cancel glyph and the tooltip are laid over the bars; rounding aside this is the full frame
+                assert!(max_diff(&pm, &render(&s, t)) <= 3, "bubble {with_bubble}: frame at {t}");
+                t += FRAME;
+            }
+            assert!(partial > 50, "hover state is still incremental ({partial})");
+        }
+    }
+
+    #[test]
+    fn thinking_glow_frames_match_the_full_render_and_stay_inside_the_glow_rect() {
+        for (scale, with_bubble) in [(1.0f32, false), (1.0, true), (1.5, false)] {
+            let mut s = RenderState::new(Palette::DARK, scale, PanelPosition::BottomRight);
+            if with_bubble {
+                s.set_app(Some(AppBubble::new("Explorer", &[180u8; 16 * 16 * 4], 16, scale).unwrap()), 0.0);
+            }
+            s.set_mode(PillMode::Recording, 0.0);
+            let mut t = 0.0;
+            run(&mut s, &mut t, 1200.0, &speech);
+            s.set_mode(PillMode::Thinking, t);
+            let until = t + 1000.0;
+            run(&mut s, &mut t, until, &|_| 0.0);
+            let mut pm = new_pm(&s);
+            let mut cache = FrameCache::new();
+            assert_eq!(cache.render(&s, t, &mut pm), FrameOutcome::Dirty(full_rect(&pm)));
+            let mut worst = 0;
+            for _ in 0..200 {
+                t += FRAME;
+                s.tick(t, 0.0);
+                let out = cache.render(&s, t, &mut pm);
+                let FrameOutcome::Dirty(r) = out else { panic!("the glow never rests") };
+                assert!(r.area() < full_rect(&pm).area(), "glow update is a sub-rect: {r:?}");
+                worst = worst.max(max_diff(&pm, &render(&s, t)));
+            }
+            assert!(worst <= 3, "scale {scale} bubble {with_bubble}: cached glow differs from the full render by {worst}");
+        }
+    }
+
+    #[test]
+    fn glow_rect_contains_every_glow_pixel_over_the_orbit() {
+        for (scale, pos) in [(1.0f32, PanelPosition::BottomRight), (1.25, PanelPosition::BottomCenter), (2.0, PanelPosition::BottomLeft)] {
+            let mut s = RenderState::new(Palette::LIGHT, scale, pos);
+            s.set_mode(PillMode::Thinking, 0.0);
+            s.settle();
+            let mut pm = new_pm(&s);
+            let (w, h) = (pm.width() as i32, pm.height() as i32);
+            let mut covered = 0usize;
+            for i in 0..320 {
+                let t = 100.0 + i as f64 * 97.0; // sweeps both the 1.6 s orbit and the 1.9 s breathe
+                render_layers(&s, t, &mut pm, L_GLOW);
+                let rect = glow_rect(&s.geometry(t), scale, w, h);
+                for (n, px) in pm.data().chunks_exact(4).enumerate() {
+                    if px[3] != 0 {
+                        covered += 1;
+                        let (x, y) = ((n as i32) % w, (n as i32) / w);
+                        assert!(rect.contains_pixel(x, y), "glow pixel ({x},{y}) outside {rect:?} at t={t} scale {scale}");
+                    }
+                }
+            }
+            assert!(covered > 0);
+        }
+    }
+
+    #[test]
+    fn bar_rect_contains_every_bar_pixel() {
+        for scale in [1.0f32, 1.25, 1.5, 2.0] {
+            let mut s = RenderState::new(Palette::LIGHT, scale, PanelPosition::BottomRight);
+            s.set_mode(PillMode::Recording, 0.0);
+            let mut t = 0.0;
+            run(&mut s, &mut t, 1500.0, &|t| if (t / 80.0) as i64 % 2 == 0 { 1.0 } else { 0.3 });
+            let mut pm = new_pm(&s);
+            render_layers(&s, t, &mut pm, L_BARS);
+            let (w, h) = (pm.width() as i32, pm.height() as i32);
+            let rect = lane_rect(&s, &s.geometry(t), t, w, h);
+            let painted = pm.data().chunks_exact(4).enumerate().filter(|(_, p)| p[3] != 0).collect::<Vec<_>>();
+            assert!(painted.len() > 100);
+            for (n, _) in painted {
+                assert!(rect.contains_pixel((n as i32) % w, (n as i32) / w), "bar pixel outside {rect:?} at scale {scale}");
+            }
+        }
+    }
+
+    #[test]
+    fn layer_groups_compose_to_the_full_frame() {
+        // the split is only an ordering: drawing the groups one after another equals `render_into`
+        let mut s = rec_state(true);
+        s.set_app(Some(AppBubble::new("App", &[120u8; 8 * 8 * 4], 8, 1.0).unwrap()), 0.0);
+        let mut t = 0.0;
+        run(&mut s, &mut t, 1500.0, &speech);
+        s.set_pointer(Pointer { group: true, pill: true, bubble: false, cancel: false }, t);
+        let until = t + 500.0;
+        run(&mut s, &mut t, until, &speech);
+        let want = render(&s, t);
+        let mut pm = new_pm(&s);
+        render_layers(&s, t, &mut pm, L_ALL);
+        assert_eq!(pm.data(), want.data());
+        // each group alone draws a subset: groups that are absent leave their pixels empty
+        let mut under = new_pm(&s);
+        render_layers(&s, t, &mut under, L_UNDER);
+        let mut bars = new_pm(&s);
+        render_layers(&s, t, &mut bars, L_BARS);
+        assert!(under.data().iter().any(|b| *b != 0) && bars.data().iter().any(|b| *b != 0));
+        let mut none = new_pm(&s);
+        render_layers(&s, t, &mut none, 0);
+        assert!(none.data().iter().all(|b| *b == 0));
+    }
+
+    #[test]
+    fn steady_frame_is_much_cheaper_than_a_full_frame() {
+        let mut s = rec_state(true);
+        let mut t = 0.0;
+        run(&mut s, &mut t, 1500.0, &speech);
+        let mut pm = new_pm(&s);
+        let mut cache = FrameCache::new();
+        cache.render(&s, t, &mut pm);
+        let n = 200;
+        let mut cached = std::time::Duration::ZERO;
+        let mut full = std::time::Duration::ZERO;
+        for _ in 0..n {
+            t += FRAME;
+            s.tick(t, speech(t));
+            let t0 = std::time::Instant::now();
+            cache.render(&s, t, &mut pm);
+            cached += t0.elapsed();
+            let t1 = std::time::Instant::now();
+            render_into(&s, t, &mut pm);
+            full += t1.elapsed();
+            // re-prime so the next cached frame starts from the same pixels
+            cache.reset();
+            cache.render(&s, t, &mut pm);
+        }
+        println!("steady lane frame {:?}/frame vs full frame {:?}/frame", cached / n, full / n);
+        // not a timing gate (CI noise): the steady path just must not be the slower one
+        assert!(cached < full, "cached {cached:?} vs full {full:?}");
     }
 }
