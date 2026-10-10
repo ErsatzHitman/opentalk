@@ -7,7 +7,7 @@
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -502,15 +502,24 @@ impl Snapshot {
 
 /// Read every restorable format. `None` when the clipboard can't be opened or holds too much data.
 pub(crate) fn snapshot_clipboard() -> Option<Snapshot> {
+    read_clipboard_snapshot()?.0
+}
+
+/// One pass over the clipboard. Outer `None`: it could not be opened. Inner `None`: it holds more
+/// than [`SNAPSHOT_CAP`]. The `u32` is `GetClipboardSequenceNumber` read while the clipboard was
+/// still open, so nobody can have changed it between the read and the number (rendering a
+/// delay-rendered format does not count as a change).
+fn read_clipboard_snapshot() -> Option<(Option<Snapshot>, u32)> {
     let owner = Owner::new()?;
     let cb = Clipboard::open(&owner)?;
     let mut formats: Vec<(u32, Vec<u8>)> = Vec::new();
     let mut total = 0usize;
     let mut has_unicode = false;
+    let mut too_big = false;
     let mut fmt = 0u32;
     // SAFETY: the clipboard stays open for the whole loop; handles returned by GetClipboardData
     // are owned by the clipboard and only read here (locked, copied, unlocked).
-    unsafe {
+    let seq = unsafe {
         loop {
             fmt = EnumClipboardFormats(fmt);
             if fmt == 0 {
@@ -544,7 +553,8 @@ pub(crate) fn snapshot_clipboard() -> Option<Snapshot> {
             }
             total += size;
             if total > SNAPSHOT_CAP {
-                return None;
+                too_big = true;
+                break;
             }
             let p = GlobalLock(hg);
             if p.is_null() {
@@ -553,9 +563,10 @@ pub(crate) fn snapshot_clipboard() -> Option<Snapshot> {
             formats.push((fmt, std::slice::from_raw_parts(p as *const u8, size).to_vec()));
             let _ = GlobalUnlock(hg);
         }
-    }
+        GetClipboardSequenceNumber()
+    };
     drop(cb);
-    Some(Snapshot { formats })
+    Some((if too_big { None } else { Some(Snapshot { formats }) }, seq))
 }
 
 /// Put a snapshot back (an empty snapshot clears the clipboard, as it was empty before).
@@ -839,11 +850,17 @@ pub(crate) fn paste_inner(
 
     // UIPI would silently drop our keystrokes: leave the text for a manual paste.
     if target.is_some_and(|t| t.elevated) {
+        discard_clipboard_snapshot();
         let reason = if write_text(&text) { ELEVATED_REASON } else { CLIPBOARD_BUSY_REASON };
         return (copied_only(reason), None);
     }
 
-    let pending = if opts.restore_clipboard { acquire_pending() } else { None };
+    let pending = if opts.restore_clipboard {
+        acquire_pending()
+    } else {
+        discard_clipboard_snapshot();
+        None
+    };
     // Any outcome other than a completed paste leaves our text on the clipboard on purpose, so
     // the user's previous contents are not put back over it.
     let fail = |reason: &str| {
@@ -909,16 +926,195 @@ static GENERATION: AtomicU64 = AtomicU64::new(1);
 
 /// Snapshot to restore after this paste. If an earlier paste has not restored yet, the clipboard
 /// holds its dictation text rather than the user's data, so that earlier snapshot is reused and
-/// the earlier restore is cancelled. `None` when the clipboard could not be snapshotted.
+/// the earlier restore is cancelled. Otherwise the snapshot taken at recording start is used when
+/// the clipboard has not changed since, keeping `GetClipboardData` off the paste's critical path.
+/// `None` when the clipboard could not be snapshotted.
 fn acquire_pending() -> Option<(u64, Arc<Snapshot>)> {
-    let mut slot = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+    acquire_pending_with(&PENDING, &PREFETCH, &SystemClip)
+}
+
+fn acquire_pending_with(
+    pending: &Mutex<Option<(u64, Arc<Snapshot>)>>,
+    prefetch: &Prefetch,
+    src: &dyn ClipSource,
+) -> Option<(u64, Arc<Snapshot>)> {
+    let mut slot = pending.lock().unwrap_or_else(|e| e.into_inner());
     let gen_id = GENERATION.fetch_add(1, Ordering::Relaxed);
     let snap = match slot.take() {
-        Some((_, prev)) => prev,
-        None => Arc::new(snapshot_clipboard()?),
+        Some((_, prev)) => {
+            // The clipboard holds our own text: a prefetch is not the user's data.
+            prefetch.clear();
+            prev
+        }
+        None => match prefetch.take_fresh(src, PREFETCH_WAIT) {
+            Prefetched::Usable(s) => s,
+            Prefetched::TooBig => return None,
+            Prefetched::Miss => Arc::new(src.snapshot()?.0?),
+        },
     };
     *slot = Some((gen_id, snap.clone()));
     Some((gen_id, snap))
+}
+
+// ---------------------------------------------------------------------------------------------
+// Clipboard prefetch (snapshot at recording start, off the paste's critical path)
+// ---------------------------------------------------------------------------------------------
+
+/// How long a paste waits for a prefetch that is still reading before it reads the clipboard
+/// itself (reading twice at once would only make both slower).
+const PREFETCH_WAIT: Duration = Duration::from_secs(5);
+
+/// Where clipboard state comes from (injectable for tests).
+trait ClipSource: Send + Sync {
+    fn sequence(&self) -> u32;
+    /// See [`read_clipboard_snapshot`].
+    fn snapshot(&self) -> Option<(Option<Snapshot>, u32)>;
+}
+
+struct SystemClip;
+
+impl ClipSource for SystemClip {
+    fn sequence(&self) -> u32 {
+        // SAFETY: trivially safe query.
+        unsafe { GetClipboardSequenceNumber() }
+    }
+    fn snapshot(&self) -> Option<(Option<Snapshot>, u32)> {
+        read_clipboard_snapshot()
+    }
+}
+
+enum PrefetchState {
+    Empty,
+    /// A worker with this epoch is reading the clipboard.
+    Running(u64),
+    /// `snap` is `None` when the clipboard held more than [`SNAPSHOT_CAP`].
+    Ready { seq: u32, snap: Option<Arc<Snapshot>> },
+}
+
+enum Prefetched {
+    Usable(Arc<Snapshot>),
+    /// The clipboard (unchanged) is too large to snapshot: paste without restoring.
+    TooBig,
+    /// Nothing usable: read the clipboard now.
+    Miss,
+}
+
+struct PrefetchInner {
+    /// Bumped by every clear so a worker that finishes late drops its result.
+    epoch: u64,
+    state: PrefetchState,
+}
+
+/// The clipboard snapshot taken when recording starts, kept until the paste uses it.
+struct Prefetch {
+    inner: Mutex<PrefetchInner>,
+    done: Condvar,
+}
+
+static PREFETCH: Prefetch = Prefetch::new();
+
+impl Prefetch {
+    const fn new() -> Prefetch {
+        Prefetch { inner: Mutex::new(PrefetchInner { epoch: 0, state: PrefetchState::Empty }), done: Condvar::new() }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, PrefetchInner> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Claim the right to prefetch. `None` when a worker is already reading or the stored
+    /// snapshot is still current.
+    fn begin(&self, src: &dyn ClipSource) -> Option<u64> {
+        let mut g = self.lock();
+        match &g.state {
+            PrefetchState::Running(_) => return None,
+            PrefetchState::Ready { seq, .. } if *seq == src.sequence() => return None,
+            _ => {}
+        }
+        g.epoch += 1;
+        let epoch = g.epoch;
+        g.state = PrefetchState::Running(epoch);
+        Some(epoch)
+    }
+
+    fn finish(&self, epoch: u64, result: Option<(Option<Snapshot>, u32)>) {
+        let mut g = self.lock();
+        if !matches!(g.state, PrefetchState::Running(e) if e == epoch) {
+            return; // cleared meanwhile: drop the data
+        }
+        g.state = match result {
+            Some((snap, seq)) => PrefetchState::Ready { seq, snap: snap.map(Arc::new) },
+            None => PrefetchState::Empty,
+        };
+        self.done.notify_all();
+    }
+
+    /// Drop the stored snapshot, or make a worker still reading drop its result.
+    fn clear(&self) {
+        let mut g = self.lock();
+        g.epoch += 1;
+        g.state = PrefetchState::Empty;
+        self.done.notify_all();
+    }
+
+    /// Consume the prefetch if the clipboard is unchanged since it was read, waiting up to `wait`
+    /// for a worker still reading.
+    fn take_fresh(&self, src: &dyn ClipSource, wait: Duration) -> Prefetched {
+        let deadline = Instant::now() + wait;
+        let mut g = self.lock();
+        while matches!(g.state, PrefetchState::Running(_)) {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                g.epoch += 1; // the late result is dropped
+                g.state = PrefetchState::Empty;
+                return Prefetched::Miss;
+            }
+            g = self.done.wait_timeout(g, left).unwrap_or_else(|e| e.into_inner()).0;
+        }
+        match std::mem::replace(&mut g.state, PrefetchState::Empty) {
+            PrefetchState::Ready { seq, snap } if seq == src.sequence() => match snap {
+                Some(s) => Prefetched::Usable(s),
+                None => Prefetched::TooBig,
+            },
+            _ => Prefetched::Miss,
+        }
+    }
+}
+
+/// Start reading the clipboard on a worker thread, unless a current prefetch exists.
+fn prepare_with(prefetch: &'static Prefetch, src: Arc<dyn ClipSource>) -> Option<JoinHandle<()>> {
+    let epoch = prefetch.begin(&*src)?;
+    let spawned = thread::Builder::new().name("clipboard-prefetch".into()).spawn(move || {
+        let result = src.snapshot();
+        prefetch.finish(epoch, result);
+    });
+    match spawned {
+        Ok(h) => Some(h),
+        Err(_) => {
+            prefetch.clear();
+            None
+        }
+    }
+}
+
+/// Snapshot the user's clipboard now, on a worker thread, so [`paste_text`] does not read it on
+/// the critical path (a delay-rendering owner such as an Excel range renders every format
+/// synchronously inside `GetClipboardData`: hundreds of ms to seconds). Call it when recording
+/// starts, from a helper thread. The paste reuses the snapshot only while
+/// `GetClipboardSequenceNumber` is unchanged and otherwise reads the clipboard itself. Returns
+/// at once.
+pub fn prepare_clipboard_snapshot() {
+    // While an earlier paste has not restored yet, the clipboard holds its dictation text.
+    if PENDING.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
+        return;
+    }
+    let _ = prepare_with(&PREFETCH, Arc::new(SystemClip));
+}
+
+/// Drop the snapshot taken by [`prepare_clipboard_snapshot`] (dictation cancelled or failed), so
+/// large clipboard data is not kept in memory.
+pub fn discard_clipboard_snapshot() {
+    PREFETCH.clear();
 }
 
 /// Claim the restore for `gen_id`; false if a newer paste owns it or it was abandoned.
@@ -947,6 +1143,11 @@ pub fn paste_text(text: &str, target: Option<&Target>, opts: PasteOptions) -> Pa
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows::Win32::Foundation::{LRESULT, WPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        DefWindowProcW, DispatchMessageW, GetMessageW, MSG, PostMessageW, PostQuitMessage, RegisterClassW, WM_CLOSE,
+        WM_DESTROY, WNDCLASSW,
+    };
 
     #[test]
     fn spacing_appends_space() {
@@ -1078,6 +1279,143 @@ mod tests {
         assert!(PENDING.lock().unwrap().is_none());
     }
 
+    /// Clipboard stand-in that counts how often it is read.
+    struct FakeClip {
+        seq: std::sync::atomic::AtomicU32,
+        reads: std::sync::atomic::AtomicUsize,
+        delay: Duration,
+        too_big: bool,
+    }
+
+    impl FakeClip {
+        fn new(seq: u32) -> Arc<FakeClip> {
+            Arc::new(FakeClip { seq: seq.into(), reads: 0.into(), delay: Duration::ZERO, too_big: false })
+        }
+        fn reads(&self) -> usize {
+            self.reads.load(Ordering::SeqCst)
+        }
+        fn set_seq(&self, seq: u32) {
+            self.seq.store(seq, Ordering::SeqCst);
+        }
+    }
+
+    impl ClipSource for FakeClip {
+        fn sequence(&self) -> u32 {
+            self.seq.load(Ordering::SeqCst)
+        }
+        fn snapshot(&self) -> Option<(Option<Snapshot>, u32)> {
+            thread::sleep(self.delay);
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            let snap = Snapshot { formats: vec![(CF_UNICODETEXT, vec![1, 2, 3])] };
+            Some((if self.too_big { None } else { Some(snap) }, self.sequence()))
+        }
+    }
+
+    fn leaked_prefetch() -> &'static Prefetch {
+        Box::leak(Box::new(Prefetch::new()))
+    }
+
+    fn pending_slot() -> Mutex<Option<(u64, Arc<Snapshot>)>> {
+        Mutex::new(None)
+    }
+
+    #[test]
+    fn fresh_prefetch_means_no_snapshot_on_the_paste_path() {
+        let (pre, pending, clip) = (leaked_prefetch(), pending_slot(), FakeClip::new(5));
+        prepare_with(pre, clip.clone()).expect("started").join().unwrap();
+        assert_eq!(clip.reads(), 1);
+        let (_, snap) = acquire_pending_with(&pending, pre, &*clip).expect("snapshot");
+        assert_eq!(clip.reads(), 1, "the paste must not read the clipboard again");
+        assert_eq!(snap.format_count(), 1);
+        // The prefetch was consumed: a second paste (nothing pending) reads again.
+        pending.lock().unwrap().take();
+        acquire_pending_with(&pending, pre, &*clip).expect("snapshot");
+        assert_eq!(clip.reads(), 2);
+    }
+
+    #[test]
+    fn changed_sequence_snapshots_again() {
+        let (pre, pending, clip) = (leaked_prefetch(), pending_slot(), FakeClip::new(5));
+        prepare_with(pre, clip.clone()).expect("started").join().unwrap();
+        clip.set_seq(6); // the user copied something after recording started
+        assert!(acquire_pending_with(&pending, pre, &*clip).is_some());
+        assert_eq!(clip.reads(), 2, "stale prefetch must not be reused");
+    }
+
+    #[test]
+    fn no_prefetch_snapshots_on_the_paste_path() {
+        let (pre, pending, clip) = (leaked_prefetch(), pending_slot(), FakeClip::new(1));
+        assert!(acquire_pending_with(&pending, pre, &*clip).is_some());
+        assert_eq!(clip.reads(), 1);
+    }
+
+    #[test]
+    fn discarded_prefetch_is_not_used() {
+        let (pre, pending, clip) = (leaked_prefetch(), pending_slot(), FakeClip::new(1));
+        prepare_with(pre, clip.clone()).unwrap().join().unwrap();
+        pre.clear();
+        assert!(matches!(pre.lock().state, PrefetchState::Empty));
+        assert!(acquire_pending_with(&pending, pre, &*clip).is_some());
+        assert_eq!(clip.reads(), 2);
+    }
+
+    #[test]
+    fn current_prefetch_is_not_repeated_but_a_stale_one_is() {
+        let (pre, clip) = (leaked_prefetch(), FakeClip::new(1));
+        prepare_with(pre, clip.clone()).unwrap().join().unwrap();
+        assert!(prepare_with(pre, clip.clone()).is_none(), "still current");
+        clip.set_seq(2);
+        prepare_with(pre, clip.clone()).expect("stale").join().unwrap();
+        assert_eq!(clip.reads(), 2);
+    }
+
+    #[test]
+    fn earlier_pending_snapshot_wins_and_drops_the_prefetch() {
+        let (pre, pending, clip) = (leaked_prefetch(), pending_slot(), FakeClip::new(1));
+        let user = Arc::new(Snapshot { formats: vec![(CF_UNICODETEXT, vec![9])] });
+        *pending.lock().unwrap() = Some((1, user.clone()));
+        prepare_with(pre, clip.clone()).unwrap().join().unwrap();
+        let (_, snap) = acquire_pending_with(&pending, pre, &*clip).unwrap();
+        assert!(Arc::ptr_eq(&snap, &user));
+        assert!(matches!(pre.lock().state, PrefetchState::Empty));
+        assert_eq!(clip.reads(), 1);
+    }
+
+    #[test]
+    fn paste_waits_for_a_running_prefetch_instead_of_reading_twice() {
+        let (pre, pending) = (leaked_prefetch(), pending_slot());
+        let clip = Arc::new(FakeClip {
+            seq: 3.into(),
+            reads: 0.into(),
+            delay: Duration::from_millis(150),
+            too_big: false,
+        });
+        let worker = prepare_with(pre, clip.clone()).expect("started");
+        assert!(acquire_pending_with(&pending, pre, &*clip).is_some());
+        worker.join().unwrap();
+        assert_eq!(clip.reads(), 1);
+    }
+
+    #[test]
+    fn oversized_clipboard_is_remembered_and_not_read_again() {
+        let (pre, pending) = (leaked_prefetch(), pending_slot());
+        let clip = Arc::new(FakeClip { seq: 3.into(), reads: 0.into(), delay: Duration::ZERO, too_big: true });
+        prepare_with(pre, clip.clone()).unwrap().join().unwrap();
+        assert!(acquire_pending_with(&pending, pre, &*clip).is_none());
+        assert_eq!(clip.reads(), 1);
+        assert!(pending.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn late_prefetch_result_after_clear_is_dropped() {
+        let pre = leaked_prefetch();
+        let clip = FakeClip::new(1);
+        let epoch = pre.begin(&*clip).unwrap();
+        pre.clear();
+        pre.finish(epoch, clip.snapshot());
+        assert!(matches!(pre.lock().state, PrefetchState::Empty));
+    }
+
     #[test]
     fn describe_own_window() {
         let owner = Owner::new().expect("window");
@@ -1198,6 +1536,117 @@ mod tests {
         thread::sleep(RESTORE_DELAY + Duration::from_millis(200));
         assert_eq!(read_clipboard_text().as_deref(), Some("elevated text "));
         assert!(restore_clipboard(&before));
+    }
+
+    /// A clipboard owner that renders on demand, like an Excel range: each `GetClipboardData`
+    /// on one of its formats takes `RENDER_MS`. Returns the owner's thread and window.
+    const RENDER_MS: u64 = 150;
+    const RENDER_FORMATS: usize = 4;
+
+    unsafe extern "system" fn delay_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+        const WM_RENDERFORMAT: u32 = 0x0305;
+        match msg {
+            WM_RENDERFORMAT => {
+                thread::sleep(Duration::from_millis(RENDER_MS));
+                // SAFETY: the requesting thread holds the clipboard open; ownership of the 1 MiB
+                // block passes to the clipboard on success.
+                unsafe {
+                    if let Ok(h) = GlobalAlloc(GMEM_MOVEABLE, 1 << 20) {
+                        if SetClipboardData(wp.0 as u32, Some(HANDLE(h.0))).is_err() {
+                            let _ = GlobalFree(Some(h));
+                        }
+                    }
+                }
+                LRESULT(0)
+            }
+            WM_DESTROY => {
+                // SAFETY: plain message-loop call on the window's own thread.
+                unsafe { PostQuitMessage(0) };
+                LRESULT(0)
+            }
+            // SAFETY: forwarding the unhandled message with the original arguments.
+            _ => unsafe { DefWindowProcW(hwnd, msg, wp, lp) },
+        }
+    }
+
+    /// Put `RENDER_FORMATS` delay-rendered formats on the clipboard, owned by a window that
+    /// serves them from its own thread. Returns the window to close later.
+    fn delay_rendered_owner() -> (JoinHandle<()>, isize) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let th = thread::spawn(move || {
+            // SAFETY: standard window class + message loop on this thread; the window is
+            // destroyed by WM_CLOSE (posted by the test) before the thread ends.
+            unsafe {
+                let class = w!("OpenTalkDelayRenderOwner");
+                let wc = WNDCLASSW { lpfnWndProc: Some(delay_proc), lpszClassName: class, ..Default::default() };
+                RegisterClassW(&wc);
+                let hwnd = CreateWindowExW(
+                    WINDOW_EX_STYLE(0), class, PCWSTR::null(), WS_POPUP, 0, 0, 0, 0, Some(HWND_MESSAGE), None, None, None,
+                )
+                .expect("owner window");
+                assert!(OpenClipboard(Some(hwnd)).is_ok());
+                let _ = EmptyClipboard();
+                for i in 0..RENDER_FORMATS {
+                    let name: Vec<u16> = format!("OpenTalkDelayed{i} ").encode_utf16().collect();
+                    let fmt = RegisterClipboardFormatW(PCWSTR(name.as_ptr()));
+                    // A NULL handle promises the data later (WM_RENDERFORMAT).
+                    let _ = SetClipboardData(fmt, None);
+                }
+                let _ = CloseClipboard();
+                tx.send(hwnd.0 as isize).unwrap();
+                let mut msg = MSG::default();
+                while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+                    DispatchMessageW(&msg);
+                }
+            }
+        });
+        (th, rx.recv().expect("owner started"))
+    }
+
+    /// The fix for the 40 ms budget: with delay-rendered formats on the clipboard, reading them at
+    /// paste time costs `RENDER_MS` per format, while the prefetch taken at recording start moves
+    /// that off the critical path.
+    #[test]
+    #[ignore]
+    fn desktop_prefetch_keeps_delay_rendered_clipboard_off_the_paste_path() {
+        let _g = DESKTOP.lock().unwrap_or_else(|e| e.into_inner());
+        let before = snapshot_clipboard().expect("snapshot");
+        let (th, owner) = delay_rendered_owner();
+
+        // Without a prefetch the paste pays for every render.
+        discard_clipboard_snapshot();
+        let t = Instant::now();
+        let (gen_id, snap) = acquire_pending().expect("inline snapshot");
+        let inline = t.elapsed();
+        assert!(snap.format_count() >= RENDER_FORMATS);
+        abandon_pending(gen_id);
+
+        // With one, only a sequence-number comparison is left.
+        let t = Instant::now();
+        prepare_clipboard_snapshot();
+        let prepare = t.elapsed();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !matches!(PREFETCH.lock().state, PrefetchState::Ready { .. }) {
+            assert!(Instant::now() < deadline, "prefetch never finished");
+            thread::sleep(Duration::from_millis(20));
+        }
+        let t = Instant::now();
+        let (gen_id, snap) = acquire_pending().expect("prefetched snapshot");
+        let prefetched = t.elapsed();
+        assert!(snap.format_count() >= RENDER_FORMATS);
+        abandon_pending(gen_id);
+        eprintln!("prepare {prepare:?}, paste-path snapshot: inline {inline:?} vs prefetched {prefetched:?}");
+
+        // Put the user's clipboard back and close the owner window.
+        assert!(restore_clipboard(&before));
+        // SAFETY: posting WM_CLOSE to our own window.
+        unsafe {
+            let _ = PostMessageW(Some(to_hwnd(owner)), WM_CLOSE, WPARAM(0), LPARAM(0));
+        }
+        th.join().unwrap();
+        assert!(prepare < Duration::from_millis(20), "prepare must not block: {prepare:?}");
+        assert!(inline >= Duration::from_millis(RENDER_MS * RENDER_FORMATS as u64 / 2), "{inline:?}");
+        assert!(prefetched < Duration::from_millis(5), "{prefetched:?}");
     }
 
     #[test]
