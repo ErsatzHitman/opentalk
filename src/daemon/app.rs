@@ -6,7 +6,6 @@
 //!   STT -> cleanup -> paste -> history)
 //! - [`pipeline`]: the text stages shared with `--transcribe-file`
 //! - [`latency`]: per-dictation latency samples (ring buffer + log line)
-//! - [`settings`]: the Settings child process
 //! - [`micpolicy`]: when a microphone stream may stay prepared (not on Bluetooth headsets)
 //! - [`cli_cmds`]: `--transcribe-file` and `--bench`
 //!
@@ -25,10 +24,9 @@ pub mod latency;
 pub mod machine;
 pub mod micpolicy;
 pub mod pipeline;
-pub mod settings;
 
-pub fn run(hidden: bool) -> i32 {
-    host::run(hidden)
+pub fn run(hidden: bool, initial: Option<crate::core::nav::Route>) -> i32 {
+    host::run(hidden, initial)
 }
 
 pub fn cli_transcribe_file(args: &[String]) -> i32 {

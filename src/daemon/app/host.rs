@@ -27,14 +27,15 @@ use windows::core::{HSTRING, PCWSTR};
 use super::dictation::{ActiveJob, Failed, RecSession};
 use super::machine::{Action, Input, Machine, Phase};
 use super::micpolicy;
-use super::settings::{self, SettingsProc};
 use crate::core::config::{Config, SttProviderId};
 use crate::core::ipc::{self, IpcMsg};
+use crate::core::nav::{Route, Section};
 use crate::core::timing::now_ms;
 use crate::core::{autostart, history, secrets};
 use crate::daemon::hotkey::{self, HotkeyEvent};
 use crate::daemon::pill::{Pill, PillEvent, PillMode, PillOptions};
-use crate::daemon::tray::{Tray, TrayCmd, TrayState, WM_TRAY_POPUP_CMD, command_from_popup};
+use crate::daemon::tray::page::{PopupAction, TestKind, TestResult, mailbox};
+use crate::daemon::tray::{Tray, TrayCmd, TrayState, WM_TRAY_POPUP_ACT, WM_TRAY_POPUP_CMD, command_from_popup};
 use crate::daemon::{media, sound};
 use crate::{log_err, log_info, log_warn};
 
@@ -43,19 +44,15 @@ pub(super) const WM_PILL_EVT: u32 = ipc::WM_OT_INTERNAL_BASE + 2;
 pub(super) const WM_TRAY_EVT: u32 = ipc::WM_OT_INTERNAL_BASE + 3;
 /// Helper threads posted notes into the dictation mailbox.
 pub(super) const WM_NOTE: u32 = ipc::WM_OT_INTERNAL_BASE + 4;
-/// The Settings child process exited (posted by its watcher thread).
-pub(super) const WM_SETTINGS_EXITED: u32 = ipc::WM_OT_INTERNAL_BASE + 5;
+/// A provider test (Settings > Test) finished on its worker thread; the result is in [`TEST_SLOT`].
+const WM_TEST_DONE: u32 = ipc::WM_OT_INTERNAL_BASE + 5;
 /// Start-up: add the tray icon once the message loop runs.
 const WM_CREATE_TRAY: u32 = ipc::WM_OT_INTERNAL_BASE + 6;
 
 pub(super) const TIMER_ARM: usize = 1;
 pub(super) const TIMER_CAP: usize = 2;
 const TIMER_PRUNE: usize = 3;
-const TIMER_SUSPEND: usize = 4;
 const PRUNE_EVERY_MS: u32 = 24 * 60 * 60 * 1000;
-/// Hotkeys suspended by a Settings hotkey capture come back by themselves after this long, in
-/// case the Settings process dies without resuming them (they also come back when it exits).
-const SUSPEND_LIMIT_MS: u32 = 2 * 60 * 1000;
 
 // Window messages without a constant in the enabled `windows` features.
 const WM_POWERBROADCAST: u32 = 0x0218;
@@ -66,6 +63,32 @@ const WTS_SESSION_UNLOCK: usize = 0x8;
 
 /// The registered `TaskbarCreated` broadcast id (0 until the window exists).
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
+
+/// Result of the latest provider test with the token it was started under.
+static TEST_SLOT: std::sync::Mutex<Option<(u64, TestResult)>> = std::sync::Mutex::new(None);
+
+/// What a finished test shows on its page.
+fn test_result(kind: TestKind, outcome: crate::core::settings_logic::TestOutcome) -> TestResult {
+    use crate::core::settings_logic::TestOutcome;
+    match (kind, outcome) {
+        (TestKind::Stt, TestOutcome::Ok { text, latency_ms }) => TestResult { kind, ok: true, badge: format!("Transcribed in {latency_ms} ms"), text },
+        (TestKind::Llm, TestOutcome::Ok { text, latency_ms }) => TestResult { kind, ok: true, badge: format!("Cleaned in {latency_ms} ms"), text },
+        (_, TestOutcome::Err(e)) => TestResult { kind, ok: false, badge: "Failed".into(), text: e },
+    }
+}
+
+/// The view the popup opens at when the daemon starts: nothing for a login launch; an explicit
+/// `--settings` page; Speech-to-Text on the first run (no key yet); otherwise Home.
+fn start_route(hidden: bool, initial: Option<Route>, first_run: bool) -> Option<Route> {
+    if hidden {
+        return None;
+    }
+    Some(match initial {
+        Some(r) => r,
+        None if first_run => Route::Settings(Section::SpeechToText),
+        None => Route::Home,
+    })
+}
 
 pub struct App {
     pub hwnd: isize,
@@ -78,7 +101,6 @@ pub struct App {
     pub rec: Option<RecSession>,
     pub job: Option<ActiveJob>,
     pub last_failed: Option<Failed>,
-    pub settings: SettingsProc,
     /// "Hide for now" / tray "Hide floating icon": the idle pill stays hidden.
     pub icon_hidden: bool,
     pub seq: u64,
@@ -86,8 +108,9 @@ pub struct App {
     pub arm_t0: f64,
     /// The dictation being transcribed was stopped by the recording cap (notice after the paste).
     pub capped: bool,
-    /// Hotkeys are suspended for a Settings hotkey capture.
-    pub hotkeys_suspended: bool,
+    /// Generation of the provider test whose result is still wanted; a config or key change bumps
+    /// it, so a late result of the old settings is dropped.
+    pub test_token: u64,
 }
 
 /// Most messages parked while the app is busy; beyond it the oldest is dropped.
@@ -273,6 +296,43 @@ pub(super) fn needs_setup(cfg: &Config) -> bool {
     !any_key && cfg.stt.custom_base_url.trim().is_empty()
 }
 
+/// The differences between two configs that need a one-off live action (the rest, such as the
+/// pill options or the activation mode, is applied unconditionally because it is idempotent).
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ConfigDiff {
+    /// A new hotkey must be handed to the keyboard hook (the hook refuses unparsable ones).
+    hotkey: bool,
+    /// Input device or keep-warm time changed: prepare the microphone again.
+    microphone: bool,
+    /// "Pause media" was just turned on: warm the media-session client.
+    warm_media: bool,
+    /// "Dictation sounds" was just turned on: load the cues.
+    init_cues: bool,
+    /// "Mute system audio" was just turned off: a recording in progress gives the speakers back.
+    release_mute: bool,
+    /// "Keep the last failed recording" is off: nothing may be held for Retry.
+    drop_failed: bool,
+    /// History retention changed: prune now (on a worker).
+    prune: bool,
+    /// Speech or AI provider settings changed: a provider test in flight is stale.
+    providers: bool,
+}
+
+impl ConfigDiff {
+    fn between(old: &Config, new: &Config) -> ConfigDiff {
+        ConfigDiff {
+            hotkey: new.hotkey != old.hotkey,
+            microphone: new.mic_device_id != old.mic_device_id || new.mic_warm_hold_secs != old.mic_warm_hold_secs,
+            warm_media: new.pause_media && !old.pause_media,
+            init_cues: new.audio_cues && !old.audio_cues,
+            release_mute: !new.mute_system_audio && old.mute_system_audio,
+            drop_failed: !new.keep_failed_audio,
+            prune: new.history_retention_days != old.history_retention_days,
+            providers: new.stt != old.stt || new.ai_cleanup != old.ai_cleanup,
+        }
+    }
+}
+
 impl App {
     fn new(hwnd: isize, cfg: Config) -> Result<App, String> {
         let level = Arc::new(AtomicU32::new(0f32.to_bits()));
@@ -295,12 +355,11 @@ impl App {
             rec: None,
             job: None,
             last_failed: None,
-            settings: SettingsProc::new(hwnd, WM_SETTINGS_EXITED),
             icon_hidden: false,
             seq: 0,
             arm_t0: 0.0,
             capped: false,
-            hotkeys_suspended: false,
+            test_token: 0,
         })
     }
 
@@ -341,6 +400,13 @@ impl App {
             Some(HotkeyEvent::Down) => Input::HotkeyDown,
             Some(HotkeyEvent::Up) => Input::HotkeyUp,
             Some(HotkeyEvent::Escape) => Input::Escape,
+            // Hotkey capture (Settings > Hotkeys): the popup shows it, the dictation is untouched.
+            Some(e @ (HotkeyEvent::CaptureUpdate | HotkeyEvent::CaptureDone | HotkeyEvent::CaptureCancel)) => {
+                if let Some(msg) = hotkey::capture_msg(e) {
+                    crate::daemon::tray::popup_capture(msg);
+                }
+                return;
+            }
             None => return,
         };
         self.step(input, t0);
@@ -354,7 +420,7 @@ impl App {
             PillEvent::ErrorDismissed => {}
             PillEvent::MenuToggleListening => self.step(Input::Toggle, t0),
             PillEvent::MenuHideForNow => self.set_icon_hidden(true),
-            PillEvent::MenuOpenSettings => self.settings.open(settings::PAGE_HISTORY),
+            PillEvent::MenuOpenSettings => self.request_route(Route::Home),
         }
     }
 
@@ -365,9 +431,9 @@ impl App {
                 let hide = !self.icon_hidden;
                 self.set_icon_hidden(hide);
             }
-            TrayCmd::OpenSettings => self.settings.open(settings::PAGE_SETTINGS),
-            TrayCmd::OpenHistory => self.settings.open(settings::PAGE_HISTORY),
-            TrayCmd::OpenDictionary => self.settings.open(settings::PAGE_DICTIONARY),
+            TrayCmd::OpenSettings => self.request_route(Route::SettingsIndex),
+            TrayCmd::OpenHistory => self.request_route(Route::History),
+            TrayCmd::OpenDictionary => self.request_route(Route::Dictionary),
             TrayCmd::RetryLast => self.retry_last(),
             TrayCmd::Quit => self.quit(),
         }
@@ -430,10 +496,6 @@ impl App {
                 self.step(Input::CapTimer, t0);
             }
             TIMER_PRUNE => self.prune_history(),
-            TIMER_SUSPEND => {
-                log_warn!("hotkeys were suspended for {} s without a resume; resuming", SUSPEND_LIMIT_MS / 1000);
-                self.suspend_hotkeys(false);
-            }
             _ => {}
         }
     }
@@ -454,8 +516,8 @@ impl App {
     fn on_ipc(&mut self, msg: u32, wparam: usize, t0: f64) {
         match msg {
             ipc::WM_OT_RELOAD => self.reload(),
-            ipc::WM_OT_SUSPEND_HOTKEYS => self.suspend_hotkeys(wparam != 0),
-            ipc::WM_OT_OPEN_SETTINGS => self.settings.open(settings::PAGE_HISTORY),
+            // The popup captures hotkeys inside this process now; the message id stays reserved.
+            ipc::WM_OT_SUSPEND_HOTKEYS => log_info!("ignored SuspendHotkeys({}) (the tray popup captures hotkeys itself)", wparam != 0),
             ipc::WM_OT_TOGGLE => self.step(Input::Toggle, t0),
             ipc::WM_OT_START => self.step(Input::Start, t0),
             ipc::WM_OT_STOP => self.step(Input::Stop, t0),
@@ -466,24 +528,11 @@ impl App {
         }
     }
 
-    /// Settings captures a new hotkey with its own hook: ours must not fire meanwhile.
-    fn suspend_hotkeys(&mut self, on: bool) {
-        hotkey::set_suspended(on);
-        self.hotkeys_suspended = on;
-        if on {
-            self.set_timer(TIMER_SUSPEND, SUSPEND_LIMIT_MS);
-        } else {
-            self.kill_timer(TIMER_SUSPEND);
-        }
-    }
-
-    /// The Settings process exited (its watcher thread posted this).
-    fn on_settings_exited(&mut self) {
-        let _ = self.settings.is_open(); // reaps the child
-        if self.hotkeys_suspended {
-            log_info!("settings closed during a hotkey capture; resuming hotkeys");
-            self.suspend_hotkeys(false);
-        }
+    /// Ask for the popup to open at `route`. Posted to the daemon window rather than done here:
+    /// opening a window runs the popup's own message handling, which must happen with the app
+    /// released (see [`open_route`]).
+    pub(super) fn request_route(&self, route: Route) {
+        post(self.hwnd, ipc::WM_OT_OPEN_PAGE, route.encode());
     }
 
     /// Windows silently drops a low-level hook whose callback once took too long (typically
@@ -498,16 +547,28 @@ impl App {
         hotkey::set_esc_capture(self.machine.is_busy());
     }
 
-    /// `config.json` changed (Settings saved it): re-apply everything that can change live.
+    /// `config.json` changed on disk (an external edit or tool): re-apply everything that can
+    /// change live.
     fn reload(&mut self) {
-        let new = Config::load();
+        self.apply_config(Config::load());
+    }
+
+    /// Make `new` the running configuration and apply every difference to `self.cfg` live: the
+    /// hotkey (a rejected one is reverted), Start-menu mask, activation mode, pill options, app
+    /// bubble, microphone and warm-hold, media/cue warm-ups, system-audio mute, the kept failed
+    /// recording and history retention. Does not touch the disk (see [`App::save_config`]).
+    pub(super) fn apply_config(&mut self, new: Config) {
         let old = std::mem::replace(&mut self.cfg, new);
-        let cfg = &self.cfg;
-        if cfg.hotkey != old.hotkey {
-            match hotkey::set_hotkey(&cfg.hotkey) {
-                Ok(()) => log_info!("hotkey changed to {}", cfg.hotkey),
+        let diff = ConfigDiff::between(&old, &self.cfg);
+        if diff.providers {
+            // A test started with the old provider settings no longer describes them.
+            self.test_token += 1;
+        }
+        if diff.hotkey {
+            match hotkey::set_hotkey(&self.cfg.hotkey) {
+                Ok(()) => log_info!("hotkey changed to {}", self.cfg.hotkey),
                 Err(e) => {
-                    log_warn!("hotkey '{}' rejected ({e}); keeping '{}'", cfg.hotkey, old.hotkey);
+                    log_warn!("hotkey '{}' rejected ({e}); keeping '{}'", self.cfg.hotkey, old.hotkey);
                     self.cfg.hotkey = old.hotkey.clone();
                 }
             }
@@ -517,26 +578,137 @@ impl App {
         let opts = pill_options(&self.cfg);
         self.pill.set_options(opts);
         self.sync_foreground();
-        if self.cfg.mic_device_id != old.mic_device_id || self.cfg.mic_warm_hold_secs != old.mic_warm_hold_secs {
+        if diff.microphone {
             micpolicy::prepare_in_background(self.cfg.mic_device_id.clone(), self.cfg.mic_warm_hold_secs);
         }
-        if self.cfg.pause_media && !old.pause_media {
+        if diff.warm_media {
             media::warm();
         }
-        if self.cfg.audio_cues && !old.audio_cues {
+        if diff.init_cues {
             sound::init();
         }
-        if !self.cfg.mute_system_audio && old.mute_system_audio {
+        if diff.release_mute {
             // Turned off while recording: give the speakers back now.
             self.release_mute();
         }
-        if !self.cfg.keep_failed_audio && self.last_failed.take().is_some() {
+        if diff.drop_failed && self.last_failed.take().is_some() {
             log_info!("keep failed audio turned off: dropped the recording kept for Retry");
         }
-        if self.cfg.history_retention_days != old.history_retention_days {
+        if diff.prune {
             self.prune_history();
         }
-        log_info!("config reloaded");
+        crate::daemon::tray::sync_config(&self.cfg);
+        self.sync_tray_popup();
+        log_info!("config applied");
+    }
+
+    /// Persist the running configuration (atomic temp + rename).
+    fn save_config(&self) {
+        if let Err(e) = self.cfg.save() {
+            log_warn!("cannot save config.json: {e}");
+            crate::daemon::tray::popup_toast(&format!("Could not save settings: {e}"));
+        }
+    }
+
+    // ---- popup actions ------------------------------------------------------------------
+
+    /// Run everything the tray popup queued in the mailbox, in order.
+    fn on_popup_actions(&mut self) {
+        for action in mailbox::drain() {
+            self.on_popup_action(action);
+        }
+    }
+
+    fn on_popup_action(&mut self, action: PopupAction) {
+        match action {
+            PopupAction::SetConfig(new) => {
+                self.apply_config(*new);
+                self.save_config();
+            }
+            PopupAction::SetSecret { name, value } => {
+                self.test_token += 1;
+                match secrets::set(&name, value.as_deref().unwrap_or("")) {
+                    Ok(()) => log_info!("secret '{name}' {}", if value.is_some() { "saved" } else { "removed" }),
+                    Err(e) => {
+                        log_warn!("cannot store secret '{name}': {e}");
+                        crate::daemon::tray::popup_toast(&format!("Could not save the key: {e}"));
+                    }
+                }
+            }
+            PopupAction::HistoryDelete(id) => {
+                if let Err(e) = history::delete(id) {
+                    log_warn!("history: cannot delete {id}: {e}");
+                }
+                self.sync_tray_popup();
+            }
+            PopupAction::HistoryClear => {
+                if let Err(e) = history::clear() {
+                    log_warn!("history: cannot clear: {e}");
+                }
+                self.sync_tray_popup();
+            }
+            PopupAction::HistoryPrune(days) => {
+                let spawned = std::thread::Builder::new().name("history-prune".into()).spawn(move || prune_history_now(days));
+                if let Err(e) = spawned {
+                    log_warn!("history: cannot start the prune thread: {e}");
+                }
+            }
+            PopupAction::Autostart(on) => {
+                if let Err(e) = autostart::set_enabled(on) {
+                    log_warn!("autostart: cannot set {on}: {e}");
+                    crate::daemon::tray::popup_toast(&format!("Could not change startup: {e}"));
+                }
+            }
+            PopupAction::Reset => self.reset_app_data(),
+            PopupAction::RunTest(kind) => self.run_test(kind),
+            PopupAction::Retry => self.retry_last(),
+        }
+    }
+
+    /// Delete the user's files (settings, history, saved keys) and start from defaults.
+    fn reset_app_data(&mut self) {
+        match crate::core::settings_logic::reset_files(&crate::core::paths::app_dir()) {
+            Ok(()) => {
+                // The saved startup entry belongs to the data being deleted.
+                let _ = autostart::set_enabled(false);
+                self.test_token += 1;
+                self.apply_config(Config::default());
+                log_info!("app data reset");
+            }
+            Err(e) => {
+                log_warn!("reset failed: {e}");
+                crate::daemon::tray::popup_toast(&format!("Reset failed: {e}"));
+            }
+        }
+    }
+
+    /// Start a provider test on a worker thread with the running configuration. The result is
+    /// delivered to the popup only if no config or key change happened since (see `test_token`).
+    fn run_test(&mut self, kind: TestKind) {
+        self.test_token += 1;
+        let (token, cfg, hwnd) = (self.test_token, self.cfg.clone(), self.hwnd);
+        let spawned = std::thread::Builder::new().name("provider-test".into()).spawn(move || {
+            let outcome = match kind {
+                TestKind::Stt => crate::core::settings_logic::run_stt_sample(&cfg),
+                TestKind::Llm => crate::core::settings_logic::run_llm_sample(&cfg),
+            };
+            *TEST_SLOT.lock().unwrap_or_else(|e| e.into_inner()) = Some((token, test_result(kind, outcome)));
+            post(hwnd, WM_TEST_DONE, 0);
+        });
+        if let Err(e) = spawned {
+            log_warn!("cannot start the test thread: {e}");
+            crate::daemon::tray::popup_test_done(test_result(kind, crate::core::settings_logic::TestOutcome::Err("could not start a worker thread".into())));
+        }
+    }
+
+    /// A test worker posted its result.
+    fn on_test_done(&mut self) {
+        let Some((token, result)) = TEST_SLOT.lock().unwrap_or_else(|e| e.into_inner()).take() else { return };
+        if token == self.test_token {
+            crate::daemon::tray::popup_test_done(result);
+        } else {
+            log_info!("dropped the result of a superseded provider test");
+        }
     }
 
     fn quit(&mut self) {
@@ -641,7 +813,12 @@ fn dispatch(hwnd: HWND, msg: u32, wparam: usize, lparam: isize, t0: f64) -> Opti
             }
         })),
         WM_NOTE => Some(with_app(|a| a.on_notes())),
-        WM_SETTINGS_EXITED => Some(with_app(|a| a.on_settings_exited())),
+        WM_TEST_DONE => Some(with_app(|a| a.on_test_done())),
+        WM_TRAY_POPUP_ACT => Some(with_app(|a| a.on_popup_actions())),
+        // Open the popup at a page (`--settings`, a second launch, first run, the pill menu, the
+        // tray rows). An old client's OpenSettings opens Home.
+        ipc::WM_OT_OPEN_PAGE => Some(open_route_released(hwnd, Route::decode(wparam).unwrap_or(Route::Home))),
+        ipc::WM_OT_OPEN_SETTINGS => Some(open_route_released(hwnd, Route::Home)),
         WM_CREATE_TRAY => Some(with_app(|a| match Tray::create(a.hwnd, WM_TRAY_EVT) {
             Ok(t) => a.tray = Some(t),
             Err(e) => log_warn!("tray unavailable: {e}"),
@@ -736,6 +913,7 @@ fn on_tray_message(hwnd: HWND, lparam: isize) -> bool {
     let mut open = None;
     if !with_app(|a| {
         if let Some(act) = a.tray.as_ref().and_then(|t| t.activation(lparam)) {
+            crate::daemon::tray::sync_config(&a.cfg);
             open = Some((act, a.tray_state()));
         }
     }) {
@@ -744,6 +922,22 @@ fn on_tray_message(hwnd: HWND, lparam: isize) -> bool {
     if let Some((act, state)) = open {
         // The app is released: the popup only reads the state it was handed.
         crate::daemon::tray::activate(hwnd.0 as isize, act, &state);
+    }
+    true
+}
+
+/// Open the popup at `route`. Like a tray click, it runs with the app released: the popup only
+/// reads the state it is handed. `false` when the app was busy (the caller defers the message).
+fn open_route_released(hwnd: HWND, route: Route) -> bool {
+    let mut state = None;
+    if !with_app(|a| {
+        crate::daemon::tray::sync_config(&a.cfg);
+        state = Some(a.tray_state());
+    }) {
+        return false;
+    }
+    if let Some(state) = state {
+        crate::daemon::tray::open_route(hwnd.0 as isize, route, &state);
     }
     true
 }
@@ -783,10 +977,13 @@ fn register_and_create() -> Result<isize, String> {
 }
 
 /// Daemon entry point. Returns the process exit code.
-pub fn run(hidden: bool) -> i32 {
+///
+/// `initial` is the view to open (`--settings [page]`); see [`start_route`]. When another daemon
+/// owns the tray, it is asked to open that view (Home when `None`) and this process exits; a
+/// login launch (`hidden`) just exits.
+pub fn run(hidden: bool, initial: Option<Route>) -> i32 {
     let Some(_instance) = ipc::acquire_single_instance() else {
-        // Another daemon owns the tray: ask it to open the window (a login launch just exits).
-        if !hidden && !ipc::notify_daemon(IpcMsg::OpenSettings) {
+        if !hidden && !ipc::notify_daemon(IpcMsg::OpenPage(initial.unwrap_or(Route::Home))) {
             log_warn!("another instance holds the lock but has no window yet");
         }
         return 0;
@@ -813,8 +1010,8 @@ pub fn run(hidden: bool) -> i32 {
     allow_ipc_from_lower_integrity(hwnd_of(hwnd));
     register_session_notifications(hwnd_of(hwnd));
 
-    // Only an interactive launch opens Settings, so a login launch skips the key lookups.
-    let first_run = !hidden && needs_setup(&cfg);
+    // Only an interactive launch opens the popup, so a login launch skips the key lookups.
+    let first_run = !hidden && initial.is_none() && needs_setup(&cfg);
     let mut app = match App::new(hwnd, cfg) {
         Ok(a) => a,
         Err(e) => {
@@ -843,10 +1040,16 @@ pub fn run(hidden: bool) -> i32 {
     let warm_hold = app.cfg.mic_warm_hold_secs;
     let pause_media = app.cfg.pause_media;
     let audio_cues = app.cfg.audio_cues;
-    let start_minimized = app.cfg.start_minimized;
     // Shell_NotifyIconW is a synchronous call into Explorer (occasionally ~200 ms): add the tray
     // icon from the message loop, after the hotkey is already live.
     post(hwnd, WM_CREATE_TRAY, 0);
+    // Queued behind the tray icon, so the popup finds the icon's position.
+    if let Some(route) = start_route(hidden, initial, first_run) {
+        if first_run {
+            log_info!("no speech-to-text key yet: opening Settings > Speech-to-Text");
+        }
+        post(hwnd, ipc::WM_OT_OPEN_PAGE, route.encode());
+    }
     let retention = app.cfg.history_retention_days;
     APP.with(|gate| gate.set(app));
 
@@ -878,14 +1081,6 @@ pub fn run(hidden: bool) -> i32 {
     // SAFETY: timer on our own window.
     unsafe {
         SetTimer(Some(hwnd_of(hwnd)), TIMER_PRUNE, PRUNE_EVERY_MS, None);
-    }
-    if !hidden {
-        if first_run {
-            log_info!("no speech-to-text key yet: opening Settings");
-            with_app(|a| a.settings.open(settings::PAGE_STT));
-        } else if !start_minimized {
-            with_app(|a| a.settings.open(settings::PAGE_HISTORY));
-        }
     }
     log_info!("ready in {:.0} ms", now_ms());
 
@@ -1069,5 +1264,93 @@ mod tests {
         let mut touched = false;
         assert!(gate.run(|_| touched = true, &mut |_| {}));
         assert!(!touched, "no state yet: the closure does not run, the message is dropped");
+    }
+
+    // ---- apply_config diffs, start route, test results ----
+
+    fn cfg(f: impl FnOnce(&mut Config)) -> Config {
+        let mut c = Config::default();
+        f(&mut c);
+        c
+    }
+
+    #[test]
+    fn identical_configs_need_no_live_action() {
+        let d = ConfigDiff::between(&Config::default(), &Config::default());
+        assert_eq!(d, ConfigDiff { drop_failed: false, ..ConfigDiff::default() });
+    }
+
+    #[test]
+    fn each_setting_triggers_exactly_its_live_action() {
+        let base = Config::default();
+        let table: Vec<(&str, Config, ConfigDiff)> = vec![
+            ("hotkey", cfg(|c| c.hotkey = "F8".into()), ConfigDiff { hotkey: true, ..Default::default() }),
+            ("input device", cfg(|c| c.mic_device_id = Some("{x}".into())), ConfigDiff { microphone: true, ..Default::default() }),
+            ("keep warm", cfg(|c| c.mic_warm_hold_secs = 300), ConfigDiff { microphone: true, ..Default::default() }),
+            ("pause media on", cfg(|c| c.pause_media = true), ConfigDiff { warm_media: true, ..Default::default() }),
+            ("cues stay on", cfg(|c| c.audio_cues = true), ConfigDiff::default()),
+            ("mute off", cfg(|c| c.mute_system_audio = false), ConfigDiff { release_mute: true, ..Default::default() }),
+            ("keep failed off", cfg(|c| c.keep_failed_audio = false), ConfigDiff { drop_failed: true, ..Default::default() }),
+            ("retention", cfg(|c| c.history_retention_days = 30), ConfigDiff { prune: true, ..Default::default() }),
+            ("stt provider", cfg(|c| c.stt.provider = SttProviderId::Groq), ConfigDiff { providers: true, ..Default::default() }),
+            ("ai model", cfg(|c| { c.ai_cleanup.models.insert(crate::core::config::LlmProviderId::Openrouter, "m".into()); }), ConfigDiff { providers: true, ..Default::default() }),
+            ("rewrite trigger", cfg(|c| c.rewrite_trigger = "shorten this".into()), ConfigDiff::default()),
+            ("theme", cfg(|c| c.theme = crate::core::config::Theme::Dark), ConfigDiff::default()),
+        ];
+        for (name, new, want) in table {
+            assert_eq!(ConfigDiff::between(&base, &new), want, "{name}");
+        }
+        // The one-way actions fire only on the way "on" (or "off").
+        let on = Config { pause_media: true, audio_cues: false, ..Config::default() };
+        assert!(!ConfigDiff::between(&on, &Config::default()).warm_media, "pause media turned off: nothing to warm");
+        assert!(ConfigDiff::between(&on, &Config::default()).init_cues, "cues turned on");
+        let muted_off = cfg(|c| c.mute_system_audio = false);
+        assert!(!ConfigDiff::between(&muted_off, &Config::default()).release_mute, "mute turned on: nothing to release");
+    }
+
+    #[test]
+    fn a_rejected_hotkey_leaves_the_hook_untouched() {
+        // apply_config reverts to the old accelerator when the hook refuses the new one.
+        assert!(hotkey::set_hotkey("NotAKey+Banana").is_err());
+        assert!(hotkey::set_hotkey("").is_err());
+    }
+
+    #[test]
+    fn start_route_follows_the_launch_kind() {
+        // A login launch opens nothing, whatever else is set.
+        assert_eq!(start_route(true, None, false), None);
+        assert_eq!(start_route(true, Some(Route::History), true), None);
+        // Interactive: Home, or Speech-to-Text on the first run, or the requested page.
+        assert_eq!(start_route(false, None, false), Some(Route::Home));
+        assert_eq!(start_route(false, None, true), Some(Route::Settings(Section::SpeechToText)));
+        assert_eq!(start_route(false, Some(Route::History), false), Some(Route::History));
+        assert_eq!(start_route(false, Some(Route::Settings(Section::Cleanup)), true), Some(Route::Settings(Section::Cleanup)), "an explicit page wins over first run");
+    }
+
+    #[test]
+    fn test_results_name_what_ran() {
+        use crate::core::settings_logic::TestOutcome;
+        let ok = test_result(TestKind::Stt, TestOutcome::Ok { text: "hello".into(), latency_ms: 840 });
+        assert_eq!((ok.ok, ok.badge.as_str(), ok.text.as_str(), ok.kind), (true, "Transcribed in 840 ms", "hello", TestKind::Stt));
+        let ok = test_result(TestKind::Llm, TestOutcome::Ok { text: "Hello.".into(), latency_ms: 12 });
+        assert_eq!((ok.ok, ok.badge.as_str(), ok.kind), (true, "Cleaned in 12 ms", TestKind::Llm));
+        let bad = test_result(TestKind::Stt, TestOutcome::Err("HTTP 401".into()));
+        assert_eq!((bad.ok, bad.badge.as_str(), bad.text.as_str()), (false, "Failed", "HTTP 401"));
+    }
+
+    #[test]
+    fn the_message_ids_do_not_collide() {
+        let ids = [WM_HOTKEY_EVT, WM_PILL_EVT, WM_TRAY_EVT, WM_NOTE, WM_TEST_DONE, WM_CREATE_TRAY, WM_TRAY_POPUP_CMD, WM_TRAY_POPUP_ACT];
+        let mut sorted = ids.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), ids.len());
+        assert!(ids.iter().all(|m| *m >= ipc::WM_OT_INTERNAL_BASE));
+    }
+
+    #[test]
+    fn open_page_requests_fall_back_to_home_for_junk() {
+        assert_eq!(Route::decode(0).unwrap_or(Route::Home), Route::Home);
+        assert_eq!(Route::decode(Route::History.encode()).unwrap_or(Route::Home), Route::History);
     }
 }

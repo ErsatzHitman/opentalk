@@ -8,7 +8,8 @@
 //! --bench latency [n]              print the daemon log's latency lines + median/p95 summary
 //! --bench start | stop             idempotent: start only from idle, stop only while recording
 //! --bench phase                    print the daemon's phase (idle | arming | recording | thinking)
-//! --bench toggle | cancel | quit | settings   one IPC message to the running daemon
+//! --bench toggle | cancel | quit   one IPC message to the running daemon
+//! --bench settings [page]         open the tray popup at a page (default: the Settings index)
 //! --bench wait-ready [secs]        block until the daemon window exists
 //! --bench mock-stt [--port P] [--delay-ms D] [--text T]   local STT server: OpenAI/Deepgram REST
 //!                                  replies over HTTP, Deepgram live protocol over ws:// (same port)
@@ -24,6 +25,7 @@ use super::latency::{self, Sample};
 use super::pipeline;
 use crate::core::config::{Config, SttProviderId};
 use crate::core::ipc::{self, IpcMsg};
+use crate::core::nav::Route;
 use crate::core::timing::now_ms;
 use crate::core::{history, paths};
 use crate::daemon::audio::vad;
@@ -152,12 +154,12 @@ pub fn bench(args: &[String]) -> i32 {
         Some("phase") => bench_phase(),
         Some("cancel") => send(IpcMsg::Cancel),
         Some("quit") => send(IpcMsg::Quit),
-        Some("settings") => send(IpcMsg::OpenSettings),
+        Some("settings") => send(IpcMsg::OpenPage(args.get(1).map_or(Route::SettingsIndex, |p| Route::parse(Some(p.as_str()))))),
         Some("wait-ready") => bench_wait_ready(&args[1..]),
         Some("mock-stt") => bench_mock(&args[1..]),
         Some("info") => bench_info(),
         _ => {
-            eprintln!("usage: opentalk --bench dictate <n> <wav> [secs] | latency [n] | start | stop | phase | toggle | cancel | quit | wait-ready [secs] | mock-stt [--port P] [--delay-ms D] [--text T]");
+            eprintln!("usage: opentalk --bench dictate <n> <wav> [secs] | latency [n] | start | stop | phase | toggle | cancel | quit | settings [page] | wait-ready [secs] | mock-stt [--port P] [--delay-ms D] [--text T]");
             2
         }
     }

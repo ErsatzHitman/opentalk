@@ -11,4 +11,5 @@ pub mod nav;
 pub mod paths;
 pub mod rewrite;
 pub mod secrets;
+pub mod settings_logic;
 pub mod timing;

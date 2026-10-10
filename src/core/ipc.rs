@@ -5,10 +5,13 @@ use std::sync::OnceLock;
 use windows::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HWND, LPARAM, WPARAM};
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    FindWindowExW, FindWindowW, HWND_MESSAGE, PostMessageW, RegisterWindowMessageW, SMTO_ABORTIFHUNG, SendMessageTimeoutW,
+    AllowSetForegroundWindow, FindWindowExW, FindWindowW, GetWindowThreadProcessId, HWND_MESSAGE, PostMessageW, RegisterWindowMessageW,
+    SMTO_ABORTIFHUNG, SendMessageTimeoutW,
 };
 use windows::core::{HSTRING, PCWSTR};
 
+use crate::core::nav::Route;
+// Legacy page request of the egui Settings process; deleted together with `src/ui` (agent H).
 use crate::ui::{Launch, Page, Section};
 
 pub const DAEMON_WINDOW_CLASS: &str = "OpenTalkDaemon";
@@ -29,13 +32,32 @@ pub const WM_OT_START: u32 = WM_APP + 8;
 pub const WM_OT_STOP: u32 = WM_APP + 9;
 /// Synchronous query (`SendMessage`, not posted): the reply is [`DaemonPhase::code`], 0 if the daemon was busy.
 pub const WM_OT_QUERY_PHASE: u32 = WM_APP + 10;
+/// Open the tray popup at a page. `wparam` is [`Route::encode`]; a stray or undecodable value
+/// opens Home. Sent by `opentalk --settings [page]` and by a second launch.
+pub const WM_OT_OPEN_PAGE: u32 = WM_APP + 11;
 /// Last id of the `WM_OT_*` range (the daemon lets lower-integrity senders use all of them).
-pub const WM_OT_LAST: u32 = WM_OT_QUERY_PHASE;
+pub const WM_OT_LAST: u32 = WM_OT_OPEN_PAGE;
 /// First id the daemon may use for its own internal messages.
 pub const WM_OT_INTERNAL_BASE: u32 = WM_APP + 0x100;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum IpcMsg { Reload, SuspendHotkeys(bool), OpenSettings, Toggle, Cancel, RetryLast, Quit, Start, Stop }
+pub enum IpcMsg {
+    Reload,
+    /// Old clients and `--bench settings`: kept on the wire (the daemon opens Home); the popup
+    /// captures hotkeys itself, so nothing sends this any more.
+    SuspendHotkeys(bool),
+    /// Open the tray popup at Home (an old client's second launch; same as `OpenPage(Home)`).
+    #[allow(dead_code)] // kept on the wire for old clients
+    OpenSettings,
+    /// Open the tray popup at this page.
+    OpenPage(Route),
+    Toggle,
+    Cancel,
+    RetryLast,
+    Quit,
+    Start,
+    Stop,
+}
 
 impl IpcMsg {
     pub fn encode(self) -> (u32, usize) {
@@ -43,6 +65,7 @@ impl IpcMsg {
             IpcMsg::Reload => (WM_OT_RELOAD, 0),
             IpcMsg::SuspendHotkeys(b) => (WM_OT_SUSPEND_HOTKEYS, b as usize),
             IpcMsg::OpenSettings => (WM_OT_OPEN_SETTINGS, 0),
+            IpcMsg::OpenPage(r) => (WM_OT_OPEN_PAGE, r.encode()),
             IpcMsg::Toggle => (WM_OT_TOGGLE, 0),
             IpcMsg::Cancel => (WM_OT_CANCEL, 0),
             IpcMsg::RetryLast => (WM_OT_RETRY_LAST, 0),
@@ -122,6 +145,7 @@ const PAGE_CODE_VALID: usize = 1 << 16;
 /// Compact wparam for a Settings page request: bit 16 = valid, bits 8..16 = section (0 = none,
 /// else index in `Section::ALL` + 1), bits 0..8 = page (0 History, 1 Dictionary). Covers
 /// everything `ui::parse_page` can return.
+#[allow(dead_code)] // legacy: removed together with `src/ui`
 pub fn encode_settings_page(launch: Launch) -> usize {
     let page = match launch.page {
         Page::History => 0,
@@ -149,6 +173,7 @@ pub fn decode_settings_page(wparam: usize) -> Option<Launch> {
 }
 
 /// Ask the Settings window `hwnd` to show `launch`. False if the post failed.
+#[allow(dead_code)] // legacy: removed together with `src/ui`
 pub fn post_settings_page(hwnd: HWND, launch: Launch) -> bool {
     let id = settings_page_message();
     if id == 0 {
@@ -170,9 +195,26 @@ pub fn daemon_running() -> bool {
 
 fn post_to(class: &str, msg: IpcMsg) -> bool {
     let Some(hwnd) = find_window(class) else { return false };
+    if matches!(msg, IpcMsg::OpenPage(_) | IpcMsg::OpenSettings) {
+        allow_foreground(hwnd);
+    }
     let (id, wparam) = msg.encode();
     // SAFETY: plain PostMessageW to a window handle; a stale handle just makes the call fail.
     unsafe { PostMessageW(Some(hwnd), id, WPARAM(wparam), LPARAM(0)).is_ok() }
+}
+
+/// Let the process that owns `hwnd` take the foreground: the popup it is about to open for us
+/// needs the keyboard, and Windows only grants that to the process the user is working with (or
+/// one it delegates to). Harmless when this process has no foreground right to give.
+fn allow_foreground(hwnd: HWND) {
+    let mut pid = 0u32;
+    // SAFETY: `pid` outlives the call; a stale handle just leaves it 0.
+    unsafe {
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        if pid != 0 {
+            let _ = AllowSetForegroundWindow(pid);
+        }
+    }
 }
 
 /// Find a top-level window of `class`, falling back to message-only windows
@@ -260,6 +302,20 @@ mod tests {
         assert_eq!(IpcMsg::Stop.encode(), (WM_OT_STOP, 0));
         assert_eq!((WM_OT_START, WM_OT_STOP, WM_OT_QUERY_PHASE), (WM_APP + 8, WM_APP + 9, WM_APP + 10));
         assert!(WM_OT_LAST < WM_OT_INTERNAL_BASE);
+    }
+
+    #[test]
+    fn open_page_carries_the_encoded_route() {
+        use crate::core::nav::{PickerId, Section};
+        assert_eq!(WM_OT_OPEN_PAGE, WM_APP + 11);
+        assert_eq!(WM_OT_LAST, WM_OT_OPEN_PAGE, "the lower-integrity message filter covers it");
+        let routes = [Route::Home, Route::History, Route::HistoryEntry(7), Route::Dictionary, Route::SettingsIndex, Route::Settings(Section::SpeechToText), Route::Picker(PickerId::Language)];
+        for r in routes {
+            let (id, w) = IpcMsg::OpenPage(r).encode();
+            assert_eq!(id, WM_OT_OPEN_PAGE);
+            assert_eq!(Route::decode(w), Some(r), "{r:?}");
+        }
+        assert_eq!(Route::decode(0), None, "a stray message is not a route");
     }
 
     #[test]
@@ -385,11 +441,15 @@ mod tests {
 
             assert!(find_window(&class).is_some());
             assert!(post_to(&class, IpcMsg::SuspendHotkeys(true)));
+            assert!(post_to(&class, IpcMsg::OpenPage(Route::Settings(crate::core::nav::Section::SpeechToText))));
             assert!(post_to(&class, IpcMsg::Quit));
 
             let mut m = MSG::default();
             assert!(PeekMessageW(&mut m, Some(hwnd), WM_APP, WM_APP + 0x100, PM_REMOVE).as_bool());
             assert_eq!((m.message, m.wParam.0), (WM_OT_SUSPEND_HOTKEYS, 1));
+            assert!(PeekMessageW(&mut m, Some(hwnd), WM_APP, WM_APP + 0x100, PM_REMOVE).as_bool());
+            assert_eq!(m.message, WM_OT_OPEN_PAGE);
+            assert_eq!(Route::decode(m.wParam.0), Some(Route::Settings(crate::core::nav::Section::SpeechToText)));
             assert!(PeekMessageW(&mut m, Some(hwnd), WM_APP, WM_APP + 0x100, PM_REMOVE).as_bool());
             assert_eq!(m.message, WM_OT_QUIT);
 

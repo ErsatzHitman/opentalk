@@ -1,0 +1,14 @@
+# Speech provider
+
+## Providers
+  (*) #100 OpenAI -- Recommended
+  ( ) #101 Groq
+  ( ) #102 xAI
+  ( ) #103 Mistral
+  ( ) #104 Gemini
+  ( ) #105 Deepgram
+  ( ) #106 AssemblyAI
+  ( ) #107 Corti
+  ( ) #108 Tinfoil
+  ( ) #109 OpenRouter
+  ( ) #110 Custom

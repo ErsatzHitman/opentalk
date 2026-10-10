@@ -139,6 +139,54 @@ pub fn refresh_popup(state: &TrayState) {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Host bridge (settings agent). The daemon host talks to the popup only through these functions
+// and the page mailbox; the renderer implements them for real (page routes, live config, capture
+// events, test results) and keeps the signatures. Until then Home opens and the rest is inert.
+// ---------------------------------------------------------------------------------------------
+
+/// Posted by the popup to the daemon window after it queued actions in `page::mailbox`: the host
+/// drains the mailbox on receipt.
+pub const WM_TRAY_POPUP_ACT: u32 = crate::core::ipc::WM_OT_INTERNAL_BASE + 0x41;
+
+static LATEST_CONFIG: std::sync::Mutex<Option<crate::core::config::Config>> = std::sync::Mutex::new(None);
+
+/// The daemon's applied config, pushed by the host before the popup opens and after every apply.
+/// A page's `Cx::cfg` working copy starts from it (and is replaced when it changes under an open page).
+pub fn sync_config(cfg: &crate::core::config::Config) {
+    *LATEST_CONFIG.lock().unwrap_or_else(|e| e.into_inner()) = Some(cfg.clone());
+}
+
+/// The last config passed to [`sync_config`].
+#[allow(dead_code)] // read by the popup (renderer track)
+pub fn latest_config() -> Option<crate::core::config::Config> {
+    LATEST_CONFIG.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// Open the popup at `route` (a no-op navigation when it is open already). Used by `--settings`,
+/// a second launch, first run and the pill/tray rows.
+pub fn open_route(owner: isize, route: crate::core::nav::Route, state: &TrayState) {
+    if !popup_is_open() {
+        activate(owner, Activation { keyboard: false }, state);
+    }
+    let _ = route; // the page renderer navigates to it
+}
+
+/// Hotkey capture progress for the focused hotkey field (from the daemon's keyboard hook).
+pub fn popup_capture(msg: crate::daemon::hotkey::CaptureMsg) {
+    let _ = msg;
+}
+
+/// A provider test finished (the host already dropped stale ones).
+pub fn popup_test_done(result: page::TestResult) {
+    let _ = result;
+}
+
+/// Show `text` in the popup's status strip (e.g. "Could not save the key").
+pub fn popup_toast(text: &str) {
+    let _ = text;
+}
+
+// ---------------------------------------------------------------------------------------------
 // Commands
 // ---------------------------------------------------------------------------------------------
 

@@ -1,0 +1,23 @@
+# Speech-to-Text
+
+## Provider
+  choice #1 Speech provider > OpenAI
+  note: Audio is sent to the provider you choose, using your own API key.
+
+## API key
+  row #104 API key [Saved:ok] -- sk-...wxyz
+  button #105 Replace key <Outline>
+  button #106 Remove key <Destructive>
+
+## Model
+  (*) #40 GPT-4o Mini Transcribe -- Fast, low cost · Recommended · Streaming
+  ( ) #41 GPT-4o Transcribe -- Highest accuracy · Streaming
+  ( ) #42 GPT Transcribe -- Latest, keyword biasing
+  ( ) #43 Whisper -- Classic Whisper
+
+## Transport
+  [ ] #30 Prefer streaming -- Send audio while you speak so the text is ready sooner. Falls back to a single upload when the model does not stream.
+
+## Test
+  note: Transcribes a short built-in sample with the settings above, so you can check the key and measure latency.
+  button #31 Test transcription <Primary>

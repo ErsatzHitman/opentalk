@@ -1,0 +1,8 @@
+# Keep transcripts for
+
+## Options
+  (*) #100 Keep forever
+  ( ) #101 7 days
+  ( ) #102 30 days
+  ( ) #103 90 days
+  ( ) #104 1 year

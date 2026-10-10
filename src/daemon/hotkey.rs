@@ -22,6 +22,12 @@ pub enum HotkeyEvent {
     Down = 1,
     Up = 2,
     Escape = 3,
+    /// Capture mode: the combination typed so far changed ([`capture_preview`]).
+    CaptureUpdate = 4,
+    /// Capture mode: all keys of a combination were released ([`capture_result`]).
+    CaptureDone = 5,
+    /// Capture mode: Esc alone, or the capture timed out; capture is over.
+    CaptureCancel = 6,
 }
 
 impl HotkeyEvent {
@@ -30,6 +36,9 @@ impl HotkeyEvent {
             1 => Some(Self::Down),
             2 => Some(Self::Up),
             3 => Some(Self::Escape),
+            4 => Some(Self::CaptureUpdate),
+            5 => Some(Self::CaptureDone),
+            6 => Some(Self::CaptureCancel),
             _ => None,
         }
     }
@@ -468,6 +477,291 @@ impl Outcome {
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// Capture mode (Settings > Hotkeys)
+// ---------------------------------------------------------------------------------------------
+
+/// How long a capture may stay on without being ended (the popup ends it on close).
+#[allow(dead_code)] // called by the tray popup (renderer track)
+pub const CAPTURE_LIMIT_MS: f64 = 2.0 * 60.0 * 1000.0;
+
+/// Set of virtual keys 0..=255 (fixed size, so the hook never allocates).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct KeySet([u64; 4]);
+
+impl KeySet {
+    const fn new() -> KeySet {
+        KeySet([0; 4])
+    }
+
+    fn insert(&mut self, vk: u32) {
+        if vk < 256 {
+            self.0[(vk >> 6) as usize] |= 1 << (vk & 63);
+        }
+    }
+
+    /// Remove `vk`; true when it was in the set.
+    fn remove(&mut self, vk: u32) -> bool {
+        if vk >= 256 {
+            return false;
+        }
+        let (w, b) = ((vk >> 6) as usize, 1u64 << (vk & 63));
+        let was = self.0[w] & b != 0;
+        self.0[w] &= !b;
+        was
+    }
+
+    fn contains(&self, vk: u32) -> bool {
+        vk < 256 && self.0[(vk >> 6) as usize] & (1 << (vk & 63)) != 0
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0 == [0; 4]
+    }
+
+    fn clear(&mut self) {
+        self.0 = [0; 4];
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Mod {
+    Ctrl,
+    Alt,
+    Shift,
+    Super,
+}
+
+fn modifier_of(vk: u32) -> Option<Mod> {
+    match vk {
+        VK_CONTROL | VK_LCONTROL | VK_RCONTROL => Some(Mod::Ctrl),
+        VK_MENU | VK_LMENU | VK_RMENU => Some(Mod::Alt),
+        VK_SHIFT | VK_LSHIFT | VK_RSHIFT => Some(Mod::Shift),
+        VK_LWIN | VK_RWIN => Some(Mod::Super),
+        _ => None,
+    }
+}
+
+/// Left/right variants of one modifier collapse to the same code.
+fn norm_vk(vk: u32) -> u32 {
+    match modifier_of(vk) {
+        Some(Mod::Ctrl) => VK_CONTROL,
+        Some(Mod::Alt) => VK_MENU,
+        Some(Mod::Shift) => VK_SHIFT,
+        Some(Mod::Super) => VK_LWIN,
+        None => vk,
+    }
+}
+
+/// Electron accelerator name of a non-modifier key (what the capture writes and [`parse`] reads);
+/// `None` for keys that cannot be named.
+pub fn key_name(vk: u32) -> Option<String> {
+    Some(match vk {
+        0x30..=0x39 | 0x41..=0x5A => char::from_u32(vk)?.to_string(),
+        0x70..=0x87 => format!("F{}", vk - 0x6F),
+        0x60..=0x69 => format!("num{}", vk - 0x60),
+        VK_MULTIPLY => "nummult".into(),
+        VK_ADD => "numadd".into(),
+        VK_SUBTRACT => "numsub".into(),
+        VK_DECIMAL => "numdec".into(),
+        VK_DIVIDE => "numdiv".into(),
+        VK_SPACE => "Space".into(),
+        VK_RETURN => "Enter".into(),
+        VK_TAB => "Tab".into(),
+        VK_BACK => "Backspace".into(),
+        VK_ESCAPE => "Escape".into(),
+        VK_CAPITAL => "Capslock".into(),
+        VK_PAUSE => "Pause".into(),
+        VK_PRIOR => "PageUp".into(),
+        VK_NEXT => "PageDown".into(),
+        VK_END => "End".into(),
+        VK_HOME => "Home".into(),
+        VK_LEFT => "Left".into(),
+        VK_UP => "Up".into(),
+        VK_RIGHT => "Right".into(),
+        VK_DOWN => "Down".into(),
+        VK_SNAPSHOT => "PrintScreen".into(),
+        VK_INSERT => "Insert".into(),
+        VK_DELETE => "Delete".into(),
+        VK_NUMLOCK => "Numlock".into(),
+        VK_SCROLL => "Scrolllock".into(),
+        VK_OEM_1 => ";".into(),
+        VK_OEM_PLUS => "=".into(),
+        VK_OEM_COMMA => ",".into(),
+        VK_OEM_MINUS => "-".into(),
+        VK_OEM_PERIOD => ".".into(),
+        VK_OEM_2 => "/".into(),
+        VK_OEM_3 => "`".into(),
+        VK_OEM_4 => "[".into(),
+        VK_OEM_5 => "\\".into(),
+        VK_OEM_6 => "]".into(),
+        VK_OEM_7 => "'".into(),
+        _ => return None,
+    })
+}
+
+/// Why an accelerator cannot be used as the dictation hotkey (`None` = fine).
+pub fn validate(accel: &str) -> Option<&'static str> {
+    let parts: Vec<&str> = accel.split('+').collect();
+    if parts.len() >= 2 {
+        return None;
+    }
+    let k = parts.first().copied().unwrap_or("");
+    let is_f = k.len() >= 2 && k.starts_with('F') && k[1..].chars().all(|c| c.is_ascii_digit());
+    if is_f {
+        None
+    } else if matches!(k, "Control" | "Alt" | "Shift" | "Super") {
+        Some("A single modifier would trigger constantly. Combine it with another key.")
+    } else {
+        Some("Add a modifier (Ctrl, Alt, Shift or Win) so normal typing is not captured.")
+    }
+}
+
+/// The keys of an accelerator as separate label parts, for key caps ("Control+Super" -> Ctrl, Win).
+#[allow(dead_code)] // called by the tray popup (renderer track)
+pub fn label_parts(accel: &str) -> Vec<String> {
+    label(accel).split(" + ").filter(|s| !s.is_empty()).map(str::to_string).collect()
+}
+
+/// Outcome of a finished capture.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Captured {
+    /// A finished combination (accelerator string, unvalidated).
+    Combo(String),
+    /// Esc alone (or a timeout): abandon the capture.
+    Cancelled,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CapDone {
+    Open,
+    Cancelled,
+    Combo,
+}
+
+/// Recorder of one hotkey capture; the port of the old Settings process's capture state machine
+/// onto fixed-size state, so the hook callback stays allocation-free.
+#[derive(Clone, Copy, Debug)]
+struct Capture {
+    active: bool,
+    /// Keys whose press was swallowed and whose release has not come yet (normalised).
+    held: KeySet,
+    /// Every key seen since the capture began (or was re-armed).
+    seen: KeySet,
+    /// The most recent non-modifier key (0 = none).
+    last_main: u8,
+    done: CapDone,
+    /// `now_ms()` after which the capture ends by itself (0 = none).
+    deadline_ms: f64,
+}
+
+impl Capture {
+    const fn new() -> Capture {
+        Capture { active: false, held: KeySet::new(), seen: KeySet::new(), last_main: 0, done: CapDone::Open, deadline_ms: 0.0 }
+    }
+
+    fn start(&mut self, deadline_ms: f64) {
+        *self = Capture::new();
+        self.active = true;
+        self.deadline_ms = deadline_ms;
+    }
+
+    fn rearm(&mut self) {
+        // Keys of the rejected gesture may still be down: their releases stay swallowed (`held`).
+        self.seen.clear();
+        self.last_main = 0;
+        self.done = CapDone::Open;
+    }
+
+    /// A key-up after capture ended: swallow it if its press was swallowed.
+    fn release_residue(&mut self, vk: u32) -> bool {
+        !self.held.is_empty() && self.held.remove(norm_vk(vk))
+    }
+
+    /// Feed one key event. Returns (swallow, event to post).
+    fn feed(&mut self, vk: u32, down: bool) -> (bool, Option<HotkeyEvent>) {
+        let vk = norm_vk(vk);
+        if self.done != CapDone::Open {
+            // Result already decided: keep swallowing the keys of this gesture until released.
+            if down {
+                self.held.insert(vk);
+                return (true, None);
+            }
+            return (self.held.remove(vk), None);
+        }
+        if down {
+            if vk == VK_ESCAPE && self.held.is_empty() && self.seen.is_empty() {
+                self.done = CapDone::Cancelled;
+                self.held.insert(vk);
+                return (true, Some(HotkeyEvent::CaptureCancel));
+            }
+            self.held.insert(vk);
+            let new_key = !self.seen.contains(vk);
+            self.seen.insert(vk);
+            let mut changed = new_key;
+            if modifier_of(vk).is_none() && self.last_main != vk as u8 {
+                self.last_main = vk as u8;
+                changed = true;
+            }
+            // Auto-repeat of a held key changes nothing: no event.
+            (true, changed.then_some(HotkeyEvent::CaptureUpdate))
+        } else {
+            // Only swallow releases of keys whose press was swallowed (else the OS sees a stuck key).
+            let known = self.held.remove(vk);
+            let mut ev = None;
+            if known && self.held.is_empty() && self.done == CapDone::Open {
+                if self.accelerator().is_some() {
+                    self.done = CapDone::Combo;
+                    ev = Some(HotkeyEvent::CaptureDone);
+                } else {
+                    self.seen.clear();
+                    self.last_main = 0;
+                }
+            }
+            (known, ev)
+        }
+    }
+
+    /// The accelerator of the keys seen so far.
+    fn accelerator(&self) -> Option<String> {
+        let mut parts: Vec<&str> = Vec::with_capacity(5);
+        let mut mods: Vec<Mod> = Vec::with_capacity(4);
+        for vk in [VK_CONTROL, VK_MENU, VK_SHIFT, VK_LWIN] {
+            if self.seen.contains(vk)
+                && let Some(m) = modifier_of(vk)
+            {
+                mods.push(m);
+            }
+        }
+        mods.sort();
+        for m in mods {
+            parts.push(match m {
+                Mod::Ctrl => "Control",
+                Mod::Alt => "Alt",
+                Mod::Shift => "Shift",
+                Mod::Super => "Super",
+            });
+        }
+        let mut out = parts.join("+");
+        if self.last_main != 0 {
+            let name = key_name(self.last_main as u32)?;
+            if !out.is_empty() {
+                out.push('+');
+            }
+            out.push_str(&name);
+        }
+        if out.is_empty() { None } else { Some(out) }
+    }
+
+    fn result(&self) -> Option<Captured> {
+        match self.done {
+            CapDone::Open => None,
+            CapDone::Cancelled => Some(Captured::Cancelled),
+            CapDone::Combo => self.accelerator().map(Captured::Combo),
+        }
+    }
+}
+
 pub struct Matcher<K: KeyState = SysKeys> {
     keys: K,
     spec: HotkeySpec,
@@ -495,6 +789,9 @@ pub struct Matcher<K: KeyState = SysKeys> {
     /// a different key-down cannot be a repeat. Modifiers are left out because AltGr repeats as
     /// alternating LCtrl/RAlt downs.
     last_down: u32,
+    /// Hotkey capture mode (Settings > Hotkeys): the keys are recorded and swallowed instead of
+    /// matched against `spec`.
+    cap: Capture,
 }
 
 impl<K: KeyState> Matcher<K> {
@@ -513,6 +810,7 @@ impl<K: KeyState> Matcher<K> {
             main_swallowed: false,
             esc_swallowed: false,
             last_down: 0,
+            cap: Capture::new(),
         }
     }
 
@@ -528,6 +826,8 @@ impl<K: KeyState> Matcher<K> {
     }
 
     /// While suspended every key passes through untouched. Returns `Up` if a press was cut short.
+    /// (Hotkey capture used to suspend the matcher from outside; now it is a mode of its own.)
+    #[cfg(test)]
     pub fn set_suspended(&mut self, on: bool) -> Option<HotkeyEvent> {
         self.suspended = on;
         self.reset()
@@ -543,6 +843,62 @@ impl<K: KeyState> Matcher<K> {
 
     pub fn set_allow_injected(&mut self, on: bool) {
         self.allow_injected = on;
+    }
+
+    /// Start capture mode: from now on keys are recorded (and swallowed) instead of matched.
+    /// `limit_ms` is the longest it may stay on (a safety net: a capture nobody ends must not
+    /// eat the keyboard for good). Returns `Up` when a press was in flight.
+    pub fn begin_capture(&mut self, limit_ms: f64) -> Option<HotkeyEvent> {
+        let cut = self.reset();
+        self.cap.start(crate::core::timing::now_ms() + limit_ms);
+        cut
+    }
+
+    /// Leave capture mode. Keys still held keep being swallowed until released.
+    pub fn end_capture(&mut self) -> Option<HotkeyEvent> {
+        self.cap.active = false;
+        self.cap.deadline_ms = 0.0;
+        self.reset()
+    }
+
+    pub fn capture_active(&self) -> bool {
+        self.cap.active
+    }
+
+    /// The accelerator typed so far ("" when nothing usable yet).
+    pub fn capture_preview(&self) -> String {
+        self.cap.accelerator().unwrap_or_default()
+    }
+
+    /// The finished capture, once all keys were released (or Esc alone was pressed).
+    pub fn capture_result(&self) -> Option<Captured> {
+        self.cap.result()
+    }
+
+    /// Record again after a rejected combination (capture stays on).
+    pub fn capture_rearm(&mut self) {
+        self.cap.rearm();
+    }
+
+    fn step_capture(&mut self, vk: u32, down: bool, injected: bool) -> Outcome {
+        let mut out = Outcome::default();
+        if injected && !self.allow_injected {
+            return out;
+        }
+        if self.cap.deadline_ms > 0.0 && crate::core::timing::now_ms() > self.cap.deadline_ms {
+            // Nobody ended the capture in time: stop eating keys and tell the popup.
+            self.cap.active = false;
+            self.cap.deadline_ms = 0.0;
+            self.cap.held = KeySet::new();
+            out.push(HotkeyEvent::CaptureCancel);
+            return out;
+        }
+        let (swallow, ev) = self.cap.feed(vk, down);
+        out.swallow = swallow;
+        if let Some(ev) = ev {
+            out.push(ev);
+        }
+        out
     }
 
     /// Drop transient state and re-read the modifiers from the OS. Returns `Up` when a press was
@@ -598,6 +954,15 @@ impl<K: KeyState> Matcher<K> {
     /// Process one key event. O(1), allocation-free.
     pub fn step(&mut self, vk: u32, down: bool, injected: bool) -> Outcome {
         let mut out = Outcome::default();
+        if self.cap.active {
+            return self.step_capture(vk, down, injected);
+        }
+        // The key-up of a key whose press capture mode swallowed is eaten too, or the OS would see
+        // a release it never saw the press of (a lone Win key-up can open the Start menu).
+        if !down && self.cap.release_residue(vk) {
+            out.swallow = true;
+            return out;
+        }
         if self.suspended || (injected && !self.allow_injected) {
             return out;
         }
@@ -967,6 +1332,14 @@ pub fn set_esc_capture(on: bool) {
     lock_matcher().set_esc_capture(on);
 }
 
+pub fn set_start_menu_mask(on: bool) {
+    lock_matcher().set_start_menu_mask(on);
+}
+
+// ---- capture API (called by the popup / host) ----
+
+/// Pass every key through untouched (tests; capture mode replaced the Settings-process suspend).
+#[cfg(test)]
 pub fn set_suspended(on: bool) {
     let cut = lock_matcher().set_suspended(on);
     if let Some(ev) = cut {
@@ -974,8 +1347,70 @@ pub fn set_suspended(on: bool) {
     }
 }
 
-pub fn set_start_menu_mask(on: bool) {
-    lock_matcher().set_start_menu_mask(on);
+/// Start capturing the next key combination: the keys are recorded and swallowed (the Win key
+/// does not open the Start menu), and the dictation hotkey is inactive meanwhile. The hook posts
+/// `CaptureUpdate` / `CaptureDone` / `CaptureCancel`. Always pair it with [`end_capture`].
+#[allow(dead_code)] // called by the tray popup (renderer track)
+pub fn begin_capture() {
+    let cut = lock_matcher().begin_capture(CAPTURE_LIMIT_MS);
+    if let Some(ev) = cut {
+        post(ev);
+    }
+}
+
+/// Leave capture mode (idempotent). Normal matching resumes with no press in flight.
+#[allow(dead_code)] // called by the tray popup (renderer track)
+pub fn end_capture() {
+    let cut = lock_matcher().end_capture();
+    if let Some(ev) = cut {
+        post(ev);
+    }
+}
+
+#[allow(dead_code)] // called by the tray popup (renderer track)
+pub fn capture_active() -> bool {
+    lock_matcher().capture_active()
+}
+
+/// The accelerator typed so far ("" when nothing usable yet).
+pub fn capture_preview() -> String {
+    lock_matcher().capture_preview()
+}
+
+/// The finished capture, once all keys were released.
+pub fn capture_result() -> Option<Captured> {
+    lock_matcher().capture_result()
+}
+
+/// What the host forwards to the popup for a capture event of the hook.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CaptureMsg {
+    /// The accelerator typed so far.
+    Update(String),
+    /// The finished accelerator (unvalidated).
+    Done(String),
+    /// Esc alone, or the capture timed out: the popup leaves capture mode.
+    Cancelled,
+}
+
+/// Turn a posted capture event into the message for the popup (reads the matcher once).
+pub fn capture_msg(ev: HotkeyEvent) -> Option<CaptureMsg> {
+    match ev {
+        HotkeyEvent::CaptureUpdate => Some(CaptureMsg::Update(capture_preview())),
+        HotkeyEvent::CaptureDone => match capture_result() {
+            Some(Captured::Combo(a)) => Some(CaptureMsg::Done(a)),
+            Some(Captured::Cancelled) => Some(CaptureMsg::Cancelled),
+            None => None,
+        },
+        HotkeyEvent::CaptureCancel => Some(CaptureMsg::Cancelled),
+        _ => None,
+    }
+}
+
+/// Record again after a rejected combination.
+#[allow(dead_code)] // called by the tray popup (renderer track)
+pub fn capture_rearm() {
+    lock_matcher().capture_rearm();
 }
 
 /// Let automation-injected (`SendInput`) keys through; production ignores them (`start` honours
@@ -1953,11 +2388,11 @@ mod tests {
 
     #[test]
     fn hotkey_event_roundtrip() {
-        for e in [D, U, E] {
+        for e in [D, U, E, HotkeyEvent::CaptureUpdate, HotkeyEvent::CaptureDone, HotkeyEvent::CaptureCancel] {
             assert_eq!(HotkeyEvent::from_wparam(e as usize), Some(e));
         }
         assert_eq!(HotkeyEvent::from_wparam(0), None);
-        assert_eq!(HotkeyEvent::from_wparam(4), None);
+        assert_eq!(HotkeyEvent::from_wparam(7), None);
     }
 
     // ---- event stamps ----
@@ -2445,5 +2880,276 @@ mod tests {
             let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
             assert!(start_menu_opens(false), "control: a bare Win tap should open Start");
         }
+    }
+}
+
+#[cfg(test)]
+mod capture_tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::collections::HashSet;
+    use std::rc::Rc;
+
+    type Down = Rc<RefCell<HashSet<u32>>>;
+
+    struct Fake(Down);
+    impl KeyState for Fake {
+        fn is_down(&self, vk: u32) -> bool {
+            self.0.borrow().contains(&vk)
+        }
+    }
+
+    /// A matcher with a dictation hotkey, in capture mode.
+    fn capturing(spec: &str) -> Matcher<Fake> {
+        let down: Down = Rc::default();
+        let mut m = Matcher::with_keys(Fake(down), parse(spec).unwrap());
+        m.begin_capture(CAPTURE_LIMIT_MS);
+        m
+    }
+
+    fn press(m: &mut Matcher<Fake>, keys: &[u32]) -> Vec<HotkeyEvent> {
+        let mut evs = Vec::new();
+        for &k in keys {
+            evs.extend(m.step(k, true, false).events());
+        }
+        for &k in keys.iter().rev() {
+            evs.extend(m.step(k, false, false).events());
+        }
+        evs
+    }
+
+    fn result(m: &Matcher<Fake>) -> Option<Captured> {
+        m.capture_result()
+    }
+
+    #[test]
+    fn modifier_only_combo_with_win() {
+        let mut m = capturing("F8");
+        press(&mut m, &[VK_LCONTROL, VK_LWIN]);
+        assert_eq!(result(&m), Some(Captured::Combo("Control+Super".into())));
+    }
+
+    #[test]
+    fn right_variants_collapse_and_order_is_canonical() {
+        let mut m = capturing("F8");
+        press(&mut m, &[VK_RWIN, VK_RSHIFT, VK_RCONTROL, 0x20]);
+        assert_eq!(result(&m), Some(Captured::Combo("Control+Shift+Super+Space".into())));
+    }
+
+    #[test]
+    fn function_key_alone_and_letter_combo() {
+        let mut m = capturing("F8");
+        press(&mut m, &[0x77]);
+        assert_eq!(result(&m), Some(Captured::Combo("F8".into())));
+        let mut m = capturing("F8");
+        press(&mut m, &[VK_MENU, 0x52]);
+        assert_eq!(result(&m), Some(Captured::Combo("Alt+R".into())));
+    }
+
+    #[test]
+    fn escape_alone_cancels_but_with_modifier_is_a_key() {
+        let mut m = capturing("F8");
+        let evs: Vec<_> = m.step(VK_ESCAPE, true, false).events().collect();
+        assert_eq!(evs, vec![HotkeyEvent::CaptureCancel]);
+        assert_eq!(result(&m), Some(Captured::Cancelled));
+        let mut m = capturing("F8");
+        press(&mut m, &[VK_CONTROL, VK_ESCAPE]);
+        assert_eq!(result(&m), Some(Captured::Combo("Control+Escape".into())));
+    }
+
+    #[test]
+    fn unknown_release_is_not_swallowed() {
+        let mut m = capturing("F8");
+        assert!(!m.step(VK_LCONTROL, false, false).swallow, "a key-up without a seen key-down must pass through");
+        assert!(m.step(VK_LCONTROL, true, false).swallow);
+    }
+
+    #[test]
+    fn result_only_after_all_keys_released() {
+        let mut m = capturing("F8");
+        m.step(VK_LCONTROL, true, false);
+        m.step(VK_LWIN, true, false);
+        m.step(VK_LWIN, false, false);
+        assert!(result(&m).is_none(), "Ctrl is still down");
+        let evs: Vec<_> = m.step(VK_LCONTROL, false, false).events().collect();
+        assert_eq!(evs, vec![HotkeyEvent::CaptureDone]);
+        assert!(result(&m).is_some());
+    }
+
+    #[test]
+    fn every_key_is_swallowed_and_the_dictation_hotkey_is_inactive_while_capturing() {
+        let mut m = capturing("Control+Super");
+        for (vk, down) in [(VK_LCONTROL, true), (VK_LWIN, true), (0x41, true), (0x41, false), (VK_LWIN, false), (VK_LCONTROL, false)] {
+            let o = m.step(vk, down, false);
+            assert!(o.swallow, "vk {vk:#x} down={down}");
+            assert!(o.events().all(|e| matches!(e, HotkeyEvent::CaptureUpdate | HotkeyEvent::CaptureDone)), "never a dictation event");
+        }
+    }
+
+    #[test]
+    fn preview_follows_the_keys_and_auto_repeat_posts_nothing() {
+        let mut m = capturing("F8");
+        let first: Vec<_> = m.step(VK_LCONTROL, true, false).events().collect();
+        assert_eq!(first, vec![HotkeyEvent::CaptureUpdate]);
+        assert_eq!(m.capture_preview(), "Control");
+        assert_eq!(m.step(VK_LCONTROL, true, false).events().count(), 0, "repeat");
+        m.step(0x42, true, false);
+        assert_eq!(m.capture_preview(), "Control+B");
+        m.step(0x43, true, false);
+        assert_eq!(m.capture_preview(), "Control+C", "the newest main key wins");
+    }
+
+    #[test]
+    fn rearm_records_a_second_gesture() {
+        let mut m = capturing("F8");
+        press(&mut m, &[0x41]);
+        assert_eq!(result(&m), Some(Captured::Combo("A".into())));
+        m.capture_rearm();
+        assert!(result(&m).is_none());
+        press(&mut m, &[VK_LCONTROL, 0x42]);
+        assert_eq!(result(&m), Some(Captured::Combo("Control+B".into())));
+    }
+
+    #[test]
+    fn injected_keys_are_ignored_by_capture() {
+        let mut m = capturing("F8");
+        let o = m.step(0x41, true, true);
+        assert!(!o.swallow);
+        assert_eq!(o.events().count(), 0);
+        assert!(m.capture_preview().is_empty());
+    }
+
+    #[test]
+    fn normal_matching_resumes_with_no_press_in_flight_after_end_capture() {
+        let mut m = capturing("F8");
+        m.step(0x77, true, false); // F8 recorded, not matched
+        assert!(!m.is_active(), "capture never starts a dictation press");
+        m.end_capture();
+        assert!(!m.capture_active());
+        assert!(!m.is_active());
+        // Its release (swallowed press) is still eaten, then F8 works as a hotkey again.
+        assert!(m.step(0x77, false, false).swallow);
+        let down = m.step(0x77, true, false);
+        assert_eq!(down.events().collect::<Vec<_>>(), vec![HotkeyEvent::Down]);
+        assert!(down.swallow);
+        let up = m.step(0x77, false, false);
+        assert_eq!(up.events().collect::<Vec<_>>(), vec![HotkeyEvent::Up]);
+    }
+
+    #[test]
+    fn begin_capture_cuts_a_press_in_flight() {
+        let down: Down = Rc::default();
+        let mut m = Matcher::with_keys(Fake(down), parse("F8").unwrap());
+        assert_eq!(m.step(0x77, true, false).events().collect::<Vec<_>>(), vec![HotkeyEvent::Down]);
+        assert_eq!(m.begin_capture(CAPTURE_LIMIT_MS), Some(HotkeyEvent::Up), "the owed Up is returned");
+        assert!(!m.is_active());
+    }
+
+    #[test]
+    fn an_expired_capture_ends_itself_and_lets_the_key_through() {
+        let down: Down = Rc::default();
+        let mut m = Matcher::with_keys(Fake(down), parse("F8").unwrap());
+        m.begin_capture(-1.0); // already past
+        let o = m.step(0x41, true, false);
+        assert!(!o.swallow);
+        assert_eq!(o.events().collect::<Vec<_>>(), vec![HotkeyEvent::CaptureCancel]);
+        assert!(!m.capture_active());
+    }
+
+    #[test]
+    fn capture_state_is_fixed_size() {
+        // The hook copies no heap data: the whole recorder is plain bytes.
+        assert!(size_of::<Capture>() <= 96, "{}", size_of::<Capture>());
+    }
+
+    #[test]
+    fn every_nameable_key_is_accepted_by_the_daemon_parser() {
+        for vk in 0u32..=0xFF {
+            if modifier_of(vk).is_some() {
+                continue;
+            }
+            if let Some(name) = key_name(vk) {
+                let accel = format!("Control+{name}");
+                let spec = parse(&accel).unwrap_or_else(|e| panic!("vk {vk:#x} -> {accel}: {e}"));
+                assert!(spec.ctrl && spec.vk.is_some(), "{accel}");
+            }
+        }
+    }
+
+    #[test]
+    fn captured_combos_survive_a_parse_round_trip() {
+        let mut m = capturing("F8");
+        press(&mut m, &[VK_LCONTROL, VK_LSHIFT, VK_LMENU, VK_LWIN, 0x41]);
+        let Some(Captured::Combo(a)) = result(&m) else { panic!("no combo") };
+        let spec = parse(&a).expect("daemon parses it");
+        assert!(spec.ctrl && spec.shift && spec.alt && spec.win);
+        assert_eq!(spec.vk, Some(0x41));
+        assert_eq!(validate(&a), None);
+    }
+
+    #[test]
+    fn labels_parts_and_validation() {
+        assert_eq!(label("Control+Super"), "Ctrl + Win");
+        assert_eq!(label_parts("Control+Super"), vec!["Ctrl", "Win"]);
+        assert!(validate("Control+Super").is_none());
+        assert!(validate("F8").is_none());
+        assert!(validate("A").is_some());
+        assert!(validate("Control").is_some());
+    }
+
+    #[test]
+    fn key_names() {
+        assert_eq!(key_name(0x41).as_deref(), Some("A"));
+        assert_eq!(key_name(0x78).as_deref(), Some("F9"));
+        assert_eq!(key_name(0xC0).as_deref(), Some("`"));
+        assert_eq!(key_name(0xFF), None);
+    }
+
+    #[test]
+    fn capture_events_round_trip_through_wparam() {
+        for ev in [HotkeyEvent::Down, HotkeyEvent::Up, HotkeyEvent::Escape, HotkeyEvent::CaptureUpdate, HotkeyEvent::CaptureDone, HotkeyEvent::CaptureCancel] {
+            assert_eq!(HotkeyEvent::from_wparam(ev as usize), Some(ev));
+        }
+        assert_eq!(HotkeyEvent::from_wparam(0), None);
+        assert_eq!(HotkeyEvent::from_wparam(7), None);
+    }
+
+    /// Real hook + synthetic keys (Windows desktop only).
+    #[test]
+    #[ignore = "installs the global keyboard hook and injects keys"]
+    fn desktop_matcher_capture_ctrl_win_and_f8() {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, keybd_event};
+        if !crate::daemon::paste::require_input_desktop("desktop_matcher_capture_ctrl_win_and_f8") {
+            return;
+        }
+        fn key(vk: u8, down: bool) {
+            // SAFETY: plain synthetic key event; no pointers involved.
+            unsafe { keybd_event(vk, 0, if down { KEYBD_EVENT_FLAGS(0) } else { KEYEVENTF_KEYUP }, 0) };
+            std::thread::sleep(std::time::Duration::from_millis(40));
+        }
+        fn wait() -> Option<Captured> {
+            for _ in 0..100 {
+                if let Some(r) = capture_result() {
+                    return Some(r);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            None
+        }
+        set_allow_injected(true);
+        begin_capture();
+        key(0xA2, true);
+        key(0x5B, true);
+        key(0x5B, false);
+        key(0xA2, false);
+        let first = wait();
+        capture_rearm();
+        key(0x77, true);
+        key(0x77, false);
+        let second = wait();
+        end_capture();
+        set_allow_injected(false);
+        assert_eq!(first, Some(Captured::Combo("Control+Super".into())));
+        assert_eq!(second, Some(Captured::Combo("F8".into())));
     }
 }
