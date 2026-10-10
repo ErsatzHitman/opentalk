@@ -188,6 +188,36 @@ impl App {
         app
     }
 
+    /// A window-less app for the offscreen renderer: no HWND, acrylic assumed available.
+    #[cfg(test)]
+    pub(super) fn headless(launch: Launch, cfg: Config) -> Self {
+        App {
+            cfg,
+            page: launch.page,
+            hist: HistoryState::default(),
+            dict: DictState::default(),
+            settings_open: launch.settings.is_some(),
+            settings: SettingsState { section: launch.settings.unwrap_or_default(), ..SettingsState::default() },
+            palette: palette::State::default(),
+            toasts: Vec::new(),
+            cmds: Vec::new(),
+            sys_dark: false,
+            applied_dark: None,
+            was_focused: true,
+            trim_at: None,
+            support_open_id: Id::new("support-menu"),
+            hwnd: 0,
+            acrylic_ok: true,
+            effects_on: true,
+            backdrop_dark: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn open_palette(&mut self) {
+        self.palette.toggle();
+    }
+
     fn dark(&self) -> bool {
         match self.cfg.theme {
             crate::core::config::Theme::Auto => self.sys_dark,
@@ -241,6 +271,13 @@ impl eframe::App for App {
     }
 
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+        self.draw(ui);
+    }
+}
+
+impl App {
+    /// One frame of the whole window (also driven headlessly by `offscreen` tests).
+    pub(super) fn draw(&mut self, ui: &mut Ui) {
         let ctx = ui.ctx().clone();
 
         // Follow Windows when Auto: re-read the registry whenever the window regains focus.
@@ -448,8 +485,7 @@ impl App {
             .gap(6.0)
             .frame(egui::Frame::NONE)
             .show(|ui| {
-                w::menu_surface(ui, p, |ui| {
-                    ui.set_min_width(210.0);
+                w::menu_surface(ui, p, 210.0, |ui| {
                     ui.spacing_mut().item_spacing = vec2(0.0, 1.0);
                     if w::menu_item(ui, p, "Keyboard shortcuts", false, false, Some(icons::KEYBOARD)).clicked() {
                         open_settings = Some(Section::Hotkeys);

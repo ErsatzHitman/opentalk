@@ -491,8 +491,7 @@ pub fn select(
         .width(list_w)
         .frame(egui::Frame::NONE)
         .show(|ui| {
-            menu_surface(ui, p, |ui| {
-                ui.set_min_width(list_w - 8.0);
+            menu_surface(ui, p, list_w - 8.0, |ui| {
                 ui.spacing_mut().item_spacing = vec2(0.0, 1.0);
                 let mut filter = ui.memory_mut(|m| m.data.get_temp::<String>(filter_id).unwrap_or_default());
                 if searchable {
@@ -523,13 +522,16 @@ pub fn select(
 }
 
 /// Menu tier surface behind `add` (dropdowns, popovers, context menus): a 55 % wash of the menu
-/// surface with border, shadows and top rim. Use it as the only content of a `Popup` shown with
-/// `.frame(Frame::NONE)`.
-pub fn menu_surface<R>(ui: &mut Ui, p: &Palette, add: impl FnOnce(&mut Ui) -> R) -> R {
+/// surface with border, shadows and top rim, `width` points of content wide. Use it as the only
+/// content of a `Popup` shown with `.frame(Frame::NONE)`.
+pub fn menu_surface<R>(ui: &mut Ui, p: &Palette, width: f32, add: impl FnOnce(&mut Ui) -> R) -> R {
     let g = gl(ui, p);
     let slot = reserve(ui);
     let prev = set_in_glass(ui.ctx(), true);
-    let out = egui::Frame::new().inner_margin(Margin::same(4)).show(ui, add);
+    let out = egui::Frame::new().inner_margin(Margin::same(4)).show(ui, |ui| {
+        ui.set_width(width);
+        add(ui)
+    });
     set_in_glass(ui.ctx(), prev);
     ui.painter().set(slot, Shape::Vec(glass::menu_shapes(&g, out.response.rect, glass::RADIUS)));
     out.inner

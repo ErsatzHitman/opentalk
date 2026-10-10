@@ -165,7 +165,9 @@ pub const fn tokens(dark: bool) -> &'static Tokens {
 pub const PAGE_ALPHA_LIGHT: f32 = 0.80;
 pub const PAGE_ALPHA_DARK: f32 = 0.82;
 
-static OPAQUE: AtomicBool = AtomicBool::new(true);
+/// Opaque until a system backdrop is confirmed, so the window is never see-through without one.
+const OPAQUE_DEFAULT: bool = true;
+static OPAQUE: AtomicBool = AtomicBool::new(OPAQUE_DEFAULT);
 
 /// Switch the backdrop between "translucent over the Windows acrylic" and "opaque page colour".
 /// Opaque is the default until the window has confirmed a system backdrop, so the window is never
@@ -194,7 +196,11 @@ impl Gl {
         tokens(self.dark)
     }
     pub fn page_alpha(&self) -> f32 {
-        if is_opaque() {
+        self.page_alpha_for(is_opaque())
+    }
+    /// Page colour alpha for an explicit mode (pure; `page_alpha` reads the process-wide mode).
+    pub fn page_alpha_for(&self, opaque: bool) -> f32 {
+        if opaque {
             1.0
         } else if self.dark {
             PAGE_ALPHA_DARK
@@ -1266,14 +1272,15 @@ mod tests {
     }
 
     #[test]
-    fn opaque_mode_is_the_default_until_a_backdrop_is_confirmed() {
-        assert!(is_opaque());
-        let g = Gl { dark: false, window: WIN };
-        assert_eq!(g.page_alpha(), 1.0);
-        set_opaque(false);
-        assert_eq!(g.page_alpha(), PAGE_ALPHA_LIGHT);
-        assert_eq!(Gl { dark: true, window: WIN }.page_alpha(), PAGE_ALPHA_DARK);
-        set_opaque(true);
+    fn opaque_mode_paints_the_page_at_full_strength() {
+        let (light, dark) = (Gl { dark: false, window: WIN }, Gl { dark: true, window: WIN });
+        assert_eq!(light.page_alpha_for(true), 1.0);
+        assert_eq!(dark.page_alpha_for(true), 1.0);
+        assert_eq!(light.page_alpha_for(false), PAGE_ALPHA_LIGHT);
+        assert_eq!(dark.page_alpha_for(false), PAGE_ALPHA_DARK);
+        // The process-wide mode starts opaque (until a backdrop is confirmed): read it from a fresh
+        // static, not from the shared one other tests flip.
+        assert!(OPAQUE_DEFAULT);
     }
 
     #[cfg(windows)]
