@@ -295,6 +295,7 @@ impl Painter<'_, '_> {
     }
 
     /// Scrollbar thumb in canvas space.
+    #[cfg(test)]
     pub fn thumb(&mut self, r: Rect, hot: bool) {
         let c = self.th.fg;
         self.fill(r, r.w() * 0.5, c, if hot { 0.5 } else { 0.28 });

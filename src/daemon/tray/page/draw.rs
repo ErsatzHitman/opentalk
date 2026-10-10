@@ -14,7 +14,6 @@ use super::edit::{BULLET, Editor, LINE_H};
 use super::layout::{self, FS_BODY, FS_GROUP, FS_SMALL, Foc, LINE_BODY, LINE_SMALL, PAD_X, Part, Placed, ROW_BTN};
 use super::metrics::TextMetrics;
 use super::pager::{Confirm, BACK, Pager, STRIP_H, confirm_geo};
-use super::scroll::BAR_W;
 use super::session::{FieldEdit, Session, text_area, text_origin};
 use super::{BtnStyle, CARD_W_PAGE, FieldKind, Item, Lead, PAGE_HEADER_H, Row, Tone, ToolTone, Trailing};
 use crate::daemon::pill::kit::{Canvas, Rect, Rgba, sd_round_box};
@@ -126,9 +125,6 @@ pub fn render(f: &Frame) -> Option<Pixmap> {
 
     let mut p = Painter::new(Canvas::new(&mut pm, scale), th, f.text, f.m);
     draw_header(&mut p, pg, sess);
-    if let Some(s) = sess {
-        draw_scrollbar(&mut p, pg, s);
-    }
     if let Some(t) = &pg.toast {
         draw_strip(&mut p, pg, t);
     }
@@ -153,15 +149,6 @@ fn draw_header(p: &mut Painter, pg: &Pager, sess: Option<&Session>) {
     let max_w = CARD_W_PAGE - 52.0 - 16.0;
     let title = p.fit(&title, 15.0, 600, max_w);
     p.text(&title, 15.0, 600, MARGIN + 52.0, MARGIN + PAGE_HEADER_H * 0.5, th.fg, 1.0);
-}
-
-fn draw_scrollbar(p: &mut Painter, pg: &Pager, s: &Session) {
-    let Some(thumb) = s.scroll.thumb_rect(CARD_W_PAGE - 3.0) else { return };
-    let top = PAGE_HEADER_H + 1.0;
-    let r = Rect::new(thumb.l + MARGIN, thumb.t + top + MARGIN, thumb.r + MARGIN, thumb.b + top + MARGIN);
-    let hot = s.scroll.dragging() || s.bar_hover;
-    let _ = (pg, BAR_W);
-    p.thumb(r, hot);
 }
 
 fn draw_strip(p: &mut Painter, pg: &Pager, text: &str) {
@@ -598,9 +585,7 @@ fn draw_row(p: &mut Painter, o: Off, row: &Row, rc: R, btn: R, st: &St) {
         Lead::None => {}
         Lead::Icon(ic) => draw_icon(&mut p.cv, *ic, o.x(rc.l) + 1.0, o.y(cy), th.fg, 0.75),
         Lead::App { path, exe, name } => {
-            // beside the first line of a tall row, centred in a short one
-            let icy = if row.height >= 56.0 { rc.t + 22.0 } else { cy };
-            draw_app_icon(p, o.x(rc.l), o.y(icy), path.as_deref(), exe.as_deref(), name);
+            draw_app_icon(p, o.x(rc.l), o.y(cy), path.as_deref(), exe.as_deref(), name);
         }
     }
     if app_row {
@@ -773,6 +758,8 @@ pub fn render_page_cli(name: &str, o: &PageCli) -> Result<Pixmap, String> {
     let mut clip = MemClip::default();
     let mut r = PResp::default();
     pg.push_model(route, model, m, &mut r);
+    // the same fitting the popup does before every frame
+    pg.fit(m);
     if let (true, Some(s)) = (o.scroll > 0.0, pg.stack.last_mut()) {
         s.scroll.by(o.scroll);
     }
@@ -827,6 +814,7 @@ pub fn render_page_cli(name: &str, o: &PageCli) -> Result<Pixmap, String> {
     if !fx.is_empty() {
         pg.run(fx, m, &mut clip, &mut r);
     }
+    pg.fit(m);
     render(&Frame { pager: &pg, scale: o.scale, text: o.text, m }).ok_or_else(|| "could not render".to_string())
 }
 

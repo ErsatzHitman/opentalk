@@ -2,14 +2,15 @@
 //! Home / End, scroll-into-view of the focused item, and the thin scrollbar (thumb geometry and
 //! drag). Pure; the unit is logical px.
 
+#[cfg(test)]
 use crate::daemon::tray::popup::R;
 
 /// Logical px scrolled per wheel notch (`WHEEL_DELTA` = 120).
 pub const WHEEL_PX: f32 = 48.0;
 pub const WHEEL_DELTA: f32 = 120.0;
-/// Width of the scrollbar thumb and of its hit track.
+/// Width the scrollbar thumb had (the page no longer draws one; tests keep the geometry).
+#[cfg(test)]
 pub const BAR_W: f32 = 6.0;
-pub const BAR_HIT_W: f32 = 14.0;
 pub const THUMB_MIN: f32 = 28.0;
 /// Margin kept around an item scrolled into view.
 pub const VIEW_MARGIN: f32 = 8.0;
@@ -102,6 +103,7 @@ impl Scroll {
     }
 
     /// The thumb as a rect in viewport-local coordinates for a bar whose right edge is at `right`.
+    #[cfg(test)]
     pub fn thumb_rect(&self, right: f32) -> Option<R> {
         self.thumb().map(|(t, l)| R::new(right - BAR_W, t, right, t + l))
     }

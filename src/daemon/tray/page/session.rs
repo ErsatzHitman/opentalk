@@ -7,8 +7,8 @@
 use super::edit::{EditKey, Editor, LINE_H, NavKey};
 use super::layout::{self, CONTENT_W, Foc, Layout, Part};
 use super::metrics::TextMetrics;
-use super::scroll::{BAR_HIT_W, Scroll};
-use super::{CARD_W_PAGE, Cx, Effect, Event, FieldKind, Item, ItemId, PageModel, Route, Row, ToolTone, Trailing};
+use super::scroll::Scroll;
+use super::{Cx, Effect, Event, FieldKind, Item, ItemId, PageModel, Route, Row, ToolTone, Trailing};
 use crate::daemon::tray::popup::R;
 
 /// The system clipboard as the session sees it.
@@ -409,8 +409,9 @@ impl Session {
     // Pointer
     // -----------------------------------------------------------------------------------------
 
-    fn on_bar(&self, x: f32, y: f32) -> bool {
-        self.scroll.scrollable() && x >= CARD_W_PAGE - BAR_HIT_W && y >= 0.0 && y < self.scroll.view_h
+    /// The scrollbar is not shown (pages scroll with the wheel, keys and focus), so nothing is a bar.
+    fn on_bar(&self, _x: f32, _y: f32) -> bool {
+        false
     }
 
     /// Caret position in the edited field for a body-local pointer position.
@@ -1215,25 +1216,6 @@ mod tests {
         t.key(K::PgDn);
         t.key(K::PgUp);
         assert_eq!(t.s.scroll.offset, 0.0);
-    }
-
-    #[test]
-    fn scrollbar_drag_and_track_clicks() {
-        let items: Vec<Item> = (0..30).map(toggle).collect();
-        let mut t = setup(items, 0);
-        let (top, len) = t.s.scroll.thumb().unwrap();
-        let x = CARD_W_PAGE - 3.0;
-        t.env(|s, e| {
-            s.press(x, top + len * 0.5, false, e);
-            s.pointer(Some((x, top + len * 0.5 + 40.0)), true, e);
-        });
-        assert!(t.s.scroll.offset > 0.0 && t.s.scroll.dragging());
-        t.env(|s, e| s.release(x, 100.0, e));
-        assert!(!t.s.scroll.dragging());
-        assert!(t.events().is_empty(), "scrollbar input never reaches the model");
-        // Hovering the track is flagged.
-        t.env(|s, e| s.pointer(Some((x, 50.0)), false, e));
-        assert!(t.s.bar_hover);
     }
 
     #[test]

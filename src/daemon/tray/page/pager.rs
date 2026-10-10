@@ -76,6 +76,9 @@ pub struct ConfirmGeo {
 pub const DLG_W: f32 = 332.0;
 pub const DLG_BODY_LINE: f32 = 17.0;
 
+/// Shortest a fitted page card gets (a page with almost nothing on it).
+const FIT_MIN_H: f32 = 160.0;
+
 pub fn confirm_geo(c: &Confirm, card_h: f32, m: &dyn TextMetrics) -> ConfirmGeo {
     let body = wrap_lines(&c.body, 12.5, 400, DLG_W - 36.0, &|s, px, w| m.width(s, px, w));
     let h = 18.0 + 20.0 + 6.0 + body.len() as f32 * DLG_BODY_LINE + 18.0 + 32.0 + 16.0;
@@ -98,8 +101,10 @@ pub struct Pager {
     /// The popup's working copy of the config (pages mutate it; `Saved` posts it to the daemon).
     pub cfg: Config,
     pub dark: bool,
-    /// Card height (logical px), fixed for the popup's life.
+    /// Card height (logical px): fitted to the page's content by [`Pager::fit`], at most `max_h`.
     pub card_h: f32,
+    /// Tallest the card may be (the screen's room, see `popup::page_card_h`).
+    pub max_h: f32,
     pub stack: Vec<Session>,
     pub toast: Option<String>,
     pub confirm: Option<Confirm>,
@@ -111,7 +116,24 @@ pub struct Pager {
 
 impl Pager {
     pub fn new(cfg: Config, dark: bool, card_h: f32, waker: Waker) -> Pager {
-        Pager { cfg, dark, card_h, stack: Vec::new(), toast: None, confirm: None, back_hover: false, back_down: false, waker, now: None }
+        Pager { cfg, dark, card_h, max_h: card_h, stack: Vec::new(), toast: None, confirm: None, back_hover: false, back_down: false, waker, now: None }
+    }
+
+    /// Fit the card to the page on top: header + content (+ the toast strip), between a small minimum
+    /// and `max_h`; a page taller than that scrolls. An open confirmation keeps room for its dialog.
+    pub fn fit(&mut self, m: &dyn TextMetrics) {
+        let strip = if self.toast.is_some() { STRIP_H } else { 0.0 };
+        let content = self.top().map_or(0.0, |s| s.layout.content_h);
+        let mut want = (PAGE_HEADER_H + content + strip).ceil();
+        if let Some(c) = &self.confirm {
+            want = want.max(PAGE_HEADER_H + confirm_geo(c, 0.0, m).dlg.h() + 40.0);
+        }
+        self.card_h = want.clamp(FIT_MIN_H.min(self.max_h), self.max_h);
+        let bh = self.body_h();
+        if let Some(s) = self.stack.last_mut() {
+            let ch = s.layout.content_h;
+            s.scroll.resize(bh, ch);
+        }
     }
 
     pub fn body_h(&self) -> f32 {

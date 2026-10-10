@@ -204,7 +204,7 @@ merged build:
    you pick a row, press Esc or click anywhere else; clicking the tray icon again closes it too. While it is open it follows
    the dictation (a hotkey press or a finished transcription updates the Start / Stop row in place). **Start dictation**
    here is the same as the hotkey: same sounds, mute, app bubble and paste target (the app you were in before you clicked
-   the tray). **History**, **Dictionary** and **Settings** open as pages inside the popup (380 px wide); the arrow at the
+   the tray). **History**, **Dictionary** and **Settings** open as pages inside the popup (380 px wide, as tall as their content up to 600 px; longer pages scroll with the wheel or keys); the arrow at the
    top left, Backspace, Alt+Left or Esc go back. Settings lists Preferences, Hotkeys, Speech-to-Text, Cleanup & AI,
    Privacy & Data and About (one icon row each); choices such as the language or provider open a list page;
    the Dictionary page links to Snippets. Changes apply at once. Actions are small icon buttons (the Windows 11 icon font,

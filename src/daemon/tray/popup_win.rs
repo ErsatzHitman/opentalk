@@ -594,6 +594,11 @@ fn resize_view(p: &mut Popup) {
 
 /// Render the current state and push it to the layered window.
 fn present(p: &mut Popup) {
+    // pages are as tall as their content: fit, then resize and re-place the window if that changed
+    if let Some(pg) = p.pager.as_mut() {
+        pg.fit(&p.metrics);
+    }
+    resize_view(p);
     let pm = match &p.pager {
         Some(pg) => page_draw::render(&Frame { pager: pg, scale: p.scale, text: true, m: &p.metrics }),
         None => popup_draw::render(&View { content: &p.content, layout: &p.layout, nav: p.nav, dark: p.dark, scale: p.scale, text: true }),
