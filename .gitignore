@@ -1,5 +1,7 @@
 /target
 *.key
 *.secret
+.env
+.env.*
 /bench/out
 /bench/flac_probe/target

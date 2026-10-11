@@ -36,7 +36,7 @@ impl BatchProvider for Openrouter {
 
         let url = format!("{}/chat/completions", base_url(creds, DEFAULT_BASE));
         let auth = format!("Bearer {key}");
-        let headers = [("Authorization", auth.as_str()), ("HTTP-Referer", "https://opentalk.app"), ("X-Title", "OpenTalk")];
+        let headers = [("Authorization", auth.as_str()), ("HTTP-Referer", crate::llm::providers::chat::OPENROUTER_REFERER), ("X-Title", "OpenTalk")];
         let res = http::post_json(&url, &headers, &body, timeout(opts));
         let resp = errors::check_response("OpenRouter", Some(model), false, res)?;
         let v: Value = resp.json().map_err(|e| errors::bad_response("OpenRouter", false, &format!("invalid JSON ({e})"), &resp.body))?;
@@ -198,7 +198,7 @@ mod tests {
         let r = mock.one();
         assert_eq!((r.method.as_str(), r.path.as_str()), ("POST", "/chat/completions"));
         assert_eq!(r.header("authorization"), Some("Bearer sk-or-v1-test-key-0001"));
-        assert_eq!(r.header("http-referer"), Some("https://opentalk.app"));
+        assert_eq!(r.header("http-referer"), Some(crate::llm::providers::chat::OPENROUTER_REFERER));
         assert_eq!(r.header("x-title"), Some("OpenTalk"));
         assert_eq!(r.header("content-type"), Some("application/json"));
         let b = r.json();

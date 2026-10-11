@@ -1,7 +1,8 @@
 # Builds opentalk.exe (cross-compiled on Linux with mingw-w64, the same path as README
 # "Cross-compile and test on Linux") and publishes it as a GitHub Release asset.
 #   - every push to main updates the rolling "latest" pre-release
-#   - a pushed tag v* (e.g. v0.1.0) creates a normal release for that tag
+#   - a pushed tag v* (e.g. v1.0.0) creates a normal release for that tag, with the notes in
+#     docs/releases/<tag>.md when that file exists
 #   - "Run workflow" on the Actions tab does the same as a push to main
 name: release
 
@@ -57,11 +58,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            notes="docs/releases/${GITHUB_REF_NAME}.md"
+            if [[ -f "$notes" ]]; then set -- --notes-file "$notes"; else set -- --generate-notes; fi
             gh release create "$GITHUB_REF_NAME" dist/opentalk.exe dist/opentalk.exe.sha256 \
-              --title "OpenTalk $GITHUB_REF_NAME" --generate-notes
+              --title "OpenTalk $GITHUB_REF_NAME" --latest "$@"
           else
             gh release delete latest --yes --cleanup-tag || true
             gh release create latest dist/opentalk.exe dist/opentalk.exe.sha256 \
-              --prerelease --target "$GITHUB_SHA" --title "Latest build (main)" \
+              --prerelease --latest=false --target "$GITHUB_SHA" --title "Latest build (main)" \
               --notes "Built from ${GITHUB_SHA::7} on main. Unsigned: Windows SmartScreen may warn on first run (More info > Run anyway)."
           fi

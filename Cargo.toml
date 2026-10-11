@@ -1,7 +1,13 @@
 [package]
 name = "opentalk"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
+description = "Ultra-light voice dictation for Windows: press a hotkey, talk, and clean text is pasted where your cursor is."
+license = "MIT"
+repository = "https://github.com/ErsatzHitman/opentalk"
+readme = "README.md"
+keywords = ["dictation", "speech-to-text", "windows", "whisper", "voice"]
+categories = ["accessibility", "multimedia::audio"]
 
 [dependencies]
 base64 = "0.23.1"

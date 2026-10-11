@@ -4,7 +4,7 @@ use crate::core::config::LlmProviderId;
 use crate::llm::LlmError;
 use serde_json::{Value, json};
 
-pub const OPENROUTER_REFERER: &str = "https://github.com/opentalk";
+pub const OPENROUTER_REFERER: &str = "https://github.com/ErsatzHitman/opentalk";
 pub const OPENROUTER_TITLE: &str = "OpenTalk";
 
 /// Floor for `max_tokens` on chat-completions providers (see [`build`]).
@@ -116,7 +116,7 @@ mod tests {
     #[test]
     fn openrouter_headers_and_reasoning_toggle() {
         let b = build(&req(LlmProviderId::Openrouter, "https://openrouter.ai/api/v1", "nvidia/nemotron-3.5-lightning:free", "sk-or-test-123"));
-        assert!(b.headers.contains(&("HTTP-Referer", "https://github.com/opentalk".to_string())));
+        assert!(b.headers.contains(&("HTTP-Referer", "https://github.com/ErsatzHitman/opentalk".to_string())));
         assert!(b.headers.contains(&("X-Title", "OpenTalk".to_string())));
         assert_eq!(b.body["temperature"], 0);
         assert!(b.body.get("reasoning_effort").is_none());
@@ -159,7 +159,7 @@ mod tests {
         let c = rx.recv_timeout(Duration::from_secs(2)).unwrap();
         assert_eq!(c.path(), "/api/v1/chat/completions");
         assert_eq!(c.header("authorization"), Some("Bearer sk-or-test-123"));
-        assert_eq!(c.header("http-referer"), Some("https://github.com/opentalk"));
+        assert_eq!(c.header("http-referer"), Some("https://github.com/ErsatzHitman/opentalk"));
         assert_eq!(c.header("x-title"), Some("OpenTalk"));
         assert_eq!(c.json()["model"], "google/gemma-4-31b-it:free");
     }
