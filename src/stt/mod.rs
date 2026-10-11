@@ -2,6 +2,7 @@
 //! implement `StreamingProvider`. `transcribe()` dispatches on the active config.
 //! TASK stt-batch owns batch providers + errors + dispatch; TASK stt-stream owns streaming + Corti.
 pub mod errors;
+pub mod local;
 pub mod providers;
 pub mod registry;
 pub mod streaming;
@@ -174,6 +175,9 @@ pub fn options(cfg: &Config) -> SttOptions {
 /// Batch transcription with the active provider (streaming-only providers return
 /// `SttErrorCode::StreamingOnly`). Applies the dictionary-echo filter.
 pub fn transcribe(cfg: &Config, audio: &Audio) -> Result<Transcript, SttError> {
+    if local::is_local(cfg) {
+        return local::transcribe(cfg, audio);
+    }
     transcribe_with(cfg.stt.provider, audio, &options(cfg), &credentials(cfg))
 }
 
@@ -214,12 +218,19 @@ pub fn transcribe_with(id: SttProviderId, audio: &Audio, opts: &SttOptions, cred
 
 /// Start a streaming session if the active provider/model streams and the config prefers it.
 pub fn start_stream(cfg: &Config) -> Option<Result<Box<dyn StreamingSession>, SttError>> {
+    if local::is_local(cfg) {
+        return local::start_stream(cfg);
+    }
     streaming::start(cfg)
 }
 
 /// Pre-warm the active provider's connection (called at hotkey press). Never decrypts
 /// secrets: only the endpoint matters.
 pub fn prewarm(cfg: &Config) {
+    local::prewarm(cfg);
+    if local::is_local(cfg) {
+        return;
+    }
     let id = cfg.stt.provider;
     let streams = registry::model(id, &cfg.stt_model()).is_some_and(|m| m.streaming_only || (m.streaming && cfg.stt.prefer_streaming));
     if streams {

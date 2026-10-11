@@ -4,8 +4,9 @@
 and clean text is typed where your cursor is.
 
 - **Light:** a single ~4 MB portable `.exe` with no installer, no runtime and no web view. It uses close to 0% CPU when idle.
-- **Bring your own key:** speech-to-text runs on the cloud provider you choose (OpenAI, Groq, Deepgram, Gemini and more).
-  There is no account, no telemetry and no model to download.
+- **Cloud or local:** bring your own key for a cloud provider (OpenAI, Groq, Deepgram, Gemini and more), or download
+  one of 15 local models (Parakeet, Whisper, Qwen3-ASR, Moonshine and more) that run on your PC with no key, so audio
+  never leaves the machine. There is no account and no telemetry.
 - **Clean output:** filler words ("um", "you know"), stutters and transcription glitches are removed locally in a few
   milliseconds. Optional AI cleanup and a spoken *"rewrite this concisely"* command run on an AI model of your choice.
 - **Pleasant to use:** a floating glass pill shows a live waveform while you talk, and everything else lives in a
@@ -30,20 +31,29 @@ That's it: there is no installer, and nothing else is needed.
 
 ## Set up (one minute)
 
-On first launch OpenTalk opens **Settings → Speech-to-Text** in the tray popup.
+On first launch OpenTalk opens **Settings → Speech-to-Text** in the tray popup. Choose one option:
 
-1. **Pick a speech-to-text provider.** Groq, OpenAI, Deepgram, Gemini, Mistral, xAI, AssemblyAI, Corti, Tinfoil,
-   OpenRouter, or a custom / Azure OpenAI endpoint.
-2. **Paste your API key** and press **Save**. Keys are encrypted with Windows DPAPI for your user account.
-3. **Press ▶ Test** to check the key and model.
+- **Bring your own key** (cloud):
+  1. **Pick a provider:** Groq, OpenAI, Deepgram, Gemini, Mistral, xAI, AssemblyAI, Corti, Tinfoil, OpenRouter, or a
+     custom / Azure OpenAI endpoint.
+  2. **Paste your API key** and press **Save**. Keys are encrypted with Windows DPAPI for your user account.
+  3. **Press ▶ Test** to check the key and model.
+- **Use a local model** (on this PC, no key):
+  1. **Tap a model** to download it once. Badges show which to pick: **Best overall** (Parakeet TDT 0.6B v3),
+     **Most accurate**, **Low-end PCs**, **Fastest** and others. See [docs/LOCAL_MODELS.md](docs/LOCAL_MODELS.md) for
+     the evidence behind each.
+  2. **Wait for the download.** OpenTalk switches to the model when the download finishes, and the first one also
+     fetches the 27 MB engine.
+  3. **Press ▶ Test** on the same page to check it.
 
 Optional, under **Settings → Cleanup & AI**:
 
 - **AI cleanup:** polishes every dictation (grammar, punctuation) with an AI model. If the AI call fails, your
   transcript is pasted anyway and History marks it *STT fallback*.
 - **AI rewrite:** end a dictation with *"rewrite this concisely"* (or a phrase you choose) to paste a shorter version.
-- **AI model:** both features share one AI model: OpenAI, Anthropic, Gemini, Groq, OpenRouter, Azure OpenAI, Bedrock,
-  Vertex or any OpenAI-compatible endpoint. You can switch each feature on or off independently.
+- **AI provider:** both features share one provider and key (OpenAI, Anthropic, Gemini, Groq, OpenRouter, Azure
+  OpenAI, Bedrock, Vertex or any OpenAI-compatible endpoint). Each feature picks its own model, and each switches
+  on or off independently.
 - **On-device cleanup:** filler-word removal (Off / Standard / Aggressive), fuzzy dictionary fixes and spoken
   "new line" / "new paragraph". This runs locally and is always available.
 
@@ -87,8 +97,8 @@ Everything is in the tray popup under **Settings**, and changes apply immediatel
 |---|---|
 | Preferences | Theme (light / dark / system), sounds, pause media, mute system audio while dictating, auto-paste, keep text on the clipboard, floating pill (auto-hide, position, app bubble), language, microphone, launch at login |
 | Hotkeys | Dictation hotkey (modifier-only combos such as Ctrl + Win allowed), Tap or Push to talk, Start-menu suppression |
-| Speech-to-Text | Provider, model, API key, custom endpoint, streaming, test |
-| Cleanup & AI | AI rewrite, AI cleanup (with an editable prompt), the shared AI model, on-device cleanup |
+| Speech-to-Text | **Bring your own key**: provider, model, API key, custom endpoint, streaming, test. **Use a local model**: download, use, test or delete any of the 15 local models |
+| Cleanup & AI | AI rewrite and AI cleanup, each with its own model (and cleanup's editable prompt), the AI provider they share, on-device cleanup |
 | Privacy & Data | History on/off and retention, keep failed audio for Retry, clear history |
 | About | Version, data and log folders, reset app data |
 
@@ -97,14 +107,15 @@ launching the exe a second time.
 
 ## Privacy
 
-- **Audio:** OpenTalk records **only** between start and stop, and sends the audio over HTTPS / WSS to the
-  speech-to-text provider you picked, nowhere else. Audio is never written to disk. After a failed transcription it
+- **Audio:** OpenTalk records **only** between start and stop. With a local model it never leaves your PC.
+  With a cloud provider it goes over HTTPS / WSS to the provider you picked, nowhere else. Audio is never written to disk. After a failed transcription it
   stays in memory for Retry until the next dictation or until you quit.
 - **Text:** your transcribed text, never audio, goes to your AI model only when AI cleanup is on or when you say the
   rewrite phrase.
 - **Keys:** API keys are encrypted with Windows DPAPI in `%APPDATA%\OpenTalk\secrets.json` and are never logged.
 - **History:** history is a local file (`history.jsonl`) that you can turn off, auto-prune or clear.
-- **No telemetry:** there is no telemetry, no analytics and no account.
+- **No telemetry:** there is no telemetry, no analytics and no account. Local model downloads come from the
+  sherpa-onnx releases (GitHub), PyPI, npm and Hugging Face.
 - **Screen capture:** the pill is hidden from screenshots and screen sharing. Its glass effect needs a clean copy of
   the screen behind it.
 

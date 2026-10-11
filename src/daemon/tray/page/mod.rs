@@ -69,8 +69,6 @@ pub type ItemId = u16;
 pub enum Tone {
     Info,
     Warn,
-    /// No page uses it since the saved-key badge became a tools line; the debug gallery does.
-    #[cfg_attr(not(debug_assertions), allow(dead_code))]
     Ok,
     Err,
 }
@@ -310,6 +308,12 @@ pub enum ConfirmId {
     ResetApp,
     /// Remove a stored API key (page-private numbering).
     RemoveKey(u16),
+    /// Download the local model at this catalog index.
+    LocalDownload(u16),
+    /// Stop downloading the local model at this catalog index.
+    LocalCancel(u16),
+    /// Delete the installed local model at this catalog index.
+    LocalRemove(u16),
 }
 
 /// What a model asks the popup to do. Applied in order after each event.
@@ -479,6 +483,8 @@ pub fn model_for(route: &Route) -> Option<Box<dyn PageModel>> {
         Route::SettingsIndex => settings::index_model(),
         Route::Settings(s) => settings::model(s),
         Route::Picker(p) => settings::picker_model(p),
+        Route::SttCloud => settings::stt::SttPage::boxed(),
+        Route::SttLocal => settings::local::LocalModelsPage::boxed(),
     })
 }
 
@@ -524,6 +530,7 @@ mod tests {
         ];
         v.extend(Section::ALL.iter().map(|s| Route::Settings(*s)));
         v.extend(PickerId::ALL.iter().map(|p| Route::Picker(*p)));
+        v.extend([Route::SttCloud, Route::SttLocal]);
         v
     }
 

@@ -569,6 +569,8 @@ impl App {
         if diff.providers {
             // A test started with the old provider settings no longer describes them.
             self.test_token += 1;
+            // load the newly chosen local model now (or stop the old one)
+            crate::stt::local::prewarm(&self.cfg);
         }
         if diff.hotkey {
             match hotkey::set_hotkey(&self.cfg.hotkey) {
@@ -713,6 +715,7 @@ impl App {
     fn quit(&mut self) {
         log_info!("quit requested");
         self.cancel_everything();
+        crate::stt::local::shutdown();
         hotkey::stop();
         if let Some(tray) = self.tray.as_mut() {
             tray.remove();
@@ -1038,6 +1041,8 @@ pub fn run(hidden: bool, initial: Option<Route>) -> i32 {
     crate::daemon::tray::set_hotkey_capture_hooks(hotkey::begin_capture, hotkey::end_capture, hotkey::capture_rearm);
     crate::daemon::tray::sync_config(&app.cfg);
     app.sync_foreground();
+    // a local model loads in the background, so the first dictation does not wait for it
+    crate::stt::local::prewarm(&app.cfg);
     let mic = app.cfg.mic_device_id.clone();
     let warm_hold = app.cfg.mic_warm_hold_secs;
     let pause_media = app.cfg.pause_media;

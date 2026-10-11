@@ -35,3 +35,9 @@ SOFTWARE.```
 `opentalk.exe` statically links the Rust crates listed in `Cargo.lock`. All of them are under permissive licences
 (MIT, Apache-2.0, BSD-2-Clause, BSD-3-Clause, Zlib, Unicode-3.0, 0BSD or Unlicense). `cargo about` or
 `cargo license` lists each crate with its licence text.
+
+## sherpa-onnx and the local models (downloaded on request, not bundled)
+
+Choosing a local model downloads the [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) runtime, version 1.13.8
+(Apache-2.0), with ONNX Runtime (MIT), and the model's files from their publishers. OpenTalk does not redistribute
+them. Model licences are listed in [docs/LOCAL_MODELS.md](docs/LOCAL_MODELS.md#model-licences).

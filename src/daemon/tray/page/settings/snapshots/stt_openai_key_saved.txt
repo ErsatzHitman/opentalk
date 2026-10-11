@@ -1,4 +1,4 @@
-# Speech-to-Text
+# Bring your own key
   choice #1 Provider > OpenAI
   tools #104 API key -- sk-...wxyz [Replace key] [Remove key]
 

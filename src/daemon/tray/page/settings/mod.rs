@@ -13,10 +13,12 @@ pub mod hotkeys;
 pub mod index;
 pub mod keyfield;
 pub mod kit;
+pub mod local;
 pub mod pickers;
 pub mod prefs;
 pub mod privacy;
 pub mod stt;
+pub mod stt_home;
 
 use super::{PageModel, PickerId, Section};
 
@@ -31,7 +33,7 @@ pub fn model(section: Section) -> Box<dyn PageModel> {
     match section {
         Section::Preferences => prefs::PrefsPage::boxed(),
         Section::Hotkeys => hotkeys::HotkeysPage::boxed(),
-        Section::SpeechToText => stt::SttPage::boxed(),
+        Section::SpeechToText => stt_home::SttHomePage::boxed(),
         Section::Cleanup => cleanup::CleanupPage::boxed(),
         Section::Privacy => privacy::PrivacyPage::boxed(),
         Section::About => about::AboutPage::boxed(),
@@ -55,6 +57,7 @@ mod tests {
         let mut routes = vec![Route::SettingsIndex];
         routes.extend(Section::ALL.iter().map(|s| Route::Settings(*s)));
         routes.extend(PickerId::ALL.iter().map(|p| Route::Picker(*p)));
+        routes.extend([Route::SttCloud, Route::SttLocal]);
         for r in routes {
             let mut cfg = Config::default();
             let mut m = crate::daemon::tray::page::model_for(&r).unwrap();

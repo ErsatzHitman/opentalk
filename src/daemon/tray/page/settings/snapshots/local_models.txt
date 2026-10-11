@@ -1,0 +1,22 @@
+# Local models
+  note: Runs on this PC: no API key, and your audio never leaves it. Tap a model to download it once.
+  note: The first download also fetches the local engine (27 MB).
+
+## Recommended
+  row #100 NVIDIA Parakeet TDT 0.6B v3 -- 465 MB · 25 European languages
+  row #101 Qwen3-ASR 1.7B -- 2.3 GB · 52 languages and dialects
+  row #102 Whisper Large-v3 Turbo -- 538 MB · 99 languages
+  row #103 Nemotron-3.5-ASR-Streaming 0.6B -- 650 MB · 15 languages
+  row #104 Whisper Small -- 610 MB · 99 languages
+  row #105 Distil-Whisper Small.en -- 433 MB · English
+  row #106 Moonshine Base -- 239 MB · English
+  row #107 Moonshine Tiny -- 103 MB · English
+
+## More models
+  row #108 Qwen3-ASR 0.6B -- 900 MB · 52 languages and dialects
+  row #109 Whisper Large-v3 -- 1.0 GB · 99 languages
+  row #110 Distil-Whisper Large-v3 -- 505 MB · English
+  row #111 Distil-Whisper Medium.en -- 961 MB · English
+  row #112 Whisper Medium -- 1.8 GB · 99 languages
+  row #113 Whisper Base -- 198 MB · 99 languages
+  row #114 Whisper Tiny -- 111 MB · 99 languages

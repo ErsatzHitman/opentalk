@@ -852,8 +852,9 @@ fn after_unmute_within(unmuted: Option<mpsc::Receiver<()>>, wait: Duration, then
     }
 }
 
-fn provider_name(cfg: &Config) -> String {
-    format!("{:?}", cfg.stt.provider).to_ascii_lowercase()
+/// The `provider` a history entry records: the cloud provider's id, or `local`.
+pub(super) fn provider_name(cfg: &Config) -> String {
+    if stt::local::is_local(cfg) { "local".into() } else { format!("{:?}", cfg.stt.provider).to_ascii_lowercase() }
 }
 
 fn base_entry(cfg: &Config, app: &AppInfo) -> Entry {
@@ -863,7 +864,7 @@ fn base_entry(cfg: &Config, app: &AppInfo) -> Entry {
         app_exe: app.exe.clone(),
         app_path: app.path.clone(),
         provider: provider_name(cfg),
-        model: cfg.stt_model(),
+        model: if stt::local::is_local(cfg) { cfg.stt.local_model.clone() } else { cfg.stt_model() },
         ..Entry::default()
     }
 }

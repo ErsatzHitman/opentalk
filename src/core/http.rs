@@ -188,6 +188,36 @@ pub fn delete(url: &str, headers: &[(&str, &str)], timeout: Duration) -> Result<
     convert(req.call())
 }
 
+/// A large download in progress: the status, the announced length and the body as a stream.
+pub struct Download {
+    pub status: u16,
+    pub len: Option<u64>,
+    pub body: Box<dyn std::io::Read + Send + Sync>,
+}
+
+static DOWNLOAD_AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+
+/// Open `url` for a streamed download (model files): redirects followed, no overall deadline, but
+/// a read that stalls for 60 s fails, so a dead connection cannot hang the download for ever.
+/// Non-2xx statuses are returned, not turned into errors.
+pub fn open_download(url: &str) -> Result<Download, HttpError> {
+    let agent = match DOWNLOAD_AGENT.get() {
+        Some(a) => a,
+        None => {
+            let tls = native_tls::TlsConnector::new().map_err(|_| tls_unavailable())?;
+            DOWNLOAD_AGENT.get_or_init(|| builder().timeout_read(Duration::from_secs(60)).tls_connector(Arc::new(tls)).redirects(8).build())
+        }
+    };
+    let resp = match agent.get(url).call() {
+        Ok(r) => r,
+        Err(ureq::Error::Status(_, r)) => r,
+        Err(ureq::Error::Transport(t)) => return Err(HttpError::Network(t.to_string())),
+    };
+    let status = resp.status();
+    let len = resp.header("Content-Length").and_then(|v| v.trim().parse().ok());
+    Ok(Download { status, len, body: Box::new(resp.into_reader()) })
+}
+
 /// Open (and pool) a TLS connection to `url`'s origin in the background, so the real
 /// request right after recording reuses a warm keep-alive socket. Errors are ignored.
 pub fn prewarm(url: &str) {

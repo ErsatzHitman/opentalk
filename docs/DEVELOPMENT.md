@@ -145,6 +145,27 @@ merged build:
   `openrouter.ai`.
 
 
+## Local models: end-to-end test
+
+`stt::local::tests::local_engine_end_to_end` (ignored) exercises the whole local engine on the real sherpa-onnx
+Windows runtime:
+- **Install:** the download with hash checks, unpacking, the import patch and the model install.
+- **Run:** the server start, the websocket protocol, and splitting and joining a long dictation.
+
+It uses a synthetic CTC model that spells "hello world" for any audio, built by `tools/make_test_ctc.py`. Serve a
+folder holding that archive and the two runtime packages (file names as in `src/stt/local/install.rs`), then:
+
+```sh
+pip install onnx numpy && python3 tools/make_test_ctc.py mirror/
+# + mirror/sherpa_onnx_bin-1.13.8-py3-none-win_amd64.whl and mirror/sherpa-onnx-win-x64-1.13.8.tgz
+python3 -m http.server 8765 --directory mirror &
+OPENTALK_TEST_LOCAL_MIRROR=http://127.0.0.1:8765 cargo test -- --ignored local_engine_end_to_end
+```
+
+On Windows the system `tar.exe` unpacks. Under Wine there is none: set `OPENTALK_TAR` to a `.cmd` that runs a host
+`bsdtar` (Wine's `start /wait /unix` does not wait, so the wrapper polls for a marker file). The real models'
+accuracy is not part of this test; run the app with each model on Windows.
+
 ## Command line
 
 Command line (the exe is a GUI-subsystem program, so run these from a terminal and capture the output with a pipe):
@@ -153,7 +174,7 @@ Command line (the exe is a GUI-subsystem program, so run these from a terminal a
 |---|---|
 | `opentalk.exe --hidden` | Start straight into the tray (what launch-at-login uses) |
 | `opentalk.exe --settings [page]` | Open the tray popup at a page: `settings` (default), `settings:<preferences\|hotkeys\|stt\|cleanup\|privacy\|about>`, `history`, `dictionary`, `snippets` or `home`. A running daemon shows it; otherwise this starts the daemon and opens it |
-| `opentalk.exe --transcribe-file x.wav [--provider id] [--model m] [--llm\|--no-llm] [--rewrite-trigger "phrase"\|--no-rewrite]` | Run the full pipeline headless, print JSON `{raw, text, provider, model, stt_ms, cleanup_ms, total_ms, ai_cleaned, rewrite, rewritten, rewrite_error, original}` |
+| `opentalk.exe --transcribe-file x.wav [--provider id] [--model m] [--local <model id>] [--llm\|--no-llm] [--rewrite-trigger "phrase"\|--no-rewrite]` | Run the full pipeline headless, print JSON `{raw, text, provider, model, stt_ms, cleanup_ms, total_ms, ai_cleaned, rewrite, rewritten, rewrite_error, original}` |
 | `opentalk.exe --render-pill <state> <t_ms> out.png [--dark] [--backdrop white\|black\|gradient\|busy-text [--composite]] [--upscale N]` | Render a pill state to PNG (visual goldens), optionally over a backdrop fixture (`--composite` shows the window over the fixture it sits on) |
 | `opentalk.exe --render-tray-popup out.png [--dark] [--recording\|--transcribing] [--recent] [--retry] [--hover <row>] [--focus] [--page <page>]` | Render the tray popup (Home, or a page) to PNG (screenshots, structural goldens) |
 | `opentalk.exe --bench ...` | Benchmark helpers: `toggle`, `start`, `stop`, `cancel`, `retry`, `reload`, `quit`, `settings [page]`, `dictate <n> <wav>`, `latency`, `mock-stt`, `info` (see `bench/bench.ps1`) |

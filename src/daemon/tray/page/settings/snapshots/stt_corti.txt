@@ -1,4 +1,4 @@
-# Speech-to-Text
+# Bring your own key
   choice #1 Provider > Corti
   tools #101 Client ID [Get a key] [Save client ID (disabled)]
   field #100  [secret] = "" (hint "Paste your client ID")

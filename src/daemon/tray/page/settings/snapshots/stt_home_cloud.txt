@@ -1,0 +1,3 @@
+# Speech-to-Text
+  row #1 Bring your own key > -- OpenAI · gpt-4o-mini-transcribe
+  row #2 Use a local model > -- Runs on this PC · no API key, audio stays here

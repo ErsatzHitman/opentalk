@@ -114,6 +114,10 @@ pub enum Route {
     SettingsIndex,
     Settings(Section),
     Picker(PickerId),
+    /// Speech-to-Text > Bring your own key (cloud provider, key, model).
+    SttCloud,
+    /// Speech-to-Text > Use a local model (the model list).
+    SttLocal,
 }
 
 /// Marks a wparam as a route code, so a stray message with wparam 0 is not read as a route.
@@ -137,6 +141,8 @@ impl Route {
             "dictionary" | "dict" | "words" => Route::Dictionary,
             "snippets" => Route::Snippets,
             "settings" => Route::SettingsIndex,
+            "stt:cloud" | "stt-cloud" | "byok" | "settings:stt:cloud" => Route::SttCloud,
+            "stt:local" | "stt-local" | "local" | "local-models" | "settings:stt:local" => Route::SttLocal,
             s => {
                 if let Some(sec) = s.strip_prefix("settings:").or_else(|| s.strip_prefix("settings/")) {
                     Section::parse(sec).map_or(Route::SettingsIndex, Route::Settings)
@@ -161,6 +167,8 @@ impl Route {
             Route::SettingsIndex => (6, 0),
             Route::Settings(s) => (7, Section::ALL.iter().position(|x| *x == s).unwrap_or(0) as u64),
             Route::Picker(p) => (8, PickerId::ALL.iter().position(|x| *x == p).unwrap_or(0) as u64),
+            Route::SttCloud => (9, 0),
+            Route::SttLocal => (10, 0),
         }
     }
 
@@ -188,6 +196,8 @@ impl Route {
             6 => no_payload(Route::SettingsIndex),
             7 => Section::ALL.get(payload as usize).map(|s| Route::Settings(*s)),
             8 => PickerId::ALL.get(payload as usize).map(|p| Route::Picker(*p)),
+            9 => no_payload(Route::SttCloud),
+            10 => no_payload(Route::SttLocal),
             _ => None,
         }
     }
@@ -212,7 +222,16 @@ mod tests {
         ];
         v.extend(Section::ALL.iter().map(|s| Route::Settings(*s)));
         v.extend(PickerId::ALL.iter().map(|p| Route::Picker(*p)));
+        v.extend([Route::SttCloud, Route::SttLocal]);
         v
+    }
+
+    #[test]
+    fn speech_to_text_sub_pages_parse() {
+        assert_eq!(Route::parse(Some("stt:local")), Route::SttLocal);
+        assert_eq!(Route::parse(Some("settings:stt:cloud")), Route::SttCloud);
+        assert_eq!(Route::parse(Some("byok")), Route::SttCloud);
+        assert_eq!(Route::parse(Some("stt")), Route::Settings(Section::SpeechToText), "the chooser");
     }
 
     #[test]
@@ -284,7 +303,8 @@ mod tests {
     fn route_code_rejects_junk() {
         assert_eq!(Route::decode(0), None, "no valid bit");
         assert_eq!(Route::decode(1), None);
-        assert_eq!(Route::decode(VALID | 9), None, "unknown tag");
+        assert_eq!(Route::decode(VALID | 11), None, "unknown tag");
+        assert_eq!(Route::decode(VALID | 9 | 1 << 16), None, "the STT sub-pages take no payload");
         assert_eq!(Route::decode(VALID | 0xFF), None);
         assert_eq!(Route::decode(VALID | 1 << 9), None, "stray flag bits");
         assert_eq!(Route::decode(VALID | 7 | (Section::ALL.len()) << 16), None, "unknown section");

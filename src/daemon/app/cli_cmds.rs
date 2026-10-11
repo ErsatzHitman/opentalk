@@ -96,15 +96,16 @@ pub fn transcribe_audio(cfg: &Config, audio: &Audio, opts: &SttOptions, creds: &
     }
     let trimmed = vad::trim(audio, 150);
     let t1 = now_ms();
-    let transcript = stt::transcribe_with(cfg.stt.provider, &trimmed, opts, creds).map_err(|e| format!("{} [{}]", e.message, e.detail))?;
+    let transcript = if stt::local::is_local(cfg) { stt::local::transcribe(cfg, &trimmed) } else { stt::transcribe_with(cfg.stt.provider, &trimmed, opts, creds) }
+        .map_err(|e| format!("{} [{}]", e.message, e.detail))?;
     let t2 = now_ms();
     let cleaned = pipeline::clean(cfg, &transcript, info.speech_ms);
     let t3 = now_ms();
     Ok(FileResult {
         raw: cleaned.raw,
         text: cleaned.text,
-        provider: format!("{:?}", cfg.stt.provider).to_ascii_lowercase(),
-        model: opts.model.clone(),
+        provider: super::dictation::provider_name(cfg),
+        model: if stt::local::is_local(cfg) { cfg.stt.local_model.clone() } else { opts.model.clone() },
         stt_ms: t2 - t1,
         cleanup_ms: t3 - t2,
         total_ms: t3 - t0,
@@ -122,7 +123,7 @@ pub fn transcribe_audio(cfg: &Config, audio: &Audio, opts: &SttOptions, creds: &
 
 pub fn transcribe_file(args: &[String]) -> i32 {
     let Some(path) = args.first().filter(|a| !a.starts_with("--")) else {
-        eprintln!("usage: opentalk --transcribe-file <wav> [--provider id] [--model m] [--llm | --no-llm] [--rewrite-trigger <phrase> | --no-rewrite]");
+        eprintln!("usage: opentalk --transcribe-file <wav> [--provider id] [--model m] [--local <model id>] [--llm | --no-llm] [--rewrite-trigger <phrase> | --no-rewrite]");
         return 2;
     };
     let fail = |msg: String| {
@@ -133,9 +134,20 @@ pub fn transcribe_file(args: &[String]) -> i32 {
     let mut cfg = Config::load();
     if let Some(p) = flag_value(args, "--provider") {
         match serde_json::from_value::<SttProviderId>(Value::String(p.to_ascii_lowercase())) {
-            Ok(id) => cfg.stt.provider = id,
+            Ok(id) => {
+                cfg.stt.provider = id;
+                cfg.stt.engine = crate::core::config::SttEngine::Cloud;
+            }
             Err(_) => return fail(format!("unknown provider '{p}'")),
         }
+    }
+    if let Some(id) = flag_value(args, "--local") {
+        if stt::local::catalog::get(id).is_none() {
+            let ids: Vec<&str> = stt::local::catalog::MODELS.iter().map(|m| m.id).collect();
+            return fail(format!("unknown local model '{id}' (one of: {})", ids.join(", ")));
+        }
+        cfg.stt.engine = crate::core::config::SttEngine::Local;
+        cfg.stt.local_model = id.to_string();
     }
     if let Some(m) = flag_value(args, "--model") {
         if cfg.stt.provider == SttProviderId::Custom {

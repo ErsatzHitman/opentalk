@@ -29,6 +29,7 @@ fn icon(s: Section) -> Icon {
 fn value(s: Section, cfg: &Config) -> Trailing {
     match s {
         Section::Hotkeys => Trailing::Value(hotkey::label(&cfg.hotkey)),
+        Section::SpeechToText if crate::stt::local::is_local(cfg) => Trailing::Value("Local model".into()),
         Section::SpeechToText => Trailing::Value(crate::stt::registry::provider(cfg.stt.provider).name.into()),
         _ => Trailing::Chevron,
     }

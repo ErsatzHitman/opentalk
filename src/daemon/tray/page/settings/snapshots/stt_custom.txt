@@ -1,4 +1,4 @@
-# Speech-to-Text
+# Bring your own key
   choice #1 Provider > Custom
   tools #101 API key (optional) [Save key (disabled)]
   field #100  [secret] = "" (hint "Paste your API key")

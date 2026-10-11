@@ -77,9 +77,22 @@ pub enum LlmTask {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct Snippet { pub trigger: String, pub replacement: String }
 
+/// Where speech is transcribed: a cloud provider with your key, or a model on this PC.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum SttEngine {
+    #[default]
+    Cloud,
+    Local,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(default)]
 pub struct SttConfig {
+    /// Cloud (bring your own key) or a local model.
+    pub engine: SttEngine,
+    /// The local model's catalog id (`stt::local::catalog`); empty = none chosen yet.
+    pub local_model: String,
     pub provider: SttProviderId,
     /// Selected model per provider (so switching tabs remembers choices).
     pub models: BTreeMap<SttProviderId, String>,
@@ -98,6 +111,8 @@ pub struct SttConfig {
 impl Default for SttConfig {
     fn default() -> Self {
         Self {
+            engine: SttEngine::Cloud,
+            local_model: String::new(),
             provider: SttProviderId::Openai,
             models: BTreeMap::new(),
             prefer_streaming: false,
@@ -501,6 +516,17 @@ mod tests {
         let mut v2: Config = serde_json::from_str(r#"{"version":2,"ai_cleanup":{"models":{"openrouter":"x/old"}}}"#).unwrap();
         v2.migrate();
         assert!(v2.ai_cleanup.rewrite_models.is_empty());
+    }
+
+    #[test]
+    fn stt_engine_defaults_to_cloud_and_round_trips() {
+        let old: Config = serde_json::from_str(r#"{"stt":{"provider":"groq"}}"#).unwrap();
+        assert_eq!(old.stt.engine, SttEngine::Cloud);
+        assert_eq!(old.stt.local_model, "");
+        let c: Config = serde_json::from_str(r#"{"stt":{"engine":"local","local_model":"parakeet-tdt-0.6b-v3"}}"#).unwrap();
+        assert_eq!((c.stt.engine, c.stt.local_model.as_str()), (SttEngine::Local, "parakeet-tdt-0.6b-v3"));
+        assert_eq!(c.stt.provider, SttProviderId::Openai, "the cloud settings are kept alongside");
+        assert_eq!(serde_json::from_str::<Config>(&serde_json::to_string(&c).unwrap()).unwrap(), c);
     }
 
     #[test]

@@ -1,4 +1,4 @@
-# Speech-to-Text
+# Bring your own key
   choice #1 Provider > OpenAI
   tools #101 API key [Get a key] [Save key (disabled)]
   field #100  [secret] = "" (hint "Paste your API key")

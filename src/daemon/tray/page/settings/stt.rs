@@ -1,13 +1,15 @@
-//! Settings > Speech-to-Text: provider (picker), API key(s), provider specifics, model, transport
-//! and the Test button (the embedded sample through the active provider, on a worker).
+//! Settings > Speech-to-Text > Bring your own key: provider (picker), API key(s), provider
+//! specifics, model, transport and the Test button (the embedded sample through the active
+//! provider, on a worker). While a local model is in use, a line at the top switches back.
 use super::keyfield::{KeyField, SecretStore, SysSecrets};
 use super::kit::{choice, group, note, radio, saved, segmented, text_field};
-use crate::core::config::SttProviderId;
+use crate::core::config::{SttEngine, SttProviderId};
 use crate::core::secrets::SecretName;
-use crate::daemon::tray::page::{ConfirmId, Cx, Effect, Event, Item, ItemId, PageModel, PickerId, Route, TestKind, TestResult};
+use crate::daemon::tray::page::{ConfirmId, Cx, Effect, Event, Icon, Item, ItemId, PageModel, PickerId, Route, TestKind, TestResult, Tool, ToolTone};
 use crate::stt::registry::{self, ProviderInfo};
 
 pub const ID_PROVIDER: ItemId = 1;
+pub const ID_USE_CLOUD: ItemId = 2;
 pub const ID_REGION: ItemId = 20;
 pub const ID_TENANT: ItemId = 21;
 pub const ID_CUSTOM_URL: ItemId = 22;
@@ -95,7 +97,7 @@ impl SttPage {
 
 impl PageModel for SttPage {
     fn title(&self) -> String {
-        "Speech-to-Text".into()
+        "Bring your own key".into()
     }
 
     fn enter(&mut self, cx: &mut Cx) {
@@ -111,7 +113,17 @@ impl PageModel for SttPage {
         let cfg = &*cx.cfg;
         let provider = cfg.stt.provider;
         let info = registry::provider(provider);
-        let mut v = vec![choice(ID_PROVIDER, "Provider", info.name)];
+        let local = cfg.stt.engine == SttEngine::Local;
+        let mut v = Vec::new();
+        if local {
+            v.push(Item::Tools {
+                id: ID_USE_CLOUD,
+                label: "A local model is in use".into(),
+                sub: crate::stt::local::display_name(cfg),
+                tools: vec![Tool::new(Icon::Check, "Use the cloud provider", ToolTone::Primary, true)],
+            });
+        }
+        v.push(choice(ID_PROVIDER, "Provider", info.name));
         for (i, k) in self.keys.iter().enumerate() {
             v.extend(k.items(Self::key_base(i)));
         }
@@ -140,8 +152,10 @@ impl PageModel for SttPage {
             v.push(super::kit::toggle(ID_STREAMING, "Prefer streaming", "Text is ready sooner", cfg.stt.prefer_streaming));
         }
         v.push(group("Test"));
-        let ready = self.ready(cx);
-        let sub = if ready {
+        let ready = self.ready(cx) && !local;
+        let sub = if local {
+            "Switch to the cloud provider first"
+        } else if ready {
             "Transcribes a short sample"
         } else {
             match provider {
@@ -171,6 +185,11 @@ impl PageModel for SttPage {
         let provider = cx.cfg.stt.provider;
         match (id, ev) {
             (ID_PROVIDER, Event::Activated) => vec![Effect::Navigate(Route::Picker(PickerId::SttProvider))],
+            (ID_USE_CLOUD, Event::Pressed | Event::Activated | Event::Picked(0)) if cx.cfg.stt.engine == SttEngine::Local => {
+                cx.cfg.stt.engine = SttEngine::Cloud;
+                self.invalidate();
+                saved()
+            }
             (ID_REGION, Event::Picked(i)) => {
                 cx.cfg.stt.corti_environment = if i == 1 { "eu" } else { "us" }.into();
                 self.invalidate();
@@ -205,7 +224,7 @@ impl PageModel for SttPage {
                 self.invalidate();
                 saved()
             }
-            (ID_TEST, Event::Pressed | Event::Picked(0)) if self.ready(cx) && !self.busy => {
+            (ID_TEST, Event::Pressed | Event::Picked(0)) if self.ready(cx) && !self.busy && cx.cfg.stt.engine == SttEngine::Cloud => {
                 self.busy = true;
                 self.result = None;
                 // Saved first: the worker tests the config the daemon holds, which must be this one.
@@ -253,6 +272,24 @@ mod tests {
         let cx = Cx::new(cfg, 0);
         let _ = name;
         dump(&p.title(), &p.items(&cx))
+    }
+
+    #[test]
+    fn a_local_model_in_use_offers_the_way_back() {
+        let mut cfg = Config::default();
+        let p = page(&cfg, Fake::with("openai", "sk-...abcd"));
+        assert!(!p.items(&Cx::new(&mut cfg, 0)).iter().any(|i| i.id() == Some(ID_USE_CLOUD)), "cloud in use: no switch");
+        cfg.stt.engine = SttEngine::Local;
+        cfg.stt.local_model = "moonshine-tiny".into();
+        let mut p = page(&cfg, Fake::with("openai", "sk-...abcd"));
+        let mut cx = Cx::new(&mut cfg, 0);
+        let items = p.items(&cx);
+        let Some(Item::Tools { sub, .. }) = items.first() else { panic!("{items:?}") };
+        assert_eq!(sub, "Moonshine Tiny (local)");
+        assert_eq!(p.event(ID_TEST, Event::Pressed, &mut cx), vec![], "the cloud test waits for the switch");
+        assert_eq!(p.event(ID_USE_CLOUD, Event::Picked(0), &mut cx), vec![Effect::Saved]);
+        assert_eq!(cx.cfg.stt.engine, SttEngine::Cloud);
+        assert_eq!(cx.cfg.stt.local_model, "moonshine-tiny", "the local choice is remembered");
     }
 
     #[test]

@@ -560,6 +560,7 @@ impl Pager {
     }
 
     pub fn wake(&mut self, m: &dyn TextMetrics) -> PResp {
+        let before = self.cfg.clone();
         {
             let mut cx = Self::cx(&mut self.cfg, &self.waker, self.now);
             if let Some(s) = self.stack.last_mut() {
@@ -567,7 +568,13 @@ impl Pager {
             }
         }
         self.rebuild_top(m);
-        PResp { redraw: true, ..PResp::default() }
+        let mut r = PResp { redraw: true, ..PResp::default() };
+        // a worker's result can change the config (a finished download selects its model)
+        if self.cfg != before {
+            r.saved = true;
+            r.out.push(Outward::Post(PopupAction::SetConfig(Box::new(self.cfg.clone()))));
+        }
+        r
     }
 
     pub fn test_done(&mut self, result: TestResult, m: &dyn TextMetrics) -> PResp {
