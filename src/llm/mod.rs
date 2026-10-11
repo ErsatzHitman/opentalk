@@ -42,6 +42,34 @@ const REWRITE_TIMEOUT_MAX_MS: u64 = 60_000;
 /// providers keep their path layout and swap only the origin.
 pub const BASE_URL_ENV: &str = "OPENTALK_LLM_BASE_URL";
 
+/// Open a connection to the AI provider in the background while the speech is transcribed, so an
+/// AI cleanup or a voice rewrite right after starts on a warm socket. Only when one of them can run
+/// (cleanup on, or a rewrite phrase set) and a key is saved; enterprise providers sign their own
+/// requests and are left alone. Sends no text: a bare `HEAD /` to the provider's host.
+pub fn prewarm(cfg: &Config) {
+    let ai = &cfg.ai_cleanup;
+    if !ai.enabled && cfg.rewrite_trigger_effective().is_none() {
+        return;
+    }
+    let info = registry::provider(ai.provider);
+    if info.enterprise {
+        return;
+    }
+    let base = std::env::var(BASE_URL_ENV).ok().filter(|b| !b.trim().is_empty()).unwrap_or_else(|| {
+        if ai.provider == LlmProviderId::Custom { ai.custom_base_url.clone() } else { info.base_url.to_string() }
+    });
+    // only remote https endpoints: a LAN or local server needs no warm-up
+    if !base.trim().to_ascii_lowercase().starts_with("https://") {
+        return;
+    }
+    let secret = info.secret;
+    let _ = std::thread::Builder::new().name("llm-prewarm".into()).spawn(move || {
+        if crate::core::secrets::get(secret).is_some_and(|k| !k.trim().is_empty()) {
+            crate::core::http::prewarm(base.trim());
+        }
+    });
+}
+
 /// Clean `text` with the configured LLM. Uses `cfg.ai_cleanup.timeout_ms` (default 4 s), no retries.
 pub fn cleanup(cfg: &Config, text: &str, hints: &[String]) -> Result<String, LlmError> {
     let info = registry::provider(cfg.ai_cleanup.provider);

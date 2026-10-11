@@ -1,9 +1,11 @@
-//! Shared HTTP client: one keep-alive `ureq::Agent` over schannel (native-tls),
-//! a multipart builder, and connection pre-warming.
+//! Shared HTTP client: keep-alive `ureq::Agent`s over schannel (native-tls), one connection pool
+//! per origin that is thrown away after [`IDLE_REUSE_MAX`] without traffic, a multipart builder,
+//! and connection pre-warming.
 //!
 //! Non-2xx responses are returned as `Ok(HttpResponse)` with the status set — callers classify.
 //! Only transport failures are `Err(HttpError)`.
 use std::io::Read;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -15,6 +17,20 @@ static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
 static TLS_RETRY: Mutex<TlsRetry> = Mutex::new(TlsRetry { last_failure: None, logged: false });
 /// Minimum gap between schannel init attempts after a failure.
 const TLS_RETRY_INTERVAL: Duration = Duration::from_secs(30);
+/// The schannel connector, shared by every per-origin agent.
+static TLS: OnceLock<Arc<native_tls::TlsConnector>> = OnceLock::new();
+
+/// A pooled keep-alive connection that has been idle longer than this is not reused. ureq only
+/// notices a connection the server closed properly; one dropped silently on the way (a router's
+/// NAT timeout, a Wi-Fi change, sleep and resume, a VPN reconnect) looks alive, so a POST written
+/// to it goes nowhere and waits out its whole timeout, and a POST is never retried. That showed up
+/// as AI rewrites that "timed out" without ever reaching the provider. A fresh connection costs one
+/// TLS handshake (~100-300 ms); a dead one costs the full timeout.
+pub const IDLE_REUSE_MAX: Duration = Duration::from_secs(30);
+
+/// One agent (and so one connection pool) per origin, with when it last carried traffic.
+static ORIGINS: Mutex<Option<HashMap<String, (ureq::Agent, Instant)>>> = Mutex::new(None);
+
 /// Fallback used by [`agent`] when schannel is unavailable: plain HTTP works, HTTPS fails
 /// with a transport error from ureq (no TLS backend configured) instead of panicking.
 static PLAIN_AGENT: OnceLock<ureq::Agent> = OnceLock::new();
@@ -64,7 +80,8 @@ fn try_agent_in<'a>(
     match factory() {
         Ok(tls) => {
             st.last_failure = None;
-            Ok(slot.get_or_init(|| builder().tls_connector(Arc::new(tls)).build()))
+            let tls = TLS.get_or_init(|| Arc::new(tls)).clone();
+            Ok(slot.get_or_init(|| builder().tls_connector(tls).build()))
         }
         Err(e) => {
             st.last_failure = Some(now);
@@ -87,10 +104,63 @@ pub fn agent() -> &'static ureq::Agent {
     }
 }
 
+/// `scheme://host[:port]` of `url` (lowercase), the key of its connection pool.
+pub fn origin_of(url: &str) -> String {
+    let o = match url.find("://") {
+        Some(i) => match url[i + 3..].find(['/', '?', '#']) {
+            Some(j) => &url[..i + 3 + j],
+            None => url,
+        },
+        None => url,
+    };
+    o.to_ascii_lowercase()
+}
+
 /// Agent for one request: plain `http://` URLs (local/self-hosted endpoints) never need TLS,
-/// so only `https://` requests fail when schannel is unavailable.
-fn agent_for(url: &str) -> Result<&'static ureq::Agent, HttpError> {
-    if url.get(..7).is_some_and(|p| p.eq_ignore_ascii_case("http://")) { Ok(agent()) } else { try_agent() }
+/// so only `https://` requests fail when schannel is unavailable. Each origin has its own pool,
+/// replaced when it sat idle longer than [`IDLE_REUSE_MAX`] (see there).
+fn agent_for(url: &str) -> Result<ureq::Agent, HttpError> {
+    let plain = url.get(..7).is_some_and(|p| p.eq_ignore_ascii_case("http://"));
+    if plain {
+        agent();
+    } else {
+        try_agent()?;
+    }
+    let origin = origin_of(url);
+    let fresh = || match TLS.get() {
+        Some(tls) => builder().tls_connector(tls.clone()).build(),
+        None => builder().build(),
+    };
+    let now = Instant::now();
+    let mut map = ORIGINS.lock().unwrap_or_else(|p| p.into_inner());
+    let map = map.get_or_insert_with(HashMap::new);
+    let entry = map.entry(origin).or_insert_with(|| (fresh(), now));
+    if pool_is_stale(entry.1, now) {
+        crate::log_debug!("http: connections idle {:.0} s, opening a fresh one", now.saturating_duration_since(entry.1).as_secs_f64());
+        entry.0 = fresh();
+    }
+    entry.1 = now;
+    Ok(entry.0.clone())
+}
+
+fn pool_is_stale(last_used: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(last_used) > IDLE_REUSE_MAX
+}
+
+/// The origin's pool carried traffic just now (a long upload or a slow answer ends long after it
+/// began; idleness counts from the end).
+fn touch(url: &str) {
+    let mut map = ORIGINS.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(e) = map.as_mut().and_then(|m| m.get_mut(&origin_of(url))) {
+        e.1 = Instant::now();
+    }
+}
+
+/// Run one request on `url`'s agent and mark its pool used when it ends.
+fn with_agent(url: &str, f: impl FnOnce(ureq::Agent) -> Result<HttpResponse, HttpError>) -> Result<HttpResponse, HttpError> {
+    let r = f(agent_for(url)?);
+    touch(url);
+    r
 }
 
 #[derive(Debug, Clone)]
@@ -160,11 +230,13 @@ fn convert(res: Result<ureq::Response, ureq::Error>) -> Result<HttpResponse, Htt
 
 /// POST raw bytes.
 pub fn post(url: &str, headers: &[(&str, &str)], content_type: &str, body: &[u8], timeout: Duration) -> Result<HttpResponse, HttpError> {
-    let mut req = agent_for(url)?.post(url).timeout(timeout).set("Content-Type", content_type);
-    for (k, v) in headers {
-        req = req.set(k, v);
-    }
-    convert(req.send_bytes(body))
+    with_agent(url, |agent| {
+        let mut req = agent.post(url).timeout(timeout).set("Content-Type", content_type);
+        for (k, v) in headers {
+            req = req.set(k, v);
+        }
+        convert(req.send_bytes(body))
+    })
 }
 
 /// POST a JSON value.
@@ -173,19 +245,23 @@ pub fn post_json(url: &str, headers: &[(&str, &str)], body: &serde_json::Value, 
 }
 
 pub fn get(url: &str, headers: &[(&str, &str)], timeout: Duration) -> Result<HttpResponse, HttpError> {
-    let mut req = agent_for(url)?.get(url).timeout(timeout);
-    for (k, v) in headers {
-        req = req.set(k, v);
-    }
-    convert(req.call())
+    with_agent(url, |agent| {
+        let mut req = agent.get(url).timeout(timeout);
+        for (k, v) in headers {
+            req = req.set(k, v);
+        }
+        convert(req.call())
+    })
 }
 
 pub fn delete(url: &str, headers: &[(&str, &str)], timeout: Duration) -> Result<HttpResponse, HttpError> {
-    let mut req = agent_for(url)?.delete(url).timeout(timeout);
-    for (k, v) in headers {
-        req = req.set(k, v);
-    }
-    convert(req.call())
+    with_agent(url, |agent| {
+        let mut req = agent.delete(url).timeout(timeout);
+        for (k, v) in headers {
+            req = req.set(k, v);
+        }
+        convert(req.call())
+    })
 }
 
 /// A large download in progress: the status, the announced length and the body as a stream.
@@ -221,14 +297,12 @@ pub fn open_download(url: &str) -> Result<Download, HttpError> {
 /// Open (and pool) a TLS connection to `url`'s origin in the background, so the real
 /// request right after recording reuses a warm keep-alive socket. Errors are ignored.
 pub fn prewarm(url: &str) {
-    let origin = match url.find("://").and_then(|i| url[i + 3..].find('/').map(|j| &url[..i + 3 + j])) {
-        Some(o) => o.to_string(),
-        None => url.to_string(),
-    };
+    let origin = origin_of(url);
     std::thread::Builder::new()
         .name("prewarm".into())
         .spawn(move || {
-            let Ok(agent) = try_agent() else { return };
+            // the origin's own pool, which the real request will use
+            let Ok(agent) = agent_for(&origin) else { return };
             let t = crate::core::timing::now_ms();
             let r = agent.head(&format!("{origin}/")).timeout(Duration::from_secs(5)).call();
             crate::log_debug!("prewarm {origin} -> {} in {:.0} ms", match &r { Ok(x) => x.status(), Err(ureq::Error::Status(c, _)) => *c, Err(_) => 0 }, crate::core::timing::now_ms() - t);
@@ -236,6 +310,7 @@ pub fn prewarm(url: &str) {
             if let Ok(resp) | Err(ureq::Error::Status(_, resp)) = r {
                 let _ = std::io::copy(&mut resp.into_reader().take(64 * 1024), &mut std::io::sink());
             }
+            touch(&origin);
         })
         .ok();
 }
@@ -347,6 +422,69 @@ mod tests {
             assert!(try_agent_in(&slot, &state, t0 + Duration::from_secs(31 * i), &factory, &log).is_err());
         }
         assert_eq!((calls.get(), logs.get()), (3, 1));
+    }
+
+    #[test]
+    fn origins_key_the_pools() {
+        assert_eq!(origin_of("https://OpenRouter.ai/api/v1/chat/completions"), "https://openrouter.ai");
+        assert_eq!(origin_of("http://127.0.0.1:8080/v1?x=1"), "http://127.0.0.1:8080");
+        assert_eq!(origin_of("https://api.groq.com"), "https://api.groq.com");
+        let t0 = Instant::now();
+        assert!(!pool_is_stale(t0, t0 + IDLE_REUSE_MAX));
+        assert!(pool_is_stale(t0, t0 + IDLE_REUSE_MAX + Duration::from_millis(1)));
+        assert!(!pool_is_stale(t0 + Duration::from_secs(5), t0), "a clock that went backwards is not idle");
+    }
+
+    /// A pool that sat idle past `IDLE_REUSE_MAX` is not reused: the next request opens a new
+    /// connection (a silently dropped one would swallow it), while back-to-back requests share one.
+    #[test]
+    fn idle_connections_are_not_reused() {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let n = accepted.clone();
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(conn) = conn else { return };
+                n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::thread::spawn(move || {
+                    let mut w = conn.try_clone().unwrap();
+                    let mut r = BufReader::new(conn);
+                    loop {
+                        // headers, then the (empty) body of a GET
+                        let mut line = String::new();
+                        loop {
+                            line.clear();
+                            if r.read_line(&mut line).unwrap_or(0) == 0 {
+                                return;
+                            }
+                            if line == "\r\n" {
+                                break;
+                            }
+                        }
+                        if w.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        let url = format!("http://127.0.0.1:{port}/x");
+        let count = || accepted.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(get(&url, &[], Duration::from_secs(5)).unwrap().body, "ok");
+        assert_eq!(get(&url, &[], Duration::from_secs(5)).unwrap().body, "ok");
+        assert_eq!(count(), 1, "a recent connection is reused");
+        // pretend the pool has been idle past the limit
+        {
+            let mut map = ORIGINS.lock().unwrap();
+            let e = map.as_mut().unwrap().get_mut(&origin_of(&url)).unwrap();
+            e.1 = Instant::now().checked_sub(IDLE_REUSE_MAX + Duration::from_secs(1)).unwrap();
+        }
+        assert_eq!(get(&url, &[], Duration::from_secs(5)).unwrap().body, "ok");
+        assert_eq!(count(), 2, "an idle pool is replaced by a fresh connection");
+        assert_eq!(get(&url, &[], Duration::from_secs(5)).unwrap().body, "ok");
+        assert_eq!(count(), 2, "and the fresh one is reused again");
     }
 
     #[test]

@@ -928,6 +928,8 @@ fn run_job(job: Job) -> Outcome {
         Capture::Kept { audio, speech_ms } => (audio, speech_ms, -1.0, stream),
     };
 
+    // the AI provider's connection opens while the speech is transcribed
+    crate::llm::prewarm(&cfg);
     let t_req = now_ms();
     let streamed = stream.is_some();
     let result = pipeline::transcribe(&cfg, &audio, stream);
