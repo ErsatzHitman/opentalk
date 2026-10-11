@@ -1,10 +1,10 @@
 # Cleanup & AI
 
 ## AI rewrite
-  [ ] #1 Enable AI rewrite -- Uses the AI model below
+  [ ] #1 Enable AI rewrite -- Say the phrase at the end for a concise version
 
 ## AI cleanup
-  [ ] #20 Enable AI cleanup -- Polishes every dictation with the AI model below
+  [ ] #20 Enable AI cleanup -- Polishes every dictation with an AI model
 
 ## On-device cleanup
   seg #10 Filler words: Off | (Standard) | Aggressive

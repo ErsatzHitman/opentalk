@@ -1,8 +1,9 @@
-//! Settings > Cleanup & AI: the AI rewrite trigger (first group), on-device cleanup options,
-//! the AI cleanup provider (also used by the rewrite) and the prompt editor.
+//! Settings > Cleanup & AI: AI rewrite (trigger phrase, model), AI cleanup (prompt, model), the AI
+//! provider both share (key, endpoint, test) and the on-device cleanup options. The two features
+//! are independent: each has its own switch and its own model on the shared provider.
 use super::keyfield::{KeyField, SecretStore, SysSecrets};
 use super::kit::{ToggleDef, apply_toggle, choice, group, note, saved, segmented, text_field};
-use crate::core::config::{Config, DEFAULT_REWRITE_TRIGGER, FillerMode, LlmProviderId};
+use crate::core::config::{Config, DEFAULT_REWRITE_TRIGGER, FillerMode, LlmProviderId, LlmTask};
 use crate::core::rewrite;
 use crate::core::secrets::SecretName;
 use crate::core::settings_logic::{editor_text, filler_from_index, filler_index, stored_prompt};
@@ -13,6 +14,9 @@ use crate::llm::registry::{self, LlmProviderInfo};
 pub const ID_RW_TOGGLE: ItemId = 1;
 pub const ID_RW_TRIGGER: ItemId = 2;
 pub const ID_RW_RESET: ItemId = 3;
+pub const ID_RW_MODEL: ItemId = 4;
+pub const ID_RW_SUGGEST: ItemId = 5;
+pub const ID_RW_AZ_DEPLOYMENT: ItemId = 6;
 // On-device cleanup
 pub const ID_FILLER: ItemId = 10;
 pub const ID_FUZZY: ItemId = 11;
@@ -58,14 +62,14 @@ const OPTIONS: &[ToggleDef] = &[
     ToggleDef {
         id: ID_AI_ENABLE,
         label: "Enable AI cleanup",
-        desc: "Polishes every dictation with the AI model below",
+        desc: "Polishes every dictation with an AI model",
         get: |c| c.ai_cleanup.enabled,
         set: |c, v| c.ai_cleanup.enabled = v,
     },
     ToggleDef {
         id: ID_RW_TOGGLE,
         label: "Enable AI rewrite",
-        desc: "Uses the AI model below",
+        desc: "Say the phrase at the end for a concise version",
         get: |c| c.ai_cleanup.rewrite_enabled,
         set: |c, v| c.ai_cleanup.rewrite_enabled = v,
     },
@@ -140,18 +144,52 @@ impl CleanupPage {
         self.result = None;
     }
 
-    /// Does the cleanup provider have what it needs to answer a request?
+    /// Does the provider have what the features that are on need to answer a request?
     pub fn ai_ready(&self, cfg: &Config) -> bool {
+        self.tasks_on(cfg).into_iter().all(|t| self.ready_for(cfg, t))
+    }
+
+    /// The AI features that are switched on (AI cleanup when neither is, for the test button).
+    fn tasks_on(&self, cfg: &Config) -> Vec<LlmTask> {
+        let a = &cfg.ai_cleanup;
+        let mut v = Vec::new();
+        if a.rewrite_enabled {
+            v.push(LlmTask::Rewrite);
+        }
+        if a.enabled || v.is_empty() {
+            v.push(LlmTask::Cleanup);
+        }
+        v
+    }
+
+    /// Can `task` reach its model: keys, endpoint and `task`'s own model.
+    fn ready_for(&self, cfg: &Config, task: LlmTask) -> bool {
         let a = &cfg.ai_cleanup;
         let keys = self.keys.iter().all(KeyField::has_key);
-        let has_model = !cfg.llm_model().trim().is_empty();
+        let has_model = !cfg.llm_model_for(task).trim().is_empty();
         match self.provider {
             LlmProviderId::Custom => !a.custom_base_url.trim().is_empty() && has_model,
-            LlmProviderId::AzureOpenai => keys && !a.azure_endpoint.trim().is_empty() && !a.azure_deployment.trim().is_empty(),
+            LlmProviderId::AzureOpenai => keys && !a.azure_endpoint.trim().is_empty() && !cfg.azure_deployment_for(task).is_empty(),
             LlmProviderId::Bedrock => keys && !a.bedrock_region.trim().is_empty() && has_model,
             LlmProviderId::Vertex => keys && !a.vertex_project.trim().is_empty() && !a.vertex_location.trim().is_empty() && has_model,
             _ => keys && has_model,
         }
+    }
+
+    /// The model row of `task`'s section: a model id with suggestions, or an Azure deployment.
+    fn model_items(&self, cfg: &Config, info: &LlmProviderInfo, task: LlmTask) -> Vec<Item> {
+        let (model_id, suggest_id, dep_id) = match task {
+            LlmTask::Rewrite => (ID_RW_MODEL, ID_RW_SUGGEST, ID_RW_AZ_DEPLOYMENT),
+            LlmTask::Cleanup => (ID_AI_MODEL, ID_AI_SUGGEST, ID_AZ_DEPLOYMENT),
+        };
+        if self.provider == LlmProviderId::AzureOpenai {
+            return vec![text_field(dep_id, "Deployment", "gpt-5-mini", cfg.azure_deployment_for(task))];
+        }
+        let mut v = vec![text_field(model_id, "Model", "Model id", &cfg.llm_model_for(task))];
+        if !info.models.is_empty() {
+            v.push(choice(suggest_id, "Suggested models", "Choose..."));
+        }
+        v
     }
 
     /// What is missing before the provider can answer, in words for the warning banner (`None`
@@ -162,7 +200,7 @@ impl CleanupPage {
         }
         let keys = self.provider == LlmProviderId::Custom || self.keys.iter().all(KeyField::has_key);
         Some(if keys {
-            "The AI model is not fully set up (a model or an address is missing). Until it is, dictations paste the transcript."
+            "The AI provider is not fully set up (a model or an address is missing). Until it is, dictations paste the transcript."
         } else {
             "No API key is saved for the AI provider. Until there is, dictations paste the transcript."
         })
@@ -170,8 +208,8 @@ impl CleanupPage {
 
     fn provider_items(&self, cfg: &Config, info: &LlmProviderInfo) -> Vec<Item> {
         let a = &cfg.ai_cleanup;
-        let mut v = vec![group("AI model")];
-        v.push(note("Used by both AI rewrite and AI cleanup."));
+        let mut v = vec![group("AI provider")];
+        v.push(note("Shared by AI rewrite and AI cleanup; each picks its own model above."));
         v.push(choice(ID_AI_PROVIDER, "Provider", info.name));
         for (i, k) in self.keys.iter().enumerate() {
             v.extend(k.items(Self::key_base(i)));
@@ -183,7 +221,6 @@ impl CleanupPage {
             }
             LlmProviderId::AzureOpenai => {
                 v.push(text_field(ID_AZ_ENDPOINT, "Endpoint", "https://my-resource.openai.azure.com", &a.azure_endpoint));
-                v.push(text_field(ID_AZ_DEPLOYMENT, "Deployment", "gpt-5-mini", &a.azure_deployment));
                 v.push(text_field(ID_AZ_VERSION, "API version", "2024-10-21", &a.azure_api_version));
                 v.push(text_field(ID_AZ_MODEL, "Underlying model (optional)", "gpt-5-mini", &a.azure_model));
                 v.push(note("Set the model behind the deployment when its name does not contain it (a deployment called \"cleanup\" serving gpt-5), so the right request parameters are used."));
@@ -194,12 +231,6 @@ impl CleanupPage {
                 v.push(text_field(ID_VERTEX_LOCATION, "Location", "us-central1", &a.vertex_location));
             }
             _ => {}
-        }
-        if self.provider != LlmProviderId::AzureOpenai {
-            v.push(text_field(ID_AI_MODEL, "Model", "Model id", &cfg.llm_model()));
-            if !info.models.is_empty() {
-                v.push(choice(ID_AI_SUGGEST, "Suggested models", "Choose..."));
-            }
         }
         v
     }
@@ -241,6 +272,7 @@ impl PageModel for CleanupPage {
                 max_chars: TRIGGER_MAX_CHARS,
             });
             v.push(note("End a dictation with this phrase to paste a concise rewrite."));
+            v.extend(self.model_items(cfg, registry::provider(self.provider), LlmTask::Rewrite));
         }
 
         v.push(group("AI cleanup"));
@@ -262,6 +294,7 @@ impl PageModel for CleanupPage {
                 error: None,
                 max_chars: 0,
             });
+            v.extend(self.model_items(cfg, registry::provider(self.provider), LlmTask::Cleanup));
         }
 
         if a.enabled || rewrite_toggle {
@@ -300,7 +333,6 @@ impl PageModel for CleanupPage {
             }
             return saved();
         }
-        let provider = self.provider;
         let ai = &mut cx.cfg.ai_cleanup;
         let commit = |dst: &mut String, t: &str| *dst = t.trim().to_string();
         match (id, ev) {
@@ -335,13 +367,15 @@ impl PageModel for CleanupPage {
             }
             (ID_AI_PROVIDER, Event::Activated) => vec![Effect::Navigate(Route::Picker(PickerId::LlmProvider))],
             (ID_AI_SUGGEST, Event::Activated) => vec![Effect::Navigate(Route::Picker(PickerId::LlmModel))],
-            (ID_AI_MODEL, Event::Committed(t)) => {
-                let t = t.trim().to_string();
-                if t.is_empty() {
-                    ai.models.remove(&provider);
-                } else {
-                    ai.models.insert(provider, t);
-                }
+            (ID_RW_SUGGEST, Event::Activated) => vec![Effect::Navigate(Route::Picker(PickerId::LlmRewriteModel))],
+            (ID_AI_MODEL | ID_RW_MODEL, Event::Committed(t)) => {
+                let task = if id == ID_RW_MODEL { LlmTask::Rewrite } else { LlmTask::Cleanup };
+                cx.cfg.set_llm_model(task, &t);
+                self.invalidate();
+                saved()
+            }
+            (ID_RW_AZ_DEPLOYMENT, Event::Committed(t)) => {
+                commit(&mut ai.rewrite_azure_deployment, &t);
                 self.invalidate();
                 saved()
             }
@@ -588,9 +622,12 @@ mod tests {
         let mut cfg = Config::default();
         let p = page(LlmProviderId::Openrouter, Fake::default());
         assert!(text(&p, &mut cfg).is_some_and(|t| t.contains("No API key")), "the key is what is missing, not the model");
-        cfg.ai_cleanup.models.insert(LlmProviderId::Openrouter, "  ".into());
-        let p = page(LlmProviderId::Openrouter, Fake::with("openrouter", "sk-...abcd"));
-        assert!(text(&p, &mut cfg).is_some_and(|t| t.contains("not fully set up")), "a key but no model");
+        // a blank model falls back to the provider's default; Custom has none
+        cfg.ai_cleanup.provider = LlmProviderId::Custom;
+        cfg.ai_cleanup.custom_base_url = "http://localhost:11434/v1".into();
+        cfg.ai_cleanup.rewrite_models.insert(LlmProviderId::Custom, "  ".into());
+        let p = page(LlmProviderId::Custom, Fake::default());
+        assert!(text(&p, &mut cfg).is_some_and(|t| t.contains("not fully set up")), "an address but no model");
     }
 
     #[test]
@@ -601,12 +638,12 @@ mod tests {
         };
         let p = page(LlmProviderId::Openrouter, Fake::default());
         let mut cfg = Config::default();
-        assert!(groups(&p, &mut cfg).contains(&"AI model".to_string()), "the rewrite reuses the provider even with AI cleanup off");
+        assert!(groups(&p, &mut cfg).contains(&"AI provider".to_string()), "the rewrite reuses the provider even with AI cleanup off");
         cfg.ai_cleanup.rewrite_enabled = false;
         let g = groups(&p, &mut cfg);
-        assert!(!g.contains(&"AI model".to_string()), "neither feature on, no model needed: {g:?}");
+        assert!(!g.contains(&"AI provider".to_string()), "neither feature on, no model needed: {g:?}");
         cfg.ai_cleanup.enabled = true;
-        assert!(groups(&p, &mut cfg).contains(&"AI model".to_string()), "AI cleanup needs it");
+        assert!(groups(&p, &mut cfg).contains(&"AI provider".to_string()), "AI cleanup needs it");
     }
 
     #[test]
@@ -617,9 +654,15 @@ mod tests {
         cfg.ai_cleanup.provider = LlmProviderId::Custom;
         assert!(!p.ai_ready(&cfg) || p.keys.iter().all(KeyField::has_key));
         cfg.ai_cleanup.custom_base_url = "http://localhost:11434/v1".into();
+        cfg.ai_cleanup.enabled = true;
         cfg.ai_cleanup.models.insert(LlmProviderId::Custom, "llama".into());
         let p2 = page(LlmProviderId::Custom, Fake::with("custom_llm", "x"));
+        assert!(!p2.ai_ready(&cfg), "the rewrite is on and has no model of its own yet");
+        cfg.ai_cleanup.rewrite_models.insert(LlmProviderId::Custom, "qwen".into());
         assert!(p2.ai_ready(&cfg));
+        cfg.ai_cleanup.rewrite_enabled = false;
+        cfg.ai_cleanup.rewrite_models.clear();
+        assert!(p2.ai_ready(&cfg), "only the features that are on count");
         // Azure: key + endpoint + deployment, no model field.
         let p = page(LlmProviderId::AzureOpenai, Fake::with("azure_openai", "k..y"));
         assert!(!p.ai_ready(&cfg));
@@ -630,6 +673,33 @@ mod tests {
         let store = Fake::with("aws_access_key_id", "AKIA...");
         let p = page(LlmProviderId::Bedrock, store);
         assert!(!p.ai_ready(&cfg));
+    }
+
+    #[test]
+    fn each_feature_edits_its_own_model() {
+        let mut cfg = Config::default();
+        cfg.ai_cleanup.enabled = true;
+        let mut p = page(LlmProviderId::Openrouter, Fake::default());
+        let mut cx = Cx::new(&mut cfg, 0);
+        assert_eq!(p.event(ID_RW_MODEL, Event::Committed(" r/model ".into()), &mut cx), vec![Effect::Saved]);
+        assert_eq!(p.event(ID_AI_MODEL, Event::Committed("c/model".into()), &mut cx), vec![Effect::Saved]);
+        assert_eq!(cx.cfg.llm_model_for(LlmTask::Rewrite), "r/model");
+        assert_eq!(cx.cfg.llm_model_for(LlmTask::Cleanup), "c/model");
+        assert_eq!(p.event(ID_AI_MODEL, Event::Committed("c/other".into()), &mut cx), vec![Effect::Saved]);
+        assert_eq!(cx.cfg.llm_model_for(LlmTask::Rewrite), "r/model", "the rewrite model did not move");
+        assert_eq!(p.event(ID_RW_SUGGEST, Event::Activated, &mut cx), vec![Effect::Navigate(Route::Picker(PickerId::LlmRewriteModel))]);
+        // each section shows its own model
+        let items = p.items(&cx);
+        let field = |want: ItemId| items.iter().find_map(|i| match i { Item::Field { id, value, .. } if *id == want => Some(value.clone()), _ => None });
+        assert_eq!(field(ID_RW_MODEL).as_deref(), Some("r/model"));
+        assert_eq!(field(ID_AI_MODEL).as_deref(), Some("c/other"));
+        // Azure: one deployment per feature
+        cx.cfg.ai_cleanup.provider = LlmProviderId::AzureOpenai;
+        p.rebuild_keys(LlmProviderId::AzureOpenai);
+        assert_eq!(p.event(ID_AZ_DEPLOYMENT, Event::Committed("clean".into()), &mut cx), vec![Effect::Saved]);
+        assert_eq!(p.event(ID_RW_AZ_DEPLOYMENT, Event::Committed("short".into()), &mut cx), vec![Effect::Saved]);
+        assert_eq!(cx.cfg.azure_deployment_for(LlmTask::Rewrite), "short");
+        assert_eq!(cx.cfg.azure_deployment_for(LlmTask::Cleanup), "clean");
     }
 
     #[test]
@@ -659,7 +729,7 @@ mod tests {
         let has = |cfg: &mut Config| {
             let p = page(LlmProviderId::Openrouter, Fake::default());
             let cx = Cx::new(cfg, 0);
-            p.items(&cx).iter().any(|i| matches!(i, Item::Group(g) if g == "AI model"))
+            p.items(&cx).iter().any(|i| matches!(i, Item::Group(g) if g == "AI provider"))
         };
         let mut cfg = Config::default();
         assert!(has(&mut cfg), "rewrite is on by default and needs a provider");

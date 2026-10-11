@@ -78,12 +78,14 @@ pub enum PickerId {
     SttProvider,
     /// AI cleanup / rewrite provider.
     LlmProvider,
-    /// AI model suggestions for the active LLM provider.
+    /// AI cleanup model suggestions for the active LLM provider.
     LlmModel,
+    /// AI rewrite model suggestions for the active LLM provider.
+    LlmRewriteModel,
 }
 
 impl PickerId {
-    pub const ALL: [PickerId; 7] = [
+    pub const ALL: [PickerId; 8] = [
         PickerId::Language,
         PickerId::InputDevice,
         PickerId::MicWarm,
@@ -91,6 +93,7 @@ impl PickerId {
         PickerId::SttProvider,
         PickerId::LlmProvider,
         PickerId::LlmModel,
+        PickerId::LlmRewriteModel,
     ];
 }
 

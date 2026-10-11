@@ -1,4 +1,4 @@
-# AI model
+# AI cleanup model
   note: Suggestions for the current provider. Type any other model id in the Model field.
 
 ## Models

@@ -79,8 +79,8 @@ pub fn rewrite_timeout_ms(cfg: &Config) -> u64 {
     }
 }
 
-/// Rewrite `text` (a dictation without its trigger phrase) more concisely with the cleanup
-/// provider, model and key. Works whether or not "Enable AI cleanup" is on. Uses
+/// Rewrite `text` (a dictation without its trigger phrase) more concisely with the shared AI
+/// provider and key and the rewrite's own model. Works whether or not "Enable AI cleanup" is on. Uses
 /// [`rewrite_timeout_ms`] (default 10 s), no retries. `hints` are dictionary words plus snippet
 /// triggers, so the model keeps them intact for the snippet stage that follows.
 pub fn rewrite(cfg: &Config, text: &str, hints: &[String]) -> Result<String, LlmError> {
@@ -103,7 +103,9 @@ pub fn rewrite_with(
     }
     let system = prompt::rewrite_system_prompt(&cfg.language, hints);
     let user = prompt::rewrite_user_message(text);
-    let output = run(cfg, &system, &user, text.chars().count(), rewrite_timeout_ms(cfg), key, base_override)?;
+    // the rewrite's own model (and Azure deployment) on the shared provider
+    let rw = cfg.for_llm_task(crate::core::config::LlmTask::Rewrite);
+    let output = run(&rw, &system, &user, text.chars().count(), rewrite_timeout_ms(cfg), key, base_override)?;
     providers::sanitize::validate_rewrite(text, &output)
 }
 
@@ -172,6 +174,7 @@ mod tests {
         let mut c = Config::default();
         c.ai_cleanup.provider = provider;
         c.ai_cleanup.models.insert(provider, model.to_string());
+        c.ai_cleanup.rewrite_models.insert(provider, model.to_string());
         c.ai_cleanup.timeout_ms = 3_000;
         c.ai_cleanup.rewrite_timeout_ms = 3_000;
         c.language = "en".into();
@@ -396,6 +399,20 @@ mod tests {
     }
 
     #[test]
+    fn rewrite_and_cleanup_each_send_their_own_model() {
+        let mut c = cfg(LlmProviderId::Custom, "cleanup-model");
+        c.ai_cleanup.rewrite_models.insert(LlmProviderId::Custom, "rewrite-model".into());
+        let (base, rx) = serve_once(200, &chat_body(CONCISE), Duration::ZERO);
+        c.ai_cleanup.custom_base_url = format!("{base}/v1");
+        rewrite_with(&c, WORDY, &[], None, None).unwrap();
+        assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap().json()["model"], "rewrite-model");
+        let (base, rx) = serve_once(200, &chat_body(CLEAN), Duration::ZERO);
+        c.ai_cleanup.custom_base_url = format!("{base}/v1");
+        cleanup_with(&c, RAW, &[], None, None).unwrap();
+        assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap().json()["model"], "cleanup-model");
+    }
+
+    #[test]
     fn rewrite_not_configured_cases() {
         let c = cfg(LlmProviderId::Openai, "gpt-5-nano");
         assert_eq!(rewrite_with(&c, WORDY, &[], None, None), Err(LlmError::NotConfigured));
@@ -403,7 +420,7 @@ mod tests {
         let mut c = cfg(LlmProviderId::Custom, "llama");
         assert_eq!(rewrite_with(&c, WORDY, &[], Some("k"), None), Err(LlmError::NotConfigured), "custom without a base URL");
         c.ai_cleanup.custom_base_url = "http://127.0.0.1:1".into();
-        c.ai_cleanup.models.insert(LlmProviderId::Custom, String::new());
+        c.ai_cleanup.rewrite_models.insert(LlmProviderId::Custom, String::new());
         assert_eq!(rewrite_with(&c, WORDY, &[], None, None), Err(LlmError::NotConfigured), "no model");
     }
 

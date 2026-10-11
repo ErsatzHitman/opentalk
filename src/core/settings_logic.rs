@@ -193,6 +193,9 @@ pub fn run_stt_sample(cfg: &Config) -> TestOutcome {
 
 /// Run [`SAMPLE_TEXT`] through the configured cleanup model, as the daemon does (blocking).
 pub fn run_llm_sample(cfg: &Config) -> TestOutcome {
+    // the model of the feature in use: AI cleanup's, or the rewrite's when only the rewrite is on
+    let task = if !cfg.ai_cleanup.enabled && cfg.ai_cleanup.rewrite_enabled { crate::core::config::LlmTask::Rewrite } else { crate::core::config::LlmTask::Cleanup };
+    let cfg = &cfg.for_llm_task(task);
     let started = Instant::now();
     let hints = crate::core::dictionary::hint_words(&cfg.dictionary, &cfg.snippets);
     match safe(|| crate::llm::cleanup(cfg, SAMPLE_TEXT, &hints)) {

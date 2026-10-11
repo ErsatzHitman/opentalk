@@ -1,22 +1,24 @@
 # Cleanup & AI
 
 ## AI rewrite
-  [x] #1 Enable AI rewrite -- Uses the AI model below
+  [x] #1 Enable AI rewrite -- Say the phrase at the end for a concise version
   tools #3 Trigger phrase [Reset to default (disabled)]
   field #2  [text] = "rewrite this concisely" (hint "rewrite this concisely", max 80)
   note: End a dictation with this phrase to paste a concise rewrite.
+  field #4 Model [text] = "nvidia/nemotron-3-super-120b-a12b:free" (hint "Model id")
+  choice #5 Suggested models > Choose...
 
 ## AI cleanup
-  [x] #20 Enable AI cleanup -- Polishes every dictation with the AI model below
+  [x] #20 Enable AI cleanup -- Polishes every dictation with an AI model
   tools #41 Cleanup prompt -- Built-in [Reset to default (disabled)]
   field #40  [multiline x8] = "DEFAULT PROMPT" (hint "")
-
-## AI model
-  note: Used by both AI rewrite and AI cleanup.
-  choice #21 Provider > OpenRouter
-  tools #104 API key -- sk-or-...abcd [Replace key] [Remove key]
   field #22 Model [text] = "nvidia/nemotron-3-super-120b-a12b:free" (hint "Model id")
   choice #23 Suggested models > Choose...
+
+## AI provider
+  note: Shared by AI rewrite and AI cleanup; each picks its own model above.
+  choice #21 Provider > OpenRouter
+  tools #104 API key -- sk-or-...abcd [Replace key] [Remove key]
   tools #42 Run on a sample -- Polishes a rough sentence [Run the test]
 
 ## On-device cleanup

@@ -1,23 +1,24 @@
 # Cleanup & AI
 
 ## AI rewrite
-  [x] #1 Enable AI rewrite -- Uses the AI model below
+  [x] #1 Enable AI rewrite -- Say the phrase at the end for a concise version
   tools #3 Trigger phrase [Reset to default (disabled)]
   field #2  [text] = "rewrite this concisely" (hint "rewrite this concisely", max 80)
   note: End a dictation with this phrase to paste a concise rewrite.
+  field #6 Deployment [text] = "" (hint "gpt-5-mini")
 
 ## AI cleanup
-  [x] #20 Enable AI cleanup -- Polishes every dictation with the AI model below
+  [x] #20 Enable AI cleanup -- Polishes every dictation with an AI model
   tools #41 Cleanup prompt -- Built-in [Reset to default (disabled)]
   field #40  [multiline x8] = "DEFAULT PROMPT" (hint "")
+  field #26 Deployment [text] = "" (hint "gpt-5-mini")
 
-## AI model
-  note: Used by both AI rewrite and AI cleanup.
+## AI provider
+  note: Shared by AI rewrite and AI cleanup; each picks its own model above.
   choice #21 Provider > Azure OpenAI
   tools #101 API key [Save key (disabled)]
   field #100  [secret] = "" (hint "Paste your API key")
   field #25 Endpoint [text] = "" (hint "https://my-resource.openai.azure.com")
-  field #26 Deployment [text] = "" (hint "gpt-5-mini")
   field #27 API version [text] = "2024-10-21" (hint "2024-10-21")
   field #28 Underlying model (optional) [text] = "" (hint "gpt-5-mini")
   note: Set the model behind the deployment when its name does not contain it (a deployment called "cleanup" serving gpt-5), so the right request parameters are used.

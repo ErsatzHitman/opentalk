@@ -15,6 +15,11 @@ const ID_OPT0: ItemId = 100;
 /// Capture devices as (endpoint id, display name).
 pub type Devices = Vec<(String, String)>;
 
+/// Which feature's model a model picker edits.
+fn llm_task(id: PickerId) -> crate::core::config::LlmTask {
+    if id == PickerId::LlmRewriteModel { crate::core::config::LlmTask::Rewrite } else { crate::core::config::LlmTask::Cleanup }
+}
+
 fn system_devices() -> Devices {
     std::panic::catch_unwind(crate::daemon::audio::list_devices).unwrap_or_default().into_iter().map(|d| (d.id, d.name)).collect()
 }
@@ -97,9 +102,9 @@ impl PickerPage {
                     (i, p.name.to_string(), if p.enterprise { "Enterprise".into() } else { String::new() }, p.id == cfg.ai_cleanup.provider)
                 }));
             }
-            PickerId::LlmModel => {
+            PickerId::LlmModel | PickerId::LlmRewriteModel => {
                 let info = crate::llm::registry::provider(cfg.ai_cleanup.provider);
-                let cur = cfg.llm_model();
+                let cur = cfg.llm_model_for(llm_task(self.id));
                 rows.extend(info.models.iter().enumerate().map(|(i, m)| (i, m.to_string(), String::new(), *m == cur)));
             }
         }
@@ -139,12 +144,10 @@ impl PickerPage {
                 Some(p) => cfg.ai_cleanup.provider = p.id,
                 None => return false,
             },
-            PickerId::LlmModel => {
+            PickerId::LlmModel | PickerId::LlmRewriteModel => {
                 let info = crate::llm::registry::provider(cfg.ai_cleanup.provider);
                 match info.models.get(index) {
-                    Some(m) => {
-                        cfg.ai_cleanup.models.insert(cfg.ai_cleanup.provider, m.to_string());
-                    }
+                    Some(m) => cfg.set_llm_model(llm_task(self.id), m),
                     None => return false,
                 }
             }
@@ -162,7 +165,8 @@ impl PageModel for PickerPage {
             PickerId::Retention => "Keep transcripts for",
             PickerId::SttProvider => "Speech provider",
             PickerId::LlmProvider => "AI provider",
-            PickerId::LlmModel => "AI model",
+            PickerId::LlmModel => "AI cleanup model",
+            PickerId::LlmRewriteModel => "AI rewrite model",
         }
         .into()
     }
@@ -186,21 +190,21 @@ impl PageModel for PickerPage {
             PickerId::InputDevice => {
                 v.push(button(ID_REFRESH, if self.devices.is_none() { "Looking for microphones..." } else { "Refresh devices" }, BtnStyle::Outline, self.devices.is_some()));
             }
-            PickerId::LlmModel => v.push(note("Suggestions for the current provider. Type any other model id in the Model field.")),
+            PickerId::LlmModel | PickerId::LlmRewriteModel => v.push(note("Suggestions for the current provider. Type any other model id in the Model field.")),
             _ => {}
         }
         let rows = self.options(cx.cfg);
         if rows.is_empty() {
             v.push(note(match self.id {
                 PickerId::Language => "No language matches the filter.",
-                PickerId::LlmModel => "This provider has no suggestions. Type the model id in the Model field.",
+                PickerId::LlmModel | PickerId::LlmRewriteModel => "This provider has no suggestions. Type the model id in the Model field.",
                 _ => "Nothing to choose from.",
             }));
         } else {
             v.push(group(match self.id {
                 PickerId::Language => "Languages",
                 PickerId::InputDevice => "Microphones",
-                PickerId::LlmModel => "Models",
+                PickerId::LlmModel | PickerId::LlmRewriteModel => "Models",
                 PickerId::SttProvider | PickerId::LlmProvider => "Providers",
                 _ => "Options",
             }));
@@ -293,6 +297,20 @@ mod tests {
         assert_eq!(cfg.stt.provider, SttProviderId::Groq);
         assert_eq!(cfg.ai_cleanup.provider, LlmProviderId::Openrouter);
         assert_eq!(cfg.llm_model(), crate::llm::registry::provider(LlmProviderId::Openrouter).models[1]);
+    }
+
+    #[test]
+    fn the_rewrite_model_picker_leaves_the_cleanup_model_alone() {
+        let mut cfg = Config::default();
+        let models = crate::llm::registry::provider(cfg.ai_cleanup.provider).models;
+        let mut p = picker(PickerId::LlmRewriteModel);
+        let mut cx = Cx::new(&mut cfg, 0);
+        assert_eq!(p.event(ID_OPT0 + 1, Event::Activated, &mut cx), vec![Effect::Saved, Effect::Back]);
+        assert_eq!(cfg.llm_model_for(crate::core::config::LlmTask::Rewrite), models[1]);
+        assert_eq!(cfg.llm_model(), models[0], "the cleanup model stays on the default");
+        assert_eq!(on_ids(&picker(PickerId::LlmRewriteModel), &mut cfg), vec![ID_OPT0 + 1]);
+        assert_eq!(on_ids(&picker(PickerId::LlmModel), &mut cfg), vec![ID_OPT0]);
+        assert_eq!(picker(PickerId::LlmRewriteModel).title(), "AI rewrite model");
     }
 
     #[test]

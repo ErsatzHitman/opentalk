@@ -7,7 +7,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-pub const CONFIG_VERSION: u32 = 1;
+/// 2: AI rewrite got its own model (`ai_cleanup.rewrite_models`, `rewrite_azure_deployment`).
+pub const CONFIG_VERSION: u32 = 2;
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
 #[serde(rename_all = "kebab-case")]
@@ -66,6 +67,13 @@ pub enum LlmProviderId {
     Vertex,
 }
 
+/// What an LLM call is for: each has its own model on the shared provider.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum LlmTask {
+    Cleanup,
+    Rewrite,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct Snippet { pub trigger: String, pub replacement: String }
 
@@ -111,8 +119,14 @@ pub const DEFAULT_REWRITE_TIMEOUT_MS: u64 = 10_000;
 #[serde(default)]
 pub struct AiCleanupConfig {
     pub enabled: bool,
+    /// AI provider shared by AI cleanup and AI rewrite (one key, one endpoint).
     pub provider: LlmProviderId,
+    /// AI cleanup's model per provider.
     pub models: BTreeMap<LlmProviderId, String>,
+    /// AI rewrite's model per provider, independent of `models` (empty = the provider's default).
+    pub rewrite_models: BTreeMap<LlmProviderId, String>,
+    /// AI rewrite's Azure deployment (empty = `azure_deployment`).
+    pub rewrite_azure_deployment: String,
     pub custom_base_url: String,
     /// Empty = OpenWhispr default cleanup prompt.
     pub custom_prompt: String,
@@ -142,6 +156,8 @@ impl Default for AiCleanupConfig {
             enabled: false,
             provider: LlmProviderId::Openrouter,
             models: BTreeMap::new(),
+            rewrite_models: BTreeMap::new(),
+            rewrite_azure_deployment: String::new(),
             custom_base_url: String::new(),
             custom_prompt: String::new(),
             timeout_ms: 4_000,
@@ -276,6 +292,17 @@ impl Config {
     }
 
     fn migrate(&mut self) {
+        if self.version < 2 {
+            // Before v2 the rewrite used the cleanup model: carry those choices over so an upgrade
+            // changes nothing, after which the two are edited separately.
+            let ai = &mut self.ai_cleanup;
+            if ai.rewrite_models.is_empty() {
+                ai.rewrite_models = ai.models.clone();
+            }
+            if ai.rewrite_azure_deployment.is_empty() {
+                ai.rewrite_azure_deployment = ai.azure_deployment.clone();
+            }
+        }
         if self.version < CONFIG_VERSION {
             self.version = CONFIG_VERSION;
         }
@@ -301,14 +328,61 @@ impl Config {
             .unwrap_or_else(|| crate::stt::registry::default_model(self.stt.provider).to_string())
     }
 
-    /// Model for the active cleanup LLM provider.
+    /// AI cleanup's model for the active LLM provider.
     pub fn llm_model(&self) -> String {
-        self.ai_cleanup
-            .models
-            .get(&self.ai_cleanup.provider)
+        self.llm_model_for(LlmTask::Cleanup)
+    }
+
+    /// The model `task` uses with the active LLM provider (falls back to the registry default).
+    pub fn llm_model_for(&self, task: LlmTask) -> String {
+        let ai = &self.ai_cleanup;
+        let models = match task {
+            LlmTask::Cleanup => &ai.models,
+            LlmTask::Rewrite => &ai.rewrite_models,
+        };
+        models
+            .get(&ai.provider)
+            .map(|m| m.trim())
             .filter(|m| !m.is_empty())
-            .cloned()
-            .unwrap_or_else(|| crate::llm::registry::default_model(self.ai_cleanup.provider).to_string())
+            .map(str::to_string)
+            .unwrap_or_else(|| crate::llm::registry::default_model(ai.provider).to_string())
+    }
+
+    /// Set (or, with an empty `model`, reset to the default) `task`'s model for the active provider.
+    pub fn set_llm_model(&mut self, task: LlmTask, model: &str) {
+        let ai = &mut self.ai_cleanup;
+        let provider = ai.provider;
+        let models = match task {
+            LlmTask::Cleanup => &mut ai.models,
+            LlmTask::Rewrite => &mut ai.rewrite_models,
+        };
+        let m = model.trim();
+        if m.is_empty() {
+            models.remove(&provider);
+        } else {
+            models.insert(provider, m.to_string());
+        }
+    }
+
+    /// `task`'s Azure deployment (the rewrite falls back to the cleanup one when it has none).
+    pub fn azure_deployment_for(&self, task: LlmTask) -> &str {
+        let ai = &self.ai_cleanup;
+        match task {
+            LlmTask::Rewrite if !ai.rewrite_azure_deployment.trim().is_empty() => ai.rewrite_azure_deployment.trim(),
+            _ => ai.azure_deployment.trim(),
+        }
+    }
+
+    /// This config as `task` sees it: the shared provider settings with `task`'s model and Azure
+    /// deployment in the cleanup slots every provider reads.
+    pub fn for_llm_task(&self, task: LlmTask) -> Config {
+        let mut c = self.clone();
+        if task == LlmTask::Rewrite {
+            let model = self.llm_model_for(LlmTask::Rewrite);
+            c.ai_cleanup.models.insert(self.ai_cleanup.provider, model);
+            c.ai_cleanup.azure_deployment = self.azure_deployment_for(LlmTask::Rewrite).to_string();
+        }
+        c
     }
 }
 
@@ -388,6 +462,47 @@ mod tests {
         let back: Config = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
         assert_eq!(back, c);
     }
+    #[test]
+    fn rewrite_and_cleanup_models_are_independent() {
+        let mut c = Config::default();
+        c.ai_cleanup.provider = LlmProviderId::Openrouter;
+        let default = crate::llm::registry::default_model(LlmProviderId::Openrouter).to_string();
+        assert_eq!(c.llm_model_for(LlmTask::Rewrite), default);
+        assert_eq!(c.llm_model_for(LlmTask::Cleanup), default);
+        c.set_llm_model(LlmTask::Cleanup, "a/cleanup");
+        assert_eq!(c.llm_model_for(LlmTask::Cleanup), "a/cleanup");
+        assert_eq!(c.llm_model_for(LlmTask::Rewrite), default, "changing cleanup leaves the rewrite alone");
+        c.set_llm_model(LlmTask::Rewrite, " b/rewrite ");
+        assert_eq!(c.llm_model_for(LlmTask::Rewrite), "b/rewrite");
+        assert_eq!(c.llm_model_for(LlmTask::Cleanup), "a/cleanup", "and the other way round");
+        let rw = c.for_llm_task(LlmTask::Rewrite);
+        assert_eq!(rw.llm_model(), "b/rewrite", "the rewrite's view puts its model in the shared slot");
+        assert_eq!(c.for_llm_task(LlmTask::Cleanup).llm_model(), "a/cleanup");
+        c.set_llm_model(LlmTask::Rewrite, "");
+        assert_eq!(c.llm_model_for(LlmTask::Rewrite), default, "empty resets to the default");
+        // Azure: the rewrite deployment falls back to the cleanup one
+        c.ai_cleanup.azure_deployment = "clean-dep".into();
+        assert_eq!(c.azure_deployment_for(LlmTask::Rewrite), "clean-dep");
+        c.ai_cleanup.rewrite_azure_deployment = "rw-dep".into();
+        assert_eq!(c.for_llm_task(LlmTask::Rewrite).ai_cleanup.azure_deployment, "rw-dep");
+        assert_eq!(c.for_llm_task(LlmTask::Cleanup).ai_cleanup.azure_deployment, "clean-dep");
+    }
+
+    #[test]
+    fn v1_configs_keep_the_rewrite_on_the_cleanup_model() {
+        let mut c: Config = serde_json::from_str(r#"{"version":1,"ai_cleanup":{"provider":"openrouter","models":{"openrouter":"x/old"},"azure_deployment":"dep"}}"#).unwrap();
+        c.migrate();
+        assert_eq!(c.version, CONFIG_VERSION);
+        assert_eq!(c.llm_model_for(LlmTask::Rewrite), "x/old");
+        assert_eq!(c.ai_cleanup.rewrite_azure_deployment, "dep");
+        c.set_llm_model(LlmTask::Cleanup, "y/new");
+        assert_eq!(c.llm_model_for(LlmTask::Rewrite), "x/old", "after the upgrade they are separate");
+        // a v2 file is not migrated again
+        let mut v2: Config = serde_json::from_str(r#"{"version":2,"ai_cleanup":{"models":{"openrouter":"x/old"}}}"#).unwrap();
+        v2.migrate();
+        assert!(v2.ai_cleanup.rewrite_models.is_empty());
+    }
+
     #[test]
     fn roundtrip() {
         let c = Config::default();
