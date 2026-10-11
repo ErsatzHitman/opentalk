@@ -67,11 +67,16 @@ Optional, under **Settings → Cleanup & AI**:
 | Click the pill / right-click it | Start or stop / hide it for now |
 | Click the **tray icon** | Open the popup: status, History, Dictionary, Settings, recent dictations |
 | End with *"…rewrite this concisely"* | Paste a concise AI rewrite instead of what you said |
+| *"…rewrite this concisely and make it formal"* | Rewrite following your extra instructions |
 
 **While you record,** the pill shows the app the text will go to and a live waveform. The waveform follows your voice
 and breathes gently when you're silent, so you can always tell the microphone is live. When you stop, the pill glows
 while the text is transcribed, then the text is pasted into that app. Your clipboard is restored afterwards, and the
 dictated text never appears in Win + V clipboard history.
+
+**If nothing can take text** (the desktop, a button, a web page with no field selected), the text is not pasted
+into nowhere: it is copied to the clipboard and a small **Copied** bubble pops out of the pill. Press Ctrl + V where
+you want it.
 
 **If a transcription fails** (network, quota), the pill's error card offers **Retry** with the audio kept in memory.
 
@@ -81,9 +86,13 @@ casing. **Snippets** expand a spoken trigger into longer text.
 
 ### The rewrite phrase
 
-Say it as the **last** thing in a dictation, for example: *"Let's move the meeting to Friday afternoon because the
+Say it after your message, for example: *"Let's move the meeting to Friday afternoon because the
 client is out on Thursday, rewrite this concisely."*
 
+- **Extra instructions:** keep talking after the phrase and those words go to the AI model as extra instructions,
+  for example *"… rewrite this concisely and translate it to Spanish"* or *"… rewrite this concisely as bullet
+  points"*. Only the text before the phrase is rewritten; the phrase and the instructions are never pasted. This
+  works with any phrase you set.
 - A trailing "please" or "thanks" is fine. Case, punctuation and "re-write" spellings don't matter.
 - Only the text before the phrase is sent, as text and never audio. Bodies of three words or fewer are pasted as spoken.
 - If the AI call fails, your text is pasted as dictated, without the phrase, and a card tells you why.

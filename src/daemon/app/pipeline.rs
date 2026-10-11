@@ -60,15 +60,20 @@ pub struct Cleaned {
     pub original: Option<String>,
 }
 
+/// `(body, extra instructions)` -> the rewrite.
+pub type RewriteCall<'a> = dyn Fn(&str, Option<&str>) -> Result<String, LlmError> + 'a;
+
 /// The two LLM calls the text stage can make (injected in tests).
 pub struct LlmCalls<'a> {
     /// Polish the deterministic text (`ai_cleanup.enabled`).
     pub cleanup: &'a dyn Fn(&str) -> Result<String, LlmError>,
-    /// Rewrite the body of a dictation that ended with the phrase, concisely.
-    pub rewrite: &'a dyn Fn(&str) -> Result<String, LlmError>,
+    /// Rewrite the body of a dictation that contained the phrase, concisely, following the
+    /// speaker's extra instructions when they said any after the phrase.
+    pub rewrite: &'a RewriteCall<'a>,
 }
 
 /// Bodies of up to this many words are pasted as spoken: a rewrite cannot make them shorter.
+/// Extra instructions lift the limit ("translate it to Spanish" applies to two words too).
 pub const REWRITE_MIN_WORDS: usize = 4;
 
 /// STT stage. A streaming session that fails (or returns nothing) falls back to the batch
@@ -111,7 +116,7 @@ pub fn clean(cfg: &Config, transcript: &Transcript, speech_ms: u64) -> Cleaned {
         speech_ms,
         &LlmCalls {
             cleanup: &|text| crate::llm::cleanup(cfg, text, &cfg.dictionary),
-            rewrite: &|text| crate::llm::rewrite(cfg, text, &hints),
+            rewrite: &|text, instructions| crate::llm::rewrite(cfg, text, instructions, &hints),
         },
     )
 }
@@ -124,7 +129,7 @@ pub fn clean_with(
     speech_ms: u64,
     llm: &dyn Fn(&str) -> Result<String, LlmError>,
 ) -> Cleaned {
-    clean_with_calls(cfg, transcript, speech_ms, &LlmCalls { cleanup: llm, rewrite: llm })
+    clean_with_calls(cfg, transcript, speech_ms, &LlmCalls { cleanup: llm, rewrite: &|text, _| llm(text) })
 }
 
 /// [`clean`] with both LLM calls injected (tests).
@@ -181,18 +186,21 @@ pub fn clean_with_calls(cfg: &Config, transcript: &Transcript, speech_ms: u64, c
             state = RewriteState::NothingToRewrite;
             text.clear();
         }
-        Detect::Match { body } => {
+        Detect::Match { body, instructions } => {
             let words = rewrite::word_count(&body);
-            log_info!("rewrite matched; body {words} words");
+            match &instructions {
+                Some(i) => log_info!("rewrite matched; body {words} words, instructions {} words", rewrite::word_count(i)),
+                None => log_info!("rewrite matched; body {words} words"),
+            }
             // The rewrite replaces the cleanup call: one network round trip, and the rewrite prompt
             // already covers grammar and fillers. A failed rewrite does NOT fall back to cleanup (that
             // could add seconds after a long wait); the deterministic body is pasted.
-            if words < REWRITE_MIN_WORDS {
+            if words < REWRITE_MIN_WORDS && instructions.is_none() {
                 text = body;
                 state = RewriteState::Skipped;
             } else {
                 let t = now_ms();
-                let reply = (calls.rewrite)(&body);
+                let reply = (calls.rewrite)(&body, instructions.as_deref());
                 rewrite_ms = now_ms() - t;
                 match choose_rewrite(reply) {
                     Ok(concise) => {
@@ -367,21 +375,23 @@ mod tests {
     struct Calls {
         cleanup_seen: RefCell<Vec<String>>,
         rewrite_seen: RefCell<Vec<String>>,
+        instructions_seen: RefCell<Vec<Option<String>>>,
         cleanup_reply: Result<String, LlmError>,
         rewrite_reply: Result<String, LlmError>,
     }
 
     impl Calls {
         fn new(rewrite_reply: Result<String, LlmError>) -> Calls {
-            Calls { cleanup_seen: RefCell::default(), rewrite_seen: RefCell::default(), cleanup_reply: Ok("CLEANUP".into()), rewrite_reply }
+            Calls { cleanup_seen: RefCell::default(), rewrite_seen: RefCell::default(), instructions_seen: RefCell::default(), cleanup_reply: Ok("CLEANUP".into()), rewrite_reply }
         }
         fn run(&self, cfg: &Config, spoken: &str) -> Cleaned {
             let cleanup = |t: &str| {
                 self.cleanup_seen.borrow_mut().push(t.to_string());
                 self.cleanup_reply.clone()
             };
-            let rewrite = |t: &str| {
+            let rewrite = |t: &str, i: Option<&str>| {
                 self.rewrite_seen.borrow_mut().push(t.to_string());
+                self.instructions_seen.borrow_mut().push(i.map(str::to_string));
                 self.rewrite_reply.clone()
             };
             clean_with_calls(cfg, &t(spoken), 4000, &LlmCalls { cleanup: &cleanup, rewrite: &rewrite })
@@ -475,6 +485,28 @@ mod tests {
         let (title, body) = nothing_to_rewrite_card(&cfg);
         assert_eq!(title, "Nothing to rewrite");
         assert_eq!(body, "Say your message first, then \"rewrite this concisely\".");
+    }
+
+    #[test]
+    fn words_after_the_phrase_go_to_the_model_as_instructions() {
+        let cfg = Config::default();
+        let calls = Calls::new(Ok("Hola equipo.".into()));
+        let c = calls.run(&cfg, &format!("{LONG}. Rewrite this concisely and translate it to Spanish."));
+        assert_eq!((c.text.as_str(), &c.rewrite), ("Hola equipo.", &RewriteState::Done));
+        let sent = calls.rewrite_seen.borrow()[0].to_lowercase();
+        assert!(sent.ends_with("everyone.") && !sent.contains("rewrite") && !sent.contains("spanish"), "only the body is the source text: {sent}");
+        assert_eq!(calls.instructions_seen.borrow()[0].as_deref(), Some("translate it to Spanish."));
+        assert!(!c.original.as_deref().unwrap().to_lowercase().contains("spanish"));
+        // A custom phrase works the same way.
+        let cfg = Config { rewrite_trigger: "fix this up".into(), ..Config::default() };
+        let calls = Calls::new(Ok("Hi.".into()));
+        assert_eq!(calls.run(&cfg, "hey there fix this up as a formal email").rewrite, RewriteState::Done);
+        assert_eq!(calls.rewrite_seen.borrow()[0], "Hey there", "instructions lift the short-body limit");
+        assert_eq!(calls.instructions_seen.borrow()[0].as_deref(), Some("as a formal email"));
+        // Without extra words nothing changes.
+        let calls = Calls::new(Ok(SHORT.into()));
+        calls.run(&Config::default(), &format!("{LONG} rewrite this concisely, thanks"));
+        assert_eq!(calls.instructions_seen.borrow()[0], None);
     }
 
     #[test]

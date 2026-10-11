@@ -71,6 +71,9 @@ pub enum PasteOutcome {
     /// The dictation was cancelled (Esc) before the paste keystroke was sent: nothing was pasted
     /// and the user's clipboard is being put back.
     Cancelled,
+    /// Nothing focused takes text (the desktop, a button, a page with no field selected): the
+    /// text was left on the clipboard instead of being pasted nowhere.
+    NoTextField,
 }
 
 /// `dwExtraInfo` stamped on the keystrokes we inject ("OTPS"), so our own hook can recognise them.
@@ -171,14 +174,14 @@ fn to_hwnd(h: isize) -> HWND {
     HWND(h as *mut c_void)
 }
 
-fn class_of(hwnd: HWND) -> String {
+pub(crate) fn class_of(hwnd: HWND) -> String {
     let mut buf = [0u16; 256];
     // SAFETY: buf is a valid, writable slice for the duration of the call.
     let n = unsafe { GetClassNameW(hwnd, &mut buf) };
     String::from_utf16_lossy(&buf[..n.max(0) as usize])
 }
 
-fn pid_of(hwnd: HWND) -> u32 {
+pub(crate) fn pid_of(hwnd: HWND) -> u32 {
     let mut pid = 0u32;
     // SAFETY: `pid` is a valid out pointer.
     unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
@@ -199,7 +202,7 @@ pub(crate) fn exe_path_of(pid: u32) -> Option<String> {
     }
 }
 
-fn file_name(path: &str) -> &str {
+pub(crate) fn file_name(path: &str) -> &str {
     path.rsplit(['\\', '/']).next().unwrap_or(path)
 }
 
@@ -937,6 +940,8 @@ trait PasteEnv: Send + Sync {
     /// A Ctrl/Alt/Shift/Win key is physically down.
     fn modifiers_held(&self) -> bool;
     fn ensure_foreground(&self, target: &Target) -> bool;
+    /// Does the focused element take text? `None` when that cannot be told (see `focus`).
+    fn takes_text(&self) -> Option<bool>;
     /// Inject the paste chord (the key injector).
     fn send_paste(&self, terminal: bool) -> Result<(), SendError>;
     fn acquire_pending(&self) -> Option<(u64, Arc<Snapshot>)>;
@@ -963,6 +968,9 @@ impl PasteEnv for SystemPaste {
     }
     fn ensure_foreground(&self, target: &Target) -> bool {
         ensure_foreground(target)
+    }
+    fn takes_text(&self) -> Option<bool> {
+        super::focus::text_input_focused()
     }
     fn send_paste(&self, terminal: bool) -> Result<(), SendError> {
         send_chord(&paste_chord(terminal))
@@ -1086,6 +1094,13 @@ fn paste_with(
         if !env.ensure_foreground(t) {
             return fail(NO_FOCUS_REASON);
         }
+    }
+    // Nowhere to paste: the text stays on the clipboard on purpose (no restore) and the pill says so.
+    if env.takes_text() == Some(false) {
+        if let Some((gen_id, _)) = &pending {
+            env.take_pending(*gen_id);
+        }
+        return (PasteOutcome::NoTextField, None);
     }
     // Give the clipboard-owner change a moment to settle before the target reads it.
     thread::sleep(Duration::from_millis(10));
@@ -1799,6 +1814,8 @@ mod tests {
         cancel_in_foreground: bool,
         /// A snapshot of the user's clipboard is pending.
         pending: bool,
+        /// What the focus check answers (`None`: cannot tell).
+        text_field: Option<bool>,
         cancel: Arc<std::sync::atomic::AtomicBool>,
         cancelled_at: Mutex<Option<Instant>>,
         probes: std::sync::atomic::AtomicUsize,
@@ -1843,6 +1860,9 @@ mod tests {
             }
             true
         }
+        fn takes_text(&self) -> Option<bool> {
+            self.text_field
+        }
         fn send_paste(&self, _terminal: bool) -> Result<(), SendError> {
             self.sends.fetch_add(1, Ordering::SeqCst);
             Ok(())
@@ -1884,6 +1904,23 @@ mod tests {
         assert_eq!(FakeEnv::count(&env.writes), 1);
         restore.expect("restore thread").join().unwrap();
         assert_eq!((FakeEnv::count(&env.takes), FakeEnv::count(&env.restores)), (1, 1));
+    }
+
+    #[test]
+    fn no_text_field_leaves_the_text_on_the_clipboard_without_a_keystroke() {
+        let env = Arc::new(FakeEnv { text_field: Some(false), pending: true, ..Default::default() });
+        let (out, restore, _) = run_paste(&env, true);
+        assert_eq!(out, PasteOutcome::NoTextField);
+        assert_eq!(FakeEnv::count(&env.sends), 0, "no keystroke into nowhere");
+        assert_eq!(FakeEnv::count(&env.writes), 1, "the text is on the clipboard");
+        assert!(restore.is_none() && FakeEnv::count(&env.restores) == 0, "and stays there");
+        assert_eq!(FakeEnv::count(&env.takes), 1, "the snapshot is dropped");
+        // a field, or an answer nobody could give, pastes as before
+        for text_field in [Some(true), None] {
+            let env = Arc::new(FakeEnv { text_field, ..Default::default() });
+            assert_eq!(run_paste(&env, false).0, PasteOutcome::Pasted, "{text_field:?}");
+            assert_eq!(FakeEnv::count(&env.sends), 1);
+        }
     }
 
     #[test]

@@ -1,9 +1,12 @@
-//! Voice rewrite trigger: detects a spoken phrase (default "rewrite this concisely") at the END of
-//! a cleaned dictation and splits it into the body that is sent to the AI provider.
+//! Voice rewrite trigger: detects a spoken phrase (default "rewrite this concisely") in a cleaned
+//! dictation and splits it into the body that is sent to the AI provider and, when the speaker
+//! kept talking after the phrase ("... rewrite this concisely and make it formal"), the extra
+//! instructions for the model.
 //!
-//! Pure, no Win32, no config I/O. Matching is token-aligned and end-anchored, insensitive to
-//! punctuation, case, whitespace and apostrophes, with no edit-distance fuzz; one trailing
-//! courtesy group ([`COURTESY`]) may follow the phrase and trailing connectives
+//! Pure, no Win32, no config I/O. Matching is token-aligned, insensitive to punctuation, case,
+//! whitespace and apostrophes, with no edit-distance fuzz. A phrase that ends the text (optionally
+//! followed by one courtesy group, [`COURTESY`]) wins; otherwise the last occurrence followed by
+//! more words is used and those words become the instructions. Trailing connectives
 //! ([`CONNECTIVES`]) are stripped from the body. Runs after `cleanup::process_pre_llm`.
 //!
 //! Why no fuzz: a false positive silently rewrites (destroys) the user's text, a false negative
@@ -102,9 +105,10 @@ pub enum Detect {
     NoMatch,
     /// The text is only the trigger (nothing to rewrite).
     OnlyPhrase,
-    /// The text ends with the trigger; `body` is everything before it, trimmed, with trailing
-    /// connectives removed.
-    Match { body: String },
+    /// The text contains the trigger; `body` is everything before it, trimmed, with trailing
+    /// connectives removed. `instructions` are the words spoken after the phrase (leading
+    /// connectives removed), `None` when the phrase ended the dictation.
+    Match { body: String, instructions: Option<String> },
 }
 
 /// Words stripped from the end of the body, before the trigger ("..., and rewrite this concisely").
@@ -125,23 +129,50 @@ fn is_separator(c: char) -> bool {
     c.is_whitespace() || TRAILING_SEPARATORS.contains(&c)
 }
 
-/// Detect the trigger at the end of `text` (already through `process_pre_llm`).
+/// Words dropped from the start of the instructions ("... concisely, and then make it formal").
+const LEADING_CONNECTIVES: &[&str] = &["and", "then", "also", "so", "but", "just"];
+/// Words that alone are only politeness after the phrase ("..., thank you so much"), not instructions.
+const POLITE: &[&str] = &["please", "thanks", "thank", "you", "very", "much", "so", "a", "lot"];
+
+/// Detect the trigger in `text` (already through `process_pre_llm`).
 pub fn detect(text: &str, t: &Trigger) -> Detect {
     let toks = tokens(text);
     if toks.is_empty() || t.squashed.is_empty() {
         return Detect::NoMatch;
     }
-    let cut = match align(&toks, toks.len(), &t.squashed) {
-        Some(c) => c,
-        None => match courtesy_start(&toks).and_then(|end| align(&toks, end, &t.squashed)) {
-            Some(c) => c,
-            None => return Detect::NoMatch,
-        },
-    };
+    // The phrase ends the dictation (optionally before one courtesy group): no instructions.
+    if let Some(cut) = align(&toks, toks.len(), &t.squashed).or_else(|| courtesy_start(&toks).and_then(|end| align(&toks, end, &t.squashed))) {
+        return split_at(text, &toks, cut, None);
+    }
+    // The last occurrence followed by more words: those words are instructions for the model.
+    for end in (1..toks.len()).rev() {
+        if let Some(cut) = align(&toks, end, &t.squashed) {
+            return split_at(text, &toks, cut, trim_instructions(&text[toks[end - 1].end..]));
+        }
+    }
+    Detect::NoMatch
+}
+
+fn split_at(text: &str, toks: &[Tok], cut: usize, instructions: Option<String>) -> Detect {
     match trim_body(&text[..toks[cut].start]) {
-        Some(body) => Detect::Match { body },
+        Some(body) => Detect::Match { body, instructions },
         None => Detect::OnlyPhrase,
     }
+}
+
+/// The words after the phrase without the separators and connectives that led into them, or
+/// `None` when nothing but politeness is left.
+fn trim_instructions(raw: &str) -> Option<String> {
+    let lead = |c: char| is_separator(c) || matches!(c, '.' | '!' | '?' | '\u{3002}' | '\u{FF01}' | '\u{FF1F}');
+    let mut s = raw.trim_start_matches(lead);
+    while let Some(first) = tokens(s).first().filter(|t| t.start == 0 && LEADING_CONNECTIVES.contains(&t.sq.as_str())) {
+        s = s[first.end..].trim_start_matches(lead);
+    }
+    let toks = tokens(s);
+    if toks.iter().all(|t| POLITE.contains(&t.sq.as_str())) {
+        return None;
+    }
+    Some(s.trim_end().to_string())
 }
 
 /// Index of the first token of `squashed` when it ends exactly at token `end`, token aligned.
@@ -264,13 +295,17 @@ mod tests {
 
     fn body(text: &str) -> String {
         match d(text) {
-            Detect::Match { body } => body,
+            Detect::Match { body, .. } => body,
             other => panic!("{text:?} -> {other:?}"),
         }
     }
 
     fn m(b: &str) -> Detect {
-        Detect::Match { body: b.to_string() }
+        Detect::Match { body: b.to_string(), instructions: None }
+    }
+
+    fn mi(b: &str, i: &str) -> Detect {
+        Detect::Match { body: b.to_string(), instructions: Some(i.to_string()) }
     }
 
     /// The real cleanup stage, as the pipeline binds it.
@@ -333,11 +368,11 @@ mod tests {
     fn t12_thanks_after_the_phrase() {
         assert_eq!(d("We ship Friday. Rewrite this concisely. Thanks."), m("We ship Friday."));
         assert_eq!(d("We ship Friday. Rewrite this concisely. Thank you."), m("We ship Friday."));
-        assert_eq!(d("We ship Friday. Rewrite this concisely, thank you very much."), Detect::NoMatch, "only one short courtesy group");
+        assert_eq!(d("We ship Friday. Rewrite this concisely, thank you very much."), m("We ship Friday."), "politeness is not an instruction");
     }
     #[test]
-    fn t13_phrase_not_last() {
-        assert_eq!(d("Rewrite this concisely and send it to Bob."), Detect::NoMatch);
+    fn t13_phrase_first_with_instructions_is_only_the_phrase() {
+        assert_eq!(d("Rewrite this concisely and send it to Bob."), Detect::OnlyPhrase);
     }
     #[test]
     fn t14_token_misalignment() {
@@ -354,8 +389,11 @@ mod tests {
         assert_eq!(d("Rewrite this precisely."), Detect::NoMatch);
     }
     #[test]
-    fn t17_phrase_inside_a_sentence() {
-        assert_eq!(d("He said rewrite this concisely to me."), Detect::NoMatch);
+    fn t17_words_after_the_phrase_are_instructions() {
+        assert_eq!(d("He said rewrite this concisely to me."), mi("He said", "to me."));
+        assert_eq!(d("We ship Friday. Rewrite this concisely and make it formal."), mi("We ship Friday.", "make it formal."));
+        assert_eq!(d("We ship Friday, rewrite this concisely, and then translate it to Spanish"), mi("We ship Friday", "translate it to Spanish"));
+        assert_eq!(d("We ship Friday. Rewrite this concisely. As bullet points, please."), mi("We ship Friday.", "As bullet points, please."));
     }
     #[test]
     fn t18_genuine_sentence_matches_by_design() {
@@ -389,7 +427,8 @@ mod tests {
         let t = trig("请简化");
         assert_eq!(detect("明天开会。请简化。", &t), m("明天开会。"));
         assert_eq!(detect("请简化", &t), Detect::OnlyPhrase);
-        assert_eq!(detect("请简化明天开会", &t), Detect::NoMatch);
+        assert_eq!(detect("请简化明天开会", &t), Detect::OnlyPhrase, "the phrase first: nothing before it to rewrite");
+        assert_eq!(detect("明天开会。请简化，用英文", &t), mi("明天开会。", "用英文"));
         let ja = trig("簡潔に書き直して");
         assert_eq!(detect("明日の会議です。簡潔に書き直して", &ja), m("明日の会議です。"));
     }
@@ -527,8 +566,8 @@ mod tests {
         assert_eq!(d("Ship it Friday rewrite this concisely thanks"), m("Ship it Friday"));
         assert_eq!(d("Ship it Friday rewrite this concisely please"), m("Ship it Friday"));
         assert_eq!(d("Ship it Friday rewrite this concisely thank you"), m("Ship it Friday"));
-        assert_eq!(d("Ship it Friday rewrite this concisely please thanks"), Detect::NoMatch, "two courtesy groups");
-        assert_eq!(d("Ship it Friday rewrite this concisely thank"), Detect::NoMatch);
+        assert_eq!(d("Ship it Friday rewrite this concisely please thanks"), m("Ship it Friday"), "politeness only, not instructions");
+        assert_eq!(d("Ship it Friday rewrite this concisely thank"), m("Ship it Friday"));
         assert_eq!(d("Thanks. Rewrite this concisely. Thanks."), m("Thanks."));
         // A courtesy word BEFORE the phrase is a connective only for "please".
         assert_eq!(d("Ship it Friday thanks rewrite this concisely"), m("Ship it Friday thanks"));
@@ -541,7 +580,7 @@ mod tests {
         assert_eq!(d("..."), Detect::NoMatch);
         assert_eq!(d("rewrite this"), Detect::NoMatch, "partial phrase");
         assert_eq!(d("this concisely"), Detect::NoMatch);
-        assert_eq!(d("Send it. Rewrite this concisely now"), Detect::NoMatch);
+        assert_eq!(d("Send it. Rewrite this concisely now"), mi("Send it.", "now"));
         assert_eq!(d("rewrite this concisely rewrite this concisely"), m("rewrite this concisely"), "the LAST occurrence is cut");
     }
 
@@ -641,7 +680,7 @@ mod tests {
                 text.push_str(rng.pick(&["", ".", " thanks", ", thank you", " please", "!!", " 🙂"]));
             }
             for t in &triggers {
-                if let Detect::Match { body } = detect(&text, t) {
+                if let Detect::Match { body, .. } = detect(&text, t) {
                     matches += 1;
                     assert!(!body.is_empty() && body == body.trim(), "untrimmed body {body:?} from {text:?}");
                     assert!(text.contains(&body), "body is not a slice of the text: {body:?} / {text:?}");

@@ -400,6 +400,36 @@ pub fn validate_rewrite(input: &str, output: &str) -> Result<String, LlmError> {
     Ok(s)
 }
 
+/// A rewrite with the speaker's extra instructions may grow, shrink or change language
+/// ("expand this into an email", "translate it to Spanish"), so only the guards that do not
+/// depend on length or wording apply: not empty, not a refusal, not the transcript twice, and not
+/// a runaway answer of more than this many times the input (+ [`GUIDED_GROWTH_SLACK`] words).
+const GUIDED_GROWTH: f64 = 4.0;
+const GUIDED_GROWTH_SLACK: f64 = 60.0;
+
+/// Validate a rewrite that followed extra instructions. See [`GUIDED_GROWTH`].
+pub fn validate_guided_rewrite(input: &str, output: &str) -> Result<String, LlmError> {
+    let s = sanitize(output, input);
+    if s.trim().is_empty() {
+        return Err(LlmError::InvalidOutput("empty rewrite".into()));
+    }
+    let low = s.trim_start().to_lowercase();
+    let input_low = input.trim_start().to_lowercase();
+    if let Some(p) = REFUSAL_PREFIXES.iter().find(|p| low.starts_with(**p))
+        && !input_low.starts_with(*p)
+    {
+        return Err(LlmError::InvalidOutput("the model declined to rewrite".into()));
+    }
+    if is_duplicated_transcript(input, &s) {
+        return Err(LlmError::InvalidOutput("AI rewrite repeated the transcript".into()));
+    }
+    let (i, o) = (comparison_tokens(input).len(), comparison_tokens(&s).len());
+    if o as f64 > i as f64 * GUIDED_GROWTH + GUIDED_GROWTH_SLACK {
+        return Err(LlmError::InvalidOutput(format!("rewrite has {o} words from {i}")));
+    }
+    Ok(s)
+}
+
 /// First four characters of a lowercase token ("shipping" and "shipped" share "ship").
 fn stem(token: &str) -> String {
     token.chars().take(4).collect()
@@ -661,6 +691,21 @@ mod tests {
         assert!(validate_rewrite(zh, "明天的会议推迟到下周，需重新确认时间。").is_ok());
         let en = "we were shipping the releases yesterday and the testing finished quickly afterwards without problems";
         assert!(validate_rewrite(en, "We shipped the release; testing finished without problems.").is_ok());
+    }
+
+    #[test]
+    fn a_guided_rewrite_may_grow_shrink_or_change_language() {
+        let q = "what time does the pharmacy close tonight and also do they deliver";
+        let es = "¿A qué hora cierra la farmacia esta noche y hacen entregas a domicilio?";
+        assert_eq!(validate_guided_rewrite(q, es).unwrap(), es, "a translation shares no words");
+        let email = format!("Hi team,\n\n{CONCISE} Please let me know if that works for you.\n\nBest regards");
+        assert!(validate_guided_rewrite(CONCISE, &email).is_ok(), "an email grows");
+        assert!(validate_guided_rewrite(WORDY, "Meeting moved.").is_ok(), "a one-liner collapses");
+        assert!(invalid(validate_guided_rewrite(WORDY, "  ")).contains("empty"));
+        assert!(invalid(validate_guided_rewrite(WORDY, "I'm sorry, I can't help with that.")).contains("declined"));
+        assert!(validate_guided_rewrite(WORDY, &format!("{WORDY} {WORDY}")).is_err());
+        let essay: String = (0..200).map(|i| format!("w{i} ")).collect();
+        assert!(invalid(validate_guided_rewrite("send it friday", &essay)).contains("words from"));
     }
 
     fn invalid(r: Result<String, LlmError>) -> String {

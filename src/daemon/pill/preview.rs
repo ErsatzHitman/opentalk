@@ -38,6 +38,7 @@ pub const STATES: &[&str] = &[
     "cancel",
     "cancel-hot",
     "cancel-out",
+    "copied",
     "error",
     "error-noretry",
     "error-long",
@@ -205,6 +206,18 @@ pub fn build(scene: &Scene) -> Result<(RenderState, f64), String> {
                     st.set_pointer(Pointer::default(), 0.0);
                 }
                 _ => st.set_pointer(Pointer { group: true, pill: false, bubble: false, cancel: true }, 0.0),
+            }
+        }
+        // a dictation that had nowhere to be pasted: thinking, then idle with the bubble popping out
+        "copied" => {
+            st.set_mode(PillMode::Thinking, -1000.0);
+            st.settle();
+            st.set_mode(PillMode::Idle, 0.0);
+            st.show_copied(0.0);
+            let mut now = 0.0;
+            while now < t {
+                now = (now + FRAME_MS).min(t);
+                st.tick_level(now, 0.0);
             }
         }
         "error" => st.error = Some(super::card::ErrorCard::new("Transcription failed", "The speech provider rejected your API key. Check it in Settings.", true, 0.0)),

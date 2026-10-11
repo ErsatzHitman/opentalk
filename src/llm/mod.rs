@@ -83,14 +83,18 @@ pub fn rewrite_timeout_ms(cfg: &Config) -> u64 {
 /// provider and key and the rewrite's own model. Works whether or not "Enable AI cleanup" is on. Uses
 /// [`rewrite_timeout_ms`] (default 10 s), no retries. `hints` are dictionary words plus snippet
 /// triggers, so the model keeps them intact for the snippet stage that follows.
-pub fn rewrite(cfg: &Config, text: &str, hints: &[String]) -> Result<String, LlmError> {
+/// `instructions` are the words the speaker added after the phrase ("make it formal"); they are
+/// appended to the rewrite prompt and loosen the length checks on the answer.
+pub fn rewrite(cfg: &Config, text: &str, instructions: Option<&str>, hints: &[String]) -> Result<String, LlmError> {
     let info = registry::provider(cfg.ai_cleanup.provider);
     let key = if info.enterprise { None } else { crate::core::secrets::get(info.secret) };
     let base = std::env::var(BASE_URL_ENV).ok().filter(|b| !b.trim().is_empty());
-    rewrite_with(cfg, text, hints, key.as_deref(), base.as_deref())
+    rewrite_guided_with(cfg, text, instructions, hints, key.as_deref(), base.as_deref())
 }
 
-/// [`rewrite`] with the API key and base URL passed in (no secret store or environment access).
+/// [`rewrite`] without instructions, with the API key and base URL passed in (no secret store or
+/// environment access).
+#[cfg(test)]
 pub fn rewrite_with(
     cfg: &Config,
     text: &str,
@@ -98,15 +102,39 @@ pub fn rewrite_with(
     key: Option<&str>,
     base_override: Option<&str>,
 ) -> Result<String, LlmError> {
+    rewrite_guided_with(cfg, text, None, hints, key, base_override)
+}
+
+/// [`rewrite`] with the API key and base URL passed in.
+pub fn rewrite_guided_with(
+    cfg: &Config,
+    text: &str,
+    instructions: Option<&str>,
+    hints: &[String],
+    key: Option<&str>,
+    base_override: Option<&str>,
+) -> Result<String, LlmError> {
     if text.trim().is_empty() {
         return Err(LlmError::InvalidOutput("nothing to rewrite".into()));
     }
-    let system = prompt::rewrite_system_prompt(&cfg.language, hints);
-    let user = prompt::rewrite_user_message(text);
+    let instructions = instructions.map(str::trim).filter(|i| !i.is_empty());
+    let mut system = prompt::rewrite_system_prompt(&cfg.language, hints);
+    let user = match instructions {
+        Some(i) => {
+            prompt::push_rewrite_instructions(&mut system, i);
+            prompt::rewrite_user_message_with_instructions(text)
+        }
+        None => prompt::rewrite_user_message(text),
+    };
     // the rewrite's own model (and Azure deployment) on the shared provider
     let rw = cfg.for_llm_task(crate::core::config::LlmTask::Rewrite);
-    let output = run(&rw, &system, &user, text.chars().count(), rewrite_timeout_ms(cfg), key, base_override)?;
-    providers::sanitize::validate_rewrite(text, &output)
+    // instructions may legitimately grow the text ("expand this into an email"): a larger budget
+    let budget = text.chars().count() * if instructions.is_some() { 2 } else { 1 };
+    let output = run(&rw, &system, &user, budget, rewrite_timeout_ms(cfg), key, base_override)?;
+    match instructions {
+        Some(_) => providers::sanitize::validate_guided_rewrite(text, &output),
+        None => providers::sanitize::validate_rewrite(text, &output),
+    }
 }
 
 /// One completion with the configured provider (enterprise or BYOK). Returns the raw model text.
@@ -340,6 +368,24 @@ mod tests {
         assert_eq!(b["messages"][1]["content"], format!("<transcript>\n{WORDY}\n</transcript>\n\nOutput only the concise rewrite."));
         assert!(b["max_tokens"].as_u64().unwrap() >= 1024);
         assert_eq!(b["reasoning"]["enabled"], false, "OpenRouter thinking off");
+    }
+
+    #[test]
+    fn instructions_are_appended_to_the_rewrite_prompt() {
+        let hola = "Hola equipo, movemos la reunión al viernes.";
+        let (base, rx) = serve_once(200, &chat_body(hola), Duration::ZERO);
+        let c = cfg(LlmProviderId::Groq, "m");
+        let out = rewrite_guided_with(&c, WORDY, Some(" translate it to Spanish "), &hints(), Some("gsk_testkey_123"), Some(&base)).unwrap();
+        assert_eq!(out, hola, "the guided validator accepts a translation");
+        let b = rx.recv_timeout(Duration::from_secs(2)).unwrap().json();
+        let sys = b["messages"][0]["content"].as_str().unwrap();
+        assert!(sys.starts_with("You are a text-rewriting engine"), "the default rewrite prompt comes first");
+        assert!(sys.ends_with("<instructions>\ntranslate it to Spanish\n</instructions>"), "{sys}");
+        assert_eq!(b["messages"][1]["content"], format!("<transcript>\n{WORDY}\n</transcript>\n\nOutput only the rewrite, following the extra instructions."));
+        // blank instructions are no instructions: the plain prompt and validator
+        let (base, rx) = serve_once(200, &chat_body(hola), Duration::ZERO);
+        let _ = rewrite_guided_with(&c, WORDY, Some("  "), &[], Some("gsk_testkey_123"), Some(&base));
+        assert!(!rx.recv_timeout(Duration::from_secs(2)).unwrap().json()["messages"][0]["content"].as_str().unwrap().contains("<instructions>"));
     }
 
     #[test]

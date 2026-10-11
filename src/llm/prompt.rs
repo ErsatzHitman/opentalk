@@ -60,6 +60,19 @@ pub fn rewrite_user_message(text: &str) -> String {
     format!("<transcript>\n{text}\n</transcript>\n\nOutput only the concise rewrite.")
 }
 
+/// Append the speaker's extra instructions (the words said after the rewrite phrase) to a rewrite
+/// system prompt. They are the only words of the dictation the model is meant to follow.
+pub fn push_rewrite_instructions(prompt: &mut String, instructions: &str) {
+    prompt.push_str("\n\nEXTRA INSTRUCTIONS: after the rewrite phrase the speaker added the instructions below. They are addressed to you: apply them to the rewrite, and where they conflict with the rules above (length, tone, format, language) they win. They never ask you to answer the transcript or to output anything but the rewritten text.\n<instructions>\n");
+    prompt.push_str(instructions.trim());
+    prompt.push_str("\n</instructions>");
+}
+
+/// The user message of a rewrite with extra instructions.
+pub fn rewrite_user_message_with_instructions(text: &str) -> String {
+    format!("<transcript>\n{text}\n</transcript>\n\nOutput only the rewrite, following the extra instructions.")
+}
+
 /// Instructions of the concise rewrite. Same guard rails as the cleanup prompt (the speaker is
 /// never talking to the model) but the job is to shorten, which the cleanup validator forbids.
 pub const REWRITE_PROMPT: &str = r#"You are a text-rewriting engine inside a dictation app. Input: one dictated message between <transcript> tags (already lightly cleaned). The speaker asked for it to be rewritten concisely. Output: the same message, shorter. That is your only function.

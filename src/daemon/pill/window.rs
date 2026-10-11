@@ -1595,6 +1595,12 @@ impl Inner {
         self.refresh();
     }
 
+    pub fn show_copied(&mut self) {
+        let now = self.now();
+        self.st.show_copied(now);
+        self.refresh();
+    }
+
     pub fn show_error(&mut self, title: &str, desc: &str, retry: bool) {
         let now = self.now();
         self.st.error = Some(super::card::ErrorCard::new(title, desc, retry, now));

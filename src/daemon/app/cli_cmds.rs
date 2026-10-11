@@ -933,7 +933,7 @@ mod tests {
         assert_eq!(transcript.text, sentence);
         let calls = pipeline::LlmCalls {
             cleanup: &|t| crate::llm::cleanup_with(&cfg, t, &[], Some("llm-key-12345"), Some(&base)),
-            rewrite: &|t| crate::llm::rewrite_with(&cfg, t, &[], Some("llm-key-12345"), Some(&base)),
+            rewrite: &|t, i| crate::llm::rewrite_guided_with(&cfg, t, i, &[], Some("llm-key-12345"), Some(&base)),
         };
         let cleaned = pipeline::clean_with_calls(&cfg, &transcript, info.speech_ms, &calls);
         assert_eq!(cleaned.rewrite, pipeline::RewriteState::Done, "{cleaned:?}");

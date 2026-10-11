@@ -4,6 +4,7 @@ pub mod app;
 pub mod appicon;
 pub mod audio;
 pub mod cli;
+pub mod focus;
 pub mod foreground;
 pub mod hotkey;
 pub mod media;

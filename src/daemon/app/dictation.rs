@@ -81,8 +81,9 @@ pub struct Failed {
 
 pub enum Outcome {
     /// Text delivered. `note` explains a degraded delivery (copied, not pasted); `warn` is the
-    /// (title, description) pill card for a voice rewrite that fell back to the text as dictated.
-    Done { note: Option<String>, warn: Option<(String, String)> },
+    /// (title, description) pill card for a voice rewrite that fell back to the text as dictated;
+    /// `copied` means nothing focused took text, so the text was left on the clipboard.
+    Done { note: Option<String>, warn: Option<(String, String)>, copied: bool },
     /// Nothing usable was said (silence, only fillers, hallucination).
     Nothing,
     Failed { title: String, message: String, retry: Option<Failed> },
@@ -263,6 +264,8 @@ fn paste_note(outcome: PasteOutcome) -> Result<Option<String>, Outcome> {
         PasteOutcome::Pasted => Ok(None),
         PasteOutcome::CopiedOnly { reason } => Ok(Some(reason)),
         PasteOutcome::Cancelled => Err(Outcome::Cancelled),
+        // not degraded: the pill's "Copied" bubble says where the text went
+        PasteOutcome::NoTextField => Ok(None),
     }
 }
 
@@ -701,8 +704,11 @@ impl App {
         self.set_idle();
         let capped = std::mem::take(&mut self.capped);
         match outcome {
-            Outcome::Done { note, warn } => {
+            Outcome::Done { note, warn, copied } => {
                 self.last_failed = None;
+                if copied {
+                    self.pill.show_copied();
+                }
                 if let Some((title, desc)) = done_card(note, warn, capped) {
                     self.pill.show_error(&title, &desc, false);
                 }
@@ -958,10 +964,16 @@ fn run_job(job: Job) -> Outcome {
 
     let (target, app) = if cfg.auto_paste && cfg.show_app_bubble { retarget(target, app) } else { (target, app) };
     let t_paste = now_ms();
+    let mut copied = false;
     let note = if cfg.auto_paste {
         let opts = PasteOptions { restore_clipboard: restores_clipboard(&cfg), smart_spacing: cfg.smart_spacing };
         // Esc during the paste step (the modifier wait, the focus return) stops the keystroke.
-        match paste_note(paste::paste_text_cancellable(&cleaned.text, target.as_ref(), opts, &cancelled)) {
+        let pasted = paste::paste_text_cancellable(&cleaned.text, target.as_ref(), opts, &cancelled);
+        if pasted == PasteOutcome::NoTextField {
+            log_info!("no text field has focus; the dictation was copied to the clipboard");
+            copied = true;
+        }
+        match paste_note(pasted) {
             Ok(note) => note,
             Err(outcome) => return outcome,
         }
@@ -990,7 +1002,7 @@ fn run_job(job: Job) -> Outcome {
         model: cfg.stt_model(),
     });
     let warn = rewrite_warn(&cleaned.rewrite);
-    Outcome::Done { note, warn }
+    Outcome::Done { note, warn, copied }
 }
 
 fn failure(cfg: &Config, app: &AppInfo, e: SttError, audio: Audio, speech_ms: u64) -> Outcome {
@@ -1196,6 +1208,7 @@ mod tests {
     fn cancelled_paste_maps_to_cancelled_outcome() {
         assert!(matches!(paste_note(PasteOutcome::Cancelled), Err(Outcome::Cancelled)));
         assert!(matches!(paste_note(PasteOutcome::Pasted), Ok(None)));
+        assert!(matches!(paste_note(PasteOutcome::NoTextField), Ok(None)), "no error card: the Copied bubble says it");
         match paste_note(PasteOutcome::CopiedOnly { reason: "r".into() }) {
             Ok(Some(r)) => assert_eq!(r, "r"),
             _ => panic!("expected the copied-only note"),

@@ -25,6 +25,11 @@ pub const CANCEL_LIVE: f32 = 0.8;
 /// Size the button grows from as it slides out of the pill (fraction of its final diameter).
 pub const CANCEL_FROM: f32 = 0.6;
 pub const BUBBLE_GAP: f32 = 8.0;
+/// The "Copied" bubble that pops out of the top of the pill when a dictation had nowhere to be
+/// pasted (logical px at rest; it grows from [`CANCEL_FROM`] like the cancel button).
+pub const COPIED_SIZE: (f32, f32) = (84.0, 28.0);
+/// How long the "Copied" bubble stays out before it tucks back into the pill.
+pub const COPIED_HOLD_MS: f64 = 1600.0;
 /// Width of the layered window for the two non-right panel positions: bubble 36 + 8 + capsule 98 + 8 +
 /// cancel 36 plus the 12 px glow margin on both sides does not fit 208 px there. The window is
 /// transparent and click-through outside the surfaces, so extra width costs nothing visible; it grows
@@ -255,6 +260,9 @@ pub struct Geometry {
     pub cancel: (f32, f32, f32),
     /// Bubble circle centre/radius.
     pub bubble: (f32, f32, f32),
+    /// Emergence of the "Copied" bubble (0 hidden inside the pill, 1 at rest) and its capsule.
+    pub copied_t: f32,
+    pub copied: Rect,
 }
 
 /// Tooltip alignment relative to its anchor (`voicePillPopoverAlign`).
@@ -291,6 +299,9 @@ pub struct RenderState {
     pub(crate) cancel: Spring,
     pub(crate) bubble: Track,
     pub(crate) cancel_hot: Track,
+    /// The "Copied" bubble's emergence (same springs as the cancel button) and when it tucks back.
+    pub(crate) copied: Spring,
+    pub(crate) copied_until: Option<f64>,
     pub(crate) appearance: Blend<Appearance>,
     pub(crate) glow_since: Option<f64>,
     pub(crate) pulse_since: Option<f64>,
@@ -334,6 +345,8 @@ impl RenderState {
             cancel: Spring::new(0.0),
             bubble: Track::new(0.0),
             cancel_hot: Track::new(0.0),
+            copied: Spring::new(0.0),
+            copied_until: None,
             appearance: Blend::new(appearance(look, &pal)),
             glow_since: None,
             pulse_since: None,
@@ -530,10 +543,11 @@ impl RenderState {
         let prev = self.mode;
         self.mode = mode;
         if matches!(mode, PillMode::Preparing | PillMode::Recording) {
-            // starting a new dictation dismisses a lingering error
+            // starting a new dictation dismisses a lingering error and the "Copied" bubble
             if let Some(e) = self.error.as_mut() {
                 e.dismiss_now(now);
             }
+            self.tuck_copied(now);
         }
         let continuing = prev == PillMode::Unavailable && mode == PillMode::Recording;
         if prev == PillMode::Recording && mode != PillMode::Unavailable {
@@ -553,6 +567,28 @@ impl RenderState {
             // already compact (e.g. coming from Unavailable): no entrance replay
             self.rec_start = None;
         }
+    }
+
+    /// Pop the "Copied" bubble out of the top of the pill (the dictation went to the clipboard
+    /// because nothing could take a paste); it tucks back in after [`COPIED_HOLD_MS`]. Shown again
+    /// while out, it stays out longer.
+    pub fn show_copied(&mut self, now: f64) {
+        if self.copied.target() < 0.5 {
+            self.copied.set(now, 1.0, CANCEL_POP);
+        }
+        self.copied_until = Some(now + COPIED_HOLD_MS);
+    }
+
+    fn tuck_copied(&mut self, now: f64) {
+        self.copied_until = None;
+        if self.copied.target() > 0.5 {
+            self.copied.set(now, 0.0, CANCEL_TUCK);
+        }
+    }
+
+    /// The "Copied" bubble is out, on its way, or waiting to tuck back in.
+    pub fn copied_showing(&self, t: f64) -> bool {
+        self.copied_until.is_some() || self.copied.is_active(t) || self.copied.value(t) > 0.003
     }
 
     pub fn set_pointer(&mut self, p: Pointer, now: f64) {
@@ -617,7 +653,17 @@ impl RenderState {
         let pill = Rect::from_xywh(x, y, w, h);
         let cy = pill.cy();
         let bubble = (pill.l - slot_b + h * 0.5, cy, h * 0.5);
-        Geometry { compact: c, pill, cancel_t, bubble_t, cancel: cancel_circle(pill, cancel_e), bubble }
+        let copied_e = self.copied.value(t).clamp(0.0, 1.25);
+        Geometry {
+            compact: c,
+            pill,
+            cancel_t,
+            bubble_t,
+            cancel: cancel_circle(pill, cancel_e),
+            bubble,
+            copied_t: copied_e.min(1.0),
+            copied: copied_rect(pill, copied_e, ww),
+        }
     }
 
     /// Hit test in logical window coordinates.
@@ -696,6 +742,9 @@ impl RenderState {
             self.wave.tick(now, level, peak);
         }
         let mut out = TickOutcome::default();
+        if self.copied_until.is_some_and(|until| now >= until) {
+            self.tuck_copied(now);
+        }
         if let Some(e) = self.error.as_mut() {
             if e.update(now) {
                 out.error_expired = true;
@@ -733,6 +782,10 @@ impl RenderState {
         if tracks.iter().any(|tr| tr.is_active(t)) || self.cancel.is_active(t) || self.appearance.is_active(t) {
             return true;
         }
+        // the hold counts: the tick that tucks the bubble back in must come
+        if self.copied_showing(t) {
+            return true;
+        }
         if self.pulse_since.is_some() || self.glow_since.is_some() {
             return true;
         }
@@ -747,12 +800,12 @@ impl RenderState {
 
     /// `true` while the pill's footprint is changing at `t` (expand, shrink, cancel bud, app bubble).
     pub fn is_resizing(&self, t: f64) -> bool {
-        self.compact.is_active(t) || self.cancel.is_active(t) || self.bubble.is_active(t)
+        self.compact.is_active(t) || self.cancel.is_active(t) || self.bubble.is_active(t) || self.copied.is_active(t)
     }
 
     /// Should the layered window be shown at `t` (auto-hide aware)?
     pub fn wants_visible(&self, t: f64, auto_hide: bool) -> bool {
-        if self.error.is_some() {
+        if self.error.is_some() || self.copied_showing(t) {
             return true;
         }
         match self.mode {
@@ -780,6 +833,8 @@ impl RenderState {
         }
         let c = self.cancel.target();
         self.cancel.snap(c);
+        let c = self.copied.target();
+        self.copied.snap(c);
         let to = self.appearance.to();
         self.appearance = Blend::new(to);
     }
@@ -819,6 +874,22 @@ pub fn cancel_circle(pill: Rect, e: f32) -> (f32, f32, f32) {
     let rad = pill.h() * 0.5;
     let cx = (pill.r - rad) + e * (CANCEL_GAP + 2.0 * rad);
     (cx, pill.cy(), rad * (CANCEL_FROM + (1.0 - CANCEL_FROM) * e))
+}
+
+/// The "Copied" capsule for an emergence `e` (0 hidden inside the pill, 1 at rest): centred above
+/// the pill, `CANCEL_GAP` over its top, kept inside the window; it rises out of the pill while it
+/// grows from [`CANCEL_FROM`] of its size. `e` above 1 is the spring's overshoot.
+pub fn copied_rect(pill: Rect, e: f32, win_w: f32) -> Rect {
+    let e = e.clamp(0.0, 1.25);
+    let (w1, h1) = COPIED_SIZE;
+    let w0 = pill.w().min(w1) * CANCEL_FROM;
+    let h0 = h1 * CANCEL_FROM;
+    let (w, h) = (w0 + (w1 - w0) * e, h0 + (h1 - h0) * e);
+    let rest_cx = pill.cx().clamp(4.0 + w1 * 0.5, (win_w - 4.0 - w1 * 0.5).max(4.0 + w1 * 0.5));
+    let cx = pill.cx() + (rest_cx - pill.cx()) * e.min(1.0);
+    let rest_cy = pill.t - CANCEL_GAP - h1 * 0.5;
+    let cy = pill.cy() + (rest_cy - pill.cy()) * e;
+    Rect::from_xywh(cx - w * 0.5, cy - h * 0.5, w, h)
 }
 
 /// Window size in logical px for the current content.
@@ -886,6 +957,30 @@ mod tests {
     }
 
     #[test]
+    fn copied_bubble_pops_out_holds_and_tucks_back_in() {
+        let mut s = st();
+        s.set_mode(PillMode::Idle, 0.0);
+        s.show_copied(1000.0);
+        assert!(s.wants_visible(1000.0, true), "shown even with auto-hide");
+        let g = s.geometry(2500.0);
+        assert!((g.copied_t - 1.0).abs() < 0.02, "{g:?}");
+        assert!((g.copied.b - (g.pill.t - CANCEL_GAP)).abs() < 0.5 && (g.copied.w() - COPIED_SIZE.0).abs() < 0.5, "{g:?}");
+        assert!(g.copied.l >= 4.0 - 0.01 && g.copied.r <= win_w(s.position) - 4.0 + 0.01, "inside the window: {g:?}");
+        assert_eq!(s.hit_test(g.copied.cx(), g.copied.cy(), 2500.0), Hit::None, "click-through");
+        // held while nothing moves, then the tick past the hold tucks it in
+        assert!(s.is_animating(2000.0));
+        s.tick_level(1000.0 + COPIED_HOLD_MS + 1.0, 0.0);
+        assert!(s.copied.target() < 0.5);
+        let gone = 1000.0 + COPIED_HOLD_MS + 2000.0;
+        assert_eq!(s.geometry(gone).copied_t, 0.0);
+        assert!(!s.copied_showing(gone) && !s.wants_visible(gone, true));
+        // a new dictation tucks it away at once
+        s.show_copied(10_000.0);
+        s.set_mode(PillMode::Preparing, 10_100.0);
+        assert!(s.copied_until.is_none() && s.copied.target() < 0.5);
+    }
+
+    #[test]
     fn stop_during_hold_cancels_expansion() {
         let mut s = st();
         s.set_mode(PillMode::Recording, 0.0);
@@ -944,7 +1039,7 @@ mod tests {
                     assert_eq!(g.pill, before.pill, "{pos:?} bubble {bubble} t {t}");
                     assert_eq!(g.bubble, before.bubble);
                 }
-                let g = s.geometry(1400.0);
+                let g = s.geometry(2500.0);
                 // the button, its 12 px glow margin and the window all fit
                 let ww = win_w(pos);
                 assert!(g.cancel.0 + g.cancel.2 + DOCK <= ww + 0.01, "{pos:?} bubble {bubble}: {g:?} in {ww}");

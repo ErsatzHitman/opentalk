@@ -103,6 +103,10 @@ fn draw_under(cv: &mut Canvas, st: &RenderState, g: &Geometry, t: f64) {
     if g.cancel_t > 0.003 {
         draw_cancel_button(cv, &ctx, g, &app);
     }
+    // 3a. the "Copied" bubble rises out of the pill the same way
+    if g.copied_t > 0.003 {
+        draw_copied_bubble(cv, &ctx, g, &app);
+    }
 
     // 3b. pill shadow
     let p = g.pill;
@@ -135,6 +139,11 @@ fn draw_over(cv: &mut Canvas, st: &RenderState, g: &Geometry, t: f64) {
         let hot = st.cancel_hot.value(t);
         let col = pal.muted_fg.lerp(pal.fg, hot);
         draw_x_glyph(cv, g.cancel.0, g.cancel.1, col, a);
+    }
+
+    // 7b. "Copied" label
+    if g.copied_t > 0.35 {
+        draw_copied_label(cv, st, g.copied, cancel_glyph_alpha(g.copied_t));
     }
 
     // 8. tooltip
@@ -402,6 +411,54 @@ fn draw_cancel_button(cv: &mut Canvas, ctx: &Ctx, g: &Geometry, app: &Appearance
     glass::paint(cv, ctx, &Surface { field, radius: Some(r), sdf: &sdf }, &Params { shadow_alpha: 0.0, ..params });
 }
 
+// --- "Copied" bubble ----------------------------------------------------------------------
+
+/// The "Copied" bubble: a glass capsule with the cancel button's recipe, poured out of the top of the
+/// pill with the same stretching neck, so the two read as one family.
+fn draw_copied_bubble(cv: &mut Canvas, ctx: &Ctx, g: &Geometry, app: &Appearance) {
+    let c = g.copied;
+    let (cx, cy, w, h) = (c.cx(), c.cy(), c.w(), c.h());
+    let alpha = cancel_alpha(g.copied_t);
+    let k = neck_k(g.copied_t);
+    let params = Params { alpha, shadow: app.shadow, shadow_alpha: alpha, lift: app.lift, edge: app.edge, frost: None };
+    let capsule = move |x: f32, y: f32| sd_capsule(x, y, cx, cy, w, h);
+    if k <= 0.05 {
+        glass::paint(cv, ctx, &Surface { field: c, radius: Some(h * 0.5), sdf: &capsule }, &params);
+        return;
+    }
+    let p = g.pill;
+    let (pcx, pcy, pw, ph) = (p.cx(), p.cy(), p.w(), p.h());
+    let sdf = move |x: f32, y: f32| {
+        let pill = sd_capsule(x, y, pcx, pcy, pw, ph);
+        smin(capsule(x, y), pill, k).max(-(pill + 1.0))
+    };
+    glass::paint_shadow(cv, &Surface { field: c, radius: Some(h * 0.5), sdf: &capsule }, app.shadow, alpha);
+    let field = Rect::new(c.l.min(p.l), c.t.min(p.t), c.r.max(p.r), p.cy().max(c.b));
+    glass::paint(cv, ctx, &Surface { field, radius: Some(h * 0.5), sdf: &sdf }, &Params { shadow_alpha: 0.0, ..params });
+}
+
+/// Check mark + "Copied", centred in the capsule.
+fn draw_copied_label(cv: &mut Canvas, st: &RenderState, c: Rect, alpha: f32) {
+    let s = st.scale;
+    let font = Font::new(11.0, s, 500);
+    let tw = text::measure(COPIED_TEXT, font) / s;
+    let (check_w, gap) = (9.0, 5.0);
+    let x0 = c.cx() - (check_w + gap + tw) * 0.5;
+    let cy = c.cy();
+    let col = st.pal.fg;
+    // a rounded check, stroked like the cancel glyph
+    let (a, b, d) = ((x0, cy), (x0 + 3.2, cy + 3.0), (x0 + check_w, cy - 3.6));
+    let bb = Rect::new(x0 - 2.0, cy - 6.0, x0 + check_w + 2.0, cy + 6.0);
+    cv.fill_sdf(bb, col, alpha, |x, y| sd_segment(x, y, a.0, a.1, b.0, b.1).min(sd_segment(x, y, b.0, b.1, d.0, d.1)) - 0.8);
+    if let Some(m) = text::mask(COPIED_TEXT, font) {
+        let cell = text::content_height(font) / s;
+        text::draw(cv, &m, x0 + check_w + gap, cy - cell * 0.5, col, alpha);
+    }
+}
+
+/// The bubble's label.
+pub const COPIED_TEXT: &str = "Copied";
+
 // --- tooltip -----------------------------------------------------------------------------
 
 fn draw_tooltip(cv: &mut Canvas, st: &RenderState, txt: &str, anchor: Rect, align: Align) {
@@ -534,7 +591,7 @@ impl Fnv {
 /// Is the frame at `t` one of the two steady shapes? Everything except the lane (resp. the glow) is a
 /// pure function of the state, not of `t`: no track is moving, nothing pulses, no error card.
 fn classify(st: &RenderState, t: f64) -> Option<Kind> {
-    if st.error().is_some() || st.pulse_since.is_some() {
+    if st.error().is_some() || st.pulse_since.is_some() || st.copied_showing(t) {
         return None;
     }
     let tracks = [&st.compact, &st.grad, &st.wave_live, &st.wave_rest, &st.divider, &st.glow, &st.bubble, &st.cancel_hot, &st.icon_swap];
@@ -555,7 +612,7 @@ fn classify(st: &RenderState, t: f64) -> Option<Kind> {
 
 /// Is there anything in the overlay group (ring, cancel glyph, tooltip) at this instant?
 fn has_overlay(st: &RenderState, g: &Geometry) -> bool {
-    st.look() == Look::Unavailable || g.cancel_t > 0.35 || ((st.pointer().pill || st.pointer().bubble) && tooltip_for(st).is_some())
+    st.look() == Look::Unavailable || g.cancel_t > 0.35 || g.copied_t > 0.35 || ((st.pointer().pill || st.pointer().bubble) && tooltip_for(st).is_some())
 }
 
 /// Hash of everything that decides the static pixels of a steady frame.

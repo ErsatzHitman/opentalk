@@ -109,6 +109,12 @@ impl Pill {
         self.win.with(|i| i.show_error(title, description, retry));
     }
 
+    /// Pop the "Copied" bubble out of the pill: the dictation is on the clipboard because nothing
+    /// could take a paste.
+    pub fn show_copied(&mut self) {
+        self.win.with(|i| i.show_copied());
+    }
+
     pub fn set_options(&mut self, opts: PillOptions) {
         self.win.with(|i| i.set_options(opts));
     }
