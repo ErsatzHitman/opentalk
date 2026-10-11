@@ -366,7 +366,7 @@ STT correctness therefore rests on the mock contract tests; getting a real trans
 
 ## Voice rewrite (cost note)
 
-The rewrite adds exactly one LLM round trip (default budget 10 s, no retries) after the transcript is final, and only
+The rewrite adds exactly one LLM round trip (default budget 30 s, no retries) after the transcript is final, and only
 for a dictation that ends with the rewrite phrase; it replaces the cleanup call for that dictation, so such a dictation
 makes one LLM call, not two. Nothing runs while recording or idle (no timer, no polling), the detection is a single token
 pass over the text (a unit test pins it linear on a 100k-word input), and the mute is already released before the Thinking state, so a slow rewrite never keeps the speakers muted.

@@ -81,7 +81,7 @@ pub fn rewrite_timeout_ms(cfg: &Config) -> u64 {
 
 /// Rewrite `text` (a dictation without its trigger phrase) more concisely with the shared AI
 /// provider and key and the rewrite's own model. Works whether or not "Enable AI cleanup" is on. Uses
-/// [`rewrite_timeout_ms`] (default 10 s), no retries. `hints` are dictionary words plus snippet
+/// [`rewrite_timeout_ms`] (default 30 s), no retries. `hints` are dictionary words plus snippet
 /// triggers, so the model keeps them intact for the snippet stage that follows.
 /// `instructions` are the words the speaker added after the phrase ("make it formal"); they are
 /// appended to the rewrite prompt and loosen the length checks on the answer.
@@ -479,8 +479,8 @@ mod tests {
     #[test]
     fn rewrite_timeout_defaults_and_clamps() {
         let mut c = Config::default();
-        assert_eq!(c.ai_cleanup.rewrite_timeout_ms, 10_000);
-        assert_eq!(rewrite_timeout_ms(&c), 10_000);
+        assert_eq!(c.ai_cleanup.rewrite_timeout_ms, DEFAULT_REWRITE_TIMEOUT_MS);
+        assert_eq!(rewrite_timeout_ms(&c), DEFAULT_REWRITE_TIMEOUT_MS);
         c.ai_cleanup.rewrite_timeout_ms = 0;
         assert_eq!(rewrite_timeout_ms(&c), DEFAULT_REWRITE_TIMEOUT_MS, "0 = default");
         c.ai_cleanup.rewrite_timeout_ms = 3_000;
@@ -492,7 +492,7 @@ mod tests {
         // The cleanup timeout is independent.
         c.ai_cleanup.timeout_ms = 1_234;
         c.ai_cleanup.rewrite_timeout_ms = 0;
-        assert_eq!(rewrite_timeout_ms(&c), 10_000);
+        assert_eq!(rewrite_timeout_ms(&c), DEFAULT_REWRITE_TIMEOUT_MS);
     }
 
     #[test]

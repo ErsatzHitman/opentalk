@@ -8,7 +8,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 /// 2: AI rewrite got its own model (`ai_cleanup.rewrite_models`, `rewrite_azure_deployment`).
-pub const CONFIG_VERSION: u32 = 2;
+/// 3: the rewrite timeout default moved from 10 s to 30 s (saved 10 s values follow it).
+pub const CONFIG_VERSION: u32 = 3;
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
 #[serde(rename_all = "kebab-case")]
@@ -128,7 +129,8 @@ impl Default for SttConfig {
 /// Default spoken trigger for the concise rewrite.
 pub const DEFAULT_REWRITE_TRIGGER: &str = "rewrite this concisely";
 /// Default timeout of the rewrite LLM call (ms): generative and longer than the 4 s cleanup call.
-pub const DEFAULT_REWRITE_TIMEOUT_MS: u64 = 10_000;
+/// 30 s so a cold DNS/TLS handshake or a queued (free) model still answers before the wall.
+pub const DEFAULT_REWRITE_TIMEOUT_MS: u64 = 30_000;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(default)]
@@ -318,6 +320,14 @@ impl Config {
                 ai.rewrite_azure_deployment = ai.azure_deployment.clone();
             }
         }
+        if self.version < 3 {
+            // The rewrite shipped with a 10 s default, and any config saved by that build carries
+            // the explicit 10_000 that timed out slow (free or cold) models. Follow the new
+            // default instead; a value the user picked (3_000, 45_000, …) is left alone.
+            if self.ai_cleanup.rewrite_timeout_ms == 10_000 {
+                self.ai_cleanup.rewrite_timeout_ms = 0;
+            }
+        }
         if self.version < CONFIG_VERSION {
             self.version = CONFIG_VERSION;
         }
@@ -455,7 +465,7 @@ mod tests {
         let old: Config = serde_json::from_str(r#"{"version":1,"hotkey":"F8","ai_cleanup":{"enabled":true,"timeout_ms":2000}}"#).unwrap();
         assert_eq!(old.rewrite_trigger, "rewrite this concisely");
         assert!(old.ai_cleanup.rewrite_enabled);
-        assert_eq!(old.ai_cleanup.rewrite_timeout_ms, 10_000);
+        assert_eq!(old.ai_cleanup.rewrite_timeout_ms, DEFAULT_REWRITE_TIMEOUT_MS);
         assert!(old.ai_cleanup.enabled && old.ai_cleanup.timeout_ms == 2000, "other fields untouched");
         assert_eq!(old.rewrite_trigger_effective(), Some("rewrite this concisely"));
         let d = Config::default();
@@ -476,6 +486,23 @@ mod tests {
         assert_eq!(custom.rewrite_trigger_effective(), Some("make it short"));
         let back: Config = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
         assert_eq!(back, c);
+    }
+    #[test]
+    fn the_old_rewrite_timeout_default_migrates_to_the_new_one() {
+        // v2 files saved the old 10 s default explicitly; v3 follows the 30 s default instead.
+        let mut old: Config = serde_json::from_str(r#"{"version":2,"ai_cleanup":{"rewrite_timeout_ms":10000}}"#).unwrap();
+        old.migrate();
+        assert_eq!(old.version, CONFIG_VERSION);
+        assert_eq!(old.ai_cleanup.rewrite_timeout_ms, 0, "0 = follow the default");
+        assert_eq!(crate::llm::rewrite_timeout_ms(&old), DEFAULT_REWRITE_TIMEOUT_MS);
+        // A value the user picked is not the old default and survives the migration.
+        let mut custom: Config = serde_json::from_str(r#"{"version":2,"ai_cleanup":{"rewrite_timeout_ms":3000}}"#).unwrap();
+        custom.migrate();
+        assert_eq!(custom.ai_cleanup.rewrite_timeout_ms, 3000);
+        // Only old versions migrate; an explicit 10000 in a v3 file is kept.
+        let mut current: Config = serde_json::from_str(r#"{"version":3,"ai_cleanup":{"rewrite_timeout_ms":10000}}"#).unwrap();
+        current.migrate();
+        assert_eq!(current.ai_cleanup.rewrite_timeout_ms, 10_000);
     }
     #[test]
     fn rewrite_and_cleanup_models_are_independent() {
