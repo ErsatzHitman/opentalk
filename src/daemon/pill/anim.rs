@@ -152,7 +152,11 @@ impl Spring {
         }
     }
 
+    /// Position at `t`; exactly the target once the spring has come to rest.
     pub fn value(&self, t: f64) -> f32 {
+        if !self.is_active(t) {
+            return self.target;
+        }
         self.target + self.state(t).0 as f32
     }
 
@@ -372,14 +376,38 @@ impl QuietRun {
 /// How long a bar takes to reach a new height (OpenWhispr: `transition-[height] duration-75 ease-out`).
 pub const WAVE_EASE_MS: f64 = 75.0;
 
+/// Idle ripple: while recording in silence the bars breathe in a slow wave that spreads from the
+/// centre outwards, so a live microphone never looks frozen. It is deliberately unlike speech (which
+/// scrolls right to left, jagged, up to 22 px): smooth, symmetric, at most `IDLE_PX` above the floor.
+pub const IDLE_PERIOD_MS: f64 = 1600.0;
+pub const IDLE_PX: f32 = 2.6;
+/// Bar level at which the ripple has fully given way to speech.
+pub const IDLE_GIVE_WAY: f32 = 0.2;
+/// How long the ripple takes to fade in once the first sample arrives.
+pub const IDLE_FADE_MS: f64 = 400.0;
+
+/// Extra height (px) the idle ripple adds to bar `i` at `t` ms after the recording's first sample.
+pub fn idle_px(i: usize, since_start: f64) -> f32 {
+    if !since_start.is_finite() || since_start <= 0.0 {
+        return 0.0;
+    }
+    let c = (WAVE_BARS - 1) as f64 / 2.0;
+    let d = (i as f64 - c).abs() / c; // 0 at the centre, 1 at either end
+    let phase = std::f64::consts::TAU * (since_start / IDLE_PERIOD_MS - d * 0.45);
+    let breathe = 0.5 - 0.5 * phase.cos(); // starts at 0, so the ripple grows out of the floor
+    let taper = 1.0 - 0.4 * d; // the ends move less than the middle
+    let fade = (since_start / IDLE_FADE_MS).min(1.0);
+    (IDLE_PX as f64 * breathe * taper * fade) as f32
+}
+
 /// The waveform, as OpenWhispr's `PillWaveform` draws it: every `WAVE_STEP_MS` (80 ms) the live level
 /// is sampled, the bars shift one place to the left and the sample enters on the right; each bar then
 /// eases to its new height over `WAVE_EASE_MS` (ease-out). 80 ms spacing lets neighbouring bars
 /// straddle syllable onsets and gaps, so the signal itself supplies the bar-to-bar variance.
 ///
-/// Silence is exactly zero (the meter's dead zone), and then every bar is exactly 4 px, which lets the
-/// renderer skip frames and the timer slow down. `heights(t)` is a pure function of the fed samples
-/// and `t`; after the last tick the picture holds (a recording that ended freezes its bars).
+/// Silence is exactly zero (the meter's dead zone); the bars then show only the idle ripple
+/// ([`idle_px`]), which fades out as a bar's speech level rises. `heights(t)` is a pure function of
+/// the fed samples and `t`; after the last tick the picture holds (a recording that ended freezes).
 #[derive(Clone, Debug)]
 pub struct Waveform {
     /// Levels before and after the latest shift, oldest bar first.
@@ -388,6 +416,10 @@ pub struct Waveform {
     /// When the latest sample was taken (the eases start there).
     sampled_at: f64,
     last_t: f64,
+    /// The idle ripple's clock: when this recording started (or its first sample, if nobody said)
+    /// and when it ended (the ripple holds from there).
+    started_at: f64,
+    ended_at: f64,
 }
 
 impl Default for Waveform {
@@ -415,12 +447,25 @@ fn ease_out(x: f64) -> f64 {
 
 impl Waveform {
     pub fn new() -> Self {
-        Waveform { from: [0.0; WAVE_BARS], to: [0.0; WAVE_BARS], sampled_at: f64::NEG_INFINITY, last_t: f64::NEG_INFINITY }
+        Waveform { from: [0.0; WAVE_BARS], to: [0.0; WAVE_BARS], sampled_at: f64::NEG_INFINITY, last_t: f64::NEG_INFINITY, started_at: f64::NAN, ended_at: f64::INFINITY }
     }
 
     /// New recording: start from silence (never replay the previous recording's wave).
     pub fn reset(&mut self) {
         *self = Waveform::new();
+    }
+
+    /// New recording at `now`: start from silence, the idle ripple's clock starts here.
+    pub fn begin(&mut self, now: f64) {
+        self.reset();
+        self.started_at = if now.is_finite() { now } else { f64::NAN };
+    }
+
+    /// The recording ended at `now`: the idle ripple holds its picture from here.
+    pub fn end(&mut self, now: f64) {
+        if now.is_finite() {
+            self.ended_at = self.ended_at.min(now);
+        }
     }
 
     /// Advance to `now` (ms): take a sample of `level` when 80 ms have passed since the last one.
@@ -431,6 +476,9 @@ impl Waveform {
             return;
         }
         self.last_t = now;
+        if self.started_at.is_nan() {
+            self.started_at = now;
+        }
         if now - self.sampled_at < WAVE_STEP_MS {
             return;
         }
@@ -458,14 +506,23 @@ impl Waveform {
         bar_height(self.levels_at(t.min(self.last_t))[i.min(WAVE_BARS - 1)])
     }
 
+    /// Bar heights at `t`: the speech levels plus the idle ripple, which gives way as a bar's level
+    /// rises. Frozen at the last tick like the levels.
     pub fn heights(&self, t: f64) -> [f32; WAVE_BARS] {
-        self.levels_at(t.min(self.last_t)).map(bar_height)
+        let levels = self.levels_at(t.min(self.last_t));
+        let since = t.min(self.ended_at) - self.started_at;
+        let mut out = [0.0; WAVE_BARS];
+        for (i, o) in out.iter_mut().enumerate() {
+            let l = if levels[i].is_finite() { levels[i] } else { 0.0 };
+            let give_way = 1.0 - (l / IDLE_GIVE_WAY).clamp(0.0, 1.0);
+            *o = bar_height(l) + idle_px(i, since) * give_way * give_way;
+        }
+        out
     }
 
-    /// Something is still above the floor, or a bar is still easing, and the animation is being fed.
+    /// The recording is live at `t` (the idle ripple keeps the bars moving even in silence).
     pub fn is_easing(&self, t: f64) -> bool {
-        let fed = t <= self.last_t + WAVE_STEP_MS;
-        fed && (self.to.iter().any(|&v| v > 0.0) || t - self.sampled_at < WAVE_EASE_MS && self.from.iter().any(|&v| v > 0.0))
+        !self.started_at.is_nan() && t < self.ended_at
     }
 }
 
@@ -585,28 +642,53 @@ mod tests {
         assert!((w.height(WAVE_BARS - 1, 1075.0) - bar_height(0.5)).abs() < 0.01);
         w.tick(1080.0, 0.9, 0.0);
         w.tick(1160.0, 0.9, 0.0);
-        assert!((w.height(WAVE_BARS - 2, 1160.0) - bar_height(0.9)).abs() < 0.01, "the old sample moved one bar left");
+        w.tick(1235.0, 0.9, 0.0);
+        assert!((w.height(WAVE_BARS - 2, 1235.0) - bar_height(0.9)).abs() < 0.01, "the old sample moved one bar left");
     }
 
     #[test]
-    fn silence_is_exactly_flat_and_stops_the_animation() {
+    fn silence_breathes_gently_from_the_centre() {
+        let mut w = Waveform::new();
+        let mut t = 0.0;
+        let mut seen_max = [WAVE_MIN_PX; WAVE_BARS];
+        while t < 3200.0 {
+            w.tick(t, 0.0, 0.0);
+            for (m, h) in seen_max.iter_mut().zip(w.heights(t)) {
+                assert!((WAVE_MIN_PX..=WAVE_MIN_PX + IDLE_PX + 1e-3).contains(&h), "idle stays small: {h}");
+                *m = m.max(h);
+            }
+            t += 16.0;
+        }
+        assert!(seen_max.iter().all(|&m| m > WAVE_MIN_PX + 1.0), "every bar moves: {seen_max:?}");
+        assert!(seen_max[WAVE_BARS / 2] > seen_max[0], "the centre moves more than the ends");
+        assert!(w.is_easing(t), "a live recording keeps animating in silence");
+        w.end(t);
+        assert!(!w.is_easing(t + 1.0));
+        assert_eq!(w.heights(t), w.heights(t + 500.0), "an ended recording holds its picture");
+        // the ripple starts from the floor (no jump when recording begins)
+        let mut fresh = Waveform::new();
+        fresh.tick(0.0, 0.0, 0.0);
+        assert!(fresh.heights(0.0).iter().all(|&h| h == WAVE_MIN_PX));
+    }
+
+    #[test]
+    fn speech_replaces_the_idle_ripple() {
         let mut w = Waveform::new();
         let mut t = 0.0;
         while t < 2000.0 {
-            w.tick(t, 0.0, 0.0);
+            w.tick(t, 0.6, 0.0);
             t += 16.0;
         }
-        assert!(w.heights(t).iter().all(|&h| h == WAVE_MIN_PX));
-        assert!(!w.is_easing(t));
-        w.tick(t, 0.4, 0.0);
-        assert!(w.is_easing(t + 1.0));
+        let hs = w.heights(t);
+        assert!(hs.iter().all(|&h| (h - bar_height(0.6)).abs() < 0.01), "loud bars carry no ripple: {hs:?}");
     }
 
     #[test]
     fn reset_and_garbage() {
         let mut w = Waveform::new();
+        assert!(w.heights(10.0).iter().all(|&h| h == WAVE_MIN_PX), "never fed: flat");
         w.tick(0.0, f32::NAN, 0.0);
-        assert!(w.heights(10.0).iter().all(|&h| h == WAVE_MIN_PX));
+        assert!(w.heights(10.0).iter().all(|&h| h.is_finite() && h <= WAVE_MIN_PX + IDLE_PX));
         w.tick(100.0, 1.0, 0.0);
         w.reset();
         assert!(w.heights(500.0).iter().all(|&h| h == WAVE_MIN_PX));

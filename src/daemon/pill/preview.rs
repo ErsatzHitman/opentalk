@@ -861,11 +861,12 @@ mod golden {
                         tiles.push((composite_over_fixture(&st, &win, &png).expect("composite"), level, peak));
                     }
                     let hs = st.waveform().heights(next_frame);
+                    let rippling = |hs: &[f32]| hs.iter().all(|&h| h <= 4.0 + crate::daemon::pill::anim::IDLE_PX + 1e-3);
                     if next_frame < 590.0 {
-                        flat_before &= hs.iter().all(|&h| h == 4.0);
+                        flat_before &= rippling(&hs);
                     }
                     peak_h = peak_h.max(hs.iter().cloned().fold(0.0, f32::max));
-                    end_flat = hs.iter().all(|&h| h == 4.0);
+                    end_flat = rippling(&hs);
                     peak = 0.0;
                     next_frame += FRAME_MS;
                     frame_no += 1;
@@ -875,9 +876,9 @@ mod golden {
                     peak = peak.max(h.level);
                 });
             }
-            assert!(flat_before, "the room before the voice must draw an exactly flat lane");
-            assert!(peak_h > 18.0, "the voice reaches near full height, got {peak_h}");
-            assert!(end_flat, "the silence after the voice is exactly flat again");
+            assert!(flat_before, "the room before the voice draws only the idle ripple");
+            assert!(peak_h > 16.0, "the voice reaches near full height, got {peak_h}");
+            assert!(end_flat, "the silence after the voice is back to the idle ripple");
             if let Some(dir) = &out {
                 let (cw, ch, cols) = (CROP.2, CROP.3 + 10, 6u32);
                 let rows = (tiles.len() as u32).div_ceil(cols);

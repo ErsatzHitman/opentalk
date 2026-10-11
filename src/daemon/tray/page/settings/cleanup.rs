@@ -594,19 +594,19 @@ mod tests {
     }
 
     #[test]
-    fn the_provider_group_follows_a_rewrite_that_can_fire() {
+    fn the_model_group_follows_either_feature() {
         let groups = |p: &CleanupPage, cfg: &mut Config| {
             let cx = Cx::new(cfg, 0);
             p.items(&cx).iter().filter_map(|i| if let Item::Group(g) = i { Some(g.clone()) } else { None }).collect::<Vec<_>>()
         };
         let p = page(LlmProviderId::Openrouter, Fake::default());
         let mut cfg = Config::default();
-        assert!(groups(&p, &mut cfg).contains(&"AI provider".to_string()), "the rewrite reuses the provider even with AI cleanup off");
-        cfg.rewrite_trigger.clear();
+        assert!(groups(&p, &mut cfg).contains(&"AI model".to_string()), "the rewrite reuses the provider even with AI cleanup off");
+        cfg.ai_cleanup.rewrite_enabled = false;
         let g = groups(&p, &mut cfg);
-        assert!(!g.contains(&"AI provider".to_string()) && !g.contains(&"Test".to_string()), "no phrase, no rewrite, no provider needed: {g:?}");
+        assert!(!g.contains(&"AI model".to_string()), "neither feature on, no model needed: {g:?}");
         cfg.ai_cleanup.enabled = true;
-        assert!(groups(&p, &mut cfg).contains(&"AI provider".to_string()), "AI cleanup needs it");
+        assert!(groups(&p, &mut cfg).contains(&"AI model".to_string()), "AI cleanup needs it");
     }
 
     #[test]
@@ -659,7 +659,7 @@ mod tests {
         let has = |cfg: &mut Config| {
             let p = page(LlmProviderId::Openrouter, Fake::default());
             let cx = Cx::new(cfg, 0);
-            p.items(&cx).iter().any(|i| matches!(i, Item::Group(g) if g == "AI provider"))
+            p.items(&cx).iter().any(|i| matches!(i, Item::Group(g) if g == "AI model"))
         };
         let mut cfg = Config::default();
         assert!(has(&mut cfg), "rewrite is on by default and needs a provider");

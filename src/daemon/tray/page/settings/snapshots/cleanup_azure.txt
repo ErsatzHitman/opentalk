@@ -1,21 +1,18 @@
 # Cleanup & AI
 
 ## AI rewrite
-  [x] #1 Enable AI rewrite -- Uses the AI provider below
+  [x] #1 Enable AI rewrite -- Uses the AI model below
   tools #3 Trigger phrase [Reset to default (disabled)]
   field #2  [text] = "rewrite this concisely" (hint "rewrite this concisely", max 80)
   note: End a dictation with this phrase to paste a concise rewrite.
-  banner[warn]: No API key is saved for the AI provider below. Add one, or the rewrite pastes your plain text.
-
-## On-device cleanup
-  seg #10 Filler words: Off | (Standard) | Aggressive
-  [x] #11 Fuzzy dictionary correction -- Fix near-misses of dictionary words
-  [ ] #12 Spoken line breaks -- Say “new line” or “new paragraph”
 
 ## AI cleanup
-  [x] #20 Enable AI cleanup -- Sends the text (never audio) to the model below
+  [x] #20 Enable AI cleanup -- Polishes every dictation with the AI model below
+  tools #41 Cleanup prompt -- Built-in [Reset to default (disabled)]
+  field #40  [multiline x8] = "DEFAULT PROMPT" (hint "")
 
-## AI provider
+## AI model
+  note: Used by both AI rewrite and AI cleanup.
   choice #21 Provider > Azure OpenAI
   tools #101 API key [Save key (disabled)]
   field #100  [secret] = "" (hint "Paste your API key")
@@ -24,10 +21,10 @@
   field #27 API version [text] = "2024-10-21" (hint "2024-10-21")
   field #28 Underlying model (optional) [text] = "" (hint "gpt-5-mini")
   note: Set the model behind the deployment when its name does not contain it (a deployment called "cleanup" serving gpt-5), so the right request parameters are used.
-
-## Prompt Studio
-  tools #41 Cleanup prompt -- Built-in [Reset to default (disabled)]
-  field #40  [multiline x8] = "DEFAULT PROMPT" (hint "")
-
-## Test
+  banner[warn]: No API key is saved for the AI provider. Until there is, dictations paste the transcript.
   tools #42 Run on a sample -- Polishes a rough sentence [Run the test (disabled)]
+
+## On-device cleanup
+  seg #10 Filler words: Off | (Standard) | Aggressive
+  [x] #11 Fuzzy dictionary correction -- Fix near-misses of dictionary words
+  [ ] #12 Spoken line breaks -- Say “new line” or “new paragraph”

@@ -916,17 +916,13 @@ mod tests {
     }
 
     #[test]
-    fn scrolling_moves_the_content_and_draws_a_scrollbar() {
+    fn scrolling_moves_the_content() {
+        // (no scrollbar is drawn: pages fit their content, and the wheel scrolls a tall one)
         let mut p = pager_with(toggles(30), false, 400.0);
         let top = shot(&p, 1.0);
-        let thumb = |pm: &Pixmap| px(pm, MARGIN + CARD_W_PAGE - 6.0, MARGIN + PAGE_HEADER_H + 20.0, 1.0);
-        assert!(thumb(&top)[3] == 255 && thumb(&top)[0] < 245 || thumb(&top)[0] < 250, "the thumb is drawn at the top: {:?}", thumb(&top));
         p.stack.last_mut().unwrap().scroll.by(200.0);
         let moved = shot(&p, 1.0);
         assert_ne!(top.data(), moved.data());
-        // A short page has no scrollbar.
-        let short = shot(&pager_with(toggles(2), false, 400.0), 1.0);
-        assert_eq!(px(&short, MARGIN + CARD_W_PAGE - 6.0, MARGIN + PAGE_HEADER_H + 20.0, 1.0)[..3], [255, 255, 255]);
     }
 
     #[test]

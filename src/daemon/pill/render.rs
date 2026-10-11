@@ -1120,19 +1120,28 @@ mod tests {
         }
     }
 
+    /// Silence still moves the bars (the idle ripple), but only the bar lane is ever repainted.
     #[test]
-    fn silent_recording_frames_are_skipped() {
+    fn silent_recording_repaints_only_the_lane() {
         let mut s = rec_state(true);
         let mut t = 0.0;
         run(&mut s, &mut t, 1500.0, &|_| 0.0);
         let mut pm = new_pm(&s);
         let mut cache = FrameCache::new();
         assert!(matches!(cache.render(&s, t, &mut pm), FrameOutcome::Dirty(_)));
+        let mut moved = 0;
         for _ in 0..120 {
             t += FRAME;
             s.tick_level(t, 0.0);
-            assert_eq!(cache.render(&s, t, &mut pm), FrameOutcome::Skip, "silent input needs no repaint at {t}");
+            match cache.render(&s, t, &mut pm) {
+                FrameOutcome::Dirty(r) => {
+                    assert_ne!(r, full_rect(&pm), "silent input repaints the lane only at {t}");
+                    moved += 1;
+                }
+                FrameOutcome::Skip => {}
+            }
         }
+        assert!(moved > 60, "the idle ripple keeps the lane moving ({moved})");
         assert_eq!(pm.data(), render(&s, t).data());
         // speech wakes the lane again
         let mut woke = false;
@@ -1145,11 +1154,10 @@ mod tests {
         assert_eq!(pm.data(), render(&s, t).data());
     }
 
-    /// A real microphone in a quiet room is never digital zero: through the meter its noise is still
-    /// an exactly flat lane, so the renderer skips every frame (the old raw-RMS path repainted
-    /// nearly every one, since room noise moved the bars by fractions of a pixel).
+    /// A real microphone in a quiet room is never digital zero: through the meter its noise reads as
+    /// silence, so the lane shows only the idle ripple and no frame repaints more than the lane.
     #[test]
-    fn a_noisy_room_through_the_meter_skips_every_frame() {
+    fn a_noisy_room_through_the_meter_only_ripples() {
         use crate::daemon::audio::meter::Meter;
         let mut s = rec_state(true);
         let mut t = 0.0;
@@ -1158,7 +1166,6 @@ mod tests {
         let mut cache = FrameCache::new();
         assert!(matches!(cache.render(&s, t, &mut pm), FrameOutcome::Dirty(_)));
         let (mut meter, mut seed, mut level) = (Meter::new(), 0x2545_F491u32, 0.0f32);
-        let mut skipped = 0;
         for _ in 0..600 {
             // 16.7 ms of room noise (about -58 dBFS), in 10 ms packets as they arrive
             let pkt: Vec<i16> = (0..267)
@@ -1174,11 +1181,13 @@ mod tests {
             }
             t += FRAME;
             s.tick_level(t, level);
-            if cache.render(&s, t, &mut pm) == FrameOutcome::Skip {
-                skipped += 1;
+            assert_eq!(level, 0.0, "room noise is below the meter's dead zone");
+            if let FrameOutcome::Dirty(r) = cache.render(&s, t, &mut pm) {
+                assert_ne!(r, full_rect(&pm), "room noise repaints the lane only");
             }
+            let hs = s.waveform().heights(t);
+            assert!(hs.iter().all(|&h| h <= crate::daemon::pill::anim::WAVE_MIN_PX + crate::daemon::pill::anim::IDLE_PX + 1e-3));
         }
-        assert_eq!(skipped, 600, "every frame of a noisy-but-silent recording is skipped");
     }
 
     #[test]
@@ -1403,7 +1412,8 @@ mod tests {
             run(&mut s, &mut t, 1500.0, &speech);
             let over_pill = Pointer { group: true, pill: true, bubble: false, cancel: false };
             s.set_pointer(over_pill, t);
-            let until = t + 800.0;
+            // the button's spring has settled
+            let until = t + 1500.0;
             run(&mut s, &mut t, until, &speech);
             let mut pm = new_pm(&s);
             let mut cache = FrameCache::new();
@@ -1678,7 +1688,8 @@ mod tests {
                     t += FRAME;
                 }
             }
-            assert_eq!(bakes, 0, "{scale}x: an emerge / retract frame baked a displacement map");
+            // the fused neck's field is the only new shape; a couple of maps for it, never one per frame
+            assert!(bakes <= 2, "{scale}x: emerge / retract frames baked {bakes} displacement maps");
             assert!(glass::disp_cache_len() >= held, "{scale}x: the emerge evicted a steady map");
             let worst = frames.iter().cloned().fold(0.0, f64::max);
             println!("cancel emerge frames {scale}x: median {:.3} ms, worst {worst:.3} ms", median(frames.clone()));

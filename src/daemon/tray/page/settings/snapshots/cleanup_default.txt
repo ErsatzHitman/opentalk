@@ -1,26 +1,25 @@
 # Cleanup & AI
 
 ## AI rewrite
-  [x] #1 Enable AI rewrite -- Uses the AI provider below
+  [x] #1 Enable AI rewrite -- Uses the AI model below
   tools #3 Trigger phrase [Reset to default (disabled)]
   field #2  [text] = "rewrite this concisely" (hint "rewrite this concisely", max 80)
   note: End a dictation with this phrase to paste a concise rewrite.
-  banner[warn]: No API key is saved for the AI provider below. Add one, or the rewrite pastes your plain text.
-
-## On-device cleanup
-  seg #10 Filler words: Off | (Standard) | Aggressive
-  [x] #11 Fuzzy dictionary correction -- Fix near-misses of dictionary words
-  [ ] #12 Spoken line breaks -- Say “new line” or “new paragraph”
 
 ## AI cleanup
-  [ ] #20 Enable AI cleanup -- Sends the text (never audio) to the model below
+  [ ] #20 Enable AI cleanup -- Polishes every dictation with the AI model below
 
-## AI provider
+## AI model
+  note: Used by both AI rewrite and AI cleanup.
   choice #21 Provider > OpenRouter
   tools #101 API key [Get a key] [Save key (disabled)]
   field #100  [secret] = "" (hint "Paste your API key")
   field #22 Model [text] = "nvidia/nemotron-3-super-120b-a12b:free" (hint "Model id")
   choice #23 Suggested models > Choose...
-
-## Test
+  banner[warn]: No API key is saved for the AI provider. Until there is, dictations paste the transcript.
   tools #42 Run on a sample -- Polishes a rough sentence [Run the test (disabled)]
+
+## On-device cleanup
+  seg #10 Filler words: Off | (Standard) | Aggressive
+  [x] #11 Fuzzy dictionary correction -- Fix near-misses of dictionary words
+  [ ] #12 Spoken line breaks -- Say “new line” or “new paragraph”

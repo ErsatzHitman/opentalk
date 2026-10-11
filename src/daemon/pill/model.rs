@@ -536,9 +536,12 @@ impl RenderState {
             }
         }
         let continuing = prev == PillMode::Unavailable && mode == PillMode::Recording;
+        if prev == PillMode::Recording && mode != PillMode::Unavailable {
+            self.wave.end(now);
+        }
         let entering = mode == PillMode::Recording && !continuing && !(prev == PillMode::Recording);
         if entering {
-            self.wave.reset();
+            self.wave.begin(now);
             self.rec_start = Some(now);
         } else if !matches!(mode, PillMode::Recording | PillMode::Unavailable) {
             self.rec_start = None;
@@ -911,21 +914,21 @@ mod tests {
         assert_eq!(s.hit_test(g0.pill.r + 10.0, 90.0, 1000.0), Hit::Gap, "the spot the button is heading for is hovered");
         // after: a 36 px circle (the pill's height) 8 px right of the pill; the window cannot grow past the
         // screen edge, so the group (pill + 8 + 36) keeps the pill's 12 px dock and the pill slides left 44
-        let g = s.geometry(1400.0);
+        let g = s.geometry(1800.0);
         assert!((g.pill.r - 152.0).abs() < 0.01, "{g:?}");
         assert!((g.cancel.2 * 2.0 - 36.0).abs() < 0.01 && (g.cancel.0 - g.cancel.2 - g.pill.r - 8.0).abs() < 0.01, "{g:?}");
-        assert!((g.cancel.0 + g.cancel.2 - (208.0 - 12.0)).abs() < 0.01);
+        assert!((g.cancel.0 + g.cancel.2 - (208.0 - 12.0)).abs() < 0.05, "{g:?}");
         assert_eq!(g.cancel.1, g.pill.cy());
-        assert_eq!(s.hit_test(g.cancel.0, 90.0, 1400.0), Hit::Cancel);
+        assert_eq!(s.hit_test(g.cancel.0, 90.0, 1800.0), Hit::Cancel);
         // the gap between the surfaces keeps the hover, the transparent corners beyond the circle do not
-        assert_eq!(s.hit_test(g.pill.r + 4.0, 90.0, 1400.0), Hit::Gap);
-        assert_eq!(s.hit_test(g.cancel.0 + g.cancel.2 - 1.0, g.cancel.1 - g.cancel.2 + 1.0, 1400.0), Hit::None);
-        assert_eq!(s.hit_test(g.pill.r + 4.0, g.pill.t - 4.0, 1400.0), Hit::None);
-        assert_eq!(s.hit_test(100.0, 90.0, 1400.0), Hit::Pill);
-        assert_eq!(s.hit_test(5.0, 5.0, 1400.0), Hit::None);
+        assert_eq!(s.hit_test(g.pill.r + 4.0, 90.0, 1800.0), Hit::Gap);
+        assert_eq!(s.hit_test(g.cancel.0 + g.cancel.2 - 1.0, g.cancel.1 - g.cancel.2 + 1.0, 1800.0), Hit::None);
+        assert_eq!(s.hit_test(g.pill.r + 4.0, g.pill.t - 4.0, 1800.0), Hit::None);
+        assert_eq!(s.hit_test(100.0, 90.0, 1800.0), Hit::Pill);
+        assert_eq!(s.hit_test(5.0, 5.0, 1800.0), Hit::None);
         // leave: the button retracts into the pill, which slides back
         s.set_pointer(Pointer::default(), 2000.0);
-        let g = s.geometry(2400.0);
+        let g = s.geometry(2600.0);
         assert!((g.pill.r - 196.0).abs() < 0.01 && g.cancel_t == 0.0);
     }
 

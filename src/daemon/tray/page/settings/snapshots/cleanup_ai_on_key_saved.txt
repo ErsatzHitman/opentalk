@@ -1,28 +1,25 @@
 # Cleanup & AI
 
 ## AI rewrite
-  [x] #1 Enable AI rewrite -- Uses the AI provider below
+  [x] #1 Enable AI rewrite -- Uses the AI model below
   tools #3 Trigger phrase [Reset to default (disabled)]
   field #2  [text] = "rewrite this concisely" (hint "rewrite this concisely", max 80)
   note: End a dictation with this phrase to paste a concise rewrite.
+
+## AI cleanup
+  [x] #20 Enable AI cleanup -- Polishes every dictation with the AI model below
+  tools #41 Cleanup prompt -- Built-in [Reset to default (disabled)]
+  field #40  [multiline x8] = "DEFAULT PROMPT" (hint "")
+
+## AI model
+  note: Used by both AI rewrite and AI cleanup.
+  choice #21 Provider > OpenRouter
+  tools #104 API key -- sk-or-...abcd [Replace key] [Remove key]
+  field #22 Model [text] = "nvidia/nemotron-3-super-120b-a12b:free" (hint "Model id")
+  choice #23 Suggested models > Choose...
+  tools #42 Run on a sample -- Polishes a rough sentence [Run the test]
 
 ## On-device cleanup
   seg #10 Filler words: Off | (Standard) | Aggressive
   [x] #11 Fuzzy dictionary correction -- Fix near-misses of dictionary words
   [ ] #12 Spoken line breaks -- Say “new line” or “new paragraph”
-
-## AI cleanup
-  [x] #20 Enable AI cleanup -- Sends the text (never audio) to the model below
-
-## AI provider
-  choice #21 Provider > OpenRouter
-  tools #104 API key -- sk-or-...abcd [Replace key] [Remove key]
-  field #22 Model [text] = "nvidia/nemotron-3-super-120b-a12b:free" (hint "Model id")
-  choice #23 Suggested models > Choose...
-
-## Prompt Studio
-  tools #41 Cleanup prompt -- Built-in [Reset to default (disabled)]
-  field #40  [multiline x8] = "DEFAULT PROMPT" (hint "")
-
-## Test
-  tools #42 Run on a sample -- Polishes a rough sentence [Run the test]

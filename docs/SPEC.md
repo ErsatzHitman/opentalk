@@ -13,20 +13,17 @@ Build: `PATH=$HOME/.cargo/bin:/c/Users/aksha/tools/mingw64/bin:$PATH cargo build
 - Footprints: idle circle 40x40; recording capsule 98x36. Border 1px inside. rounded-full.
 - Capsule internals: pr 6px when compact; logo slot 22x22; divider hidden while recording (margins 3px);
   waveform lane 52x24: 11 bars, 2px wide, 3px gap, min 4 max 22, rounded, color foreground.
-- Level (changed in round 3, owner: "smoothly responds to my voice in real time and stays stable when I'm silent"):
-  the capture thread runs a streaming meter (`audio/meter.rs`): 70 Hz high-pass (DC removal), power of the latest
-  20 ms every 10 ms, an adaptive noise floor in dB (snaps down, creeps up; -66..-38 dBFS), a gate with hysteresis
-  (opens above max(floor+9 dB, -48 dBFS), closes after 150 ms below max(floor+5 dB, -52 dBFS)) and a display
-  level 0..1 linear in dB between the close threshold and a slowly decaying running speech peak (-34..-10 dBFS),
-  so quiet and hot microphones both use the whole range. A closed gate publishes exactly 0.0. It publishes the
-  level and the highest level since the pill last looked (`take_peak`), so nothing between two frames is lost.
-  Bar = 4 + level*18 (the old `(rms*8)^0.75` mapping and the 1/255 px "quiet" band are gone). The bars are a tapped
-  delay line over one continuous envelope: the envelope follows max(level, peak) every frame with a 12 ms attack and
-  a 120 ms release (integrated exactly, frame-rate independent); the right-most bar is the live envelope, bar j
-  shows the envelope (10-j)*80 ms ago, interpolated between frames, so the lane scrolls smoothly instead of
-  changing every 80 ms. Silence is exactly flat: every bar 4px, frames skipped, timer slow (the capture thread
-  wakes it when the gate opens). Reset to 4px on start. Look unchanged (11 bars, 2px, 3px gap, 4-22px, colours,
-  660 ms fade-in). `--render-pill --level x` is the display level (0 = flat, 1 = full height), not an RMS.
+- Level and waveform (OpenWhispr's `PillWaveform`): the capture thread runs a streaming meter (`audio/meter.rs`):
+  70 Hz high-pass (DC removal), RMS of the latest 20 ms every 10 ms, bar level `min(1, (rms*8)^0.75)` with a dead
+  zone under RMS 0.004 (about -48 dBFS) that publishes exactly 0. The adaptive floor and gate only feed the
+  per-recording diagnostics. Every 80 ms the pill samples the live level, the bars shift one place left and the
+  sample enters on the right; each bar eases to its new height over 75 ms (CSS ease-out). Bar = 4 + level*18.
+- Idle ripple: while recording, silence is never a frozen line. The bars breathe in a slow wave (1.6 s period) that
+  spreads from the centre outwards, at most 2.6 px above the 4 px floor, the ends moving less than the middle; it
+  fades in over 400 ms from recording start and gives way per bar as that bar's speech level rises (gone at 0.2),
+  so speech always reads as the jagged, right-to-left scroll it is. Only the bar lane is repainted. When the
+  recording ends the bars hold their picture. Look unchanged (11 bars, 2px, 3px gap, 4-22px, colours, 660 ms
+  fade-in). `--render-pill --level x` is the display level (0 = flat, 1 = full height), not an RMS.
 - Logo (24 viewBox at 22px): ring circle c(12,12) r10 stroke 2; bars x=8.75 y10..14, x=12 y8..16, x=15.25 y10..14, stroke 2 round caps.
 - States/colors (light | dark):
   fg #171717 | #e8e8e8; muted-fg #525252 | #8f8f8f; border #e5e5e5 | #383b3e; border-hover #d4d4d4 | #4a4d53

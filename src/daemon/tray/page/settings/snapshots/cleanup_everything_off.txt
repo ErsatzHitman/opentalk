@@ -1,12 +1,12 @@
 # Cleanup & AI
 
 ## AI rewrite
-  [ ] #1 Enable AI rewrite -- Uses the AI provider below
+  [ ] #1 Enable AI rewrite -- Uses the AI model below
+
+## AI cleanup
+  [ ] #20 Enable AI cleanup -- Polishes every dictation with the AI model below
 
 ## On-device cleanup
   seg #10 Filler words: Off | (Standard) | Aggressive
   [x] #11 Fuzzy dictionary correction -- Fix near-misses of dictionary words
   [ ] #12 Spoken line breaks -- Say “new line” or “new paragraph”
-
-## AI cleanup
-  [ ] #20 Enable AI cleanup -- Sends the text (never audio) to the model below
