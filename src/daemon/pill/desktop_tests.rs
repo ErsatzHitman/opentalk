@@ -158,7 +158,7 @@ fn desktop_pill_click_drag_hover_hittest() {
 
 #[test]
 #[ignore]
-fn desktop_pill_cancel_button_and_error_card() {
+fn desktop_pill_cancel_button_and_error_toast() {
     let (w, events) = make();
     let hwnd = HWND(w.hwnd() as *mut core::ffi::c_void);
     w.with(|i| i.set_mode(PillMode::Recording));
@@ -188,15 +188,22 @@ fn desktop_pill_cancel_button_and_error_card() {
     w.with(|i| i.set_mode(PillMode::Idle));
     pump(100);
 
-    // error card: bigger window, auto-dismiss after 3 s, then back to the pill
+    // error toast: the window keeps its size, a click on the toast retries, an unclicked one
+    // auto-dismisses
     w.with(|i| i.show_error("Transcription failed", "The speech provider rejected your API key.", true));
     let r = rect(hwnd);
-    assert_eq!(r.right - r.left, (466.0 * scale).ceil() as i32);
-    pump(3600);
+    assert_eq!(r.right - r.left, (208.0 * scale).ceil() as i32, "no bigger window for an error");
+    pump(800);
+    let g = w.with(|i| i.st.geometry(i.now()));
+    let (tx, ty) = ((g.toast.cx() * scale) as i32, (g.toast.cy() * scale) as i32);
+    send(hwnd, WM_LBUTTONDOWN, 1, lparam(tx, ty));
+    send(hwnd, WM_LBUTTONUP, 0, lparam(tx, ty));
+    assert!(events.borrow().contains(&PillEvent::ErrorRetry), "clicked: {:?}", events.borrow());
+    send(hwnd, WM_MOUSELEAVE, 0, LPARAM(0));
+    w.with(|i| i.show_error("Microphone unavailable", "Check the microphone.", false));
+    pump((crate::daemon::pill::model::ERROR_HOLD_MS + 600.0) as u64);
     assert!(events.borrow().contains(&PillEvent::ErrorDismissed), "auto-dismissed: {:?}", events.borrow());
-    let r = rect(hwnd);
-    assert_eq!(r.right - r.left, w.with(|i| i.client_size().0));
-    assert_eq!(r.right - r.left, (208.0 * scale).ceil() as i32);
+    assert!(w.with(|i| i.st.toast().is_none()), "tucked away");
 }
 
 #[test]

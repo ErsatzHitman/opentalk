@@ -254,8 +254,8 @@ pub fn rewrite_card(e: &LlmError) -> (&'static str, String) {
         LlmError::NotConfigured => ("Add an AI key to rewrite", "Pasted your text as dictated. Add a key in Settings.".into()),
         LlmError::Timeout => ("Rewrite timed out", PASTED.into()),
         LlmError::Http { status: 401 | 403, .. } => ("Check your AI key", PASTED.into()),
-        LlmError::Http { status: 429, .. } => ("AI provider is rate limiting", PASTED.into()),
-        LlmError::Http { .. } | LlmError::Network(_) => ("Couldn't reach the AI provider", PASTED.into()),
+        LlmError::Http { status: 429, .. } => ("AI provider rate limited", PASTED.into()),
+        LlmError::Http { .. } | LlmError::Network(_) => ("AI provider unreachable", PASTED.into()),
         LlmError::InvalidOutput(_) => ("Rewrite didn't look right", PASTED.into()),
     }
 }
@@ -636,9 +636,9 @@ mod tests {
                 "Rewrite timed out",
                 "Check your AI key",
                 "Check your AI key",
-                "AI provider is rate limiting",
-                "Couldn't reach the AI provider",
-                "Couldn't reach the AI provider",
+                "AI provider rate limited",
+                "AI provider unreachable",
+                "AI provider unreachable",
                 "Rewrite didn't look right"
             ]
         );

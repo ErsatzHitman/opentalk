@@ -38,9 +38,6 @@ impl Rect {
     pub fn inflate(&self, d: f32) -> Rect {
         Rect { l: self.l - d, t: self.t - d, r: self.r + d, b: self.b + d }
     }
-    pub fn contains(&self, x: f32, y: f32) -> bool {
-        x >= self.l && x < self.r && y >= self.t && y < self.b
-    }
     pub fn offset(&self, dx: f32, dy: f32) -> Rect {
         Rect { l: self.l + dx, t: self.t + dy, r: self.r + dx, b: self.b + dy }
     }

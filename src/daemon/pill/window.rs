@@ -4,8 +4,7 @@
 
 use super::anim::{QuietRun, SLOW_TICK_MS, TICK_MS};
 use super::capture::{GlassHost, Refresh, ScreenEvents, WM_APP_GLASS, WM_APP_SCREEN_EVENT};
-use super::card::CardHover;
-use super::model::{Hit, Pointer, RenderState, TickOutcome};
+use super::model::{Hit, RenderState, TickOutcome, ToastKind};
 use super::diag::Series;
 use super::pacer::{Hint, PaceSnapshot, PaceStats, Vsync};
 use super::raster::DevRect;
@@ -712,10 +711,7 @@ impl Inner {
         self.glass.last_ms = f64::NEG_INFINITY;
         // the window may have moved or been re-docked: push a full frame so the position is applied
         self.cache.reset();
-        self.pos = match (self.custom_pos, self.st.error().is_some()) {
-            (Some(p), false) => p,
-            _ => self.default_pos(),
-        };
+        self.pos = self.custom_pos.unwrap_or_else(|| self.default_pos());
         self.present();
     }
 
@@ -845,10 +841,7 @@ impl Inner {
     /// cannot capture, or rests.
     fn glass_period(&self, now: f64) -> u32 {
         let fast = self.st.pointer().group || self.down.as_ref().is_some_and(|d| d.dragging);
-        // the error card sits still for 3-5 s (its countdown counts as an animation): the capture taken
-        // as it appears is enough (rebuilding its glass costs up to ~30 ms at 2x), so it refreshes on
-        // events only, like the resting circle
-        let busy = !matches!(self.st.mode(), PillMode::Idle | PillMode::Hidden) || (self.st.error().is_none() && self.st.is_animating(now));
+        let busy = !matches!(self.st.mode(), PillMode::Idle | PillMode::Hidden) || self.st.is_animating(now);
         glass_period_ms(self.visible && self.glass.available(), fast, busy, self.st.mode() == PillMode::Recording)
     }
 
@@ -1164,21 +1157,12 @@ impl Inner {
         let now = self.now();
         self.last_hit = hit;
         let ptr = self.st.pointer_for(hit);
-        if matches!(hit, Hit::ErrorCard | Hit::ErrorRetry) || self.st.error().is_some() {
-            let h = match hit {
-                Hit::ErrorRetry => CardHover::Retry,
-                Hit::ErrorCard => CardHover::Card,
-                _ => CardHover::None,
-            };
-            let before = self.st.error().map(|e| e.hover);
-            if let Some(e) = self.st.error_mut() {
-                e.set_hover(h, now);
-            }
-            if before != self.st.error().map(|e| e.hover) {
-                self.present();
-                self.sync_timer();
-            }
-            return;
+        // hovering an error toast holds it out (and lights its Retry arrow)
+        let on_toast = hit == Hit::Toast;
+        if on_toast != self.st.toast_hover {
+            self.st.set_toast_hover(on_toast, now);
+            self.present();
+            self.sync_timer();
         }
         if ptr != self.st.pointer() {
             self.st.set_pointer(ptr, now);
@@ -1208,7 +1192,7 @@ impl Inner {
                 let id = match self.last_hit {
                     Hit::Pill if self.down.as_ref().is_some_and(|d| d.dragging) => IDC_SIZEALL,
                     Hit::Pill if !self.can_click_pill() => IDC_NO,
-                    Hit::Pill | Hit::Cancel | Hit::ErrorRetry => IDC_HAND,
+                    Hit::Pill | Hit::Cancel | Hit::Toast => IDC_HAND,
                     _ => IDC_ARROW,
                 };
                 // SAFETY: stock cursor.
@@ -1280,12 +1264,12 @@ impl Inner {
                         match up {
                             Hit::Pill if self.can_click_pill() => out.events.push(PillEvent::Clicked),
                             Hit::Cancel if self.st.cancel_interactive(self.now()) => out.events.push(PillEvent::CancelClicked),
-                            Hit::ErrorRetry => {
+                            // an error toast: Retry when it offers it, else it is dismissed
+                            Hit::Toast => {
+                                let retry = self.st.toast().is_some_and(|t| t.retry);
                                 let now = self.now();
-                                if let Some(e) = self.st.error_mut() {
-                                    e.dismiss_now(now);
-                                }
-                                out.events.push(PillEvent::ErrorRetry);
+                                self.st.tuck_toast(now);
+                                out.events.push(if retry { PillEvent::ErrorRetry } else { PillEvent::ErrorDismissed });
                                 self.present();
                                 self.sync_timer();
                             }
@@ -1309,7 +1293,7 @@ impl Inner {
             }
             WM_RBUTTONUP => {
                 let (lx, ly) = self.client_point(lp);
-                if self.hit_at_client(lx, ly) == Hit::Pill && self.st.error().is_none() {
+                if self.hit_at_client(lx, ly) == Hit::Pill {
                     out.menu = true;
                 }
                 out.result = Some(LRESULT(0));
@@ -1341,11 +1325,7 @@ impl Inner {
                     out.events.push(PillEvent::ErrorDismissed);
                 }
                 self.frame_t = Some(now);
-                if o.error_gone {
-                    self.relayout();
-                } else {
-                    self.present();
-                }
+                self.present();
                 self.frame_t = None;
                 // the frame above was the final one at rest (it also hid an idle auto-hide pill)
                 if !self.st.is_animating(now) {
@@ -1596,18 +1576,20 @@ impl Inner {
     }
 
     pub fn show_copied(&mut self) {
-        let now = self.now();
-        self.st.show_copied(now);
-        self.refresh();
+        self.show_toast(ToastKind::Copied, "Copied", false);
     }
 
+    /// An error is the title alone in a toast (the description goes to the log).
     pub fn show_error(&mut self, title: &str, desc: &str, retry: bool) {
+        crate::log_info!("pill: {title} ({desc})");
+        self.show_toast(ToastKind::Error, title, retry);
+    }
+
+    fn show_toast(&mut self, kind: ToastKind, label: &str, retry: bool) {
         let now = self.now();
-        self.st.error = Some(super::card::ErrorCard::new(title, desc, retry, now));
-        self.st.set_pointer(Pointer::default(), now);
-        // the card is anchored at the default spot (see `relayout`); a dragged position comes back after it
-        self.relayout();
-        self.sync_timer();
+        let toast = super::render::make_toast(kind, label, retry, self.st.scale, self.st.position);
+        self.st.show_toast(toast, now);
+        self.refresh();
     }
 
     pub fn set_options(&mut self, opts: PillOptions) {

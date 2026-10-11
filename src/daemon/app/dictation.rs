@@ -135,9 +135,9 @@ fn preflight(cfg: &Config) -> Option<(String, String)> {
     let info = stt::registry::provider(id);
     let creds = stt::credentials(cfg);
     if id == crate::core::config::SttProviderId::Custom {
-        return creds.base_url.is_none().then(|| ("Speech-to-text isn't set up".to_string(), "Enter your server address in Settings > Speech-to-Text.".to_string()));
+        return creds.base_url.is_none().then(|| ("Set up speech-to-text".to_string(), "Enter your server address in Settings > Speech-to-Text.".to_string()));
     }
-    creds.api_key.is_none().then(|| (format!("Add your {} API key", info.name), "Open Settings > Speech-to-Text to add it.".to_string()))
+    creds.api_key.is_none().then(|| (format!("Add your {} key", info.name), "Open Settings > Speech-to-Text to add it.".to_string()))
 }
 
 /// The paste will put the user's clipboard back afterwards, so it needs a snapshot of it.
@@ -183,7 +183,7 @@ fn error_title(code: SttErrorCode) -> &'static str {
         SttErrorCode::ModelNotFound => "Model not found",
         SttErrorCode::PayloadTooLarge => "Recording too long",
         SttErrorCode::Timeout | SttErrorCode::Unavailable | SttErrorCode::Unreachable => "Connection problem",
-        SttErrorCode::NotConfigured => "Speech-to-text isn't set up",
+        SttErrorCode::NotConfigured => "Set up speech-to-text",
         _ => "Transcription failed",
     }
 }

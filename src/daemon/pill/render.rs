@@ -1,5 +1,5 @@
 //! Pure renderer: `render(state, t_ms)` -> premultiplied RGBA pixmap of the whole pill window.
-//! No Win32 is touched except the (cached) GDI text masks used by the tooltip and the error card, so
+//! No Win32 is touched except the (cached) GDI text masks used by the tooltip and the toasts, so
 //! the output is deterministic for goldens.
 //!
 //! A frame is drawn in four layer groups, always in this order: the signal glow ([`L_GLOW`]), the
@@ -8,7 +8,7 @@
 //! [`FrameCache`] exploits that split so a steady frame redraws only what moves (see its docs).
 
 use super::anim::*;
-use super::card;
+use super::icons;
 use super::glass::{self, Ctx, Params, Surface};
 use super::glow::{self, GLOW_RADIUS, GlowFrame, Sprites};
 use super::model::*;
@@ -18,7 +18,7 @@ use super::text::{self, Font};
 use super::theme::Rgba;
 use std::hash::Hasher;
 use std::sync::Arc;
-use tiny_skia::{FilterQuality, Pixmap, PixmapPaint, Transform};
+use tiny_skia::Pixmap;
 
 /// Layer groups (bit mask for [`render_layers`]).
 pub const L_GLOW: u8 = 1;
@@ -53,13 +53,9 @@ pub fn render_into(st: &RenderState, t: f64, pm: &mut Pixmap) {
     render_layers(st, t, pm, L_ALL);
 }
 
-/// Like [`render_into`] but draws only the layer groups in `mask` (the error card ignores it).
+/// Like [`render_into`] but draws only the layer groups in `mask`.
 pub fn render_layers(st: &RenderState, t: f64, pm: &mut Pixmap, mask: u8) {
     pm.data_mut().fill(0);
-    if let Some(e) = st.error() {
-        render_error(st, e, t, pm);
-        return;
-    }
     let g = st.geometry(t);
     let mut cv = Canvas::new(pm, st.scale);
     if mask & L_GLOW != 0 {
@@ -103,9 +99,9 @@ fn draw_under(cv: &mut Canvas, st: &RenderState, g: &Geometry, t: f64) {
     if g.cancel_t > 0.003 {
         draw_cancel_button(cv, &ctx, g, &app);
     }
-    // 3a. the "Copied" bubble rises out of the pill the same way
-    if g.copied_t > 0.003 {
-        draw_copied_bubble(cv, &ctx, g, &app);
+    // 3a. the toast rises out of the pill the same way
+    if g.toast_t > 0.003 {
+        draw_toast_capsule(cv, &ctx, g, &app);
     }
 
     // 3b. pill shadow
@@ -141,10 +137,11 @@ fn draw_over(cv: &mut Canvas, st: &RenderState, g: &Geometry, t: f64) {
         draw_x_glyph(cv, g.cancel.0, g.cancel.1, col, a);
     }
 
-    // 7b. "Copied" label
-    if g.copied_t > 0.35 {
-        draw_copied_label(cv, st, g.copied, cancel_glyph_alpha(g.copied_t));
-    }
+    // 7b. toast content
+    if g.toast_t > 0.35
+        && let Some(toast) = st.toast() {
+            draw_toast_content(cv, st, toast, g.toast, cancel_glyph_alpha(g.toast_t));
+        }
 
     // 8. tooltip
     if (st.pointer().pill || st.pointer().bubble)
@@ -411,15 +408,15 @@ fn draw_cancel_button(cv: &mut Canvas, ctx: &Ctx, g: &Geometry, app: &Appearance
     glass::paint(cv, ctx, &Surface { field, radius: Some(r), sdf: &sdf }, &Params { shadow_alpha: 0.0, ..params });
 }
 
-// --- "Copied" bubble ----------------------------------------------------------------------
+// --- toasts ------------------------------------------------------------------------------
 
-/// The "Copied" bubble: a glass capsule with the cancel button's recipe, poured out of the top of the
-/// pill with the same stretching neck, so the two read as one family.
-fn draw_copied_bubble(cv: &mut Canvas, ctx: &Ctx, g: &Geometry, app: &Appearance) {
-    let c = g.copied;
+/// The toast: a glass capsule with the cancel button's recipe, poured out of the top of the pill
+/// with the same stretching neck, so the two read as one family.
+fn draw_toast_capsule(cv: &mut Canvas, ctx: &Ctx, g: &Geometry, app: &Appearance) {
+    let c = g.toast;
     let (cx, cy, w, h) = (c.cx(), c.cy(), c.w(), c.h());
-    let alpha = cancel_alpha(g.copied_t);
-    let k = neck_k(g.copied_t);
+    let alpha = cancel_alpha(g.toast_t);
+    let k = neck_k(g.toast_t);
     let params = Params { alpha, shadow: app.shadow, shadow_alpha: alpha, lift: app.lift, edge: app.edge, frost: None };
     let capsule = move |x: f32, y: f32| sd_capsule(x, y, cx, cy, w, h);
     if k <= 0.05 {
@@ -437,27 +434,68 @@ fn draw_copied_bubble(cv: &mut Canvas, ctx: &Ctx, g: &Geometry, app: &Appearance
     glass::paint(cv, ctx, &Surface { field, radius: Some(h * 0.5), sdf: &sdf }, &Params { shadow_alpha: 0.0, ..params });
 }
 
-/// Check mark + "Copied", centred in the capsule.
-fn draw_copied_label(cv: &mut Canvas, st: &RenderState, c: Rect, alpha: f32) {
-    let s = st.scale;
-    let font = Font::new(11.0, s, 500);
-    let tw = text::measure(COPIED_TEXT, font) / s;
-    let (check_w, gap) = (9.0, 5.0);
-    let x0 = c.cx() - (check_w + gap + tw) * 0.5;
-    let cy = c.cy();
-    let col = st.pal.fg;
-    // a rounded check, stroked like the cancel glyph
-    let (a, b, d) = ((x0, cy), (x0 + 3.2, cy + 3.0), (x0 + check_w, cy - 3.6));
-    let bb = Rect::new(x0 - 2.0, cy - 6.0, x0 + check_w + 2.0, cy + 6.0);
-    cv.fill_sdf(bb, col, alpha, |x, y| sd_segment(x, y, a.0, a.1, b.0, b.1).min(sd_segment(x, y, b.0, b.1, d.0, d.1)) - 0.8);
-    if let Some(m) = text::mask(COPIED_TEXT, font) {
-        let cell = text::content_height(font) / s;
-        text::draw(cv, &m, x0 + check_w + gap, cy - cell * 0.5, col, alpha);
-    }
+/// The toast's label font.
+fn toast_font(scale: f32) -> Font {
+    Font::new(TOAST_FONT_PX, scale, TOAST_FONT_WEIGHT)
 }
 
-/// The bubble's label.
-pub const COPIED_TEXT: &str = "Copied";
+/// A toast for `label`, measured for the panel `position`: a label too wide for the window is cut
+/// with an ellipsis so the capsule always fits.
+pub fn make_toast(kind: ToastKind, label: &str, retry: bool, scale: f32, position: crate::core::config::PanelPosition) -> Toast {
+    let scale = sane_scale(scale);
+    let font = toast_font(scale);
+    let max_w = win_w(position) - 2.0 * TOAST_MARGIN;
+    let measure = |l: &str| text::measure(l, font) / scale;
+    let mut label = label.trim().to_string();
+    let mut width = Toast::width_for(measure(&label), retry);
+    while width > max_w && label.chars().count() > 1 {
+        let keep: String = label.trim_end_matches('\u{2026}').chars().collect::<Vec<_>>().split_last().map(|(_, rest)| rest.iter().collect()).unwrap_or_default();
+        label = format!("{}\u{2026}", keep.trim_end());
+        width = Toast::width_for(measure(&label), retry);
+    }
+    Toast { kind, label, retry, width: width.min(max_w) }
+}
+
+/// Error mark: a red circle outline with an exclamation point, in the check mark's slot.
+fn toast_error_color(dark: bool) -> Rgba {
+    if dark { Rgba::hex(0xf87171) } else { Rgba::hex(0xdc2626) }
+}
+
+/// Icon + label (+ the Retry arrow), centred in the capsule.
+fn draw_toast_content(cv: &mut Canvas, st: &RenderState, toast: &Toast, c: Rect, alpha: f32) {
+    let s = st.scale;
+    let font = toast_font(s);
+    let tw = text::measure(&toast.label, font) / s;
+    let retry_w = if toast.retry { TOAST_GAP + TOAST_RETRY } else { 0.0 };
+    let x0 = c.cx() - (TOAST_ICON + TOAST_GAP + tw + retry_w) * 0.5;
+    let cy = c.cy();
+    let col = st.pal.fg;
+    let bb = Rect::new(x0 - 2.0, cy - 6.5, x0 + TOAST_ICON + 2.0, cy + 6.5);
+    match toast.kind {
+        ToastKind::Copied => {
+            // a rounded check, stroked like the cancel glyph
+            let (a, b, d) = ((x0, cy), (x0 + 3.2, cy + 3.0), (x0 + TOAST_ICON, cy - 3.6));
+            cv.fill_sdf(bb, col, alpha, |x, y| sd_segment(x, y, a.0, a.1, b.0, b.1).min(sd_segment(x, y, b.0, b.1, d.0, d.1)) - 0.8);
+        }
+        ToastKind::Error => {
+            let red = toast_error_color(st.pal.dark);
+            let (ix, r) = (x0 + TOAST_ICON * 0.5, TOAST_ICON * 0.5 + 0.6);
+            cv.fill_sdf(bb, red, alpha, |x, y| ((x - ix).hypot(y - cy) - r).abs() - 0.65);
+            cv.fill_sdf(bb, red, alpha, |x, y| (sd_segment(x, y, ix, cy - 2.6, ix, cy + 0.5) - 0.7).min((x - ix).hypot(y - (cy + 2.6)) - 0.75));
+        }
+    }
+    let tx = x0 + TOAST_ICON + TOAST_GAP;
+    if let Some(m) = text::mask(&toast.label, font) {
+        let cell = text::content_height(font) / s;
+        text::draw(cv, &m, tx, cy - cell * 0.5, col, alpha);
+    }
+    if toast.retry {
+        let rx = tx + tw + TOAST_GAP;
+        let icon = Rect::from_xywh(rx, cy - TOAST_RETRY * 0.5, TOAST_RETRY, TOAST_RETRY);
+        let hot = if st.toast_hover { col } else { st.pal.muted_fg };
+        icons::draw_retry_icon(cv, icon, s, hot.with_alpha(alpha));
+    }
+}
 
 // --- tooltip -----------------------------------------------------------------------------
 
@@ -513,29 +551,6 @@ fn arrow_sd(px: f32, py: f32, ax: f32, ay: f32) -> f32 {
     (ay - py).max(-(px - ax - dy) * r).max(-((ax + 4.0) - px - dy) * r)
 }
 
-// --- error card --------------------------------------------------------------------------
-
-fn render_error(st: &RenderState, e: &card::ErrorCard, t: f64, pm: &mut Pixmap) {
-    let scale = st.scale;
-    let layout = e.layout(scale);
-    let backdrop = st.backdrop_or_neutral();
-    let Some(base) = card::base_layer(e, scale, &st.pal, &backdrop) else { return };
-    let (op, ty, sc) = e.presence(t);
-    if op <= 0.001 {
-        return;
-    }
-    let mut layer = (*base).clone();
-    card::draw_countdown(&mut layer, &layout, scale, st.pal.fg, e.remaining_fraction(t));
-    if op >= 0.999 && ty.abs() < 0.01 && (sc - 1.0).abs() < 1e-4 && layer.width() == pm.width() && layer.height() == pm.height() {
-        pm.data_mut().copy_from_slice(layer.data());
-        return;
-    }
-    let cx = layout.card.cx() * scale;
-    let cy = layout.card.cy() * scale;
-    let tf = Transform::from_translate(-cx, -cy).post_scale(sc, sc).post_translate(cx, cy + ty * scale);
-    pm.draw_pixmap(0, 0, layer.as_ref(), &PixmapPaint { opacity: op.clamp(0.0, 1.0), blend_mode: tiny_skia::BlendMode::SourceOver, quality: FilterQuality::Bilinear }, tf, None);
-}
-
 // --- steady-state frame cache ---------------------------------------------------------------
 
 /// What [`FrameCache::render`] did to the pixmap.
@@ -589,9 +604,9 @@ impl Fnv {
 }
 
 /// Is the frame at `t` one of the two steady shapes? Everything except the lane (resp. the glow) is a
-/// pure function of the state, not of `t`: no track is moving, nothing pulses, no error card.
+/// pure function of the state, not of `t`: no track is moving, nothing pulses, no toast.
 fn classify(st: &RenderState, t: f64) -> Option<Kind> {
-    if st.error().is_some() || st.pulse_since.is_some() || st.copied_showing(t) {
+    if st.pulse_since.is_some() || st.toast_showing(t) {
         return None;
     }
     let tracks = [&st.compact, &st.grad, &st.wave_live, &st.wave_rest, &st.divider, &st.glow, &st.bubble, &st.cancel_hot, &st.icon_swap];
@@ -612,7 +627,7 @@ fn classify(st: &RenderState, t: f64) -> Option<Kind> {
 
 /// Is there anything in the overlay group (ring, cancel glyph, tooltip) at this instant?
 fn has_overlay(st: &RenderState, g: &Geometry) -> bool {
-    st.look() == Look::Unavailable || g.cancel_t > 0.35 || g.copied_t > 0.35 || ((st.pointer().pill || st.pointer().bubble) && tooltip_for(st).is_some())
+    st.look() == Look::Unavailable || g.cancel_t > 0.35 || g.toast_t > 0.35 || ((st.pointer().pill || st.pointer().bubble) && tooltip_for(st).is_some())
 }
 
 /// Hash of everything that decides the static pixels of a steady frame.
@@ -864,11 +879,11 @@ mod tests {
                     cache.render(&s, 1500.0, &mut target);
                     cache.render(&s, 1520.0, &mut target);
                 }
-                // the error card, with and without the retry button
+                // an error toast with the retry arrow
                 let mut s = RenderState::new(Palette::get(dark), scale, PanelPosition::BottomCenter);
                 s.set_scale(scale);
-                s.error = Some(card::ErrorCard::new("Transcription failed", "The speech provider rejected your key.", true, 0.0));
-                assert!(render_frame(&s, 400.0).is_some(), "scale {scale}: error card");
+                s.show_toast(make_toast(ToastKind::Error, "Transcription failed", true, scale, PanelPosition::BottomCenter), 0.0);
+                assert!(render_frame(&s, 400.0).is_some(), "scale {scale}: error toast");
             }
         }
         // an absurd scale is clamped, never allocated (not rendered: a 16x frame is slow in debug builds)
@@ -1258,9 +1273,9 @@ mod tests {
             assert_eq!(cache.render(&s, ms, &mut pm), FrameOutcome::Dirty(full_rect(&pm)));
             assert_eq!(pm.data(), render(&s, ms).data());
         }
-        // an error card is never cached
+        // a toast is never cached
         let mut e = rec_state(false);
-        e.error = Some(card::ErrorCard::new("Title", "Description", true, 0.0));
+        e.show_toast(Toast { kind: ToastKind::Error, label: "Title".into(), retry: true, width: 80.0 }, 0.0);
         let mut pm = new_pm(&e);
         for t in [0.0, 400.0, 800.0] {
             assert_eq!(cache.render(&e, t, &mut pm), FrameOutcome::Dirty(full_rect(&pm)));
@@ -1418,18 +1433,8 @@ mod tests {
                 full.push(t0.elapsed().as_secs_f64() * 1000.0);
             }
             let (st, rb, fu) = (median(steady), median(rebuild), median(full));
-            // the error card's base layer (glass + text), rebuilt when the picture under it changes
-            let card = card::ErrorCard::new("Transcription failed", "The speech provider rejected your API key. Check it in Settings.", true, 0.0);
-            let mut card_ms = Vec::new();
-            for i in 0..6 {
-                let bd = if i % 2 == 0 { &a } else { &b };
-                let t0 = std::time::Instant::now();
-                assert!(card::draw_base(&card, scale, &Palette::LIGHT, bd).is_some());
-                card_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
-            }
-            let cd = median(card_ms);
-            println!("glass frames {scale}x: steady recording frame {st:.3} ms, base rebuild {rb:.3} ms, full repaint {fu:.3} ms, error card base {cd:.3} ms");
-            assert!(st < 50.0 && rb < 250.0 && cd < 500.0, "{scale}x: steady {st:.1} ms, rebuild {rb:.1} ms, card {cd:.1} ms");
+            println!("glass frames {scale}x: steady recording frame {st:.3} ms, base rebuild {rb:.3} ms, full repaint {fu:.3} ms");
+            assert!(st < 50.0 && rb < 250.0, "{scale}x: steady {st:.1} ms, rebuild {rb:.1} ms");
         }
     }
 

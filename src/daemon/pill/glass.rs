@@ -117,18 +117,15 @@ pub struct Tokens {
     /// The frost layer (modal tier): `rgb` at `alpha` over the refracted backdrop.
     pub frost: [f32; 3],
     pub frost_alpha: f32,
-    /// Frost alpha of the error card: 14-16 px text, muted description included, must hold 4.5:1.
-    pub card_frost_alpha: f32,
     /// Menu tier wash (`--glass-menu-surface` over the frosted backdrop) used by the tooltip.
     pub menu: [f32; 3],
     pub menu_alpha: f32,
     pub menu_border: Rgba,
-    /// Shadow of the pill surfaces at rest / lifted, and of the error card. The skill's
+    /// Shadow of the pill surfaces at rest / lifted. The skill's
     /// `0 10px 30px` / `0 18px 40px` are scaled to the 12 px the window leaves around the pill, so
     /// the layered window never clips them.
     pub shadow: Shadow,
     pub shadow_lift: Shadow,
-    pub card_shadow: Shadow,
 }
 
 const WHITE: [f32; 3] = [1.0, 1.0, 1.0];
@@ -140,9 +137,6 @@ const GREY70: [f32; 3] = [179.0 / 255.0, 179.0 / 255.0, 179.0 / 255.0];
 /// (`legibility_over_white_black_and_busy_backdrops`).
 pub const FROST_ALPHA_LIGHT: f32 = 0.56;
 pub const FROST_ALPHA_DARK: f32 = 0.69;
-/// The error card frosts harder than the pill: its muted description (#525252 / #8f8f8f) needs 4.5:1.
-pub const CARD_FROST_ALPHA_LIGHT: f32 = 0.82;
-pub const CARD_FROST_ALPHA_DARK: f32 = 0.95;
 /// Gaussian sigma (logical px) of the frost blur.
 pub const FROST_SIGMA: f32 = 10.0;
 /// `saturate(125%)`.
@@ -160,13 +154,11 @@ pub fn tokens(dark: bool) -> &'static Tokens {
         border: Rgba::new(30.0 / 255.0, 33.0 / 255.0, 45.0 / 255.0, 0.12),
         frost: WHITE,
         frost_alpha: FROST_ALPHA_LIGHT,
-        card_frost_alpha: CARD_FROST_ALPHA_LIGHT,
         menu: [246.0 / 255.0, 247.0 / 255.0, 249.0 / 255.0],
         menu_alpha: 0.74,
         menu_border: Rgba::new(30.0 / 255.0, 33.0 / 255.0, 45.0 / 255.0, 0.12),
         shadow: Shadow { dy: 3.0, blur: 9.0, spread: 0.0, alpha: 0.13 },
         shadow_lift: Shadow { dy: 5.0, blur: 12.0, spread: -1.0, alpha: 0.16 },
-        card_shadow: Shadow { dy: 6.0, blur: 12.0, spread: -4.0, alpha: 0.16 },
     };
     static DARK: Tokens = Tokens {
         tint_top: WHITE,
@@ -179,13 +171,11 @@ pub fn tokens(dark: bool) -> &'static Tokens {
         border: Rgba::new(1.0, 1.0, 1.0, 0.08),
         frost: [14.0 / 255.0, 15.0 / 255.0, 19.0 / 255.0],
         frost_alpha: FROST_ALPHA_DARK,
-        card_frost_alpha: CARD_FROST_ALPHA_DARK,
         menu: [22.0 / 255.0, 22.0 / 255.0, 27.0 / 255.0],
         menu_alpha: 0.74,
         menu_border: Rgba::new(1.0, 1.0, 1.0, 0.08),
         shadow: Shadow { dy: 4.0, blur: 10.0, spread: 0.0, alpha: 0.32 },
         shadow_lift: Shadow { dy: 6.0, blur: 13.0, spread: -1.0, alpha: 0.36 },
-        card_shadow: Shadow { dy: 6.0, blur: 12.0, spread: -4.0, alpha: 0.40 },
     };
     if dark { &DARK } else { &LIGHT }
 }
@@ -1464,32 +1454,6 @@ mod tests {
                     }
                 }
                 assert!(logo >= 4.5, "{name} {theme}: logo contrast {logo:.2}");
-            }
-        }
-    }
-
-    #[test]
-    fn error_card_text_is_legible_over_white_black_and_busy_backdrops() {
-        // title (fg) and the muted description (muted-fg) on the card surface, both themes
-        for (name, b) in test_backdrops() {
-            for dark in [false, true] {
-                let tk = tokens(dark);
-                let mut pm = Pixmap::new(466, 120).unwrap();
-                let r = Rect::from_xywh(12.0, 12.0, 442.0, 76.0);
-                let sdf = move |x: f32, y: f32| sd_round_box(x, y, r.cx(), r.cy(), r.w() * 0.5, r.h() * 0.5, 16.0);
-                let surf = Surface { field: r, radius: Some(16.0), sdf: &sdf };
-                let p = Params { alpha: 1.0, shadow: tk.card_shadow, shadow_alpha: 1.0, lift: 0.0, edge: 1.0, frost: Some(tk.card_frost_alpha) };
-                paint(&mut Canvas::new(&mut pm, 1.0), &Ctx { backdrop: &b, dark }, &surf, &p);
-                let pal = if dark { crate::daemon::pill::theme::Palette::DARK } else { crate::daemon::pill::theme::Palette::LIGHT };
-                for (what, fg) in [("title", pal.fg), ("description", pal.muted_fg)] {
-                    let mut worst = f32::MAX;
-                    for y in 28..72u32 {
-                        for x in 28..420u32 {
-                            worst = worst.min(contrast([fg.r, fg.g, fg.b], px_rgb(&pm, x, y)));
-                        }
-                    }
-                    assert!(worst >= 4.5, "{name} {}: card {what} contrast {worst:.2}", if dark { "dark" } else { "light" });
-                }
             }
         }
     }

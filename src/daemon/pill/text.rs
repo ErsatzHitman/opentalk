@@ -18,8 +18,6 @@ use windows::Win32::Graphics::Gdi::{
 use windows::core::PCWSTR;
 
 pub const FONT_FACE: &str = "Segoe UI";
-/// CSS `leading-snug`.
-pub const LEADING_SNUG: f32 = 1.375;
 /// Supersampling factor of the GDI rasterisation.
 const SS: i32 = 4;
 
@@ -416,79 +414,6 @@ pub fn draw(canvas: &mut Canvas, m: &Mask, x: f32, y: f32, color: Rgba, alpha: f
     }
 }
 
-/// Greedy CSS-like wrap (`white-space: pre-wrap; overflow-wrap: break-word`) at `max_w` device px.
-/// Explicit `\n` start a new line; over-long words are split by character.
-pub fn wrap(text: &str, font: Font, max_w: f32) -> Vec<String> {
-    let mut out = Vec::new();
-    for para in text.split('\n') {
-        if para.is_empty() {
-            out.push(String::new());
-            continue;
-        }
-        let mut line = String::new();
-        let mut line_w = 0.0;
-        for word in split_keep_spaces(para) {
-            let ww = measure(&word, font);
-            // trailing spaces may hang past the edge, so test the word without them
-            let ww_trim = measure(word.trim_end(), font);
-            if line_w + ww_trim <= max_w || (line.is_empty() && ww_trim <= max_w) {
-                line.push_str(&word);
-                line_w += ww;
-                continue;
-            }
-            if !line.is_empty() {
-                out.push(line.trim_end().to_string());
-                line.clear();
-                line_w = 0.0;
-            }
-            if word.trim().is_empty() {
-                continue;
-            }
-            if ww_trim <= max_w {
-                line.push_str(&word);
-                line_w = ww;
-            } else {
-                // break the long word
-                for ch in word.chars() {
-                    let s = ch.to_string();
-                    let cw = measure(&s, font);
-                    if line_w + cw > max_w && !line.is_empty() {
-                        out.push(std::mem::take(&mut line));
-                        line_w = 0.0;
-                    }
-                    line.push(ch);
-                    line_w += cw;
-                }
-            }
-        }
-        out.push(line.trim_end().to_string());
-    }
-    out
-}
-
-/// Split into runs of "word + following spaces".
-fn split_keep_spaces(s: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut cur = String::new();
-    let mut in_space = false;
-    for ch in s.chars() {
-        if ch == ' ' {
-            in_space = true;
-            cur.push(ch);
-        } else {
-            if in_space {
-                out.push(std::mem::take(&mut cur));
-                in_space = false;
-            }
-            cur.push(ch);
-        }
-    }
-    if !cur.is_empty() {
-        out.push(cur);
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -537,21 +462,5 @@ mod tests {
         assert!(m.data.iter().filter(|&&v| v > 128).count() > 10);
         // supersampling yields intermediate coverage values, not just 0/255
         assert!(m.data.iter().any(|&v| v > 20 && v < 235));
-    }
-
-    #[test]
-    fn wrap_respects_width_and_newlines() {
-        let f = Font::new(14.0, 1.0, 400);
-        let lines = wrap("one two three four five six seven eight nine ten", f, 120.0);
-        assert!(lines.len() >= 3);
-        for l in &lines {
-            assert!(measure(l, f) <= 121.0, "{l}");
-        }
-        assert_eq!(wrap("a\nb", f, 200.0), vec!["a".to_string(), "b".to_string()]);
-        // an unbreakable word is split by character
-        let long = "x".repeat(200);
-        let lines = wrap(&long, f, 100.0);
-        assert!(lines.len() > 1);
-        assert_eq!(lines.concat(), long);
     }
 }

@@ -53,7 +53,7 @@ Wine differs from Windows in two places, and the affected tests say so instead o
 
 - `daemon::appicon::tests::friendly_name_from_version_info` prints `SKIPPED (Wine: ...)` when Wine's `notepad.exe` has no
   `FileDescription` in its version resource.
-- `daemon::pill::preview::golden::goldens_match` reports the GDI-text goldens (the error cards; the tooltips usually still
+- `daemon::pill::preview::golden::goldens_match` reports the GDI-text goldens (the toasts; the tooltips usually still
   match) as `SKIPPED (Wine: "Segoe UI" is not installed ...)` when the font is missing, because `DrawTextW` then
   substitutes another face. Every other golden is still asserted.
 
@@ -134,9 +134,9 @@ merged build:
   typing, IME composition and clipboard paste in the text fields; hotkey capture on the Hotkeys page; the popup taking
   the keyboard when opened by `--settings`, a second launch or the first run (otherwise a click on it does); the window
   resize when a page opens and closes.
-- The GDI-text goldens (error cards, tooltips) in `goldens_match`, with Segoe UI installed.
+- The GDI-text goldens (toasts, tooltips) in `goldens_match`, with Segoe UI installed.
 - The pill's capture exclusion: `desktop_pill_capture_excludes_the_pill`, and a manual check that the pill, bubble,
-  tooltip and error card are absent from a screenshot / screen share while the glass still shows the screen behind.
+  tooltip and toasts are absent from a screenshot / screen share while the glass still shows the screen behind.
 - The resting circle's event-driven refresh: switch, move and minimise windows behind it and confirm the frost follows
   within about half a second, with no periodic timer (Process Explorer / `bench.ps1` idle CPU at 0).
 - DPI 125 %, 150 % and 200 %, and dragging the pill between monitors with different scaling (the glass picture must be

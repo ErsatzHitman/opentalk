@@ -4,7 +4,6 @@
 
 use super::PillMode;
 use super::anim::*;
-use super::card::ErrorCard;
 use super::glass::{self, Backdrop};
 use super::raster::{Rect, sd_capsule};
 use super::theme::{Palette, Rgba};
@@ -25,11 +24,55 @@ pub const CANCEL_LIVE: f32 = 0.8;
 /// Size the button grows from as it slides out of the pill (fraction of its final diameter).
 pub const CANCEL_FROM: f32 = 0.6;
 pub const BUBBLE_GAP: f32 = 8.0;
-/// The "Copied" bubble that pops out of the top of the pill when a dictation had nowhere to be
-/// pasted (logical px at rest; it grows from [`CANCEL_FROM`] like the cancel button).
-pub const COPIED_SIZE: (f32, f32) = (84.0, 28.0);
-/// How long the "Copied" bubble stays out before it tucks back into the pill.
+/// Toasts: the small glass capsule that pops out of the top of the pill ("Copied", and every error
+/// message). Height, padding, icon slot and label font are shared; the width follows the label.
+pub const TOAST_H: f32 = 28.0;
+pub const TOAST_PAD: f32 = 16.0;
+pub const TOAST_ICON: f32 = 9.0;
+pub const TOAST_GAP: f32 = 5.0;
+/// The Retry arrow at the end of an error toast that can retry.
+pub const TOAST_RETRY: f32 = 12.0;
+pub const TOAST_FONT_PX: f32 = 11.0;
+pub const TOAST_FONT_WEIGHT: i32 = 500;
+/// Kept this far inside the window's edges.
+pub const TOAST_MARGIN: f32 = 4.0;
+/// How long a toast stays out before it tucks back into the pill (hovering an error holds it).
 pub const COPIED_HOLD_MS: f64 = 1600.0;
+pub const ERROR_HOLD_MS: f64 = 4000.0;
+/// Pointer leaving an error toast: it stays at least this much longer.
+pub const TOAST_LINGER_MS: f64 = 1200.0;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToastKind {
+    /// The dictation is on the clipboard (nothing could take a paste).
+    Copied,
+    Error,
+}
+
+/// One toast's content.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Toast {
+    pub kind: ToastKind,
+    pub label: String,
+    /// Clicking the toast retries the dictation (a Retry arrow follows the label).
+    pub retry: bool,
+    /// Capsule width at rest, logical px (measured from the label when it was made).
+    pub width: f32,
+}
+
+impl Toast {
+    /// Width of a toast whose label measures `label_w` logical px.
+    pub fn width_for(label_w: f32, retry: bool) -> f32 {
+        TOAST_PAD * 2.0 + TOAST_ICON + TOAST_GAP + label_w + if retry { TOAST_GAP + TOAST_RETRY } else { 0.0 }
+    }
+
+    fn hold_ms(&self) -> f64 {
+        match self.kind {
+            ToastKind::Copied => COPIED_HOLD_MS,
+            ToastKind::Error => ERROR_HOLD_MS,
+        }
+    }
+}
 /// Width of the layered window for the two non-right panel positions: bubble 36 + 8 + capsule 98 + 8 +
 /// cancel 36 plus the 12 px glow margin on both sides does not fit 208 px there. The window is
 /// transparent and click-through outside the surfaces, so extra width costs nothing visible; it grows
@@ -245,8 +288,8 @@ pub enum Hit {
     /// Between pill and cancel button (keeps hover alive).
     Gap,
     Bubble,
-    ErrorCard,
-    ErrorRetry,
+    /// An error toast (click: retry when it offers it, else dismiss).
+    Toast,
 }
 
 /// Where everything sits at one instant (logical px, window space).
@@ -260,9 +303,9 @@ pub struct Geometry {
     pub cancel: (f32, f32, f32),
     /// Bubble circle centre/radius.
     pub bubble: (f32, f32, f32),
-    /// Emergence of the "Copied" bubble (0 hidden inside the pill, 1 at rest) and its capsule.
-    pub copied_t: f32,
-    pub copied: Rect,
+    /// Emergence of the toast (0 hidden inside the pill, 1 at rest) and its capsule.
+    pub toast_t: f32,
+    pub toast: Rect,
 }
 
 /// Tooltip alignment relative to its anchor (`voicePillPopoverAlign`).
@@ -299,9 +342,12 @@ pub struct RenderState {
     pub(crate) cancel: Spring,
     pub(crate) bubble: Track,
     pub(crate) cancel_hot: Track,
-    /// The "Copied" bubble's emergence (same springs as the cancel button) and when it tucks back.
-    pub(crate) copied: Spring,
-    pub(crate) copied_until: Option<f64>,
+    /// The toast, its emergence (same springs as the cancel button), when it tucks back in and
+    /// whether the pointer is on it.
+    pub(crate) toast: Option<Toast>,
+    pub(crate) toast_e: Spring,
+    pub(crate) toast_until: Option<f64>,
+    pub(crate) toast_hover: bool,
     pub(crate) appearance: Blend<Appearance>,
     pub(crate) glow_since: Option<f64>,
     pub(crate) pulse_since: Option<f64>,
@@ -312,7 +358,6 @@ pub struct RenderState {
     /// The icon being replaced and the 0..1 progress of the cross-fade to `app` (see `set_app`).
     pub(crate) prev_icon: Option<Arc<Pixmap>>,
     pub(crate) icon_swap: Track,
-    pub(crate) error: Option<ErrorCard>,
     pub(crate) dragging: bool,
     /// The frosted screen under the window; `None` renders the glass over a flat neutral backdrop.
     pub(crate) backdrop: Option<Arc<Backdrop>>,
@@ -345,8 +390,10 @@ impl RenderState {
             cancel: Spring::new(0.0),
             bubble: Track::new(0.0),
             cancel_hot: Track::new(0.0),
-            copied: Spring::new(0.0),
-            copied_until: None,
+            toast: None,
+            toast_e: Spring::new(0.0),
+            toast_until: None,
+            toast_hover: false,
             appearance: Blend::new(appearance(look, &pal)),
             glow_since: None,
             pulse_since: None,
@@ -355,7 +402,6 @@ impl RenderState {
             app: None,
             prev_icon: None,
             icon_swap: Track::new(1.0),
-            error: None,
             dragging: false,
             backdrop: None,
         }
@@ -382,11 +428,8 @@ impl RenderState {
     pub fn app(&self) -> Option<&AppBubble> {
         self.app.as_ref()
     }
-    pub fn error(&self) -> Option<&ErrorCard> {
-        self.error.as_ref()
-    }
-    pub fn error_mut(&mut self) -> Option<&mut ErrorCard> {
-        self.error.as_mut()
+    pub fn toast(&self) -> Option<&Toast> {
+        self.toast.as_ref()
     }
     pub fn waveform(&self) -> &Waveform {
         &self.wave
@@ -543,11 +586,8 @@ impl RenderState {
         let prev = self.mode;
         self.mode = mode;
         if matches!(mode, PillMode::Preparing | PillMode::Recording) {
-            // starting a new dictation dismisses a lingering error and the "Copied" bubble
-            if let Some(e) = self.error.as_mut() {
-                e.dismiss_now(now);
-            }
-            self.tuck_copied(now);
+            // starting a new dictation tucks a lingering toast away
+            self.tuck_toast(now);
         }
         let continuing = prev == PillMode::Unavailable && mode == PillMode::Recording;
         if prev == PillMode::Recording && mode != PillMode::Unavailable {
@@ -569,26 +609,40 @@ impl RenderState {
         }
     }
 
-    /// Pop the "Copied" bubble out of the top of the pill (the dictation went to the clipboard
-    /// because nothing could take a paste); it tucks back in after [`COPIED_HOLD_MS`]. Shown again
-    /// while out, it stays out longer.
-    pub fn show_copied(&mut self, now: f64) {
-        if self.copied.target() < 0.5 {
-            self.copied.set(now, 1.0, CANCEL_POP);
+    /// Pop `toast` out of the top of the pill; it tucks back in after its hold (an error's is
+    /// paused while the pointer is on it). One already out takes the new content and holds again.
+    pub fn show_toast(&mut self, toast: Toast, now: f64) {
+        if self.toast_e.target() < 0.5 {
+            self.toast_e.set(now, 1.0, CANCEL_POP);
         }
-        self.copied_until = Some(now + COPIED_HOLD_MS);
+        self.toast_until = Some(now + toast.hold_ms());
+        self.toast = Some(toast);
+        self.toast_hover = false;
     }
 
-    fn tuck_copied(&mut self, now: f64) {
-        self.copied_until = None;
-        if self.copied.target() > 0.5 {
-            self.copied.set(now, 0.0, CANCEL_TUCK);
+    /// Tuck the toast back into the pill now (a click, a new dictation).
+    pub fn tuck_toast(&mut self, now: f64) {
+        self.toast_until = None;
+        self.toast_hover = false;
+        if self.toast_e.target() > 0.5 {
+            self.toast_e.set(now, 0.0, CANCEL_TUCK);
         }
     }
 
-    /// The "Copied" bubble is out, on its way, or waiting to tuck back in.
-    pub fn copied_showing(&self, t: f64) -> bool {
-        self.copied_until.is_some() || self.copied.is_active(t) || self.copied.value(t) > 0.003
+    /// Pointer on (or off) the toast: an error toast stays out while hovered and a little after.
+    pub fn set_toast_hover(&mut self, hover: bool, now: f64) {
+        if hover == self.toast_hover || self.toast_until.is_none() {
+            return;
+        }
+        self.toast_hover = hover;
+        if !hover {
+            self.toast_until = self.toast_until.map(|u| u.max(now + TOAST_LINGER_MS));
+        }
+    }
+
+    /// The toast is out, on its way, or waiting to tuck back in.
+    pub fn toast_showing(&self, t: f64) -> bool {
+        self.toast.is_some() && (self.toast_until.is_some() || self.toast_e.is_active(t) || self.toast_e.value(t) > 0.003)
     }
 
     pub fn set_pointer(&mut self, p: Pointer, now: f64) {
@@ -653,7 +707,8 @@ impl RenderState {
         let pill = Rect::from_xywh(x, y, w, h);
         let cy = pill.cy();
         let bubble = (pill.l - slot_b + h * 0.5, cy, h * 0.5);
-        let copied_e = self.copied.value(t).clamp(0.0, 1.25);
+        let toast_e = if self.toast.is_some() { self.toast_e.value(t).clamp(0.0, 1.25) } else { 0.0 };
+        let toast_w = self.toast.as_ref().map_or(0.0, |x| x.width);
         Geometry {
             compact: c,
             pill,
@@ -661,17 +716,21 @@ impl RenderState {
             bubble_t,
             cancel: cancel_circle(pill, cancel_e),
             bubble,
-            copied_t: copied_e.min(1.0),
-            copied: copied_rect(pill, copied_e, ww),
+            toast_t: toast_e.min(1.0),
+            toast: toast_rect(pill, toast_e, toast_w, ww),
         }
     }
 
     /// Hit test in logical window coordinates.
     pub fn hit_test(&self, lx: f32, ly: f32, t: f64) -> Hit {
-        if let Some(e) = &self.error {
-            return e.hit_test(lx, ly, self.scale);
-        }
         let g = self.geometry(t);
+        // an error toast is clickable once it has emerged; "Copied" lets clicks through
+        if g.toast_t >= CANCEL_LIVE && self.toast.as_ref().is_some_and(|x| x.kind == ToastKind::Error) {
+            let r = g.toast;
+            if sd_capsule(lx, ly, r.cx(), r.cy(), r.w(), r.h()) <= 0.0 {
+                return Hit::Toast;
+            }
+        }
         let p = g.pill;
         if sd_capsule(lx, ly, p.cx(), p.cy(), p.w(), p.h()) <= 0.0 {
             return Hit::Pill;
@@ -742,17 +801,14 @@ impl RenderState {
             self.wave.tick(now, level, peak);
         }
         let mut out = TickOutcome::default();
-        if self.copied_until.is_some_and(|until| now >= until) {
-            self.tuck_copied(now);
+        if self.toast_hover {
+            // held while the pointer is on it
+        } else if self.toast_until.is_some_and(|until| now >= until) {
+            out.error_expired = self.toast.as_ref().is_some_and(|x| x.kind == ToastKind::Error);
+            self.tuck_toast(now);
         }
-        if let Some(e) = self.error.as_mut() {
-            if e.update(now) {
-                out.error_expired = true;
-            }
-            if e.finished(now) {
-                self.error = None;
-                out.error_gone = true;
-            }
+        if self.toast.is_some() && !self.toast_showing(now) {
+            self.toast = None;
         }
         out
     }
@@ -783,7 +839,7 @@ impl RenderState {
             return true;
         }
         // the hold counts: the tick that tucks the bubble back in must come
-        if self.copied_showing(t) {
+        if self.toast_showing(t) {
             return true;
         }
         if self.pulse_since.is_some() || self.glow_since.is_some() {
@@ -792,20 +848,17 @@ impl RenderState {
         if self.wave.is_easing(t) {
             return true;
         }
-        if let Some(e) = &self.error {
-            return e.is_animating(t);
-        }
         false
     }
 
     /// `true` while the pill's footprint is changing at `t` (expand, shrink, cancel bud, app bubble).
     pub fn is_resizing(&self, t: f64) -> bool {
-        self.compact.is_active(t) || self.cancel.is_active(t) || self.bubble.is_active(t) || self.copied.is_active(t)
+        self.compact.is_active(t) || self.cancel.is_active(t) || self.bubble.is_active(t) || self.toast_e.is_active(t)
     }
 
     /// Should the layered window be shown at `t` (auto-hide aware)?
     pub fn wants_visible(&self, t: f64, auto_hide: bool) -> bool {
-        if self.error.is_some() || self.copied_showing(t) {
+        if self.toast_showing(t) {
             return true;
         }
         match self.mode {
@@ -833,8 +886,8 @@ impl RenderState {
         }
         let c = self.cancel.target();
         self.cancel.snap(c);
-        let c = self.copied.target();
-        self.copied.snap(c);
+        let c = self.toast_e.target();
+        self.toast_e.snap(c);
         let to = self.appearance.to();
         self.appearance = Blend::new(to);
     }
@@ -851,10 +904,8 @@ impl RenderState {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TickOutcome {
-    /// The error card's timer ran out (card now fading out).
+    /// An error toast's hold ran out (it is tucking back in).
     pub error_expired: bool,
-    /// The card finished fading and was removed.
-    pub error_gone: bool,
 }
 
 /// Width of the layered window for a panel position (logical px).
@@ -876,16 +927,17 @@ pub fn cancel_circle(pill: Rect, e: f32) -> (f32, f32, f32) {
     (cx, pill.cy(), rad * (CANCEL_FROM + (1.0 - CANCEL_FROM) * e))
 }
 
-/// The "Copied" capsule for an emergence `e` (0 hidden inside the pill, 1 at rest): centred above
-/// the pill, `CANCEL_GAP` over its top, kept inside the window; it rises out of the pill while it
-/// grows from [`CANCEL_FROM`] of its size. `e` above 1 is the spring's overshoot.
-pub fn copied_rect(pill: Rect, e: f32, win_w: f32) -> Rect {
+/// The toast capsule `width` wide for an emergence `e` (0 hidden inside the pill, 1 at rest):
+/// centred above the pill, `CANCEL_GAP` over its top, kept inside the window; it rises out of the
+/// pill while it grows from [`CANCEL_FROM`] of its size. `e` above 1 is the spring's overshoot.
+pub fn toast_rect(pill: Rect, e: f32, width: f32, win_w: f32) -> Rect {
     let e = e.clamp(0.0, 1.25);
-    let (w1, h1) = COPIED_SIZE;
+    let (w1, h1) = (width.min(win_w - 2.0 * TOAST_MARGIN).max(0.0), TOAST_H);
     let w0 = pill.w().min(w1) * CANCEL_FROM;
     let h0 = h1 * CANCEL_FROM;
     let (w, h) = (w0 + (w1 - w0) * e, h0 + (h1 - h0) * e);
-    let rest_cx = pill.cx().clamp(4.0 + w1 * 0.5, (win_w - 4.0 - w1 * 0.5).max(4.0 + w1 * 0.5));
+    let lo = TOAST_MARGIN + w1 * 0.5;
+    let rest_cx = pill.cx().clamp(lo, (win_w - lo).max(lo));
     let cx = pill.cx() + (rest_cx - pill.cx()) * e.min(1.0);
     let rest_cy = pill.t - CANCEL_GAP - h1 * 0.5;
     let cy = pill.cy() + (rest_cy - pill.cy()) * e;
@@ -894,13 +946,7 @@ pub fn copied_rect(pill: Rect, e: f32, win_w: f32) -> Rect {
 
 /// Window size in logical px for the current content.
 pub fn window_size(st: &RenderState) -> (f32, f32) {
-    match &st.error {
-        Some(e) => {
-            let l = e.layout(st.scale);
-            (l.win_w, l.win_h)
-        }
-        None => (win_w(st.position), WIN_H),
-    }
+    (win_w(st.position), WIN_H)
 }
 
 #[cfg(test)]
@@ -956,28 +1002,50 @@ mod tests {
         assert!(!s.is_animating(3300.0));
     }
 
+    fn toast(kind: ToastKind, retry: bool) -> Toast {
+        Toast { kind, label: "Copied".into(), retry, width: 84.0 }
+    }
+
     #[test]
-    fn copied_bubble_pops_out_holds_and_tucks_back_in() {
+    fn copied_toast_pops_out_holds_and_tucks_back_in() {
         let mut s = st();
         s.set_mode(PillMode::Idle, 0.0);
-        s.show_copied(1000.0);
+        s.show_toast(toast(ToastKind::Copied, false), 1000.0);
         assert!(s.wants_visible(1000.0, true), "shown even with auto-hide");
         let g = s.geometry(2500.0);
-        assert!((g.copied_t - 1.0).abs() < 0.02, "{g:?}");
-        assert!((g.copied.b - (g.pill.t - CANCEL_GAP)).abs() < 0.5 && (g.copied.w() - COPIED_SIZE.0).abs() < 0.5, "{g:?}");
-        assert!(g.copied.l >= 4.0 - 0.01 && g.copied.r <= win_w(s.position) - 4.0 + 0.01, "inside the window: {g:?}");
-        assert_eq!(s.hit_test(g.copied.cx(), g.copied.cy(), 2500.0), Hit::None, "click-through");
+        assert!((g.toast_t - 1.0).abs() < 0.02, "{g:?}");
+        assert!((g.toast.b - (g.pill.t - CANCEL_GAP)).abs() < 0.5 && (g.toast.w() - 84.0).abs() < 0.5 && (g.toast.h() - TOAST_H).abs() < 0.5, "{g:?}");
+        assert!(g.toast.l >= TOAST_MARGIN - 0.01 && g.toast.r <= win_w(s.position) - TOAST_MARGIN + 0.01, "inside the window: {g:?}");
+        assert_eq!(s.hit_test(g.toast.cx(), g.toast.cy(), 2500.0), Hit::None, "click-through");
         // held while nothing moves, then the tick past the hold tucks it in
         assert!(s.is_animating(2000.0));
-        s.tick_level(1000.0 + COPIED_HOLD_MS + 1.0, 0.0);
-        assert!(s.copied.target() < 0.5);
+        assert!(!s.tick_level(1000.0 + COPIED_HOLD_MS + 1.0, 0.0).error_expired, "not an error");
+        assert!(s.toast_e.target() < 0.5);
         let gone = 1000.0 + COPIED_HOLD_MS + 2000.0;
-        assert_eq!(s.geometry(gone).copied_t, 0.0);
-        assert!(!s.copied_showing(gone) && !s.wants_visible(gone, true));
+        s.tick_level(gone, 0.0);
+        assert_eq!(s.geometry(gone).toast_t, 0.0);
+        assert!(s.toast().is_none() && !s.toast_showing(gone) && !s.wants_visible(gone, true));
         // a new dictation tucks it away at once
-        s.show_copied(10_000.0);
+        s.show_toast(toast(ToastKind::Copied, false), 10_000.0);
         s.set_mode(PillMode::Preparing, 10_100.0);
-        assert!(s.copied_until.is_none() && s.copied.target() < 0.5);
+        assert!(s.toast_until.is_none() && s.toast_e.target() < 0.5);
+    }
+
+    #[test]
+    fn error_toasts_are_clickable_held_while_hovered_and_report_expiry() {
+        let mut s = st();
+        s.show_toast(Toast { kind: ToastKind::Error, label: "Connection problem".into(), retry: true, width: 150.0 }, 0.0);
+        let g = s.geometry(1500.0);
+        assert_eq!(s.hit_test(g.toast.cx(), g.toast.cy(), 1500.0), Hit::Toast);
+        assert!((g.toast.w() - 150.0).abs() < 0.5, "{g:?}");
+        s.set_toast_hover(true, 1500.0);
+        assert!(!s.tick_level(ERROR_HOLD_MS + 500.0, 0.0).error_expired, "held while hovered");
+        s.set_toast_hover(false, ERROR_HOLD_MS + 600.0);
+        assert!(!s.tick_level(ERROR_HOLD_MS + 700.0, 0.0).error_expired, "lingers after the pointer leaves");
+        assert!(s.tick_level(ERROR_HOLD_MS + 600.0 + TOAST_LINGER_MS + 1.0, 0.0).error_expired);
+        // a label too wide for the window is kept inside it
+        let r = toast_rect(g.pill, 1.0, 400.0, win_w(s.position));
+        assert!(r.l >= TOAST_MARGIN - 0.01 && r.r <= win_w(s.position) - TOAST_MARGIN + 0.01, "{r:?}");
     }
 
     #[test]

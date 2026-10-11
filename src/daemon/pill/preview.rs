@@ -12,7 +12,7 @@
 
 use super::PillMode;
 use super::glass::{self, Backdrop, Cells};
-use super::model::{AppBubble, Pointer, RenderState};
+use super::model::{AppBubble, Pointer, RenderState, ToastKind};
 use super::render::{pixel_size, render_frame, render_into};
 use super::theme::Palette;
 use super::window::place_window;
@@ -208,37 +208,20 @@ pub fn build(scene: &Scene) -> Result<(RenderState, f64), String> {
                 _ => st.set_pointer(Pointer { group: true, pill: false, bubble: false, cancel: true }, 0.0),
             }
         }
-        // a dictation that had nowhere to be pasted: thinking, then idle with the bubble popping out
-        "copied" => {
-            st.set_mode(PillMode::Thinking, -1000.0);
-            st.settle();
-            st.set_mode(PillMode::Idle, 0.0);
-            st.show_copied(0.0);
-            let mut now = 0.0;
-            while now < t {
-                now = (now + FRAME_MS).min(t);
-                st.tick_level(now, 0.0);
-            }
-        }
-        "error" => st.error = Some(super::card::ErrorCard::new("Transcription failed", "The speech provider rejected your API key. Check it in Settings.", true, 0.0)),
-        "error-noretry" => st.error = Some(super::card::ErrorCard::new("No microphone found", "Connect a microphone and try again.", false, 0.0)),
-        "error-long" => {
-            st.error = Some(super::card::ErrorCard::new(
-                "Couldn't paste the transcript",
-                "The target app is running as administrator, so Windows blocked the paste. The text is on your clipboard: press Ctrl+V to paste it manually. Run OpenTalk as administrator to paste into elevated apps.",
-                true,
-                0.0,
-            ))
-        }
-        // The voice-rewrite cards, built from the same text the daemon shows.
+        // toasts: thinking, then idle with the toast popping out of the pill at t = 0
+        "copied" => pop_toast(&mut st, ToastKind::Copied, "Copied", false, t),
+        "error" => pop_toast(&mut st, ToastKind::Error, "Transcription failed", true, t),
+        "error-noretry" => pop_toast(&mut st, ToastKind::Error, "Microphone unavailable", false, t),
+        "error-long" => pop_toast(&mut st, ToastKind::Error, "Couldn't paste the transcript into the target app", true, t),
+        // The voice-rewrite toasts, built from the same text the daemon shows.
         "rewrite-nothing" => {
-            let (title, desc) = crate::daemon::app::pipeline::nothing_to_rewrite_card(&crate::core::config::Config::default());
-            st.error = Some(super::card::ErrorCard::new(title, &desc, false, 0.0));
+            let (title, _) = crate::daemon::app::pipeline::nothing_to_rewrite_card(&crate::core::config::Config::default());
+            pop_toast(&mut st, ToastKind::Error, title, false, t);
         }
         "rewrite-failed" | "rewrite-nokey" => {
             let err = if scene.state == "rewrite-failed" { crate::llm::LlmError::Timeout } else { crate::llm::LlmError::NotConfigured };
-            let (title, desc) = crate::daemon::app::pipeline::rewrite_card(&err);
-            st.error = Some(super::card::ErrorCard::new(title, &desc, false, 0.0));
+            let (title, _) = crate::daemon::app::pipeline::rewrite_card(&err);
+            pop_toast(&mut st, ToastKind::Error, title, false, t);
         }
         other => return Err(format!("unknown state '{other}' (expected one of: {})", STATES.join(", "))),
     }
@@ -247,6 +230,20 @@ pub fn build(scene: &Scene) -> Result<(RenderState, f64), String> {
         run(&mut st, 0.0, t, &level);
     }
     Ok((st, t))
+}
+
+/// Thinking, then idle with a toast popping out at t = 0, simulated frame by frame up to `t`.
+fn pop_toast(st: &mut RenderState, kind: ToastKind, label: &str, retry: bool, t: f64) {
+    st.set_mode(PillMode::Thinking, -1000.0);
+    st.settle();
+    st.set_mode(PillMode::Idle, 0.0);
+    let toast = super::render::make_toast(kind, label, retry, st.scale, st.position);
+    st.show_toast(toast, 0.0);
+    let mut now = 0.0;
+    while now < t {
+        now = (now + FRAME_MS).min(t);
+        st.tick_level(now, 0.0);
+    }
 }
 
 /// `--composite`: the rendered window over the fixture it sits on (for eyeballing).
@@ -601,11 +598,13 @@ mod golden {
             g("cancel_light_t600", "cancel", 600.0, false, false, false),
             g("cancel_dark_t600", "cancel", 600.0, true, false, false),
             g("cancel_hot_light_t600", "cancel-hot", 600.0, false, false, false),
-            g("error_light_t400", "error", 400.0, false, false, true),
-            g("error_dark_t400", "error", 400.0, true, false, true),
-            g("error_dark_t2000", "error", 2000.0, true, false, true),
-            g("error_noretry_light", "error-noretry", 400.0, false, false, true),
-            g("error_long_light", "error-long", 400.0, false, false, true),
+            g("toast_error_light_t140", "error", 140.0, false, false, true),
+            g("toast_error_light_t800", "error", 800.0, false, false, true),
+            g("toast_error_dark_t800", "error", 800.0, true, false, true),
+            g("toast_error_noretry_light_t800", "error-noretry", 800.0, false, false, true),
+            g("toast_error_long_light_t800", "error-long", 800.0, false, false, true),
+            g("toast_copied_light_t800", "copied", 800.0, false, false, true),
+            g("toast_copied_dark_t800", "copied", 800.0, true, false, true),
             g("recording_icon_light_t1500", "recording", 1500.0, false, true, false),
             g("recording_icon_dark_t1500", "recording", 1500.0, true, true, false),
             g("recording_icon_light_t400", "recording", 400.0, false, true, false),
@@ -636,7 +635,7 @@ mod golden {
                 v.push(gb(leak(format!("over_{bd}_cancel_{suffix}")), "cancel", 600.0, dark, true, false, bd));
                 v.push(gb(leak(format!("over_{bd}_hover_{suffix}")), "hover", 0.0, dark, false, false, bd));
                 v.push(gb(leak(format!("over_{bd}_tooltip_{suffix}")), "recording-tooltip", 0.0, dark, false, true, bd));
-                v.push(gb(leak(format!("over_{bd}_error_{suffix}")), "error", 400.0, dark, false, true, bd));
+                v.push(gb(leak(format!("over_{bd}_toast_error_{suffix}")), "error", 800.0, dark, false, true, bd));
             }
         }
         v
@@ -926,18 +925,27 @@ mod golden {
     }
 
     #[test]
-    fn rewrite_cards_render_with_their_text_and_no_retry_button() {
+    fn rewrite_toasts_render_with_their_text_and_no_retry() {
         for (state, title) in [("rewrite-nothing", "Nothing to rewrite"), ("rewrite-failed", "Rewrite timed out"), ("rewrite-nokey", "Add an AI key to rewrite")] {
             for dark in [false, true] {
-                let mut scene = Scene::new(state, 400.0);
+                let mut scene = Scene::new(state, 800.0);
                 scene.dark = dark;
                 let (st, _) = build(&scene).expect(state);
-                let card = st.error.as_ref().expect("card");
-                assert_eq!(card.title, title);
-                assert!(!card.retry, "informational: no Retry");
+                let toast = st.toast().expect("toast");
+                assert_eq!((toast.kind, toast.label.as_str()), (ToastKind::Error, title));
+                assert!(!toast.retry, "informational: no Retry");
                 assert!(render_scene(&scene).is_ok());
             }
         }
+    }
+
+    #[test]
+    fn a_label_too_wide_for_the_window_is_cut_with_an_ellipsis() {
+        let scene = Scene::new("error-long", 800.0);
+        let (st, _) = build(&scene).unwrap();
+        let toast = st.toast().unwrap();
+        assert!(toast.label.ends_with('\u{2026}') && toast.label.starts_with("Couldn't paste"), "{}", toast.label);
+        assert!(toast.width <= super::super::model::win_w(st.position) - 2.0 * super::super::model::TOAST_MARGIN + 0.01);
     }
 
     #[test]

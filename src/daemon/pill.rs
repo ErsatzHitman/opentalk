@@ -12,7 +12,7 @@
 //! - `raster`  — SDF rasteriser (capsules, rings, soft shadows)
 //! - `glow`    — the Signal glow (analytic conic ring + pre-blurred halo/comet sprites)
 //! - `text`    — GDI `DrawTextW` into grayscale masks
-//! - `card`    — the dictation error card
+//! - `icons`   — small shared glyphs (the Retry arrow)
 //! - `anim`    — easing, tracks, waveform envelope + delay line, looping keyframes
 //! - `diag`    — per-recording timing diagnostics (one log line)
 //! - `theme`   — design tokens and system theme lookup
@@ -27,7 +27,7 @@ use std::sync::atomic::AtomicU32;
 mod allocs;
 mod anim;
 mod capture;
-mod card;
+mod icons;
 mod diag;
 mod glass;
 mod glow;
@@ -104,7 +104,8 @@ impl Pill {
         });
     }
 
-    /// Show the error card (auto-dismiss 3/4/5 s by length). `retry` adds a Retry button.
+    /// Show an error as a toast: the title pops out of the pill in the "Copied" capsule (the
+    /// description is logged). `retry` adds a Retry arrow and makes a click retry.
     pub fn show_error(&mut self, title: &str, description: &str, retry: bool) {
         self.win.with(|i| i.show_error(title, description, retry));
     }
@@ -134,7 +135,7 @@ pub fn cli_render(args: &[String]) -> i32 {
 /// The software-render helpers the tray popup (`daemon::tray`) shares with the pill, so it does not
 /// duplicate the rasteriser, the GDI text path or the layered-window bitmap.
 pub(crate) mod kit {
-    pub(crate) use super::card::draw_retry_icon;
+    pub(crate) use super::icons::draw_retry_icon;
     pub(crate) use super::raster::{Canvas, DevRect, Rect, sd_round_box, sd_segment};
     pub(crate) use super::render::draw_logo;
     pub(crate) use super::text::{Font, content_height, draw as draw_text, draw_icon_mask, icon_mask, mask as text_mask, measure as text_measure, prefix_widths as text_prefix_widths};

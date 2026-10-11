@@ -78,7 +78,9 @@ dictated text never appears in Win + V clipboard history.
 into nowhere: it is copied to the clipboard and a small **Copied** bubble pops out of the pill. Press Ctrl + V where
 you want it.
 
-**If a transcription fails** (network, quota), the pill's error card offers **Retry** with the audio kept in memory.
+**Messages** pop out of the pill as the same small bubble as **Copied**: a red mark and a short title such as
+*Connection problem* or *Rewrite timed out*. Hovering holds it; the details are in the log. **If a transcription
+fails** (network, quota), the bubble ends in a Retry arrow: click it to retry with the audio kept in memory.
 
 **History** (tray popup) lists every dictation with its app icon, and is searchable. Open an entry to copy the final
 text, the raw transcript or the text before a rewrite. **Dictionary** holds words that improve recognition and fix
