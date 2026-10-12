@@ -2,7 +2,7 @@
 //!
 //! Layout:
 //! ```text
-//! local\runtime-1.13.8\   sherpa-onnx-{offline,online}-websocket-server.exe, ot-onnxrt.dll, runtime.json
+//! local\runtime-1.13.8\   sherpa-onnx-{offline,online}-websocket-server.exe, ot-onnxrt.dll, ot-net.dll, runtime.json
 //! local\models\<id>\      the model files and manifest.json (which file plays which role)
 //! local\work\             downloads and unpacking in progress (cleared on every install)
 //! ```
@@ -21,6 +21,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 pub const RUNTIME_VERSION: &str = "1.13.8";
 pub const OFFLINE_SERVER: &str = "sherpa-onnx-offline-websocket-server.exe";
+pub const LOOPBACK_DLL: &str = "ot-net.dll";
+const LOOPBACK_IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ot-net.dll"));
+
 pub const ONLINE_SERVER: &str = "sherpa-onnx-online-websocket-server.exe";
 /// onnxruntime.dll under a private name (see `pe`): never shadowed by System32's copy.
 pub const ORT_PRIVATE_NAME: &str = "ot-onnxrt.dll";
@@ -77,7 +80,10 @@ fn work_dir() -> PathBuf {
 /// The runtime is unpacked, patched and marked complete.
 pub fn runtime_ready() -> bool {
     let d = runtime_dir();
-    d.join("runtime.json").is_file() && [OFFLINE_SERVER, ONLINE_SERVER, ORT_PRIVATE_NAME].iter().all(|f| d.join(f).is_file())
+    std::fs::read_to_string(d.join("runtime.json")).ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .is_some_and(|v| v["loopback"] == 1)
+        && [OFFLINE_SERVER, ONLINE_SERVER, ORT_PRIVATE_NAME, LOOPBACK_DLL].iter().all(|f| d.join(f).is_file())
 }
 
 /// Which file of an installed model plays which role (paths relative to the model folder).
@@ -263,6 +269,7 @@ fn fresh_dir(p: &Path) -> Result<(), String> {
 
 /// Download, verify, unpack and patch the runtime (no-op when already there).
 pub fn install_runtime(p: &Progress) -> Result<(), String> {
+    ensure_runtime_isolation()?;
     if runtime_ready() {
         return Ok(());
     }
@@ -284,7 +291,8 @@ pub fn install_runtime(p: &Progress) -> Result<(), String> {
     for exe in [OFFLINE_SERVER, ONLINE_SERVER] {
         patch_imports(&staged.join(exe))?;
     }
-    std::fs::write(staged.join("runtime.json"), format!("{{\"version\":\"{RUNTIME_VERSION}\",\"onnxruntime\":\"{ORT_PRIVATE_NAME}\"}}"))
+    std::fs::write(staged.join(LOOPBACK_DLL), LOOPBACK_IMAGE).map_err(|e| e.to_string())?;
+    std::fs::write(staged.join("runtime.json"), runtime_marker())
         .map_err(|e| e.to_string())?;
     let dest = runtime_dir();
     if dest.exists() {
@@ -302,7 +310,44 @@ fn patch_imports(exe: &Path) -> Result<(), String> {
     if n == 0 {
         return Err(format!("{} does not import onnxruntime.dll", exe.display()));
     }
+    let network = pe::rename_import(&mut img, "WS2_32.dll", LOOPBACK_DLL).map_err(|e| format!("{}: {e}", exe.display()))?;
+    if network == 0 { return Err(format!("{} does not import WS2_32.dll", exe.display())); }
     std::fs::write(exe, img).map_err(|e| format!("cannot write {}: {e}", exe.display()))
+}
+
+fn runtime_marker() -> String {
+    format!("{{\"version\":\"{RUNTIME_VERSION}\",\"onnxruntime\":\"{ORT_PRIVATE_NAME}\",\"loopback\":1}}")
+}
+
+/// Upgrade an already-installed runtime before it can be started. The completion marker is
+/// written last, and each executable is replaced atomically; interrupted upgrades are retried.
+pub fn ensure_runtime_isolation() -> Result<(), String> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = runtime_dir();
+    if runtime_ready() { return Ok(()); }
+    ensure_runtime_isolation_in(&dir)
+}
+
+fn ensure_runtime_isolation_in(dir: &Path) -> Result<(), String> {
+    if ![OFFLINE_SERVER, ONLINE_SERVER, ORT_PRIVATE_NAME].iter().all(|f| dir.join(f).is_file()) {
+        return Ok(());
+    }
+    let shim_tmp = dir.join("ot-net.dll.tmp");
+    std::fs::write(&shim_tmp, LOOPBACK_IMAGE).map_err(|e| e.to_string())?;
+    std::fs::rename(&shim_tmp, dir.join(LOOPBACK_DLL)).map_err(|e| e.to_string())?;
+    for name in [OFFLINE_SERVER, ONLINE_SERVER] {
+        let path = dir.join(name);
+        let mut image = std::fs::read(&path).map_err(|e| e.to_string())?;
+        let n = pe::rename_import(&mut image, "WS2_32.dll", LOOPBACK_DLL)?;
+        if n == 0 && !pe::imports(&image)?.iter().any(|s| s.eq_ignore_ascii_case(LOOPBACK_DLL)) {
+            return Err(format!("{name} has no supported Winsock import; refusing to start"));
+        }
+        let tmp = path.with_extension("exe.tmp");
+        std::fs::write(&tmp, &image).map_err(|e| e.to_string())?;
+        std::fs::rename(tmp, path).map_err(|e| e.to_string())?;
+    }
+    std::fs::write(dir.join("runtime.json"), runtime_marker()).map_err(|e| e.to_string())
 }
 
 /// Download and unpack `m`, resolve its files and keep only those. Returns its manifest.
@@ -492,6 +537,38 @@ mod tests {
             std::fs::write(p, b"x").unwrap();
         }
         dir
+    }
+
+    #[test]
+    fn socket_shim_confines_both_address_families_and_preserves_exports() {
+        let dir = std::env::temp_dir().join(format!("opentalk-loopback-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(LOOPBACK_DLL), LOOPBACK_IMAGE).unwrap();
+        let test = dir.join("loopback-test.exe");
+        std::fs::write(&test, include_bytes!(concat!(env!("OUT_DIR"), "/loopback-test.exe"))).unwrap();
+        let out = std::process::Command::new(test).current_dir(&dir).output().unwrap();
+        assert!(out.status.success(), "{} {}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn existing_runtime_is_upgraded_and_upgrade_is_repeatable() {
+        let dir = std::env::temp_dir().join(format!("opentalk-isolation-upgrade-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // The test PE imports Winsock, just as the old pinned servers do.
+        let image = std::fs::read(std::env::current_exe().unwrap()).unwrap();
+        assert!(pe::imports(&image).unwrap().iter().any(|s| s.eq_ignore_ascii_case("WS2_32.dll")));
+        for name in [OFFLINE_SERVER, ONLINE_SERVER] { std::fs::write(dir.join(name), &image).unwrap(); }
+        std::fs::write(dir.join(ORT_PRIVATE_NAME), []).unwrap();
+        ensure_runtime_isolation_in(&dir).unwrap();
+        ensure_runtime_isolation_in(&dir).unwrap();
+        assert_eq!(std::fs::read(dir.join(LOOPBACK_DLL)).unwrap(), LOOPBACK_IMAGE);
+        for name in [OFFLINE_SERVER, ONLINE_SERVER] {
+            let imports = pe::imports(&std::fs::read(dir.join(name)).unwrap()).unwrap();
+            assert!(imports.iter().any(|s| s == LOOPBACK_DLL));
+            assert!(!imports.iter().any(|s| s.eq_ignore_ascii_case("WS2_32.dll")));
+        }
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

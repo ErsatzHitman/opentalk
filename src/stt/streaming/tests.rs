@@ -239,7 +239,44 @@ fn deepgram_handshake_frames_and_finalize_sequence() {
 }
 
 #[test]
-fn deepgram_quiet_period_settles_without_finalize_reply() {
+fn deepgram_waits_for_delayed_finalization_and_keeps_the_tail() {
+    let mock = serve(Options::default(), |c| {
+        let mut first = true;
+        while let Some(m) = c.recv(Duration::from_secs(5)) {
+            match m {
+                Message::Binary(_) if first => {
+                    first = false;
+                    c.send(&dg_results("first words", true, false));
+                }
+                Message::Text(t) if t.as_str().contains("Finalize") => {
+                    std::thread::sleep(Duration::from_millis(500));
+                    c.send(&dg_results("last words", true, true));
+                }
+                Message::Text(t) if t.as_str().contains("CloseStream") => break,
+                _ => {}
+            }
+        }
+    });
+    let mut s = deepgram::Deepgram.start(&opts("nova-3"), &creds(&mock)).unwrap();
+    feed(&mut s, &pcm(1600, 500), 800);
+    assert_eq!(s.finish().unwrap().text, "first words last words");
+}
+
+#[test]
+fn provider_error_after_a_final_segment_is_not_hidden_by_nonempty_text() {
+    let mock = serve(Options::default(), |c| {
+        let _ = c.recv(Duration::from_secs(5));
+        c.send(&dg_results("first words", true, false));
+        c.send(r#"{"type":"Error","description":"decoder failed"}"#);
+        while c.recv(Duration::from_secs(3)).is_some() {}
+    });
+    let mut s = deepgram::Deepgram.start(&opts("nova-3"), &creds(&mock)).unwrap();
+    feed(&mut s, &pcm(1600, 500), 800);
+    assert_eq!(s.finish().expect_err("a nonempty prefix is incomplete").code, SttErrorCode::Other);
+}
+
+#[test]
+fn deepgram_requires_finalize_reply_even_after_a_final_segment() {
     let (tx, rx) = signal();
     let mock = serve(Options::default(), move |c| {
         let mut said = false;
@@ -261,16 +298,15 @@ fn deepgram_quiet_period_settles_without_finalize_reply() {
     feed(&mut s, &pcm(1600, 500), 800);
     std::thread::sleep(Duration::from_millis(100));
     let t0 = Instant::now();
-    let out = s.finish().unwrap();
+    let e = s.finish().expect_err("a prior segment does not confirm the tail");
     let took = t0.elapsed();
-    assert_eq!(out.text, "just one segment");
-    assert!(took >= Duration::from_millis(230), "waits for the 250 ms quiet period, took {took:?}");
-    assert!(took < Duration::from_millis(1800), "does not wait for the ceiling, took {took:?}");
+    assert_eq!(e.code, SttErrorCode::Timeout);
+    assert!(took >= Duration::from_millis(1900), "wait for final acknowledgement: {took:?}");
     wait(&rx);
 }
 
 #[test]
-fn deepgram_outstanding_partial_waits_for_the_ceiling_and_is_the_fallback() {
+fn deepgram_outstanding_partial_at_the_ceiling_is_an_error() {
     let mock = serve(Options::default(), |c| {
         let mut said = false;
         while let Some(m) = c.recv(Duration::from_secs(6)) {
@@ -286,19 +322,18 @@ fn deepgram_outstanding_partial_waits_for_the_ceiling_and_is_the_fallback() {
     feed(&mut s, &pcm(1600, 500), 800);
     std::thread::sleep(Duration::from_millis(100));
     let t0 = Instant::now();
-    let out = s.finish().unwrap();
+    let e = s.finish().expect_err("partial text must not be pasted");
     let took = t0.elapsed();
-    assert_eq!(out.text, "only a partial");
+    assert_eq!(e.code, SttErrorCode::Timeout);
     assert!(took >= Duration::from_millis(1900) && took < Duration::from_millis(6000), "hard ceiling is 2000 ms, took {took:?}");
 }
 
 #[test]
-fn silent_server_yields_empty_text_at_the_quiet_period() {
+fn silent_server_without_finalize_ack_is_a_timeout() {
     let mock = serve(Options::default(), |c| while c.recv(Duration::from_secs(4)).is_some() {});
     let mut s = deepgram::Deepgram.start(&opts("nova-3"), &creds(&mock)).unwrap();
     feed(&mut s, &pcm(800, 0), 800);
-    let out = s.finish().unwrap();
-    assert_eq!(out.text, "");
+    assert_eq!(s.finish().expect_err("server did not confirm the audio").code, SttErrorCode::Timeout);
 }
 
 #[test]
@@ -311,7 +346,7 @@ fn finish_without_any_audio_returns_immediately() {
 }
 
 #[test]
-fn audio_before_the_socket_is_open_is_capped_at_three_seconds() {
+fn pre_open_overflow_is_reported_instead_of_accepting_a_truncated_transcript() {
     let log = new_log();
     let l2 = log.clone();
     let (tx, rx) = signal();
@@ -335,7 +370,7 @@ fn audio_before_the_socket_is_open_is_capped_at_three_seconds() {
     assert!(t0.elapsed() < Duration::from_secs(1), "push must never block the capture thread");
     std::thread::sleep(Duration::from_millis(1200));
     s.push(&pcm(800, 800)); // after the socket opened everything goes through
-    s.finish().unwrap();
+    assert_eq!(s.finish().expect_err("overflow must trigger recovery").code, SttErrorCode::Timeout);
     wait(&rx);
     assert_eq!(lines(&log), vec![format!("bytes:{}", (48_000 + 800) * 2)]);
 }
@@ -496,10 +531,9 @@ fn reset_after_final_round() -> Result<Transcript, SttError> {
 }
 
 #[test]
-fn connection_dropped_mid_session_keeps_text_or_errors() {
+fn connection_dropped_mid_session_rejects_a_prior_final_segment() {
     let _serial = serial();
-    // text already received survives the drop (and the RST that follows it)
-    assert_eq!(reset_after_final_round().expect("text kept").text, "kept text");
+    assert_eq!(reset_after_final_round().expect_err("later audio may be missing").code, SttErrorCode::Unreachable);
 
     // nothing received: an error rather than a silent empty transcript
     let mock = serve(Options::default(), |c| {
@@ -514,12 +548,12 @@ fn connection_dropped_mid_session_keeps_text_or_errors() {
 }
 
 #[test]
-fn final_text_survives_a_reset_under_parallel_load() {
+fn unconfirmed_text_is_rejected_after_a_reset_under_parallel_load() {
     let _serial = serial();
     let rounds: Vec<_> = (0..8).map(|_| std::thread::spawn(reset_after_final_round)).collect();
     for (i, r) in rounds.into_iter().enumerate() {
         let out = r.join().expect("round did not panic");
-        assert_eq!(out.unwrap_or_else(|e| panic!("round {i}: {e:?}")).text, "kept text", "round {i}");
+        assert_eq!(out.expect_err("missing finalization ack").code, SttErrorCode::Unreachable, "round {i}");
     }
 }
 
@@ -854,7 +888,7 @@ fn gemini_live_setup_first_then_audio_and_stream_end() {
 }
 
 #[test]
-fn gemini_unfinalized_turn_uses_the_wider_ceiling_and_is_kept() {
+fn gemini_unfinalized_turn_at_the_wider_ceiling_is_an_error() {
     let mock = serve(Options::default(), |c| {
         let _ = c.recv_json();
         c.send(r#"{"setupComplete":{}}"#);
@@ -872,9 +906,9 @@ fn gemini_unfinalized_turn_uses_the_wider_ceiling_and_is_kept() {
     feed(&mut s, &pcm(1600, 3000), 800);
     std::thread::sleep(Duration::from_millis(100));
     let t0 = Instant::now();
-    let out = s.finish().unwrap();
+    let e = s.finish().expect_err("the final turn was never confirmed");
     let took = t0.elapsed();
-    assert_eq!(out.text, "never finalized");
+    assert_eq!(e.code, SttErrorCode::Timeout);
     assert!(took >= Duration::from_millis(2900) && took < Duration::from_secs(8), "Gemini ceiling is 3000 ms, took {took:?}");
 }
 

@@ -142,6 +142,7 @@ mod tests {
     #[ignore = "needs OPENTALK_TEST_LOCAL_MIRROR (see the doc comment)"]
     fn local_engine_end_to_end() {
         let Some(mirror) = std::env::var("OPENTALK_TEST_LOCAL_MIRROR").ok() else { return };
+        crate::core::logging::init("local-e2e");
         let root = std::env::temp_dir().join(format!("ot-local-e2e-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         // SAFETY: an ignored test run on its own.
@@ -158,6 +159,7 @@ mod tests {
         let exe = std::fs::read(install::runtime_dir().join(install::OFFLINE_SERVER)).unwrap();
         let imports = pe::imports(&exe).unwrap();
         assert!(imports.iter().any(|n| n == install::ORT_PRIVATE_NAME) && !imports.iter().any(|n| n.eq_ignore_ascii_case("onnxruntime.dll")), "{imports:?}");
+        assert!(imports.iter().any(|n| n == install::LOOPBACK_DLL) && !imports.iter().any(|n| n.eq_ignore_ascii_case("WS2_32.dll")), "{imports:?}");
         let m: &'static LocalModel = &catalog::TEST_MODEL;
         let manifest = install::install_model(m, &p).expect("model installs");
         assert_eq!(install::installed(m.id), Some(manifest.clone()));

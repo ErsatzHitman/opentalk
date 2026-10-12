@@ -18,7 +18,7 @@ use super::latency::{self, Sample};
 use super::machine::{Input, MAX_RECORDING_MS, Phase};
 use super::pipeline::{self, Cleaned, RewriteState};
 use crate::core::config::Config;
-use crate::core::history::{self, Entry, Status};
+use crate::core::history::{Entry, Status};
 use crate::core::timing::{now_ms, unix_ms};
 use crate::daemon::appicon::{self, AppIcon};
 use crate::daemon::foreground::{self, Change};
@@ -77,6 +77,7 @@ pub struct ActiveJob {
 pub struct Failed {
     audio: Audio,
     speech_ms: u64,
+    privacy: super::privacy::Ticket,
 }
 
 pub enum Outcome {
@@ -120,6 +121,7 @@ enum Capture {
 struct Job {
     id: u64,
     cfg: Config,
+    privacy: super::privacy::Ticket,
     capture: Capture,
     stream: Option<Box<dyn StreamingSession>>,
     target: Option<Target>,
@@ -263,6 +265,11 @@ fn paste_note(outcome: PasteOutcome) -> Result<Option<String>, Outcome> {
     match outcome {
         PasteOutcome::Pasted => Ok(None),
         PasteOutcome::CopiedOnly { reason } => Ok(Some(reason)),
+        PasteOutcome::ClipboardPreserved => Err(Outcome::Failed {
+            title: "Couldn't paste".into(),
+            message: "Your clipboard could not be backed up safely, so it was left unchanged. Save its contents elsewhere before trying again.".into(),
+            retry: None,
+        }),
         PasteOutcome::Cancelled => Err(Outcome::Cancelled),
         // not degraded: the pill's "Copied" bubble says where the text went
         PasteOutcome::NoTextField => Ok(None),
@@ -611,6 +618,7 @@ impl App {
         self.spawn_job(Job {
             id: seq,
             cfg: self.cfg.clone(),
+            privacy: super::privacy::Privacy::ticket(&self.privacy),
             capture: Capture::Live { recorder, first_audio, t_hotkey },
             stream: take_session(feed),
             target,
@@ -645,6 +653,7 @@ impl App {
         self.spawn_job(Job {
             id: self.seq,
             cfg: self.cfg.clone(),
+            privacy: super::privacy::Privacy::ticket(&self.privacy),
             capture: Capture::Kept { audio: failed.audio, speech_ms: failed.speech_ms },
             stream: None,
             app,
@@ -715,10 +724,10 @@ impl App {
             }
             Outcome::Nothing => self.pill.show_error(NO_SPEECH_TITLE, NO_SPEECH_BODY, false),
             Outcome::Failed { title, message, retry } => {
-                let can_retry = retry.is_some();
                 // Only the newest failure can be retried: an older recording is never kept behind
                 // a failure that did not keep its own audio (keep_failed_audio off).
-                self.last_failed = retry;
+                self.last_failed = retry.filter(|r| r.privacy.keeps_audio());
+                let can_retry = self.last_failed.is_some();
                 self.pill.show_error(&title, &message, can_retry);
             }
             Outcome::Cancelled => {}
@@ -879,9 +888,8 @@ fn discarded_entry(cfg: &Config, app: &AppInfo, speech_ms: u64) -> Entry {
     Entry { status: Status::Discarded, duration_ms: speech_ms, ..base_entry(cfg, app) }
 }
 
-fn log_history(cfg: &Config, entry: Entry) {
-    if cfg.history_enabled
-        && let Err(e) = history::append_new(entry)
+fn log_history(privacy: &super::privacy::Ticket, entry: Entry) {
+    if let Err(e) = privacy.append(entry)
     {
         log_warn!("history: {e}");
     }
@@ -889,7 +897,7 @@ fn log_history(cfg: &Config, entry: Entry) {
 
 /// The worker: stop + VAD -> STT -> cleanup -> paste -> history. Runs off the UI thread.
 fn run_job(job: Job) -> Outcome {
-    let Job { id, cfg, capture, stream, target, app, cancel, t_stop, hotkey_pill } = job;
+    let Job { id, cfg, privacy, capture, stream, target, app, cancel, t_stop, hotkey_pill } = job;
     let cancelled = || cancel.load(Ordering::Relaxed);
 
     let (audio, speech_ms, hotkey_audio, stream) = match capture {
@@ -919,7 +927,7 @@ fn run_job(job: Job) -> Outcome {
                     return Outcome::Cancelled;
                 }
                 if cfg.save_discarded {
-                    log_history(&cfg, discarded_entry(&cfg, &app, info.speech_ms));
+                    log_history(&privacy, discarded_entry(&cfg, &app, info.speech_ms));
                 }
                 return Outcome::Nothing;
             }
@@ -941,17 +949,17 @@ fn run_job(job: Job) -> Outcome {
         Ok(t) => t,
         Err(e) if e.code == SttErrorCode::NoSpeech => {
             if cfg.save_discarded {
-                log_history(&cfg, discarded_entry(&cfg, &app, speech_ms));
+                log_history(&privacy, discarded_entry(&cfg, &app, speech_ms));
             }
             return Outcome::Nothing;
         }
-        Err(e) => return failure(&cfg, &app, e, audio, speech_ms),
+        Err(e) => return failure(&privacy, &cfg, &app, e, audio, speech_ms),
     };
 
     let cleaned = pipeline::clean(&cfg, &transcript, speech_ms);
     if cleaned.text.is_empty() {
         if cfg.save_discarded {
-            log_history(&cfg, Entry { raw: cleaned.raw.clone(), ..discarded_entry(&cfg, &app, speech_ms) });
+            log_history(&privacy, Entry { raw: cleaned.raw.clone(), ..discarded_entry(&cfg, &app, speech_ms) });
         }
         if cancelled() {
             return Outcome::Cancelled;
@@ -971,6 +979,11 @@ fn run_job(job: Job) -> Outcome {
         let opts = PasteOptions { restore_clipboard: restores_clipboard(&cfg), smart_spacing: cfg.smart_spacing };
         // Esc during the paste step (the modifier wait, the focus return) stops the keystroke.
         let pasted = paste::paste_text_cancellable(&cleaned.text, target.as_ref(), opts, &cancelled);
+        if pasted == PasteOutcome::ClipboardPreserved {
+            log_history(&privacy, Entry { status: Status::Failed, error: Some("Clipboard could not be backed up safely".into()), ..delivered_entry(&cfg, &app, &cleaned, speech_ms, 0) });
+            let Err(Outcome::Failed { title, message, .. }) = paste_note(pasted) else { unreachable!() };
+            return Outcome::Failed { title, message, retry: privacy.keeps_audio().then_some(Failed { audio, speech_ms, privacy: privacy.clone() }) };
+        }
         if pasted == PasteOutcome::NoTextField {
             log_info!("no text field has focus; the dictation was copied to the clipboard");
             copied = true;
@@ -987,7 +1000,7 @@ fn run_job(job: Job) -> Outcome {
     let done = now_ms();
     let (paste_ms, total) = (done - t_paste, done - t_stop);
 
-    log_history(&cfg, delivered_entry(&cfg, &app, &cleaned, speech_ms, total as u64));
+    log_history(&privacy, delivered_entry(&cfg, &app, &cleaned, speech_ms, total as u64));
     latency::record(Sample {
         seq: id,
         hotkey_pill,
@@ -1007,13 +1020,13 @@ fn run_job(job: Job) -> Outcome {
     Outcome::Done { note, warn, copied }
 }
 
-fn failure(cfg: &Config, app: &AppInfo, e: SttError, audio: Audio, speech_ms: u64) -> Outcome {
+fn failure(privacy: &super::privacy::Ticket, cfg: &Config, app: &AppInfo, e: SttError, audio: Audio, speech_ms: u64) -> Outcome {
     log_warn!("transcription failed: {:?} {} [{}]", e.code, e.message, e.detail);
-    log_history(cfg, Entry { status: Status::Failed, error: Some(e.message.clone()), duration_ms: speech_ms, ..base_entry(cfg, app) });
+    log_history(privacy, Entry { status: Status::Failed, error: Some(e.message.clone()), duration_ms: speech_ms, ..base_entry(cfg, app) });
     Outcome::Failed {
         title: error_title(e.code).to_string(),
         message: e.message,
-        retry: cfg.keep_failed_audio.then_some(Failed { audio, speech_ms }),
+        retry: privacy.keeps_audio().then_some(Failed { audio, speech_ms, privacy: privacy.clone() }),
     }
 }
 
@@ -1108,7 +1121,7 @@ mod tests {
         let mut cfg = Config { history_enabled: false, ..Config::default() };
         let audio = Audio { samples: vec![1, 2, 3], sample_rate: 16000 };
         let e = SttError::new(SttErrorCode::Timeout, "slow");
-        match failure(&cfg, &AppInfo::default(), e.clone(), audio.clone(), 500) {
+        match failure(&crate::daemon::app::privacy::Privacy::ticket(&crate::daemon::app::privacy::Privacy::new(&cfg)), &cfg, &AppInfo::default(), e.clone(), audio.clone(), 500) {
             Outcome::Failed { title, retry, .. } => {
                 assert_eq!(title, "Connection problem");
                 assert_eq!(retry.map(|f| f.audio.samples.len()), Some(3));
@@ -1116,7 +1129,7 @@ mod tests {
             _ => panic!("expected a failure"),
         }
         cfg.keep_failed_audio = false;
-        match failure(&cfg, &AppInfo::default(), e, audio, 500) {
+        match failure(&crate::daemon::app::privacy::Privacy::ticket(&crate::daemon::app::privacy::Privacy::new(&cfg)), &cfg, &AppInfo::default(), e, audio, 500) {
             Outcome::Failed { retry, .. } => assert!(retry.is_none()),
             _ => panic!("expected a failure"),
         }

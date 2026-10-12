@@ -1,0 +1,22 @@
+LIBRARY ot-net
+EXPORTS
+    bind=ot_bind @2
+    closesocket=WS2_32.closesocket @3
+    getpeername=WS2_32.getpeername @5
+    getsockopt=WS2_32.getsockopt @7
+    htonl=WS2_32.htonl @8
+    htons=WS2_32.htons @9
+    ioctlsocket=WS2_32.ioctlsocket @10
+    listen=WS2_32.listen @13
+    ntohl=WS2_32.ntohl @14
+    ntohs=WS2_32.ntohs @15
+    setsockopt=WS2_32.setsockopt @21
+    shutdown=WS2_32.shutdown @22
+    WSAGetLastError=WS2_32.WSAGetLastError @111
+    WSASetLastError=WS2_32.WSASetLastError @112
+    WSAStartup=WS2_32.WSAStartup @115
+    WSACleanup=WS2_32.WSACleanup @116
+    WSASend=WS2_32.WSASend
+    WSASocketW=WS2_32.WSASocketW
+    WSAAddressToStringW=WS2_32.WSAAddressToStringW
+    WSARecv=WS2_32.WSARecv

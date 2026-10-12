@@ -107,6 +107,7 @@ pub struct App {
     pub rec: Option<RecSession>,
     pub job: Option<ActiveJob>,
     pub last_failed: Option<Failed>,
+    pub(super) privacy: Arc<std::sync::Mutex<super::privacy::Privacy>>,
     /// "Hide for now" / tray "Hide floating icon": the idle pill stays hidden.
     pub icon_hidden: bool,
     pub seq: u64,
@@ -353,6 +354,7 @@ impl App {
         let machine = Machine::new(cfg.activation_mode);
         Ok(App {
             hwnd,
+            privacy: super::privacy::Privacy::new(&cfg),
             cfg,
             machine,
             pill,
@@ -565,6 +567,7 @@ impl App {
     /// recording and history retention. Does not touch the disk (see [`App::save_config`]).
     pub(super) fn apply_config(&mut self, new: Config) {
         let old = std::mem::replace(&mut self.cfg, new);
+        self.privacy.lock().unwrap_or_else(|e| e.into_inner()).update(&self.cfg);
         let diff = ConfigDiff::between(&old, &self.cfg);
         if diff.providers {
             // A test started with the old provider settings no longer describes them.
@@ -651,7 +654,7 @@ impl App {
                 self.sync_tray_popup();
             }
             PopupAction::HistoryClear => {
-                if let Err(e) = history::clear() {
+                if let Err(e) = self.privacy.lock().unwrap_or_else(|e| e.into_inner()).clear_history() {
                     log_warn!("history: cannot clear: {e}");
                 }
                 self.sync_tray_popup();

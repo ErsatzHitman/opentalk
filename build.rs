@@ -12,6 +12,21 @@ fn main() {
         return;
     }
     let out = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
+    println!("cargo:rerun-if-changed=tools/loopback/socket.c");
+    println!("cargo:rerun-if-changed=tools/loopback/socket.def");
+    let compiler = std::env::var("CC_x86_64_pc_windows_gnu").or_else(|_| std::env::var("CC"))
+        .unwrap_or_else(|_| if cfg!(windows) { "gcc" } else { "x86_64-w64-mingw32-gcc" }.into());
+    let status = std::process::Command::new(&compiler)
+        .args(["-shared", "-Os", "-s", "-Wl,--no-insert-timestamp", "tools/loopback/socket.c", "tools/loopback/socket.def", "-lws2_32", "-o"])
+        .arg(out.join("ot-net.dll"))
+        .status().expect("compile local-model loopback shim (MinGW gcc required)");
+    assert!(status.success(), "local-model loopback shim compilation failed");
+    println!("cargo:rerun-if-changed=tools/loopback/test.c");
+    let status = std::process::Command::new(&compiler)
+        .args(["-Os", "-s", "tools/loopback/test.c", "-lws2_32", "-o"])
+        .arg(out.join("loopback-test.exe"))
+        .status().expect("compile loopback regression executable");
+    assert!(status.success(), "loopback regression executable compilation failed");
     // OPENTALK_NO_RESOURCES=1 skips embedding (needed once to bootstrap `cargo run --example make_icon`
     // before assets/opentalk.ico exists, or when windres is unavailable).
     if std::env::var_os("OPENTALK_NO_RESOURCES").is_some() {
