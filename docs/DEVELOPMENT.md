@@ -20,7 +20,10 @@ cargo test                     # unit and headless end-to-end tests (no network,
 
 `build.rs` embeds the icon (`assets/opentalk.ico`), the manifest (per-monitor-v2 DPI, `asInvoker`, Windows 10/11,
 long paths, UTF-8 code page) and version info with `windres`. Set `OPENTALK_NO_RESOURCES=1` to skip that step.
-`cargo run --example make_icon` regenerates the icon from the OpenWhispr logo geometry.
+The build also compiles a small embedded `ot-net.dll` with MinGW. The pinned sherpa-onnx
+servers have no bind-address option: installation redirects their Winsock imports through this shim,
+which forwards their existing functions and confines IPv4/IPv6 listeners to loopback. Existing
+runtime installs are migrated before startup. `cargo run --example make_icon` regenerates the icon from the OpenWhispr logo geometry.
 
 Desktop and live tests are `#[ignore]`d and named `desktop_*` / `live_*`:
 

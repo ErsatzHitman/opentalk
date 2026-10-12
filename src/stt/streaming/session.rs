@@ -6,9 +6,9 @@
 //! - The thread connects (TCP, TLS, WebSocket upgrade), waits for the provider to be ready,
 //!   then alternates between sending frames and reading server events with a short socket
 //!   timeout, so an idle session costs ~50 wakeups/s and no busy loop.
-//! - `finish()` flushes the tail, sends the provider's finalize messages and waits until the
-//!   text has settled: the provider says it is done, or 250 ms pass without news and no
-//!   partial is outstanding, or the hard ceiling (2 s, 3 s for Gemini) expires.
+//! - `finish()` flushes the tail and requires the provider to confirm finalization. Buffer
+//!   overflow, connection loss and a finalization deadline report errors so batch/retry can
+//!   recover the complete recording rather than paste a partial transcript.
 //! - `cancel()` shuts the socket down from the caller's thread, so it takes effect at once.
 use super::util;
 use crate::stt::{StreamingSession, SttError, SttErrorCode, Transcript};
@@ -27,8 +27,6 @@ pub const SAMPLE_RATE: usize = 16_000;
 pub const FRAME_SAMPLES: usize = 800;
 /// Audio accepted before the socket is usable (3 s).
 pub const PRE_OPEN_CAP_SAMPLES: usize = 3 * SAMPLE_RATE;
-/// Silence after the last relevant server message that counts as "settled".
-pub const QUIET: Duration = Duration::from_millis(250);
 /// Default hard ceiling for the post-finalize wait.
 pub const CEILING: Duration = Duration::from_millis(2000);
 
@@ -126,12 +124,13 @@ pub struct Shared {
     cancelled: AtomicBool,
     ready: AtomicBool,
     pre_ready: AtomicUsize,
+    dropped_audio: AtomicBool,
     sock: Mutex<Option<TcpStream>>,
 }
 
 impl Shared {
     fn new() -> Self {
-        Self { cancelled: AtomicBool::new(false), ready: AtomicBool::new(false), pre_ready: AtomicUsize::new(0), sock: Mutex::new(None) }
+        Self { cancelled: AtomicBool::new(false), ready: AtomicBool::new(false), pre_ready: AtomicUsize::new(0), dropped_audio: AtomicBool::new(false), sock: Mutex::new(None) }
     }
 
     fn is_cancelled(&self) -> bool {
@@ -187,10 +186,13 @@ impl StreamingSession for WsSession {
         let mut take = pcm.len();
         if !self.shared.ready.load(Ordering::Acquire) {
             let used = self.shared.pre_ready.fetch_add(take, Ordering::Relaxed);
-            if used >= PRE_OPEN_CAP_SAMPLES {
+            take = take.min(PRE_OPEN_CAP_SAMPLES.saturating_sub(used));
+            if take < pcm.len() {
+                self.shared.dropped_audio.store(true, Ordering::Release);
+            }
+            if take == 0 {
                 return;
             }
-            take = take.min(PRE_OPEN_CAP_SAMPLES - used);
         }
         self.stage.extend_from_slice(&pcm[..take]);
         if self.stage.len() >= STAGE_SAMPLES {
@@ -203,6 +205,9 @@ impl StreamingSession for WsSession {
         self.flush_stage();
         let _ = self.tx.send(Cmd::Finish);
         match self.result.recv_timeout(FINISH_GUARD) {
+            Ok(Ok(_)) if self.shared.dropped_audio.load(Ordering::Acquire) => {
+                Err(util::err(SttErrorCode::Timeout, "The streaming connection opened too slowly. Try again.", "audio exceeded the pre-open buffer; transcript is incomplete"))
+            }
             Ok(r) => r,
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 self.shared.abort();
@@ -569,7 +574,6 @@ impl Loop<'_> {
         let mut last_send = Instant::now();
         let mut last_read = Instant::now();
         let mut finalizing: Option<Instant> = None;
-        let mut last_activity = Instant::now();
         let mut poll = Duration::ZERO; // read timeout currently applied to the socket
 
         loop {
@@ -626,24 +630,20 @@ impl Loop<'_> {
                     self.send_all(fin);
                     let now = Instant::now();
                     finalizing = Some(now);
-                    last_activity = now;
                     crate::log_debug!("{} stream: finalize sent", self.proto.name());
                 }
             }
 
             if let Some(t_fin) = finalizing {
                 let now = Instant::now();
-                if self.proto.done() {
+                if self.proto.done() && !self.proto.partial_pending() {
                     crate::log_debug!("{} stream: done after {:.0} ms", self.proto.name(), (now - t_fin).as_secs_f64() * 1000.0);
                     break;
                 }
                 if now - t_fin >= self.proto.ceiling() {
-                    crate::log_debug!("{} stream: ceiling reached", self.proto.name());
-                    break;
-                }
-                if now - last_activity >= QUIET && !self.proto.partial_pending() {
-                    crate::log_debug!("{} stream: quiet after {:.0} ms", self.proto.name(), (now - t_fin).as_secs_f64() * 1000.0);
-                    break;
+                    return Err(self.proto.error().or_else(|| self.conn_err.take()).unwrap_or_else(|| {
+                        util::err(SttErrorCode::Timeout, format!("{} did not confirm the final transcript in time.", self.proto.name()), "finalization deadline; transcript may be incomplete")
+                    }));
                 }
             }
 
@@ -662,9 +662,7 @@ impl Loop<'_> {
                     poll = want;
                 }
                 if watching {
-                    if self.read_one() == Some(true) {
-                        last_activity = Instant::now();
-                    }
+                    self.read_one();
                 } else {
                     // Bounded so a chatty server cannot starve the audio path.
                     for _ in 0..64 {
@@ -677,15 +675,13 @@ impl Loop<'_> {
             }
         }
 
-        let text = self.proto.text().trim().to_string();
-        if text.is_empty() {
-            if let Some(e) = self.proto.error().or_else(|| self.conn_err.take()) {
-                return Err(e);
-            }
-            if self.lost {
-                return Err(util::err(SttErrorCode::Unreachable, format!("{} closed the connection.", self.proto.name()), "closed before any text"));
-            }
+        if let Some(e) = self.proto.error().or_else(|| self.conn_err.take()) {
+            return Err(e);
         }
+        if self.lost && !self.proto.done() {
+            return Err(util::err(SttErrorCode::Unreachable, format!("{} closed before confirming the final transcript.", self.proto.name()), "connection lost; transcript may be incomplete"));
+        }
+        let text = self.proto.text().trim().to_string();
         Ok(Transcript { text, detected_language: None })
     }
 

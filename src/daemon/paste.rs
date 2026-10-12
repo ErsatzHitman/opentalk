@@ -1,9 +1,11 @@
 //! Text insertion + target capture. TASK win-output implements. Port of OpenWhispr
 //! windows-fast-paste.c + clipboard.js Windows path, plus improvements (docs/PLAN.md §8):
-//! full clipboard snapshot/restore (all HGLOBAL formats), clipboard-history exclusion formats,
+//! clipboard snapshot/restore (HGLOBAL and standard GDI formats), clipboard-history exclusion formats,
 //! wait (<= 1.5 s) for physically held modifiers instead of injecting key-ups, restore focus to the
 //! captured HWND, Ctrl+Shift+V for terminals, UIPI (elevated target) detection, restore after 500 ms
 //! only if GetClipboardSequenceNumber is unchanged.
+
+mod graphics;
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -74,6 +76,8 @@ pub enum PasteOutcome {
     /// Nothing focused takes text (the desktop, a button, a page with no field selected): the
     /// text was left on the clipboard instead of being pasted nowhere.
     NoTextField,
+    /// Automatic paste was refused because replacing the clipboard would lose user data.
+    ClipboardPreserved,
 }
 
 /// `dwExtraInfo` stamped on the keystrokes we inject ("OTPS"), so our own hook can recognise them.
@@ -89,7 +93,8 @@ const SEND_FAILED_REASON: &str = "Text copied \u{2014} the paste keystroke was b
 const MODIFIER_WAIT: Duration = Duration::from_millis(1500);
 /// Delay before the previous clipboard contents are put back.
 const RESTORE_DELAY: Duration = Duration::from_millis(500);
-/// Clipboard snapshots above this size are not taken (the paste proceeds without restoring).
+/// Clipboard snapshots above this size are not taken; automatic paste with restore enabled
+/// preserves the clipboard instead of destroying data it cannot back up.
 const SNAPSHOT_CAP: usize = 64 << 20;
 /// The prefetch taken at recording start keeps data only up to this size: it sits in memory for
 /// the whole recording and transcription, against the daemon's RAM budget (PLAN §1). A larger
@@ -375,19 +380,11 @@ const CF_DSPBITMAP: u32 = 0x82;
 const CF_DSPMETAFILEPICT: u32 = 0x83;
 const CF_DSPENHMETAFILE: u32 = 0x8E;
 
-/// Formats whose clipboard handle is not an HGLOBAL (GDI objects / owner-drawn), or that only make
-/// sense for the process that put them there.
+/// Owner-drawn and private GDI formats have no safe, general way to copy them.
 fn skip_format(fmt: u32) -> bool {
     matches!(
         fmt,
-        CF_BITMAP
-            | CF_METAFILEPICT
-            | CF_PALETTE
-            | CF_ENHMETAFILE
-            | CF_OWNERDISPLAY
-            | CF_DSPBITMAP
-            | CF_DSPMETAFILEPICT
-            | CF_DSPENHMETAFILE
+        CF_OWNERDISPLAY
     ) || (0x300..=0x3FF).contains(&fmt) // CF_GDIOBJFIRST..LAST
 }
 
@@ -500,6 +497,7 @@ impl Clipboard {
 
     /// Place `bytes` on the (already emptied) clipboard under `fmt`.
     fn set(&self, fmt: u32, bytes: &[u8]) -> bool {
+        if graphics::supported(fmt) { return graphics::set(fmt, bytes); }
         // SAFETY: standard HGLOBAL hand-off; on success the clipboard owns the memory, on failure
         // we free it. `h` is locked only while copying.
         unsafe {
@@ -536,7 +534,7 @@ impl Drop for Clipboard {
     }
 }
 
-/// Every HGLOBAL-backed clipboard format at one point in time.
+/// Owned bytes for restorable HGLOBAL and standard GDI clipboard formats.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct Snapshot {
     formats: Vec<(u32, Vec<u8>)>,
@@ -555,7 +553,7 @@ pub(crate) enum ClipRead {
     Data(Snapshot),
     /// More than the caller's keep cap but within [`SNAPSHOT_CAP`]: nothing was copied.
     Unkept,
-    /// More than [`SNAPSHOT_CAP`]: never snapshotted (the paste proceeds without restoring).
+    /// More than [`SNAPSHOT_CAP`]: cannot be backed up for automatic paste.
     TooBig,
 }
 
@@ -602,7 +600,7 @@ fn read_clipboard_snapshot(keep_cap: usize) -> Option<(ClipRead, u32)> {
                 break;
             }
             if skip_format(fmt) {
-                continue;
+                return None; // custom/owner-drawn handles cannot be backed up safely
             }
             // Windows re-synthesizes these from CF_UNICODETEXT.
             if has_unicode && matches!(fmt, CF_TEXT | CF_OEMTEXT | CF_DSPTEXT) {
@@ -611,9 +609,10 @@ fn read_clipboard_snapshot(keep_cap: usize) -> Option<(ClipRead, u32)> {
             if fmt >= 0xC000 && SKIPPED_REGISTERED.contains(&format_name(fmt).as_str()) {
                 continue;
             }
-            let Ok(h) = GetClipboardData(fmt) else { continue };
+            let h = GetClipboardData(fmt).ok()?;
             let hg = HGLOBAL(h.0);
-            let size = GlobalSize(hg);
+            let graphic = graphics::supported(fmt);
+            let size = if graphic { graphics::size(fmt, h)? } else { GlobalSize(hg) };
             if size == 0 {
                 continue;
             }
@@ -629,12 +628,14 @@ fn read_clipboard_snapshot(keep_cap: usize) -> Option<(ClipRead, u32)> {
                 }
                 continue;
             }
-            let p = GlobalLock(hg);
-            if p.is_null() {
-                continue;
+            if graphic {
+                formats.push((fmt, graphics::read(fmt, h, size)?));
+            } else {
+                let p = GlobalLock(hg);
+                if p.is_null() { return None; }
+                formats.push((fmt, std::slice::from_raw_parts(p as *const u8, size).to_vec()));
+                let _ = GlobalUnlock(hg);
             }
-            formats.push((fmt, std::slice::from_raw_parts(p as *const u8, size).to_vec()));
-            let _ = GlobalUnlock(hg);
         }
         GetClipboardSequenceNumber()
     };
@@ -652,9 +653,16 @@ fn read_clipboard_snapshot(keep_cap: usize) -> Option<(ClipRead, u32)> {
 /// Put a snapshot back (an empty snapshot clears the clipboard, as it was empty before). Opening
 /// the clipboard is retried for about a second ([`OpenPatience::Patient`]): this runs off the
 /// critical path and a lost restore leaves the dictation text where the user's data was.
+#[cfg(test)]
 pub(crate) fn restore_clipboard(snap: &Snapshot) -> bool {
+    restore_clipboard_if(snap, None)
+}
+
+fn restore_clipboard_if(snap: &Snapshot, expected: Option<u32>) -> bool {
     let Some(owner) = Owner::new() else { return false };
     let Some(cb) = Clipboard::open_with(&owner, OpenPatience::Patient) else { return false };
+    // No other process can change the clipboard between this check and EmptyClipboard.
+    if expected.is_some_and(|seq| unsafe { GetClipboardSequenceNumber() } != seq) { return true; }
     if !cb.empty() {
         return false;
     }
@@ -946,7 +954,7 @@ trait PasteEnv: Send + Sync {
     fn send_paste(&self, terminal: bool) -> Result<(), SendError>;
     fn acquire_pending(&self) -> Option<(u64, Arc<Snapshot>)>;
     fn take_pending(&self, gen_id: u64) -> bool;
-    fn restore(&self, snap: &Snapshot) -> bool;
+    fn restore_if_unchanged(&self, snap: &Snapshot, expected: u32) -> bool;
     fn discard_snapshot(&self);
 }
 
@@ -981,8 +989,8 @@ impl PasteEnv for SystemPaste {
     fn take_pending(&self, gen_id: u64) -> bool {
         take_pending(gen_id)
     }
-    fn restore(&self, snap: &Snapshot) -> bool {
-        restore_clipboard(snap)
+    fn restore_if_unchanged(&self, snap: &Snapshot, expected: u32) -> bool {
+        restore_clipboard_if(snap, Some(expected))
     }
     fn discard_snapshot(&self) {
         discard_clipboard_snapshot();
@@ -1003,7 +1011,7 @@ fn spawn_restore(env: Arc<dyn PasteEnv>, gen_id: u64, snap: Arc<Snapshot>, seq: 
             return;
         }
         // Only if nobody (user, other app) has touched the clipboard since our write.
-        if worker.sequence() == seq && !worker.restore(&snap) {
+        if !worker.restore_if_unchanged(&snap, seq) {
             crate::log_warn!("paste: could not restore the previous clipboard contents");
         }
     });
@@ -1065,6 +1073,9 @@ fn paste_with(
         env.discard_snapshot();
         None
     };
+    if opts.restore_clipboard && pending.is_none() {
+        return (PasteOutcome::ClipboardPreserved, None);
+    }
     // Any outcome other than a completed paste or a cancel leaves our text on the clipboard on
     // purpose, so the user's previous contents are not put back over it.
     let fail = |reason: &str| {
@@ -1753,7 +1764,7 @@ mod tests {
     }
 
     #[test]
-    fn over_snapshot_cap_at_paste_time_pastes_without_restore() {
+    fn over_snapshot_cap_has_no_restorable_snapshot() {
         let (pre, pending) = (leaked_prefetch(), pending_slot());
         let clip = Arc::new(FakeClip {
             seq: 4.into(),
@@ -1875,7 +1886,8 @@ mod tests {
             self.takes.fetch_add(1, Ordering::SeqCst);
             true
         }
-        fn restore(&self, _snap: &Snapshot) -> bool {
+        fn restore_if_unchanged(&self, _snap: &Snapshot, expected: u32) -> bool {
+            assert_eq!(expected, 7);
             self.restores.fetch_add(1, Ordering::SeqCst);
             true
         }
@@ -2004,10 +2016,81 @@ mod tests {
         assert!(our_integrity() >= 0x1000);
     }
 
+    #[test]
+    fn automatic_paste_preserves_clipboard_when_backup_fails() {
+        let env = Arc::new(FakeEnv { pending: false, ..Default::default() });
+        assert_eq!(run_paste(&env, true).0, PasteOutcome::ClipboardPreserved);
+        assert_eq!(FakeEnv::count(&env.writes), 0);
+        assert_eq!(FakeEnv::count(&env.sends), 0);
+    }
+
     // ----- desktop tests: touch the real clipboard / windows. Run with `--ignored --test-threads=1`.
 
     /// Serializes desktop tests (the clipboard is process-global).
     static DESKTOP: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn clipboard_graphics_and_restore_race_regression() {
+        use windows::Win32::Graphics::Gdi::*;
+        use windows::Win32::System::DataExchange::METAFILEPICT;
+        let _g = DESKTOP.lock().unwrap_or_else(|e| e.into_inner());
+        struct Restore(Snapshot);
+        impl Drop for Restore { fn drop(&mut self) { let _ = restore_clipboard(&self.0); } }
+        let _before = Restore(snapshot_clipboard().expect("initial clipboard backup"));
+        // SAFETY: each created GDI object is handed to the clipboard; the snapshots contain only
+        // owned bytes. Global allocations for METAFILEPICT are sized and locked correctly.
+        unsafe {
+            let owner = Owner::new().unwrap();
+            let cb = Clipboard::open(&owner).unwrap();
+            assert!(cb.empty());
+            let pixels = [0x000000ffu32, 0x0000ff00, 0x00ff0000, 0x00ffffff];
+            let bm = CreateBitmap(2, 2, 1, 32, Some(pixels.as_ptr() as _));
+            assert!(!bm.is_invalid());
+            let n = graphics::size(CF_BITMAP, HANDLE(bm.0)).unwrap();
+            let original_bitmap = graphics::read(CF_BITMAP, HANDLE(bm.0), n).unwrap();
+            assert!(SetClipboardData(CF_BITMAP, Some(HANDLE(bm.0))).is_ok());
+            let dc = CreateEnhMetaFileW(None, PCWSTR::null(), None, PCWSTR::null());
+            assert!(Rectangle(dc, 1, 2, 3, 4).as_bool());
+            let emf = CloseEnhMetaFile(dc);
+            assert!(!emf.is_invalid());
+            assert!(SetClipboardData(CF_ENHMETAFILE, Some(HANDLE(emf.0))).is_ok());
+            let dc = CreateMetaFileW(PCWSTR::null());
+            assert!(Rectangle(dc, 1, 2, 3, 4).as_bool());
+            let mf = CloseMetaFile(dc);
+            let hg = GlobalAlloc(GMEM_MOVEABLE, std::mem::size_of::<METAFILEPICT>()).unwrap();
+            let p = GlobalLock(hg);
+            assert!(!p.is_null());
+            std::ptr::write(p as *mut METAFILEPICT, METAFILEPICT { mm: MM_ANISOTROPIC.0, xExt: 100, yExt: 200, hMF: mf });
+            let _ = GlobalUnlock(hg);
+            assert!(SetClipboardData(CF_METAFILEPICT, Some(HANDLE(hg.0))).is_ok());
+            let mut palette = [0x00020300u32, 0x000000ff, 0x0000ff00];
+            let pal = CreatePalette(palette.as_mut_ptr() as *const LOGPALETTE);
+            assert!(!pal.is_invalid());
+            assert!(SetClipboardData(CF_PALETTE, Some(HANDLE(pal.0))).is_ok());
+            drop(cb);
+            let known = snapshot_clipboard().expect("GDI objects can be backed up");
+            assert_eq!(known.formats.iter().find(|(f, _)| *f == CF_BITMAP).unwrap().1, original_bitmap);
+            assert!(copy_to_clipboard("dictation"));
+            assert!(restore_clipboard(&known));
+            let again = snapshot_clipboard().unwrap();
+            for fmt in [CF_BITMAP, CF_ENHMETAFILE, CF_METAFILEPICT, CF_PALETTE] {
+                assert_eq!(known.formats.iter().find(|(f, _)| *f == fmt), again.formats.iter().find(|(f, _)| *f == fmt), "format {fmt} survives replacement and restore");
+            }
+        }
+        assert!(copy_to_clipboard("old dictation"));
+        let expected = unsafe { GetClipboardSequenceNumber() };
+        let owner = Owner::new().unwrap();
+        let cb = Clipboard::open(&owner).unwrap();
+        let snap = Snapshot { formats: vec![(CF_UNICODETEXT, utf16_bytes("stale backup"))] };
+        let worker = thread::spawn(move || restore_clipboard_if(&snap, Some(expected)));
+        // The restore is waiting for OpenClipboard, after its old sequence would have matched.
+        thread::sleep(Duration::from_millis(50));
+        assert!(cb.empty());
+        assert!(cb.set(CF_UNICODETEXT, &utf16_bytes("new user copy")));
+        drop(cb);
+        assert!(worker.join().unwrap());
+        assert_eq!(read_clipboard_text().as_deref(), Some("new user copy"));
+    }
 
     #[test]
     #[ignore]

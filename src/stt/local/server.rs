@@ -171,6 +171,7 @@ fn spawn(m: &LocalModel, manifest: &Manifest, key: &Key) -> Result<Server, SttEr
     use std::os::windows::io::AsRawHandle;
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    install::ensure_runtime_isolation().map_err(|e| err(SttErrorCode::Unavailable, "The local engine could not be secured. Download it again.", e))?;
     if !install::runtime_ready() {
         return Err(err(SttErrorCode::NotConfigured, "The local engine is not installed. Download a model in Settings > Speech-to-Text.", "runtime missing"));
     }

@@ -20,6 +20,7 @@
 pub mod cli_cmds;
 mod dictation;
 mod host;
+mod privacy;
 pub mod latency;
 pub mod machine;
 pub mod micpolicy;
