@@ -5,7 +5,7 @@ use super::{CaptureStats, Device, Output, SAMPLE_RATE, Stop};
 use crate::{log_info, log_warn};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
 use windows::Win32::Foundation::{CloseHandle, FILETIME, HANDLE, PROPERTYKEY, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::Media::Audio::{
@@ -497,6 +497,14 @@ fn open_any(requested: Option<&str>) -> Result<Stream, String> {
 // does not light the Windows microphone indicator (the ConsentStore LastUsedTimeStop stays set),
 // so one thread keeps the stream initialised and idle between recordings; `start` then only
 // pays for `IAudioClient::Start`.
+//
+// A parked stream is not free, though: as long as it exists the Windows audio engine (audiodg.exe)
+// keeps the endpoint's system effects loaded. On the development machine that is ~230 MB of
+// working set for the Realtek/Intel SST capture APO, against ~7 MB with no stream at all (the
+// same was measured with a neutral PortAudio capture, so this is the Windows audio stack, not
+// OpenTalk). The engine drops the parked stream once it has been idle for `hold_secs`, so the
+// memory comes back between dictations; only the first start after the hold pays the driver init
+// again.
 // ---------------------------------------------------------------------------------------------
 
 /// A recording request handed to the engine thread.
@@ -510,9 +518,12 @@ pub(crate) struct StartReq {
 }
 
 enum Cmd {
-    Prepare(Option<String>),
+    /// Initialise `device` (None = default) and park it for `hold_secs` after the last use.
+    Prepare(Option<String>, u32),
     /// Re-check the prepared stream against the current devices.
     Revalidate,
+    /// A recording ended: park the stream for `hold_secs` more, or drop it now (`0`).
+    Hold(u32),
     Release,
     Start(Box<StartReq>),
 }
@@ -545,10 +556,12 @@ fn send(cmd: Cmd) -> Result<(), String> {
 }
 
 /// Warm COM + the device enumerator and initialise the default microphone stream in the
-/// background, so the first `start` only pays for `IAudioClient::Start`. Returns immediately and
-/// never opens the microphone for capture (no mic indicator).
-pub(crate) fn warmup() {
-    let _ = send(Cmd::Prepare(None));
+/// background, so the first `start` only pays for `IAudioClient::Start`. `hold_secs` is how long
+/// the parked stream may live after the last use (`0` = keep it until [`release`]); dropping it
+/// lets the Windows audio engine free the endpoint's effect memory. Returns immediately and never
+/// opens the microphone for capture (no mic indicator).
+pub(crate) fn warmup(hold_secs: u32) {
+    let _ = send(Cmd::Prepare(None, hold_secs));
 }
 
 /// Device set / default changed: let a running engine re-check its prepared stream. Does not
@@ -560,14 +573,26 @@ fn revalidate() {
     }
 }
 
-/// Initialise `device` (None = default) in the background and keep it ready.
-pub(crate) fn prepare(device: Option<&str>) {
-    let _ = send(Cmd::Prepare(device.map(str::to_owned)));
+/// Initialise `device` (None = default) in the background and park it for `hold_secs` after the
+/// last use (`0` = keep it until [`release`]).
+pub(crate) fn prepare(device: Option<&str>, hold_secs: u32) {
+    let _ = send(Cmd::Prepare(device.map(str::to_owned), hold_secs));
+}
+
+/// A recording just ended: park the stream for `hold_secs` more (back-to-back dictations stay
+/// fast), or drop it immediately when the hold is `0`.
+pub(crate) fn hold(hold_secs: u32) {
+    let _ = send(Cmd::Hold(hold_secs));
 }
 
 /// Drop the idle prepared stream (the next `start` will be slow again).
 pub(crate) fn release() {
     let _ = send(Cmd::Release);
+}
+
+/// When an idle parked stream is dropped (`0` = no deadline).
+fn hold_deadline(secs: u32) -> Option<Instant> {
+    (secs > 0).then(|| Instant::now() + Duration::from_secs(u64::from(secs)))
 }
 
 /// Queue a recording on the engine thread.
@@ -580,23 +605,61 @@ fn engine_main(rx: std::sync::mpsc::Receiver<Cmd>) {
     let mut prepared: Option<Stream> = None;
     // What the user last asked to be kept ready (None = default device).
     let mut wanted: Option<String> = None;
-    while let Ok(cmd) = rx.recv() {
-        match cmd {
-            Cmd::Prepare(dev) => {
+    // How long an idle parked stream is kept (0 = until told to release).
+    let mut hold_secs = 0u32;
+    // When the idle parked stream is dropped.
+    let mut release_at: Option<Instant> = None;
+    loop {
+        // Sleep until the release deadline; with no deadline only a command can wake us.
+        let wait = release_at.map_or(Duration::from_secs(3600), |t| t.saturating_duration_since(Instant::now()));
+        match rx.recv_timeout(wait) {
+            Ok(Cmd::Prepare(dev, secs)) => {
                 wanted = dev;
+                hold_secs = secs;
                 prepare_now(&mut prepared, wanted.as_deref());
+                release_at = hold_deadline(hold_secs);
             }
-            Cmd::Revalidate => {
+            Ok(Cmd::Revalidate) => {
                 // Only follow device changes when something is being kept ready.
                 if prepared.is_some() {
                     prepare_now(&mut prepared, wanted.as_deref());
+                    release_at = hold_deadline(hold_secs);
                 }
             }
-            Cmd::Release => prepared = None,
-            Cmd::Start(req) => {
+            Ok(Cmd::Hold(secs)) => {
+                hold_secs = secs;
+                if hold_secs == 0 {
+                    // Dropping the stream here is what makes audiodg give its memory back.
+                    prepared = None;
+                    release_at = None;
+                } else if prepared.is_some() {
+                    release_at = hold_deadline(hold_secs);
+                }
+            }
+            Ok(Cmd::Release) => {
+                prepared = None;
+                release_at = None;
+            }
+            Ok(Cmd::Start(req)) => {
                 wanted = req.device.clone();
                 run_session(&mut prepared, *req);
+                // The stream is worth keeping only while it is used: restart the idle countdown.
+                if prepared.is_some() && hold_secs > 0 {
+                    release_at = hold_deadline(hold_secs);
+                } else {
+                    prepared = None;
+                    release_at = None;
+                }
             }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if release_at.is_some_and(|t| Instant::now() >= t) {
+                    if prepared.take().is_some() {
+                        log_info!("audio: released the idle prepared stream (the audio engine can free its memory)");
+                    }
+                    release_at = None;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
 }

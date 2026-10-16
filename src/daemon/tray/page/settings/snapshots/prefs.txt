@@ -25,5 +25,5 @@
 
 ## Microphone
   choice #13 Input device > System default
-  choice #14 Keep microphone warm > Off
-  note: Instant next start; the Windows mic indicator stays on
+  choice #14 Keep microphone warm > 5 minutes
+  note: Instant next start while warm; released when idle (frees the audio engine's memory)

@@ -1,68 +1,31 @@
 //! When the daemon may keep a microphone stream prepared between dictations.
 //!
-//! The audio engine keeps an initialised (not started) capture stream parked so a dictation only
-//! pays for `IAudioClient::Start`. On wired and USB microphones that is invisible: Windows only
-//! lights the mic indicator for a started stream. Initialising a capture stream on a Bluetooth
-//! headset, however, can switch it to the hands-free profile (HFP) and degrade music or call audio
-//! for as long as the stream exists. So Bluetooth endpoints are only kept prepared when the user
-//! asked for a warm microphone (`mic_warm_hold_secs > 0`); otherwise the stream is released after
-//! every recording and never prepared at start-up (PLAN §9.2: keep-warm is opt-in).
-use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_EnumeratorName;
-use windows::Win32::Media::Audio::{IMMDeviceEnumerator, MMDeviceEnumerator, eCapture, eConsole};
-use windows::Win32::System::Com::{CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize, STGM_READ};
-use windows::core::HSTRING;
-
+//! A prepared (initialised, not started) stream saves the driver's stream-initialisation cost on
+//! the next `start`: 250-700 ms on some mic arrays (measured: ~500 ms on an Intel SST array),
+//! against ~10 ms when the stream is already parked.
+//!
+//! A parked stream is not free, though: as long as it exists, the Windows audio engine
+//! (audiodg.exe) keeps the endpoint's system effects (APOs) loaded, measured at ~230 MB on a
+//! Realtek/Intel SST microphone. `mic_warm_hold_secs` therefore bounds how long the parked stream
+//! lives after the last use: `0` releases it after every recording (lowest memory, slow first
+//! start), `30`-`900` keep it warm that many seconds (fast back-to-back dictations, memory back
+//! when the user pauses). Bluetooth headsets are no different: keeping their stream alive switches
+//! them to the hands-free profile, and the same hold bounds that.
 use crate::daemon::audio;
-use crate::log_info;
 
-/// True when the PnP enumerator name belongs to a Bluetooth device (`BTHENUM`, `BTHHFENUM`,
-/// `BTHLEDevice`, ...).
-pub fn is_bluetooth_enumerator(name: &str) -> bool {
-    name.trim().to_ascii_uppercase().starts_with("BTH")
+/// Whether a stream may stay prepared between dictations under this setting.
+pub fn may_keep_prepared(warm_hold_secs: u32) -> bool {
+    warm_hold_secs > 0 || audio::inject_path().is_some()
 }
 
-/// PnP enumerator name of the capture endpoint `device_id` (None = default console capture
-/// device). Blocks for a few ms (device enumeration); call it off the UI thread.
-pub fn enumerator_name(device_id: Option<&str>) -> Option<String> {
-    // SAFETY: COM is initialised for this call and balanced when it succeeded; interface calls
-    // are on valid objects created here, and the PROPVARIANT is converted before it is dropped.
-    unsafe {
-        let init = CoInitializeEx(None, COINIT_MULTITHREADED).is_ok();
-        let name = (|| {
-            let en: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).ok()?;
-            let dev = match device_id {
-                Some(id) => en.GetDevice(&HSTRING::from(id)).or_else(|_| en.GetDefaultAudioEndpoint(eCapture, eConsole)).ok()?,
-                None => en.GetDefaultAudioEndpoint(eCapture, eConsole).ok()?,
-            };
-            let store = dev.OpenPropertyStore(STGM_READ).ok()?;
-            let value = store.GetValue(&PKEY_Device_EnumeratorName).ok()?;
-            Some(value.to_string())
-        })();
-        if init {
-            CoUninitialize();
-        }
-        name.filter(|n| !n.is_empty())
-    }
-}
-
-/// Whether a stream for `device_id` may stay prepared between dictations.
-pub fn may_keep_prepared(device_id: Option<&str>, warm_hold_secs: u32) -> bool {
-    if warm_hold_secs > 0 || audio::inject_path().is_some() {
-        return true;
-    }
-    !enumerator_name(device_id).is_some_and(|n| is_bluetooth_enumerator(&n))
-}
-
-/// Prepare the stream for `device_id` unless it is a Bluetooth headset (see the module docs).
-/// Blocks for a few ms (endpoint lookup); the preparing itself happens on the audio thread.
+/// Prepare the stream for `device_id` (or release it) according to the keep-warm setting.
 pub fn prepare_now(device_id: Option<&str>, warm_hold_secs: u32) {
-    if may_keep_prepared(device_id, warm_hold_secs) {
+    if may_keep_prepared(warm_hold_secs) {
         match device_id {
-            Some(id) => audio::Recorder::prepare(Some(id)),
-            None => audio::warmup(),
+            Some(id) => audio::Recorder::prepare(Some(id), warm_hold_secs),
+            None => audio::warmup(warm_hold_secs),
         }
     } else {
-        log_info!("audio: Bluetooth microphone; not keeping a stream prepared (keep-warm is off)");
         audio::Recorder::release_prepared();
     }
 }
@@ -75,13 +38,17 @@ pub fn prepare_in_background(device_id: Option<String>, warm_hold_secs: u32) {
         .spawn(move || prepare_now(device_id.as_deref(), warm_hold_secs));
     if spawned.is_err() {
         // Without the check thread, fall back to the plain warm-up (never fatal).
-        audio::warmup();
+        if may_keep_prepared(warm_hold_secs) {
+            audio::warmup(warm_hold_secs);
+        }
     }
 }
 
-/// After a recording ended (worker thread): drop the parked stream again on Bluetooth endpoints.
-pub fn after_recording(device_id: Option<&str>, warm_hold_secs: u32) {
-    if !may_keep_prepared(device_id, warm_hold_secs) {
+/// After a recording ended (worker thread): refresh the keep-warm window, or release the stream.
+pub fn after_recording(warm_hold_secs: u32) {
+    if may_keep_prepared(warm_hold_secs) {
+        audio::Recorder::hold_prepared(warm_hold_secs);
+    } else {
         audio::Recorder::release_prepared();
     }
 }
@@ -91,25 +58,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bluetooth_enumerators() {
-        for bt in ["BTHENUM", "BTHHFENUM", "BTHLEDevice", "bthenum ", "BTHLE"] {
-            assert!(is_bluetooth_enumerator(bt), "{bt}");
-        }
-        for wired in ["USB", "HDAUDIO", "INTELAUDIO", "SWD", "MMDEVAPI", ""] {
-            assert!(!is_bluetooth_enumerator(wired), "{wired}");
-        }
+    fn hold_keeps_the_stream_ready() {
+        assert!(may_keep_prepared(1));
+        assert!(may_keep_prepared(30));
+        assert!(may_keep_prepared(900));
     }
 
     #[test]
-    fn keep_warm_always_allows_preparing() {
-        assert!(may_keep_prepared(Some("{not-a-real-endpoint}"), 30));
-    }
-
-    #[test]
-    fn default_capture_endpoint_has_an_enumerator() {
-        // Machines without a microphone (CI) have no default endpoint: nothing to check then.
-        if let Some(name) = enumerator_name(None) {
-            assert!(!name.trim().is_empty());
+    fn off_releases_the_stream() {
+        // The injected-WAV test path keeps the recorder addresses stable; otherwise 0 means off.
+        if audio::inject_path().is_none() {
+            assert!(!may_keep_prepared(0));
         }
     }
 }

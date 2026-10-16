@@ -94,7 +94,7 @@ impl PageModel for PrefsPage {
         v.push(group("Microphone"));
         v.push(choice(ID_MIC, "Input device", &device_label(cfg)));
         v.push(choice(ID_WARM, "Keep microphone warm", WARM_CHOICES[warm_index(cfg.mic_warm_hold_secs)].0));
-        v.push(note("Instant next start; the Windows mic indicator stays on"));
+        v.push(note("Instant next start while warm; released when idle (frees the audio engine's memory)"));
         v
     }
 

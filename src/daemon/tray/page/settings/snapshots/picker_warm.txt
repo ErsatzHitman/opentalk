@@ -1,8 +1,8 @@
 # Keep microphone warm
 
 ## Options
-  (*) #100 Off
+  ( ) #100 Off
   ( ) #101 30 seconds
   ( ) #102 1 minute
-  ( ) #103 5 minutes
+  (*) #103 5 minutes
   ( ) #104 15 minutes

@@ -271,12 +271,18 @@ impl Recorder {
         })
     }
 
-    /// Initialise `device_id` (None = default) in the background and keep it ready, so the next
-    /// `start` only pays for `IAudioClient::Start` (~10 ms) instead of the driver's stream
-    /// initialisation (250-700 ms on some mic arrays). Does not light the Windows mic indicator.
-    /// Call after the user changes the microphone setting; `warmup` already does it for the default.
-    pub fn prepare(device_id: Option<&str>) {
-        wasapi::prepare(device_id);
+    /// Initialise `device_id` (None = default) in the background and park it for `hold_secs` after
+    /// the last use, so the next `start` only pays for `IAudioClient::Start` (~10 ms) instead of the
+    /// driver's stream initialisation (250-700 ms on some mic arrays). Does not light the Windows
+    /// mic indicator. Call after the user changes the microphone setting; `warmup` already does it
+    /// for the default.
+    pub fn prepare(device_id: Option<&str>, hold_secs: u32) {
+        wasapi::prepare(device_id, hold_secs);
+    }
+
+    /// A recording ended: park the stream for `hold_secs` more, or release it at once (`0`).
+    pub fn hold_prepared(hold_secs: u32) {
+        wasapi::hold(hold_secs);
     }
 
     /// Release the prepared stream (the next `start` is slow again). Normally never needed.
@@ -379,10 +385,11 @@ pub fn list_devices() -> Vec<Device> {
     wasapi::list_devices()
 }
 
-/// Initialise COM + cache the device enumerator so the first `start` is fast. Does not open the
-/// microphone.
-pub fn warmup() {
-    wasapi::warmup();
+/// Initialise COM + cache the device enumerator and park the default capture stream for
+/// `hold_secs` after the last use (`0` = keep it), so the first `start` is fast. Does not open the
+/// microphone for capture.
+pub fn warmup(hold_secs: u32) {
+    wasapi::warmup(hold_secs);
 }
 
 /// Read the published level.
@@ -752,7 +759,7 @@ mod tests {
         // (2) Warm: drop the parked stream, then let warmup prepare it in the background.
         Recorder::release_prepared();
         let t = Instant::now();
-        warmup();
+        warmup(0);
         println!("warmup() returned after {:.1} ms", t.elapsed().as_secs_f64() * 1000.0);
         std::thread::sleep(Duration::from_millis(2000));
 

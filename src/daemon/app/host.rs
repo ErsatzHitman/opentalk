@@ -1296,7 +1296,7 @@ mod tests {
         let table: Vec<(&str, Config, ConfigDiff)> = vec![
             ("hotkey", cfg(|c| c.hotkey = "F8".into()), ConfigDiff { hotkey: true, ..Default::default() }),
             ("input device", cfg(|c| c.mic_device_id = Some("{x}".into())), ConfigDiff { microphone: true, ..Default::default() }),
-            ("keep warm", cfg(|c| c.mic_warm_hold_secs = 300), ConfigDiff { microphone: true, ..Default::default() }),
+            ("keep warm", cfg(|c| c.mic_warm_hold_secs = 900), ConfigDiff { microphone: true, ..Default::default() }),
             ("pause media on", cfg(|c| c.pause_media = true), ConfigDiff { warm_media: true, ..Default::default() }),
             ("cues stay on", cfg(|c| c.audio_cues = true), ConfigDiff::default()),
             ("mute off", cfg(|c| c.mute_system_audio = false), ConfigDiff { release_mute: true, ..Default::default() }),

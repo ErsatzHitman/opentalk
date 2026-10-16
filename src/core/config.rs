@@ -260,7 +260,7 @@ impl Default for Config {
             start_minimized: false,
             mic_device_id: None,
             mic_device_label: None,
-            mic_warm_hold_secs: 0,
+            mic_warm_hold_secs: 300,
             hotkey: "Control+Super".into(),
             activation_mode: ActivationMode::Tap,
             suppress_start_menu: true,

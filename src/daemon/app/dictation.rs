@@ -196,10 +196,10 @@ fn take_session(feed: Option<Feed>) -> Option<Box<dyn StreamingSession>> {
 
 /// Stop a recorder nobody wants any more, off the UI thread (stopping waits for its capture loop).
 fn discard_recorder(recorder: Recorder, cfg: &Config) {
-    let (mic, warm) = (cfg.mic_device_id.clone(), cfg.mic_warm_hold_secs);
+    let warm = cfg.mic_warm_hold_secs;
     let spawned = std::thread::Builder::new().name("rec-discard".into()).spawn(move || {
         recorder.cancel();
-        super::micpolicy::after_recording(mic.as_deref(), warm);
+        super::micpolicy::after_recording(warm);
     });
     if let Err(e) = spawned {
         log_warn!("cannot spawn a thread to stop the recorder: {e}");
@@ -340,14 +340,13 @@ impl App {
                 paste::prepare_clipboard_snapshot();
             }
             // A hung driver must not leave the pill in Thinking until Esc (a stop may be pending).
-            let mic = device.clone();
             let result = start_with_timeout(
                 START_TIMEOUT,
                 move || Recorder::start(device.as_deref(), level, Some(sink)),
                 // A recorder that comes up after the timeout is stopped right here, on the helper.
                 move |late: Recorder| {
                     late.cancel();
-                    super::micpolicy::after_recording(mic.as_deref(), warm);
+                    super::micpolicy::after_recording(warm);
                 },
             );
             let started = result.is_ok();
@@ -674,7 +673,7 @@ impl App {
             if !live && restores_clipboard(&job.cfg) {
                 paste::prepare_clipboard_snapshot();
             }
-            let (mic, warm) = (job.cfg.mic_device_id.clone(), job.cfg.mic_warm_hold_secs);
+            let warm = job.cfg.mic_warm_hold_secs;
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_job(job))).unwrap_or_else(|_| Outcome::Failed {
                 title: "Something went wrong".into(),
                 message: "OpenTalk hit an internal error while processing that recording.".into(),
@@ -682,7 +681,7 @@ impl App {
             });
             notify(hwnd, Note::JobDone { seq: id, outcome });
             if live {
-                super::micpolicy::after_recording(mic.as_deref(), warm);
+                super::micpolicy::after_recording(warm);
             }
         });
         if let Err(e) = spawned {
